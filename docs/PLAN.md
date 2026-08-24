@@ -40,7 +40,7 @@ proved the isolated test harness actually isolates.
   QML plugin, the group manifest, the docs. `git log`: `626a40d` → `2cf9bd1` →
   `f4f3466` → `3c705d5` → `d7f63dc` → `6713239` → `741be00` → `8a329fa` →
   `e6db1c1` → … → `acc9c17` → `30532dd` → `d5e9751` → `58e3bbb` → `bedeea1` →
-  `f0732db` → `b3e29d3` → `ed08571`, all pushed. 169 specs.
+  `f0732db` → … → `2b57015` → `6981927` → … → `eee6113`, all pushed. 231 specs.
 - **`~/Devs/omarchy-personal`** — private, GitHub, the user's actual dotfiles.
   This is `OMABACKUP_REPO`: where `sync` publishes staged content. It is NOT
   where OmaBackup's own code lives — never put backup *data* in the public
@@ -103,6 +103,62 @@ the filesystem, the same way regardless of what is mounted there, never over a
 network API. A "removable drive" trigger is not a new type either — it is a
 `dir` destination whose path is a mount point, fired by udev instead of the
 timer. DESIGN.md §1, §3, §4 and §11.4 updated to match.
+
+### Three mistakes this project keeps making
+
+Four review rounds have found 45 defects. Nine of them were introduced *while
+fixing* another defect, and they sort into three shapes. They are written down
+because recognising the shape is faster than rediscovering the instance.
+
+**1. A fact stated twice.** Every duplicated fact eventually drifts, and the
+drift is silent because both copies still look right on their own.
+
+- `map_to_repo` repeated a destination the manifest already declared — the
+  whole `scripts` group vanished between staging and the repo.
+- `git add` carried the pathspec and `git commit` did not — a scoped add and an
+  unscoped commit.
+- `_dir_is_ours` and `prune_bundles` each described this tool's own filename —
+  adding the short sha to one left the other behind, and retention stopped.
+- `Persistent=true` and the comment above it described different behaviour.
+
+The fix is never "update both". It is one definition, referenced twice.
+
+**2. An exit status discarded, so "it failed" and "nothing found" become the
+same answer.** Four instances of one mistake, three of them in a security gate:
+
+- `git status` failing read as "up to date", exit 0.
+- `git grep` with a bad pattern read as "no secrets".
+- `git rev-list` on an unreadable repo read as "no commits", read as clean.
+- `jq` on an unreadable deny-list read as "no patterns", read as clean.
+
+Command substitution and `mapfile < <(...)` both throw the status away. Capture
+it, or state plainly why not caring is safe.
+
+**3. A green spec that never exercises the real path.** Five times, and the
+worst of them hid the defect it was written for:
+
+- The suite was 40/40 while `--commit` could not run at all — it tested
+  `publish_staging` as a function and never the command a human types.
+- The spec for "unrelated work stays out of the commit" edited the working tree
+  and never staged, so it passed against the bug it was written for.
+- The stamp spec called `prune_bundles` directly, never through the driver that
+  defeated it.
+- The quoting spec asserted the string contained quotes instead of asking
+  systemd whether it accepted the unit.
+
+Drive the CLI. Ask the real system. And when an assertion could only ever pass,
+add the case that makes it fail.
+
+### On reviews
+
+Scope them small. A review asking for six areas at once was killed by the
+executor's own 600s turn limit and returned nothing; the same target cut to two
+files and six concrete questions came back in four minutes with a defect nobody
+here would have found — that `git grep <rev>` reads a commit's tree and never
+its message, while `git bundle --all` packs both.
+
+Working through the questions written *for* a review, while it runs, has found
+about as much as the reviews themselves.
 
 ### What the reviews found (read before touching `sync`)
 
