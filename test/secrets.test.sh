@@ -209,3 +209,27 @@ it "push refuses when a pattern is a regex git will not accept"
 printf '%s\n' '{"schemaVersion":1,"patterns":[{"id":"bad","regex":"[unclosed","reason":"deliberately invalid"}],"exceptions":[]}' >"$FH/badre.json"
 OUT_BADRE="$(OMABACKUP_SECRETS_DENY="$FH/badre.json" _sec_env "$FH" "$FR" push 2>&1)"
 assert_contains "$OUT_BADRE" "bad"
+
+# ── "no commits" and "this repo is broken" are not the same answer ─────────
+# rev-list exits 0 with no output for an empty repo and 128 for a broken one,
+# but the output was read through `mapfile < <(...)`, which throws the exit
+# status away. Both became "nothing to scan", which became "clean", which
+# became a push. The file this lives in claims everything fails closed.
+XR="$(mktemp -d)/repo"; mkdir -p "$XR/.git"
+printf 'not a ref\n' >"$XR/.git/HEAD"
+
+it "a repository git cannot read is not reported as clean"
+scan_secrets "$XR" "$PWD/secrets.deny.json" >/dev/null 2>&1 \
+    && fail "a broken repo scanned clean" || ok
+
+it "and push refuses on it rather than sending"
+XH="$(mktemp -d)"; printf '{"schemaVersion":1,"destinations":[]}\n' >"$XH/destinations.json"
+XOUT="$(_sec_env "$XH" "$XR" push 2>&1)"
+assert_contains "$XOUT" "blocked"
+
+# ── an empty repository is genuinely empty, and says so quietly ────────────
+YR="$(mktemp -d)/repo"; git init -q "$YR"
+
+it "a repository with no commits scans clean without an error"
+scan_secrets "$YR" "$PWD/secrets.deny.json" >/dev/null 2>&1 \
+    && ok || fail "an empty repo was treated as a scan failure"

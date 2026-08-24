@@ -78,10 +78,24 @@ scan_secrets() {
     mapfile -t DENY_EXCEPTIONS < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
 
     # Every reachable commit, because that is exactly what `git bundle --all`
-    # packs. Empty for a repo with no commits, which is not an error.
+    # packs.
+    #
+    # The exit status is the whole point here. rev-list exits 0 with no output
+    # for a repository that has no commits and 128 for one git cannot read, and
+    # reading it through `mapfile < <(...)` threw that away -- so a broken repo
+    # became "nothing to scan", became "clean", became a push. Empty output with
+    # a zero exit is genuinely an empty repo and scans clean; a non-zero exit
+    # refuses.
+    local revlist revrc
+    revlist="$(git -C "$repo" rev-list --all 2>/dev/null)"; revrc=$?
+    if (( revrc != 0 )); then
+        printf '%somabackup: cannot list commits in %s -- refusing to call it clean%s\n' \
+            "$RED" "$(_tilde "$repo")" "$NC" >&2
+        return 1
+    fi
+    [[ -n "$revlist" ]] || return 0
     local -a revs=()
-    mapfile -t revs < <(git -C "$repo" rev-list --all 2>/dev/null)
-    (( ${#revs[@]} )) || return 0
+    mapfile -t revs <<<"$revlist"
 
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
