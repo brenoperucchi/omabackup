@@ -1,0 +1,23 @@
+[Unit]
+# The primary mechanism (docs/DESIGN.md §11.2). The QML plugin is its face, not
+# its engine: the panel polls `verify --json` read-only, and everything that
+# writes happens here, where a failure is visible in `systemctl --user --failed`
+# whether or not the shell is running.
+Description=OmaBackup: collect, verify and commit dotfile coverage
+Documentation=https://github.com/brenoperucchi/omabackup
+
+[Service]
+Type=oneshot
+# OMABACKUP_REPO lives here, not in the unit: it is machine identity, the same
+# class as destinations.json. The leading `-` means a missing file is not an
+# error -- the CLI produces a far better message than systemd would.
+EnvironmentFile=-%h/.config/omabackup/env
+ExecStart=%h/.config/omarchy/plugins/brenoperucchi.omabackup/bin/omabackup sync --commit
+
+# `sync` exits non-zero when coverage fails, and that is the whole point: the
+# unit goes red and stays red. A backup that reports success while the system
+# reads files it does not hold is the failure this project was built after.
+SuccessExitStatus=0
+
+Nice=10
+IOSchedulingClass=idle

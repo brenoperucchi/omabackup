@@ -1,0 +1,18 @@
+[Unit]
+# Separate unit from sync, deliberately. Committing is local and fast; sending
+# is slow and fallible. A NAS that is unplugged or an expired GitHub credential
+# must not turn the coverage timer red, because a unit whose red means two
+# different things is worse than two units -- it trains you to ignore the one
+# alarm this project exists to make you not ignore.
+Description=OmaBackup: send the backup bundle to its destinations
+Documentation=https://github.com/brenoperucchi/omabackup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/omabackup/env
+ExecStart=%h/.config/omarchy/plugins/brenoperucchi.omabackup/bin/omabackup push
+
+Nice=10
+IOSchedulingClass=idle

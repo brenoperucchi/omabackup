@@ -1,0 +1,17 @@
+[Unit]
+Description=OmaBackup: send to destinations on a schedule
+Documentation=https://github.com/brenoperucchi/omabackup
+
+[Timer]
+# Hourly, against sync's 15 minutes. Pushing is the expensive, failure-prone
+# half, and it has nothing to say unless sync produced a new commit: the bundle
+# is content-addressed by HEAD, so a tick with no new commit reuses the existing
+# artifact and each destination driver sends the same bytes it already sent.
+# Backoff per destination handles the rest.
+OnBootSec=10min
+OnUnitActiveSec=1h
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

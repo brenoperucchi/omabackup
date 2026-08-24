@@ -1,0 +1,24 @@
+[Unit]
+Description=OmaBackup: sync dotfile coverage on a schedule
+Documentation=https://github.com/brenoperucchi/omabackup
+
+[Timer]
+# 15 minutes. Measured cost of one sync on this machine is ~4s (collect 5.5s ->
+# publish is now cp rather than a per-file rsync), so this is well under 1% duty
+# cycle. §4 offers 5 minutes and it would now be affordable; 15 is the same
+# protection with a quieter history, since nothing happens at all when nothing
+# changed -- no diff, no commit, no traffic.
+OnBootSec=3min
+OnUnitActiveSec=15min
+
+# A laptop that was asleep at the scheduled moment has to catch up on wake.
+# Without this, the machine most likely to be closed mid-upgrade is the one that
+# silently skips its backup -- lesson #2, the moment of highest risk is the
+# moment of lowest attention.
+Persistent=true
+
+# Do not have every timer on the machine fire at the same second.
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
