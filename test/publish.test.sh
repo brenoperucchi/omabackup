@@ -4,6 +4,12 @@
 
 source lib/publish.sh
 
+# The manifest's trackedRepoPath entries, in the shape bin/omabackup builds
+# them. map_to_repo consults this before its general rules.
+TBL="$(printf '%s\t%s\n%s\t%s\n' \
+    '.local/share/applications' 'dotfiles/.local-share-applications' \
+    '.local/bin' 'scripts/local-bin')"
+
 # ── map_to_repo: the four general rules ──────────────────────────────────────
 it "a .config path maps under configs/"
 assert_eq "$(map_to_repo '.config/hypr/monitors.lua')" "configs/hypr/monitors.lua"
@@ -18,17 +24,29 @@ it "omarchy state maps under state/omarchy/"
 assert_eq "$(map_to_repo '.local/state/omarchy/toggles/hypr/flags.lua')" \
     "state/omarchy/toggles/hypr/flags.lua"
 
-it "a desktop entry maps into the flat .local-share-applications convention"
-assert_eq "$(map_to_repo '.local/share/applications/foo.desktop')" \
-    "dotfiles/.local-share-applications/foo.desktop"
-
 it "plugins are refused -- the triple strategy owns that path"
 map_to_repo '.config/omarchy/plugins/acme.dock/Widget.qml' >/dev/null 2>&1
 [[ $? -ne 0 ]] && ok || fail "should have failed for a plugin path"
 
-it "a tracked-only script directory is refused -- collect writes it directly"
+# ── map_to_repo: destinations come from the manifest, not from literals ──────
+# These three used to be hardcoded here: one destination repeated as a string
+# literal, the other two refused with a comment claiming collect had already
+# written them into the repo. It had not -- collect only ever writes into
+# staging -- so the whole scripts group vanished between the two.
+it "a desktop entry maps into the flat convention the manifest declared"
+assert_eq "$(map_to_repo '.local/share/applications/foo.desktop' "$TBL")" \
+    "dotfiles/.local-share-applications/foo.desktop"
+
+it "a tracked-only script maps to the trackedRepoPath the manifest declared"
+assert_eq "$(map_to_repo '.local/bin/my-script' "$TBL")" "scripts/local-bin/my-script"
+
+it "a tracked-only path maps flat, never mirroring the live tree"
+assert_eq "$(map_to_repo '.local/share/applications/sub/deep.desktop' "$TBL")" \
+    "dotfiles/.local-share-applications/deep.desktop"
+
+it "an executables directory the manifest never placed is refused, not guessed"
 map_to_repo '.local/bin/my-script' >/dev/null 2>&1
-[[ $? -ne 0 ]] && ok || fail "should have failed for .local/bin"
+[[ $? -ne 0 ]] && ok || fail "an undeclared .local/bin should not be published"
 
 # ── publish_staging: end to end against a fake repo ──────────────────────────
 STG="$(mktemp -d)"; REPO="$(mktemp -d)"

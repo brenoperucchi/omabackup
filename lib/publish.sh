@@ -9,19 +9,35 @@
 # same philosophy sync.sh always had: "review with git status/diff before
 # committing". cmd_sync (in bin/omabackup) is what turns that into a commit.
 
-# map_to_repo <path-relative-to-HOME>
+# map_to_repo <path-relative-to-HOME> [<tracked-table>]
 # Prints the path relative to the repo root, or fails (empty stdout, exit 1)
 # for anything that needs special handling by its caller (plugins, generated
-# lists, tracked-only scripts).
+# lists).
+#
+# The table is `<prefix-relative-to-HOME>\t<repo-path>` lines built from the
+# manifest's `trackedRepoPath` entries (bin/omabackup:tracked_path_map). It is
+# consulted first, and maps flat -- the repo keeps one directory of names, not
+# a mirror of the live tree. Before this, map_to_repo repeated one of those
+# destinations as a literal and refused the other two outright, so the whole
+# `scripts` group was collected into staging and then silently dropped on the
+# way to the repo. The manifest declares the destination; this only honors it.
 map_to_repo() {
-    local rel="$1"
+    local rel="$1" table="${2:-}" prefix dest
+    while IFS=$'\t' read -r prefix dest; do
+        [[ -n "$prefix" && -n "$dest" ]] || continue
+        [[ "$rel" == "$prefix"/* ]] || continue
+        printf '%s/%s' "$dest" "${rel##*/}"
+        return 0
+    done <<<"$table"
+
     case "$rel" in
         .config/omarchy/plugins/*) return 1 ;;  # triple strategy, not a plain copy
         .config/*)                  printf 'configs/%s' "${rel#.config/}" ;;
-        .local/share/applications/*)
-            printf 'dotfiles/.local-share-applications/%s' "$(basename "$rel")" ;;
         .local/state/omarchy/*)     printf 'state/omarchy/%s' "${rel#.local/state/omarchy/}" ;;
-        .local/bin/*|bin/*|scripts/*) return 1 ;;  # tracked-only, written directly by collect
+        # An executables directory the manifest never gave a trackedRepoPath:
+        # refuse rather than guess, or a stray `~/.local/bin` declaration
+        # publishes 15MB of mise and npm shims under dotfiles/.
+        .local/bin/*|bin/*)          return 1 ;;
         .*)                          printf 'dotfiles/%s' "$rel" ;;  # a top-level dotfile
         *)                           return 1 ;;
     esac
@@ -54,17 +70,17 @@ _generated_repo_name() {
     esac
 }
 
-# publish_staging <staging_dir> <repo_root>
+# publish_staging <staging_dir> <repo_root> [<tracked-table>]
 # Writes staged files into the repo's working tree. Never commits, never
 # pushes, never runs --delete: what disappeared from the machine stays in the
 # repo until a human decides with `git rm` (docs/CONTEXT.md §4).
 publish_staging() {
-    local staging="$1" repo="$2" f rel dst n=0
+    local staging="$1" repo="$2" table="${3:-}" f rel dst n=0
 
     while IFS= read -r f; do
         rel="${f#"$staging"/}"
         [[ "$rel" == .generated/* || "$rel" == .plugins/* ]] && continue
-        dst="$(map_to_repo "$rel")" || continue
+        dst="$(map_to_repo "$rel" "$table")" || continue
         _publish_file "$f" "$repo/$dst"
         n=$((n + 1))
     done < <(find "$staging" -type f 2>/dev/null)

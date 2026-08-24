@@ -48,6 +48,27 @@ group_tracked_repo_path() {
         (.paths // [])[] | select(type=="object" and .live==$live) | .trackedRepoPath // empty' "$GROUPS_FILE"
 }
 
+# The staging -> repo mapping for every path the manifest gave a
+# trackedRepoPath, as `<prefix-relative-to-HOME>\t<repo-path>` lines handed to
+# publish_staging. The manifest is the single source of truth for where a
+# tracked-only path lands: lib/publish.sh used to repeat one of these
+# destinations as a literal and refuse the rest, which dropped the whole
+# `scripts` group between staging and the repo without a word. `restore` needs
+# the inverse of this table, and an inverse only exists if there is one table.
+tracked_path_map() {
+    local id p sub e
+    while read -r id; do
+        [[ -n "$id" ]] || continue
+        while read -r p; do
+            [[ -n "$p" ]] || continue
+            sub="$(group_tracked_repo_path "$id" "$p")"
+            [[ -n "$sub" ]] || continue
+            e="$(_expand "$p")"
+            printf '%s\t%s\n' "${e#$HOME/}" "$sub"
+        done < <(group_paths "$id")
+    done < <(groups_ids)
+}
+
 # Every path declared by any group, expanded. Probes use this to answer
 # "is this file covered by anyone?".
 all_declared_paths() {
@@ -319,21 +340,31 @@ collect_triple() {
 # Only what the destination repo already tracks comes back; with no repo
 # configured there is nothing to infer, so it warns and skips instead of
 # dragging in 15MB of shims.
+#
+# "Tracked" means tracked by git, asked of the index -- never `find` over the
+# directory. Listing the directory counted anything that happened to land there
+# (an editor backup, the output of an aborted run) as tracked, so junk in the
+# repo pulled its live counterpart in and then perpetuated itself. Outside a git
+# worktree the word has no meaning at all, so that warns and skips rather than
+# quietly degrading back to the directory listing.
 collect_tracked_only() {
-    local live="$1" dest="$2" id="$3" declared="$4" repo="${OMABACKUP_REPO:-}" refdir sub base f n=0
-    if [[ -z "$repo" || ! -d "$repo" ]]; then
-        finding warn "$id" no-repo "trackedOnly needs OMABACKUP_REPO; skipped $(_tilde "$live")" "$live"
-        (( JSON )) || printf '  %s!%s %s %s(trackedOnly without a repo: skipped)%s\n' "$YELLOW" "$NC" "$(_tilde "$live")" "$DIM" "$NC"
+    local live="$1" dest="$2" id="$3" declared="$4" repo="${OMABACKUP_REPO:-}" sub base f n=0
+    if [[ -z "$repo" || ! -d "$repo" ]] || ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+        finding warn "$id" no-repo "trackedOnly needs OMABACKUP_REPO to be a git repo; skipped $(_tilde "$live")" "$live"
+        (( JSON )) || printf '  %s!%s %s %s(trackedOnly without a git repo: skipped)%s\n' "$YELLOW" "$NC" "$(_tilde "$live")" "$DIM" "$NC"
         return 1
     fi
     sub="$(group_tracked_repo_path "$id" "$declared")"
-    refdir="$repo${sub:+/$sub}"
-    [[ -d "$refdir" ]] || return 0
     mkdir -p "$dest"
-    while read -r f; do
-        base="$(basename "$f")"
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        base="${f##*/}"
+        [[ "$f" == "$sub/$base" ]] || continue   # direct children only: the repo keeps a flat directory
         [[ -f "$live/$base" ]] && { rsync -aL "$live/$base" "$dest/"; n=$((n + 1)); }
-    done < <(find "$refdir" -maxdepth 1 -type f 2>/dev/null)
+    done < <(git -C "$repo" ls-files -- "$sub" 2>/dev/null)
+    # A declared path the repo tracks nothing under backs up nothing while
+    # reporting "up to date" -- the phantom coverage verify exists to shout about.
+    (( n > 0 )) || finding warn "$id" tracked-empty "nothing tracked under $sub: $(_tilde "$live") backs up nothing yet" "$live"
     return 0
 }
 
@@ -365,7 +396,7 @@ cmd_sync() {
     [[ -n "$repo" && -d "$repo/.git" ]] || die "OMABACKUP_REPO must point at a git repo (got: ${repo:-unset})"
 
     JSON=0 cmd_collect >/dev/null
-    local n; n="$(publish_staging "$STAGING" "$repo")"
+    local n; n="$(publish_staging "$STAGING" "$repo" "$(tracked_path_map)")"
     printf '  %spublished%s %d files into %s
 ' "$GREEN" "$NC" "$n" "$(_tilde "$repo")"
 

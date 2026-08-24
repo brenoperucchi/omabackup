@@ -14,7 +14,9 @@ _env() {  # _env <home> <groups> <cmd...>
 # -- tracked-only is per-path, not per-group -------------------------------------
 H="$(mktemp -d)"; G="$H/g.json"; R="$H/repo"
 mkdir -p "$R/dotfiles/.local-share-applications" "$H/.local/share/applications" "$H/.config"
+git init -q "$R"; git -C "$R" config user.email t@t; git -C "$R" config user.name t
 printf 'seen\n' >"$R/dotfiles/.local-share-applications/kept.desktop"
+git -C "$R" add -A; git -C "$R" commit -qm base   # "tracked" means the git index, not the directory
 printf 'kept\n'  >"$H/.local/share/applications/kept.desktop"
 printf 'new\n'   >"$H/.local/share/applications/never-tracked.desktop"
 printf 'icon\n'  >"$H/.local/share/applications/icon.png"
@@ -133,3 +135,30 @@ it "a second collect wipes what an earlier run staged and no longer applies"
 
 it "a second collect still restages what is actually declared"
 assert_contains "$(cat "$H/.state/staging/.config/app/keep.txt" 2>/dev/null)" "x"
+
+# -- "tracked" means tracked by git, not merely present ----------------------------
+# Deciding membership with `find` over the repo directory lets anything that
+# landed there -- a stray file, an editor backup, output of an aborted run --
+# start pulling its live counterpart in. Once junk is in the directory it
+# perpetuates itself, which is exactly the accumulation staging was wiped to end.
+H="$(mktemp -d)"; G="$H/g.json"; R="$H/repo"
+mkdir -p "$R/dotfiles/.local-share-applications" "$H/.local/share/applications"
+git init -q "$R"; git -C "$R" config user.email t@t; git -C "$R" config user.name t
+printf 'a\n' >"$R/dotfiles/.local-share-applications/real.desktop"
+git -C "$R" add -A; git -C "$R" commit -qm base
+printf 'b\n' >"$R/dotfiles/.local-share-applications/junk.desktop"   # never `git add`ed
+printf 'live-real\n' >"$H/.local/share/applications/real.desktop"
+printf 'live-junk\n' >"$H/.local/share/applications/junk.desktop"
+cat >"$G" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"desktop","label":"Desktop","mode":"copy","coupled":false,"critical":false,
+  "paths":[{"live":"~/.local/share/applications","trackedRepoPath":"dotfiles/.local-share-applications"}]}]}
+JSON
+OMABACKUP_REPO="$R" _env "$H" "$G" collect >/dev/null
+ST="$H/.state/staging"
+
+it "a name the repo actually tracks is staged"
+assert_contains "$(cat "$ST/.local/share/applications/real.desktop" 2>/dev/null)" "live-real"
+
+it "a name merely sitting in the repo directory, untracked, is not"
+[[ ! -e "$ST/.local/share/applications/junk.desktop" ]] && ok || fail "an untracked name in the repo directory pulled its live counterpart in"
