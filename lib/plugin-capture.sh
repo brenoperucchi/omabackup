@@ -1,28 +1,29 @@
 #!/bin/bash
-# Captura de um plugin do omarchy-shell para o repo.
+# Capturing one omarchy-shell plugin into the backup.
 #
-# Três casos, cada um com a estratégia que sobrevive a um bootstrap:
-#   1. git limpo   → URL + commit (reinstala com `omarchy plugin add` e reseta no sha)
-#   2. git sujo    → URL + commit + patch do estado local
-#   3. sem remote  → cópia integral; não existe em nenhum remote de onde puxar
+# Three cases, each with the strategy that survives a bootstrap:
+#   1. clean git  -> URL + commit (reinstall with `omarchy plugin add`, reset to sha)
+#   2. dirty git  -> URL + commit + a patch of the local state
+#   3. no remote  -> full copy; there is no upstream to pull it back from
 #
-# Sourceável e sem efeito colateral no import, pra poder ser testado.
-# Regressões em test/plugin-capture.test.sh; contexto em docs/DESIGN.md §11.3.
+# Sourceable with no side effects on import, so it can be tested.
+# Regressions live in test/plugin-capture.test.sh; rationale in docs/DESIGN.md §11.3.
 
-# Cópia integral, sem arrastar o histórico git de terceiro.
+# Full copy, without dragging along a third party's git history.
 _capture_local() {
     local plugin="$1" local_dir="$2" id="$3"
     mkdir -p "$local_dir/$id"
     rsync -a --exclude '.git/' "$plugin/" "$local_dir/$id/"
 }
 
-# Patch do estado local contra HEAD, incluindo staged e untracked.
+# A patch of the local state against HEAD, including staged and untracked files.
 #
-# `git diff` sozinho vê só o que está modificado E não-staged: um `git add` no
-# diretório do plugin produzia patch vazio enquanto o `status --porcelain`
-# continuava sujo, e a customização sumia no restore. `git diff HEAD` resolve o
-# staged; os untracked exigem estarem no índice, e o índice do usuário não pode
-# ser tocado — daí a cópia descartável via GIT_INDEX_FILE.
+# Plain `git diff` only sees what is modified AND unstaged: a `git add` inside a
+# plugin directory produced an empty patch while `status --porcelain` still
+# reported the plugin dirty, and the customization vanished on restore.
+# `git diff HEAD` covers staged changes; untracked files must be in the index to
+# show up at all, and the user's index must not be touched -- hence the throwaway
+# copy via GIT_INDEX_FILE.
 _capture_patch() {
     local plugin="$1"
     local tmp_index; tmp_index="$(mktemp)"
@@ -37,7 +38,7 @@ _capture_patch() {
 }
 
 # capture_plugin <plugin_dir> <patch_dir> <local_dir> <manifest_file>
-# Escreve a classificação em stdout: "git" | "git+patch" | "local"
+# Writes the classification to stdout: "git" | "git+patch" | "local"
 capture_plugin() {
     local plugin="${1%/}" patch_dir="$2" local_dir="$3" manifest="$4"
     local id; id="$(basename "$plugin")"
@@ -48,17 +49,18 @@ capture_plugin() {
     url="$(git -C "$plugin" remote get-url origin 2>/dev/null || true)"
     sha="$(git -C "$plugin" rev-parse HEAD 2>/dev/null || true)"
 
-    # Sem remote (ou sem commit) não há de onde reinstalar, e um patch não tem
-    # base contra a qual aplicar. Antes esse plugin era classificado "git" e
-    # não era gravado em lugar nenhum — sumia por completo.
+    # With no remote (or no commit) there is nothing to reinstall from, and a
+    # patch has no base to apply against. Such a plugin used to be classified
+    # "git" and stored nowhere at all -- it disappeared completely.
     if [[ -z "$url" || -z "$sha" ]]; then
         _capture_local "$plugin" "$local_dir" "$id"
         echo "local"
         return
     fi
 
-    # O commit importa tanto quanto a URL: sem ele o restore instala o HEAD de
-    # hoje do upstream, que pode ter avançado — e aí o patch não aplica.
+    # The commit matters as much as the URL: without it a restore installs
+    # whatever upstream HEAD is today, which may have moved -- and then the
+    # patch no longer applies.
     printf '%s %s %s\n' "$id" "$url" "$sha" >>"$manifest"
 
     if [[ -z "$(git -C "$plugin" status --porcelain 2>/dev/null)" ]]; then

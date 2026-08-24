@@ -1,8 +1,9 @@
 import QtQuick
 import qs.Ui
 
-// Placeholder da etapa 5. Enquanto o CLI não existe, o widget não ocupa
-// espaço na barra em vez de mostrar erro (design §7: degradar, nunca quebrar).
+// Placeholder until stage 5. While the CLI does not exist the widget takes up
+// no room in the bar instead of showing an error (docs/DESIGN.md §7: degrade,
+// never break).
 BarWidget {
   id: root
   moduleName: "brenoperucchi.omabackup"

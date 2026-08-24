@@ -1,8 +1,9 @@
 import QtQuick
 
-// Placeholder da etapa 5. Nada pesado em Component.onCompleted, nenhum I/O
-// síncrono: um erro aqui derruba o quickshell inteiro — barra, dock e menu.
-// O agendamento de verdade vive num systemd timer, não aqui (design §11.2).
+// Placeholder until stage 5. Nothing heavy in Component.onCompleted, no
+// synchronous I/O: an error here takes down the whole quickshell process --
+// bar, dock and menu at once. Real scheduling lives in a systemd timer, not
+// here (docs/DESIGN.md §11.2).
 Item {
   id: root
   property var shell: null

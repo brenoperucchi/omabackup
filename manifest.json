@@ -5,8 +5,12 @@
   "version": "0.1.0",
   "author": "brenoperucchi",
   "license": "MIT",
-  "description": "Backup de dotfiles que avisa quando parou de cobrir o que o sistema lê, e recusa restaurar em versões que não sabe restaurar.",
-  "kinds": ["service", "bar-widget", "panel"],
+  "description": "Dotfile backup that tells you when it stopped covering what the system reads, and refuses to restore onto versions it does not know.",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "panel"
+  ],
   "keepLoaded": true,
   "entryPoints": {
     "service": "Service.qml",
@@ -15,7 +19,7 @@
   },
   "barWidget": {
     "displayName": "OmaBackup",
-    "description": "Estado do backup: cobertura, destinos e alcance de restauração",
+    "description": "Backup state: coverage, destinations and restore range",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -26,7 +30,7 @@
       {
         "key": "staleAfterIntervals",
         "type": "number",
-        "label": "Marcar como atrasado depois de N intervalos"
+        "label": "Mark as stale after N intervals"
       }
     ]
   }

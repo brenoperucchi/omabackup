@@ -1,12 +1,12 @@
-# Regressões da cobertura (bin/omabackup verify).
-# O caso central é o incidente de 17/08/2026: config íntegra, formato trocado,
-# backup verde e inútil. Contexto: docs/DESIGN.md §0 e §11.
+# Coverage regressions (bin/omabackup verify).
+# The central case is the 2026-08-17 incident: config intact, format changed,
+# backup green and useless. Rationale: docs/DESIGN.md §0 and §11.
 #
-# Cada caso monta um $HOME falso e um manifesto próprio; nada toca a máquina.
+# Each case builds a fake $HOME and its own manifest; nothing touches the machine.
 
 OB="$PWD/bin/omabackup"
 
-# _home <n>  → cria um HOME falso com uma config Hyprland em Lua
+# _home -> a fake HOME holding a Lua Hyprland config
 _home() {
     local h; h="$(mktemp -d)"
     mkdir -p "$h/.config/hypr"
@@ -19,7 +19,7 @@ LUA
     printf '%s' "$h"
 }
 
-# _groups <arquivo> <json-dos-paths> [json-das-exclusões]
+# _groups <file> <paths-json> [excluded-json]
 _groups() {
     cat >"$1" <<JSON
 { "schemaVersion": 1, "supportedTargets": ["4.*"],
@@ -29,38 +29,38 @@ _groups() {
 JSON
 }
 
-_verify() {  # ecoa o JSON do verify rodando contra o HOME falso
+_verify() {  # echoes verify's JSON, run against the fake HOME
     HOME="$1" OMABACKUP_GROUPS="$2" XDG_RUNTIME_DIR=/nonexistent \
         OMABACKUP_STATE="$1/.local/state/omabackup" "$OB" verify --json 2>/dev/null
 }
 
-# ── o incidente de agosto ────────────────────────────────────────────────────
-# O compositor lê .lua; o backup declara só os .conf. Íntegros, válidos, inúteis.
+# -- the August incident ------------------------------------------------------
+# The compositor reads .lua; the backup declares only .conf. Intact, valid, useless.
 H="$(_home)"; G="$H/groups.json"
 printf 'monitor=eDP-1\n' >"$H/.config/hypr/hyprland.conf"
 _groups "$G" '["~/.config/hypr/hyprland.conf"]'
 OUT="$(_verify "$H" "$G")"
 
-it "agosto: backup só com .conf é reprovado"
+it "august: a backup holding only .conf fails"
 assert_eq "$(jq -r .ok <<<"$OUT")" "false"
 
-it "agosto: aponta o .lua que ficou de fora"
+it "august: names the .lua that was left out"
 assert_contains "$(jq -r '.findings[]|select(.code=="lua-uncovered")|.path' <<<"$OUT")" "hyprland.lua"
 
-it "agosto: reprova cada .lua vivo descoberto, não só o primeiro"
+it "august: fails every uncovered live .lua, not just the first"
 assert_eq "$(jq -r '[.findings[]|select(.code=="lua-uncovered")]|length' <<<"$OUT")" "3"
 
-# ── o mesmo sistema, coberto ─────────────────────────────────────────────────
+# -- the same system, covered -------------------------------------------------
 H="$(_home)"; G="$H/groups.json"
 _groups "$G" '["~/.config/hypr"]'
 OUT="$(_verify "$H" "$G")"
 
-it "cobrindo o diretório inteiro, passa"
+it "covering the whole directory passes"
 assert_eq "$(jq -r .ok <<<"$OUT")" "true"
 
-# ── transitividade ───────────────────────────────────────────────────────────
-# Um módulo alcançado por require de FORA de ~/.config/hypr precisa ser cobrado.
-# É o caso real do toggles/hypr/flags.lua, que vive em ~/.local/state.
+# -- transitivity --------------------------------------------------------------
+# A module reached by require from OUTSIDE ~/.config/hypr must still be demanded.
+# This is the real toggles/hypr/flags.lua case, which lives in ~/.local/state.
 H="$(_home)"; G="$H/groups.json"
 mkdir -p "$H/.local/state/meu"
 printf 'return {}\n' >"$H/.local/state/meu/extra.lua"
@@ -68,13 +68,13 @@ printf 'require("meu.extra")\n' >>"$H/.config/hypr/hyprland.lua"
 _groups "$G" '["~/.config/hypr"]'
 OUT="$(_verify "$H" "$G")"
 
-it "módulo alcançado por require fora do grupo é reprovado"
+it "a module reached by require outside the group fails"
 assert_eq "$(jq -r .ok <<<"$OUT")" "false"
 
-it "o módulo transitivo é nomeado no achado"
+it "the transitive module is named in the finding"
 assert_contains "$(jq -r '.findings[]|select(.code=="lua-uncovered")|.path' <<<"$OUT")" "meu/extra.lua"
 
-# ── exclusão deliberada silencia, com motivo versionado ──────────────────────
+# -- a deliberate exclusion silences it, with a versioned reason ---------------
 H="$(_home)"; G="$H/groups.json"
 mkdir -p "$H/.local/state/meu"
 printf 'return {}\n' >"$H/.local/state/meu/extra.lua"
@@ -82,26 +82,26 @@ printf 'require("meu.extra")\n' >>"$H/.config/hypr/hyprland.lua"
 _groups "$G" '["~/.config/hypr"]' '[{"path":"~/.local/state/meu","reason":"gerado, reconstruível"}]'
 OUT="$(_verify "$H" "$G")"
 
-it "caminho excluído de propósito não reprova"
+it "a deliberately excluded path does not fail"
 assert_eq "$(jq -r .ok <<<"$OUT")" "true"
 
-# ── caminho fantasma ─────────────────────────────────────────────────────────
-# Um grupo crítico apontando pra lugar nenhum reportava "em dia" cobrindo zero
-# bytes — foi o que aconteceu quando o Omarchy moveu current/ pra ~/.local/state.
+# -- phantom path ---------------------------------------------------------------
+# A critical group pointing nowhere used to report "up to date" while covering
+# zero bytes -- which is what happened when Omarchy moved current/ to ~/.local/state.
 H="$(_home)"; G="$H/groups.json"
 _groups "$G" '["~/.config/hypr","~/.config/omarchy/nao-existe"]'
 OUT="$(_verify "$H" "$G")"
 
-it "caminho declarado e inexistente vira aviso"
+it "a declared but missing path becomes a warning"
 assert_contains "$(jq -r '.findings[]|select(.code=="path-missing")|.message' <<<"$OUT")" "nao-existe"
 
-# ── identidade de compatibilidade ────────────────────────────────────────────
+# -- compatibility identity ------------------------------------------------------
 H="$(_home)"; G="$H/groups.json"
 _groups "$G" '["~/.config/hypr"]'
 OUT="$(_verify "$H" "$G")"
 
-it "o relatório carrega a versão do Omarchy"
+it "the report carries the Omarchy version"
 assert_contains "$(jq -r .omarchy.version <<<"$OUT")" "."
 
-it "o relatório carrega a marca-d'água de migração"
-[[ "$(jq -r .omarchy.migrationWatermark <<<"$OUT")" =~ ^[0-9]+$ ]] && ok || fail "marca-d'água não é numérica"
+it "the report carries the migration watermark"
+[[ "$(jq -r .omarchy.migrationWatermark <<<"$OUT")" =~ ^[0-9]+$ ]] && ok || fail "watermark is not numeric"

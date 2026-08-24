@@ -1,6 +1,6 @@
 import QtQuick
 
-// Placeholder da etapa 5.
+// Placeholder until stage 5.
 Item {
   id: root
   property var shell: null

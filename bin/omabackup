@@ -1,10 +1,10 @@
 #!/bin/bash
-# omabackup — backup de dotfiles com cobertura verificada e alcance de
-# restauração declarado. O trabalho pesado mora aqui, fora do QML: um erro
-# dentro do quickshell derruba a barra, o dock e o menu de uma vez, e a
-# restauração precisa funcionar quando não há shell nenhum.
+# omabackup -- dotfile backup with verified coverage and a declared restore
+# range. The heavy lifting lives here, outside QML: an error inside quickshell
+# takes down the bar, the dock and the menu at once, and restoring has to work
+# when there is no shell at all.
 #
-# Uso: omabackup <collect|verify|status> [--json] [--groups a,b]
+# Usage: omabackup <collect|verify|status> [--json] [--groups a,b]
 
 set -uo pipefail
 
@@ -17,7 +17,7 @@ RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
 CYAN=$'\033[0;36m'; DIM=$'\033[2m'; NC=$'\033[0m'
 
 JSON=0; ONLY=""
-FINDINGS=()   # nível\tgrupo\tcódigo\tmensagem\tcaminho
+FINDINGS=()   # level\tgroup\tcode\tmessage\tpath
 
 die() { printf '%somabackup: %s%s\n' "$RED" "$*" "$NC" >&2; exit 1; }
 
@@ -28,7 +28,7 @@ finding() {
     FINDINGS+=("$1"$'\t'"$2"$'\t'"$3"$'\t'"$4"$'\t'"${5:-}")
 }
 
-# ── manifesto de grupos ──────────────────────────────────────────────────────
+# ── group manifest ───────────────────────────────────────────────────────────
 groups_ids() {
     jq -r --arg only "$ONLY" '
         .groups
@@ -39,15 +39,16 @@ groups_ids() {
 group_field() { jq -r --arg id "$1" --arg f "$2" '.groups[] | select(.id==$id) | .[$f] // empty' "$GROUPS_FILE"; }
 group_paths() { jq -r --arg id "$1" '.groups[] | select(.id==$id) | (.paths // [])[]' "$GROUPS_FILE"; }
 
-# Todo caminho declarado por qualquer grupo, expandido. Usado pelas sondas pra
-# responder "este arquivo está coberto por alguém?".
+# Every path declared by any group, expanded. Probes use this to answer
+# "is this file covered by anyone?".
 all_declared_paths() {
     local p
     jq -r '(.groups[] | (.paths // [])[])' "$GROUPS_FILE" | while read -r p; do _expand "$p"; echo; done
 }
 
-# Exclusões deliberadas: peso morto conhecido, com justificativa versionada.
-# Sem isto o verificador nasce com uma dúzia de avisos e ensina a ser ignorado.
+# Deliberate exclusions: known dead weight, each with a versioned reason.
+# Without this the checker starts out with a dozen warnings and teaches you to
+# ignore it.
 all_excluded_paths() {
     local p
     jq -r '(.excluded // [])[].path' "$GROUPS_FILE" | while read -r p; do _expand "$p"; echo; done
@@ -72,9 +73,9 @@ is_covered() {
 }
 
 # ── verify ───────────────────────────────────────────────────────────────────
-# Caminho declarado que não existe: o grupo reporta "em dia" cobrindo zero
-# bytes. Foi assim que ~/.config/omarchy/current ficou fantasma depois de uma
-# migração do próprio Omarchy mover o diretório.
+# A declared path that does not exist means the group reports "up to date" while
+# covering zero bytes. That is how ~/.config/omarchy/current became a phantom
+# after one of Omarchy's own migrations moved the directory.
 probe_declared_paths() {
     local id p e
     while read -r id; do
@@ -82,14 +83,14 @@ probe_declared_paths() {
         while read -r p; do
             [[ -n "$p" ]] || continue
             e="$(_expand "$p")"
-            [[ -e "$e" || -L "$e" ]] || finding warn "$id" path-missing "declarado e não existe: $p" "$e"
+            [[ -e "$e" || -L "$e" ]] || finding warn "$id" path-missing "declared but missing: $p" "$e"
         done < <(group_paths "$id")
     done < <(groups_ids)
 }
 
-# Um caminho em mode:link que deixou de ser symlink parou de alimentar o repo,
-# em silêncio. O reparo NUNCA é `ln -sf`: isso apagaria a edição que quebrou o
-# link. Ver design §11.2.
+# A mode:link path that stopped being a symlink stopped feeding the repo, in
+# silence. The repair is NEVER `ln -sf`: that would discard the very edit that
+# broke the link. See docs/DESIGN.md §11.2.
 probe_link_integrity() {
     local id p e linked plain
     while read -r id; do
@@ -106,11 +107,11 @@ probe_link_integrity() {
             fi
         done < <(group_paths "$id")
         if (( linked > 0 && plain > 0 )); then
-            finding fail "$id" link-broken "$plain de $((linked+plain)) deixaram de ser link — o repo parou de receber" ""
+            finding fail "$id" link-broken "$plain of $((linked+plain)) stopped being links -- the repo stopped receiving" ""
         elif (( linked > 0 )); then
-            finding pass "$id" linked "$linked caminhos ligados ao repo" ""
+            finding pass "$id" linked "$linked paths linked to the repo" ""
         elif (( plain > 0 )); then
-            finding info "$id" not-linked "$plain caminhos, modo link ainda não aplicado" ""
+            finding info "$id" not-linked "$plain paths, link mode not applied yet" ""
         fi
     done < <(groups_ids)
 }
@@ -124,9 +125,9 @@ omarchy_identity() {
     printf '%s\t%s\t%s' "$v" "$c" "${m:-0}"
 }
 
-# As sondas específicas são despachadas pelo campo `probe` do grupo, não
-# chamadas em bloco: um manifesto que não declara o grupo `shell` não deve
-# ser reprovado por não ter shell.json.
+# Group-specific probes are dispatched from the group's `probe` field rather
+# than called as a fixed block: a manifest that does not declare the `shell`
+# group must not be failed for having no shell.json.
 cmd_verify() {
     probe_declared_paths
 
@@ -141,7 +142,7 @@ cmd_verify() {
             migrations) probe_migrations ;;
             packages)   probe_packages ;;
             "")         ;;
-            *)          finding warn "$id" probe-unknown "sonda declarada e não implementada: $probe" "" ;;
+            *)          finding warn "$id" probe-unknown "probe declared but not implemented: $probe" "" ;;
         esac
     done < <(groups_ids)
 
@@ -157,7 +158,7 @@ report() {
         case "$lvl" in pass) pass=$((pass+1));; warn) warn=$((warn+1));; fail) fail=$((fail+1));; esac
     done
 
-    local id; IFS=$'\t' read -r ov oc om <<<"$(omarchy_identity)"
+    local ov oc om; IFS=$'\t' read -r ov oc om <<<"$(omarchy_identity)"
 
     if (( JSON )); then
         printf '%s\n' "${FINDINGS[@]:-}" | jq -R -s --arg v "$ov" --arg c "$oc" --arg m "$om" \
@@ -170,7 +171,7 @@ report() {
                counts:{pass:$pass, warn:$warn, fail:$fail},
                findings:.}'
     else
-        printf '%som%s %s · canal %s · migração %s%s\n\n' "$DIM" "$NC" "$ov" "$oc" "$om" ""
+        printf '%som%s %s - channel %s - migration %s\n\n' "$DIM" "$NC" "$ov" "$oc" "$om"
         for line in "${FINDINGS[@]:-}"; do
             [[ -n "$line" ]] || continue
             IFS=$'\t' read -r lvl grp code msg _ <<<"$line"
@@ -181,21 +182,18 @@ report() {
                 fail) printf '  %s✗%s %-11s %s\n' "$RED" "$NC" "$grp" "$msg" ;;
             esac
         done
-        printf '\n  %d ok · %s%d aviso%s · %s%d falha%s\n' \
+        printf '\n  %d ok - %s%d warning%s - %s%d failure%s\n' \
             "$pass" "$YELLOW" "$warn" "$NC" "$RED" "$fail" "$NC"
     fi
     (( fail == 0 ))
 }
 
 # ── collect ──────────────────────────────────────────────────────────────────
-# Coleta para staging, NUNCA direto pro repo. É o primeiro dos quatro tempos
-# (coletar → diffar → verificar → commitar): sem staging não existe diff para
-# grupos em mode:copy, e o ciclo se fecharia em si mesmo. Ver design §11.1.
-# Campos do manifesto que o coletor sabe honrar. Um campo declarado e não
-# implementado é ignorado em silêncio — que foi como a primeira versão copiou
-# 6,6MB de plugin de terceiro apesar do mode:triple, e 62MB de node_modules
-# apesar do exclude. Mesmo padrão do bug catalogado no contexto §4:
-# "loop genérico atropela lógica específica".
+# Manifest fields the collector knows how to honor. A field that is declared but
+# not implemented gets ignored in silence -- that is how the first version
+# copied 6.6MB of third-party plugin code despite mode:triple, and 62MB of
+# node_modules despite exclude. Same shape as the bug recorded in
+# docs/CONTEXT.md §4: "a generic loop overrides specific handling".
 KNOWN_FIELDS='["id","label","mode","coupled","critical","paths","probe","enabled","exclude","trackedOnly","generator","allowList","note"]'
 KNOWN_MODES='["link","copy","gen","triple"]'
 
@@ -203,20 +201,19 @@ assert_manifest_understood() {
     local bad line
     bad="$(jq -r --argjson k "$KNOWN_FIELDS" --argjson m "$KNOWN_MODES" '
         [ (.groups[] | . as $g | (keys[] | select(. as $f | $k | index($f) | not)
-            | "campo desconhecido \(.) no grupo \($g.id)"))
+            | "unknown field \(.) in group \($g.id)"))
         , (.groups[] | select(.mode as $x | $m | index($x) | not)
-            | "mode desconhecido \(.mode) no grupo \(.id)")
+            | "unknown mode \(.mode) in group \(.id)")
         ] | .[]' "$GROUPS_FILE")"
     [[ -z "$bad" ]] && return 0
-    printf '%somabackup: o manifesto declara o que o coletor não honra:%s\n' "$RED" "$NC" >&2
+    printf '%somabackup: the manifest declares what the collector cannot honor:%s\n' "$RED" "$NC" >&2
     while IFS= read -r line; do printf '  %s\n' "$line" >&2; done <<<"$bad"
     exit 1
 }
 
-# Um caminho fora de qualquer grupo é peso morto ou esquecimento; um caminho
-# excluído de propósito não é copiado.
-# Um padrão "node_modules/**" tira o conteúdo mas o rsync mantém o diretório
-# vazio. Diretório vazio no backup é ruído, então a forma sem /** vai junto.
+# A pattern like "node_modules/**" drops the contents but rsync keeps the empty
+# directory. Empty directories in a backup are noise, so the form without /**
+# goes along with it.
 _emit_exclude() {
     local pat="$1"
     [[ -n "$pat" ]] || return 0
@@ -233,6 +230,9 @@ _rsync_excludes() {
         < <(jq -r '(.excluded // [])[].path' "$GROUPS_FILE")
 }
 
+# Collects into staging, NEVER straight into the repo. This is the first of four
+# beats (collect -> diff -> verify -> commit): without staging there is no diff
+# for mode:copy groups, and the cycle would close on itself. See docs/DESIGN.md §11.1.
 cmd_collect() {
     assert_manifest_understood
     mkdir -p "$STAGING"
@@ -269,15 +269,16 @@ cmd_collect() {
     if (( JSON )); then
         jq -n --arg s "$STAGING" --argjson n "$n" '{schemaVersion:1, staging:$s, entries:$n}'
     else
-        printf '\n  %d caminhos em %s\n' "$n" "$(_tilde "$STAGING")"
+        printf '\n  %d paths in %s\n' "$n" "$(_tilde "$STAGING")"
     fi
 }
 
-# A estratégia tripla: git limpo → só URL+sha; git sujo → +patch; sem remote →
-# cópia integral. Sem isto o staging engorda com código de terceiro que já vive
-# no GitHub, e a customização local (o slotSize do rosakodu.dock) se perde.
+# The triple strategy: clean git -> URL+sha only; dirty git -> plus a patch;
+# no remote -> full copy. Without it staging balloons with third-party code that
+# already lives on GitHub, and the local customization (rosakodu.dock's
+# slotSize) is lost.
 collect_triple() {
-    local id="$1" dir p pid kind n=0
+    local id="$1" dir p pid n=0
     dir="$(_expand "$(group_paths "$id" | head -1)")"
     [[ -d "$dir" ]] || return 0
     mkdir -p "$STAGING/.plugins/patches" "$STAGING/.plugins/local"
@@ -285,20 +286,21 @@ collect_triple() {
     for p in "$dir"/*/; do
         [[ -d "$p" ]] || continue
         pid="$(basename "$p")"; [[ "$pid" == .* ]] && continue
-        kind="$(capture_plugin "$p" "$STAGING/.plugins/patches" "$STAGING/.plugins/local" "$STAGING/.plugins/manifest.txt")"
+        capture_plugin "$p" "$STAGING/.plugins/patches" "$STAGING/.plugins/local" "$STAGING/.plugins/manifest.txt" >/dev/null
         n=$((n + 1))
     done
-    (( JSON )) || printf '  %s✓%s %s %s(%d, estratégia tripla)%s\n' "$GREEN" "$NC" "$id" "$DIM" "$n" "$NC"
+    (( JSON )) || printf '  %s✓%s %s %s(%d, triple strategy)%s\n' "$GREEN" "$NC" "$id" "$DIM" "$n" "$NC"
 }
 
-# Diretórios como ~/.local/bin misturam script próprio com binário de mise e npm.
-# Só volta o que o repo de destino já rastreia; sem repo configurado, não se
-# adivinha — avisa e pula, em vez de arrastar 15MB de shim.
+# Directories like ~/.local/bin mix your own scripts with mise and npm binaries.
+# Only what the destination repo already tracks comes back; with no repo
+# configured there is nothing to infer, so it warns and skips instead of
+# dragging in 15MB of shims.
 collect_tracked_only() {
     local live="$1" dest="$2" repo="${OMABACKUP_REPO:-}" base f n=0
     if [[ -z "$repo" || ! -d "$repo" ]]; then
-        finding warn scripts no-repo "trackedOnly precisa de OMABACKUP_REPO; $(_tilde "$live") pulado" "$live"
-        (( JSON )) || printf '  %s!%s %s %s(trackedOnly sem repo: pulado)%s\n' "$YELLOW" "$NC" "$(_tilde "$live")" "$DIM" "$NC"
+        finding warn scripts no-repo "trackedOnly needs OMABACKUP_REPO; skipped $(_tilde "$live")" "$live"
+        (( JSON )) || printf '  %s!%s %s %s(trackedOnly without a repo: skipped)%s\n' "$YELLOW" "$NC" "$(_tilde "$live")" "$DIM" "$NC"
         return 1
     fi
     mkdir -p "$dest"
@@ -323,25 +325,25 @@ collect_generated() {
             systemctl list-unit-files --state=enabled --no-legend 2>/dev/null \
                 | awk '{print $1}' >"$STAGING/.generated/systemd-system.txt" ;;
     esac
-    (( JSON )) || printf '  %s✓%s %s %s(gerado)%s\n' "$GREEN" "$NC" "$id" "$DIM" "$NC"
+    (( JSON )) || printf '  %s✓%s %s %s(generated)%s\n' "$GREEN" "$NC" "$id" "$DIM" "$NC"
 }
 
 cmd_status() {
-    local id; IFS=$'\t' read -r ov oc om <<<"$(omarchy_identity)"
+    local ov oc om; IFS=$'\t' read -r ov oc om <<<"$(omarchy_identity)"
     if (( JSON )); then
         jq -n --arg v "$ov" --arg c "$oc" --arg m "$om" --arg s "$STAGING" \
               --argjson t "$(jq '.supportedTargets' "$GROUPS_FILE")" \
               '{schemaVersion:1, omarchy:{version:$v,channel:$c,migrationWatermark:$m},
-                supportedTargets:$t, staging:$s, stagingExists:($s|test(".")) }'
+                supportedTargets:$t, staging:$s}'
     else
-        printf '  Omarchy %s (%s) · marca-d%ságua %s\n' "$ov" "$oc" "'" "$om"
-        printf '  alcance de restauração: %s\n' "$(jq -r '.supportedTargets|join(", ")' "$GROUPS_FILE")"
-        printf '  grupos: %s\n' "$(groups_ids | wc -l)"
-        printf '  staging: %s\n' "$([ -d "$STAGING" ] && _tilde "$STAGING" || echo 'ainda não coletado')"
+        printf '  Omarchy %s (%s) - migration watermark %s\n' "$ov" "$oc" "$om"
+        printf '  restore range: %s\n' "$(jq -r '.supportedTargets|join(", ")' "$GROUPS_FILE")"
+        printf '  groups: %s\n' "$(groups_ids | wc -l)"
+        printf '  staging: %s\n' "$([ -d "$STAGING" ] && _tilde "$STAGING" || echo 'not collected yet')"
     fi
 }
 
-# ── entrada ──────────────────────────────────────────────────────────────────
+# ── entry point ──────────────────────────────────────────────────────────────
 source "$OMABACKUP_ROOT/lib/probes.sh"
 source "$OMABACKUP_ROOT/lib/plugin-capture.sh"
 
@@ -351,11 +353,11 @@ while (($#)); do
         --json)   JSON=1; shift ;;
         --groups) ONLY="${2:-}"; shift 2 ;;
         -h|--help) CMD=help; shift ;;
-        *) die "flag desconhecida: $1" ;;
+        *) die "unknown flag: $1" ;;
     esac
 done
 
-[[ -f "$GROUPS_FILE" ]] || die "manifesto de grupos não encontrado: $GROUPS_FILE"
+[[ -f "$GROUPS_FILE" ]] || die "group manifest not found: $GROUPS_FILE"
 
 case "$CMD" in
     verify)  cmd_verify ;;
@@ -363,16 +365,16 @@ case "$CMD" in
     status)  cmd_status ;;
     ""|help)
         cat <<'USAGE'
-omabackup <comando> [--json] [--groups a,b]
+omabackup <command> [--json] [--groups a,b]
 
-  status    identidade do Omarchy, alcance de restauração e grupos
-  collect   coleta os grupos para o staging (não toca no repo)
-  verify    checa se o backup cobre o que o sistema de fato lê
+  status    Omarchy identity, restore range and groups
+  collect   collect the groups into staging (does not touch the repo)
+  verify    check that the backup covers what the system actually reads
 
-O ciclo completo é coletar → diffar → verificar → commitar. `collect` e
-`verify` são os dois primeiros; sem eles não existe diff para os grupos em
-mode:copy e nada seria salvo.
+The full cycle is collect -> diff -> verify -> commit. `collect` and `verify`
+are the first two; without them there is no diff for mode:copy groups and
+nothing would ever be saved.
 USAGE
         ;;
-    *) die "comando desconhecido: $CMD" ;;
+    *) die "unknown command: $CMD" ;;
 esac

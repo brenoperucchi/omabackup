@@ -1,661 +1,652 @@
-# OmaBackup — proposta de design v0
+# OmaBackup — design proposal
 
-Artefato para revisão. Continuação de [CONTEXT.md](CONTEXT.md),
-que descreve o incidente do upgrade 3 → 4.0 "Quattro" e a arquitetura de
-plugins do Omarchy. Aqui as perguntas em aberto da §5 daquele doc viram
-decisões concretas, para poderem ser atacadas.
+A document under review. Continues from [CONTEXT.md](CONTEXT.md), which
+describes the 3 → 4.0 "Quattro" upgrade incident and Omarchy's plugin
+architecture. Here the open questions from that document's §5 become concrete
+decisions, so they can be attacked.
 
-Escrito 2026-08-24.
-
----
-
-## 0. Tese central
-
-**A falha de agosto não foi corrupção de backup. Foi cobertura.**
-
-O `hyprland.conf` versionado estava íntegro, válido e completo. Ele
-simplesmente deixou de ser o arquivo que o Hyprland lê. Um backup que
-verificasse *integridade* (hash, sintaxe, restore bem-sucedido) teria passado
-com nota máxima e mesmo assim não teria salvado nada.
-
-Logo, a pergunta que o OmaBackup precisa responder não é "o backup está
-íntegro?" mas:
-
-> **O backup contém os arquivos que este sistema, agora, de fato lê?**
-
-Isso é verificável interrogando a máquina viva, em segundos, sem VM nenhuma.
-A VM resolve outra pergunta (mais cara e menos frequente): "restaurado do
-zero, isso sobe?". As duas são necessárias; só a primeira precisa rodar toda
-hora.
+Written 2026-08-24.
 
 ---
 
-## 1. Arquitetura: o plugin é UI, o trabalho pesado é CLI
+## 0. Central thesis
+
+**August's failure was not backup corruption. It was coverage.**
+
+The versioned `hyprland.conf` was intact, valid and complete. It simply stopped
+being the file Hyprland reads. A backup that verified *integrity* (hash, syntax,
+a successful restore) would have passed with top marks and still saved nothing.
+
+So the question OmaBackup has to answer is not "is the backup intact?" but:
+
+> **Does the backup contain the files this system, right now, actually reads?**
+
+That is verifiable by interrogating the live machine, in seconds, with no VM at
+all. A VM answers a different question (more expensive and less frequent):
+"restored from scratch, does this come up?". Both are needed; only the first has
+to run all the time.
+
+---
+
+## 1. Architecture: the plugin is UI, the heavy lifting is a CLI
 
 ```
-┌─ omabackup (CLI bash, ~/.local/bin) ─────────────────────┐
+┌─ omabackup (bash CLI, ~/.local/bin) ─────────────────────┐
 │  collect · classify · scan-secrets · verify · pack       │
 │  push (git | rclone | dir | removable) · restore         │
-│  todo subcomando aceita --json                           │
+│  every subcommand accepts --json                         │
 └──────────────────────────▲───────────────────────────────┘
-                           │ Quickshell.Io.Process (stdout JSON)
+                           │ Quickshell.Io.Process (JSON on stdout)
 ┌──────────────────────────┴───────────────────────────────┐
-│  brenoperucchi.omabackup (plugin QML)                    │
-│    service    → timer, watcher de versão, gatilhos       │
-│    bar-widget → ícone + badge de estado                  │
-│    panel      → grupos, destinos, agenda, diff, histórico│
+│  brenoperucchi.omabackup (QML plugin)                    │
+│    service    → timer, version watcher, triggers         │
+│    bar-widget → icon + state badge                       │
+│    panel      → groups, destinations, schedule, diff     │
 └──────────────────────────────────────────────────────────┘
 ```
 
-Por que a divisão:
+Why the split:
 
-1. **O plugin roda dentro do processo que hospeda o desktop inteiro.** Um erro
-   de QML derruba barra, dock e menu — já aconteceu nesta máquina. Backup é
-   exatamente a feature que não pode ser a causa disso.
-2. **Restauração precisa funcionar quando não há shell.** Máquina nova, tty de
-   recuperação, ssh. Um plugin não alcança esse cenário; um CLI sim.
-3. **CLI é testável.** `omabackup verify --json` roda em CI, em cron, num
-   container. QML não.
+1. **The plugin runs inside the process that hosts the entire desktop.** A QML
+   error takes down the bar, the dock and the menu — it already happened on this
+   machine. Backup is exactly the feature that must not be the cause of that.
+2. **Restoring has to work when there is no shell.** A new machine, a recovery
+   tty, ssh. A plugin cannot reach that scenario; a CLI can.
+3. **A CLI is testable.** `omabackup verify --json` runs in CI, in cron, in a
+   container. QML does not.
 
-O plugin nunca escreve arquivo nem roda `git` diretamente. Se o CLI não estiver
-instalado, o widget mostra "não configurado" e não quebra nada.
-
----
-
-## 2. Grupos — "o que está sendo salvo"
-
-Manifesto declarativo versionado no repo (`omabackup.groups.json`). Cada grupo
-é uma unidade que o usuário liga/desliga e sobre a qual o painel reporta.
-
-| id | label | caminhos | estratégia | crítico |
-|----|-------|----------|-----------|:---:|
-| `compositor` | Hyprland | `~/.config/hypr/**` | cópia | ● |
-| `shell` | Omarchy shell | `~/.config/omarchy/{shell.json,themes}` | cópia | ● |
-| `state` | Estado do Omarchy | `~/.local/state/omarchy/{current,toggles,migrations}` | cópia | ● |
-| `plugins` | Plugins do shell | `~/.config/omarchy/plugins/**` | tripla (§2.1) | ● |
-| `terminal` | Terminal | alacritty, ghostty, kitty, foot, tmux, starship | cópia | |
-| `editor` | Editores | nvim, opencode | cópia | |
-| `shellrc` | Shell do usuário | `.bashrc`, `.bash_profile`, `.inputrc`, `.XCompose` | cópia | ● |
-| `desktop` | Desktop | `.local/share/applications`, `mimeapps.list`, `user-dirs.dirs` | cópia | |
-| `scripts` | Scripts pessoais | `~/bin`, `~/.local/bin`, `~/scripts` | só rastreados | |
-| `packages` | Pacotes | listas pacman/AUR/explícitos | gerado | ● |
-| `systemd` | Serviços | units + enabled lists | gerado | |
-| `secrets` | Segredos | allow-list explícita, cifrado com age | allow-list | |
-
-Cada linha no painel mostra: **nº de arquivos · tamanho · última mudança ·
-estado** (em dia / com alterações / **não coberto**).
-
-O estado "não coberto" é a inovação: vem do verificador de cobertura (§5.1),
-não de comparar com o último commit.
-
-### 2.1 A estratégia tripla dos plugins
-
-Herdada do `sync.sh`, é o detalhe que mais custou a descobrir:
-
-| caso | detecção | o que vai pro backup |
-|------|----------|----------------------|
-| git limpo | tem `.git/`, `status --porcelain` vazio | só a URL |
-| git sujo | tem `.git/`, status sujo | URL + `git diff` como patch |
-| local | sem `.git/` | o diretório inteiro |
-
-Sem isso: ou perde-se a customização local (`rosakodu.dock` carrega um
-`slotSize: 42 → 56` nosso), ou o repo engorda ~7 MB de código de terceiros.
+The plugin never writes a file or runs `git` directly. If the CLI is not
+installed, the widget shows "not configured" and breaks nothing.
 
 ---
 
-## 3. Destinos
+## 2. Groups — "what is being saved"
 
-Vários simultâneos, cada um com política própria. **O git é a fonte de verdade
-do conteúdo; os demais recebem um bundle derivado dele** — assim não existem
-três formatos divergentes para reconciliar depois.
+A declarative manifest versioned in the repo (`omabackup.groups.json`). Each
+group is a unit the user toggles and the panel reports on.
 
-| destino | mecanismo | retenção | observação |
-|---------|-----------|----------|------------|
-| `github` | `git commit` + `push` | histórico git | padrão; dá diff e blame de graça |
-| `gdrive` | `rclone copy` p/ remote | últimos N | remote `GoogleDrive:` **já configurado** nesta máquina |
-| `dir` | `cp` p/ caminho (NAS, disco) | últimos N | |
-| `removable` | igual `dir`, gatilhado por montagem | últimos N | casa por UUID; badge "aguardando pendrive" |
+| id | label | paths | strategy | critical |
+|----|-------|-------|----------|:---:|
+| `compositor` | Hyprland | `~/.config/hypr/**` | copy | ● |
+| `shell` | Omarchy shell | `~/.config/omarchy/{shell.json,themes}` | copy | ● |
+| `state` | Omarchy state | `~/.local/state/omarchy/{current,toggles,migrations}` | copy | ● |
+| `plugins` | Shell plugins | `~/.config/omarchy/plugins/**` | triple (§2.1) | ● |
+| `terminal` | Terminal | alacritty, ghostty, kitty, foot, tmux, starship | copy | |
+| `editor` | Editors | nvim, opencode | copy | |
+| `shellrc` | User shell | `.bashrc`, `.bash_profile`, `.inputrc`, `.XCompose` | copy | ● |
+| `desktop` | Desktop | `.local/share/applications`, `mimeapps.list`, `user-dirs.dirs` | copy | |
+| `scripts` | Personal scripts | `~/bin`, `~/.local/bin`, `~/scripts` | tracked only | |
+| `packages` | Packages | pacman/AUR/explicit lists | generated | ● |
+| `systemd` | Services | units + enabled lists | generated | |
+| `secrets` | Secrets | explicit allow-list, age-encrypted | allow-list | |
 
-Bundle = `omabackup-<host>-<YYYYMMDD-HHMMSS>.tar.zst`, contendo um `git bundle`
-do repo (histórico completo, clonável) + o worktree em claro (legível sem git)
-+ `manifest.json` com versões, grupos e resultado da verificação.
+Each row in the panel shows: **file count · size · last change · state**
+(up to date / changed / **not covered**).
 
-Cada destino guarda: habilitado, último sucesso, último erro, backoff.
+The "not covered" state is the innovation: it comes from the coverage checker
+(§5.1), not from comparing against the last commit.
 
-Um destino falhando **não** invalida os outros — o painel mostra por destino.
+### 2.1 The triple strategy for plugins
 
----
+Inherited from `sync.sh`, it is the detail that cost the most to discover:
 
-## 4. Agenda
+| case | detection | what goes into the backup |
+|------|-----------|---------------------------|
+| clean git | has `.git/`, `status --porcelain` empty | just the URL |
+| dirty git | has `.git/`, dirty status | URL + `git diff` as a patch |
+| local | no `.git/` | the whole directory |
 
-Intervalos oferecidos: **5 min · 30 min · 1 h · 6 h · 1 dia · manual**.
-
-Ponto de projeto: **o timer dispara uma _verificação_, não um backup.** Sem
-diff, nada acontece — nada de commit vazio, nada de tráfego. É o que torna
-"5 min" uma opção sã em vez de uma fábrica de lixo no histórico.
-
-Gatilhos além do timer, em ordem de valor:
-
-1. **Pré-upgrade do Omarchy** — o de maior valor no produto inteiro. Observa
-   `~/.local/share/omarchy/version` e/ou engancha em `omarchy-update`; força
-   backup **antes** de o upgrade rodar. Ataca a lição nº 2 (o momento de maior
-   risco é o de menor atenção).
-2. **Pós-mutação de plugin** — depois de `omarchy plugin add/update/remove`.
-3. **Ao suspender/desligar** — opcional.
-4. **Ao montar o pendrive** configurado.
-
-Backoff exponencial por destino em caso de falha. O badge não some sozinho: um
-backup velho fica visível até ser resolvido.
+Without this: either the local customization is lost (`rosakodu.dock` carries a
+`slotSize: 42 → 56` of ours), or the repo grows by ~7 MB of third-party code.
 
 ---
 
-## 5. Validação — "confirmar que o dotfile funciona"
+## 3. Destinations
 
-Três camadas, custo crescente, cada uma pegando uma classe distinta de falha.
+Several at once, each with its own policy. **Git is the source of truth for
+content; the others receive a bundle derived from it** — so there are never
+three divergent formats to reconcile later.
 
-### 5.1 T1 — Cobertura (segundos, roda em todo backup)
+| destination | mechanism | retention | note |
+|-------------|-----------|-----------|------|
+| `github` | `git commit` + `push` | git history | default; diff and blame for free |
+| `gdrive` | `rclone copy` to a remote | last N | the `GoogleDrive:` remote is **already configured** on this machine |
+| `dir` | `cp` to a path (NAS, disk) | last N | |
+| `removable` | same as `dir`, triggered by a mount | last N | matched by UUID; "waiting for the drive" badge |
 
-Interroga o **sistema vivo** e pergunta se o backup o acompanha:
+The bundle is `omabackup-<host>-<YYYYMMDD-HHMMSS>.tar.zst`, containing a
+`git bundle` of the repo (full history, clonable) plus the worktree in the clear
+(readable without git) plus a `manifest.json` with versions, groups and the
+verification result.
 
-- Hyprland: qual config foi realmente carregada? O log diz
-  `[cfg] Using lua config found at <path>`. Esse caminho está no backup?
-- Todo `.lua` sob `~/.config/hypr/` está coberto? Existe `.conf` coberto que já
-  **não** é mais lido? (avisa: peso morto)
-- `shell.json` presente, JSON válido, `version: 1`?
-- Todo plugin retornado por `omarchy-shell shell listPlugins` tem cobertura —
-  URL, patch ou cópia?
-- Todo pacote de `pacman -Qqe` aparece numa lista?
-- Toda unit habilitada aparece nas listas?
+Each destination records: enabled, last success, last error, backoff.
 
-**É esta camada que teria pego o incidente de agosto**, no dia do upgrade, sem
-VM, sem restore, em menos de um segundo.
+One destination failing does **not** invalidate the others — the panel reports
+per destination.
 
-### 5.2 T2 — Sintaxe (segundos, roda em todo backup)
+---
 
-Sobre o bundle, não sobre a máquina: `luac -p` nos `.lua`, `jq` nos `.json`,
-`bash -n` nos scripts, `omarchy plugin validate` em cada plugin local.
+## 4. Schedule
 
-Pega backup capturado no meio de uma escrita, ou config quebrada sendo
-propagada como se estivesse boa.
+Intervals offered: **5 min · 30 min · 1 h · 6 h · 1 day · manual**.
 
-### 5.3 T3 — Restore em VM (minutos, sob demanda / semanal)
+A design point: **the timer fires a _check_, not a backup.** No diff, nothing
+happens — no empty commits, no traffic. That is what makes "5 min" a sane option
+instead of a factory for junk history.
 
-Responde "isto sobe do zero?". Artefato separado (`tools/omabackup-verify-vm/`),
-não parte do plugin — o plugin só exibe "última verificação em VM: ok, há 3 dias".
+Triggers beyond the timer, in order of value:
 
-**Golden image, construída uma vez.** Três caminhos possíveis, do mais fiel ao
-mais barato:
+1. **Before an Omarchy upgrade** — the highest-value item in the whole product.
+   Watch `~/.local/share/omarchy/version` and/or hook into `omarchy-update`;
+   force a backup **before** the upgrade runs. Attacks lesson #2 (the moment of
+   highest risk is the moment of lowest attention).
+2. **After a plugin mutation** — following `omarchy plugin add/update/remove`.
+3. **On suspend/shutdown** — optional.
+4. **When the configured removable drive is mounted.**
 
-- (a) ISO oficial do Omarchy dirigido por `expect` sobre o configurador — mais
-  fiel, mais frágil.
-- (b) **Deferred provisioning** — o Omarchy já suporta: um install pode deixar
-  `/var/lib/omarchy/provisioning/pending` e o `omarchy-provision-owner.service`
-  termina o setup no primeiro boot, na tty1. É o gancho projetado para OEM, e
-  serve exatamente aqui.
-- (c) `pacstrap` direto num qcow2 usando `install/omarchy-base.packages` +
-  `install/` do próprio Omarchy — mais barato, pula o instalador (e portanto
-  não testa o instalador; aceitável, não é o que queremos testar).
+Exponential backoff per destination on failure. The badge does not clear itself:
+a stale backup stays visible until it is dealt with.
 
-**Cada execução** é barata porque não reinstala nada:
+---
+
+## 5. Verification — "confirming the dotfiles work"
+
+Three layers, increasing in cost, each catching a distinct class of failure.
+
+### 5.1 T1 — Coverage (seconds, every run)
+
+Interrogates the **live system** and asks whether the backup keeps up with it:
+
+- Hyprland: which config did it actually load? The log says
+  `[cfg] Using lua config found at <path>`. Is that path in the backup?
+- Is every `.lua` under `~/.config/hypr/` covered? Is there a covered `.conf`
+  that is **no longer** read? (warns: dead weight)
+- Is `shell.json` present, valid JSON, `version: 1`?
+- Does every plugin returned by `omarchy-shell shell listPlugins` have coverage —
+  URL, patch or copy?
+- Does every package from `pacman -Qqe` appear in a list?
+- Does every enabled unit appear in the lists?
+
+**This is the layer that would have caught the August incident**, on the day of
+the upgrade, with no VM, no restore, in under a second.
+
+### 5.2 T2 — Syntax (seconds, every run)
+
+Against the bundle, not the machine: `luac -p` on `.lua`, `jq` on `.json`,
+`bash -n` on scripts, `omarchy plugin validate` on each local plugin.
+
+Catches a backup captured mid-write, or a broken config being propagated as
+though it were fine.
+
+### 5.3 T3 — Restore in a VM (minutes, on demand / weekly)
+
+Answers "does this come up from scratch?". A separate artifact
+(`tools/omabackup-verify-vm/`), not part of the plugin — the plugin only shows
+"last VM check: ok, 3 days ago".
+
+**A golden image, built once.** Three possible paths, from most faithful to
+cheapest:
+
+- (a) The official Omarchy ISO driven by `expect` over the configurator — most
+  faithful, most fragile.
+- (b) **Deferred provisioning** — Omarchy already supports it: an install can
+  leave `/var/lib/omarchy/provisioning/pending` and
+  `omarchy-provision-owner.service` finishes setup on first boot, on tty1. It is
+  the hook designed for OEM use, and it serves here.
+- (c) `pacstrap` straight into a qcow2 using
+  `install/omarchy-base.packages` plus Omarchy's own `install/` — cheapest, skips
+  the installer (and therefore does not test the installer; acceptable, that is
+  not what we want to test).
+
+**Each run** is cheap because nothing is reinstalled:
 
 ```
 qemu-img create -f qcow2 -b golden.qcow2 -F qcow2 run.qcow2
 qemu-system-x86_64 -snapshot ... -virtfs <bundle> ...   # headless
-  → unit oneshot: restaura o bundle, roda install.sh
-  → assert.sh: quickshell vivo? hyprland subiu? shell.json carregado?
-               nº de keybindings esperado? monitores aplicados?
-  → grim/screenshot copiado de volta
-descarta run.qcow2
+  → oneshot unit: restore the bundle, run install.sh
+  → assert.sh: is quickshell alive? did hyprland start? did shell.json load?
+               the expected number of keybindings? monitors applied?
+  → grim/screenshot copied back
+discard run.qcow2
 ```
 
-A golden fica intacta; o overlay é descartável. Sem `libvirt` — só
-`qemu-system-x86_64`, que já está instalado nesta máquina.
+The golden stays intact; the overlay is disposable. No `libvirt` — just
+`qemu-system-x86_64`, already installed on this machine.
 
 ---
 
-## 6. Segredos
+## 6. Secrets
 
-**Allow-list explícita**, não deny-list. Nada entra em `secrets/` sem estar
-nomeado no manifesto; hoje são dois arquivos (`rclone.conf.age`,
-`khronos.master.key.age`), cifrados com `age`.
+**An explicit allow-list**, not a deny-list. Nothing enters `secrets/` without
+being named in the manifest; today that is two files (`rclone.conf.age`,
+`khronos.master.key.age`), encrypted with `age`.
 
-Por cima disso, um scanner deny-list roda sobre o bundle **e bloqueia o push**
-em caso de achado — não apenas avisa. Falsos positivos conhecidos e inofensivos
-(`--password-store=gnome-libsecret`, `hide_token_restore`, `source` condicional
-no `.bashrc`) vão para uma allow-list de exceções versionada, com justificativa.
+On top of that, a deny-list scanner runs over the bundle and **blocks the push**
+on a hit — it does not merely warn. Known harmless false positives
+(`--password-store=gnome-libsecret`, `hide_token_restore`, conditional `source`
+in `.bashrc`) go into a versioned exception allow-list, with justifications.
 
-Motivo de ser bloqueante: vazamento é irreversível, e "só avisa" é exatamente
-o modo de falha da lição nº 1 (aviso que ninguém lê).
-
----
-
-## 7. Robustez do plugin
-
-Requisitos derivados do crash observado (um erro de QML em *outro* plugin
-derrubou o `quickshell` inteiro e nada relançou):
-
-- try/catch em toda fronteira; nada pesado em `Component.onCompleted`
-- zero I/O síncrono no QML — só `Quickshell.Io.Process`
-- degradação: CLI ausente → widget em "não configurado", sem exceção
-- `shell.json` muda debaixo do backup (plugins escrevem nele sozinhos): o CLI
-  compara hash antes/depois e relê se divergiu
-- convenção de settings inconsistente entre plugins (`rosakodu.dock` usa
-  `settings:{}` aninhado, `argus` usa chaves soltas) → capturar o arquivo
-  inteiro, nunca reconstruí-lo campo a campo
+Why blocking: a leak is irreversible, and "just warns" is precisely the failure
+mode of lesson #1 (a warning nobody reads).
 
 ---
 
-## 8. Decisões que este documento fecha (e que a revisão deve atacar)
+## 7. Plugin robustness
 
-| # | pergunta da §5 do contexto | decisão |
-|---|---------------------------|---------|
-| 1 | git ou tarball? | **git como fonte de verdade + bundle derivado** para os demais destinos |
-| 2 | só Omarchy ou dotfiles gerais? | **dotfiles gerais**, organizados em grupos ligáveis; o escopo estreito não resolve a dor real |
-| 3 | deny-list ou allow-list de segredos? | **allow-list**, mais scanner deny-list **bloqueante** |
-| 4 | `/etc` também? | **não** — o plugin nunca pede sudo; `/etc/sudoers.d` continua sendo só um aviso |
-| 5 | onde o trabalho roda? | **CLI externo**; o plugin é UI e agendador |
-| 6 | como confirmar que funciona? | **três camadas**: cobertura (sempre) · sintaxe (sempre) · VM (semanal/sob demanda) |
-| 7 | symlink (stow) ou cópia? | **híbrido** — link no que só o usuário edita, cópia no que o Omarchy reescreve (§10) |
+Requirements derived from the observed crash (a QML error in *another* plugin
+took down the entire `quickshell` process and nothing relaunched it):
 
----
-
-## 9. Riscos conhecidos, não resolvidos
-
-- **Golden image envelhece.** Uma VM construída em agosto testa restore contra
-  um Omarchy de agosto. Precisa de política de rebuild.
-- **Nada disso ajuda se o usuário desabilitar o plugin.** O CLI + timer systemd
-  sobrevive; o plugin não. Talvez o systemd timer seja o mecanismo primário e o
-  plugin apenas a cara dele.
-- **5 min de intervalo com git** ainda gera muitos commits em dia de trabalho
-  pesado em dotfiles, mesmo com a checagem de diff. Squash automático? Branch
-  separado?
-- **Restauração seletiva** (o item mais pedido da §5 do contexto) está esboçada
-  como grupos, mas restaurar *um grupo* sobre um sistema vivo pode deixar o
-  sistema em estado misto e inconsistente.
+- try/catch at every boundary; nothing heavy in `Component.onCompleted`
+- zero synchronous I/O in QML — only `Quickshell.Io.Process`
+- degradation: CLI absent → widget shows "not configured", no exception
+- `shell.json` changes underneath the backup (plugins write to it on their own):
+  the CLI compares hashes before and after and re-reads if they diverge
+- inconsistent settings conventions between plugins (`rosakodu.dock` uses a
+  nested `settings:{}`, `argus` uses loose keys) → capture the whole file, never
+  rebuild it field by field
 
 ---
 
-## 10. Arte prévia: `omadot`, e a pergunta symlink vs. cópia
+## 8. Decisions this document closes (and the review should attack)
 
-[`tomhayes/omadot`](https://github.com/tomhayes/omadot) — wrapper fino de GNU
-Stow para Omarchy (56 stars, último push 2026-04-27, sem licença). Dois verbos:
-`get <pkg>` move `~/.config/<pkg>` para `~/.dotfiles/<pkg>/.config/<pkg>` e
-symlinka de volta; `put <pkg>` refaz o stow numa máquina nova.
-
-O que ele **não** faz e o OmaBackup precisa fazer: agenda, lembrete, destinos
-(o git é manual; não há Drive/pendrive/diretório), verificação de qualquer
-espécie, e qualquer consciência do Omarchy 4 (`shell.json`, a estratégia tripla
-de plugins, `.lua` vs `.conf` inerte).
-
-O que ele acerta, e vale roubar: **elimina o passo de sync.** Se
-`~/.config/nvim` *é* o repo, não existe `sync.sh` para alguém esquecer de
-rodar. Isso ataca a lição nº 1 na raiz, estruturalmente, em vez de com um
-lembrete.
-
-### O experimento que decide a questão
-
-O modelo do stow só vale se os escritores do sistema respeitarem o link.
-Medido nesta máquina, em ambiente isolado:
-
-| escritor | mecanismo | symlink sobrevive? |
-|----------|-----------|:---:|
-| Quickshell `FileView { atomicWrites: true }` (`shell.qml:130`) | grava através do link | **sim** |
-| `omarchy-shell-config` → `commit()` (`mktemp` + `mv`) | substitui o inode | **não** |
-
-O segundo é o que sustenta `omarchy bar move`, `omarchy bar set` e
-`omarchy plugin enable/disable`. Um `shell.json` sob stow é silenciosamente
-desconectado do repo **na primeira vez que se move um widget na barra** — e o
-sintoma é exatamente o de agosto: backup verde, conteúdo obsoleto.
-
-### Decisão: híbrido, com o modo de falha tornado visível
-
-- **Symlink (stow)** para o que só o usuário edita: `nvim`, `bashrc`,
-  `alacritty`, `ghostty`, `tmux`, `starship`, `.XCompose`. Sem passo de sync.
-- **Cópia** para o que o próprio Omarchy reescreve: `shell.json`, `hypr/*.lua`,
-  `~/.local/state/omarchy/`, e tudo que é gerado (listas de pacotes, units).
-  `plugins/` **não** é cópia rsync — mantém a estratégia tripla da §2.1; foi
-  assim que a primeira versão do `sync.sh` se atropelou.
-- O manifesto de grupos (§2) ganha uma coluna `mode: link | copy`.
-- **A verificação T1 (§5.1) passa a checar integridade de link**: todo caminho
-  declarado `mode: link` ainda é um symlink apontando para o repo? Deixou de
-  ser → alerta vermelho no painel, com o comando de reparo.
-
-Isso converte a falha silenciosa característica do stow numa falha visível, que
-é o objetivo do produto inteiro.
-
-Nota: `stow` **não está instalado** nesta máquina. Se o modo link for adotado,
-ou entra como dependência, ou o CLI faz `ln -s` por conta própria — o layout de
-diretórios do stow é simples o bastante para não justificar a dependência.
+| # | question from CONTEXT §5 | decision |
+|---|--------------------------|----------|
+| 1 | git or tarball? | **git as the source of truth + a derived bundle** for the other destinations |
+| 2 | Omarchy only or dotfiles in general? | **dotfiles in general**, organized into toggleable groups; the narrow scope does not solve the real pain |
+| 3 | deny-list or allow-list for secrets? | **allow-list**, plus a **blocking** deny-list scanner |
+| 4 | `/etc` too? | **no** — the plugin never asks for sudo; `/etc/sudoers.d` remains a warning only |
+| 5 | where does the work run? | **an external CLI**; the plugin is UI and scheduler |
+| 6 | how to confirm it works? | **three layers**: coverage (always) · syntax (always) · VM (weekly/on demand) |
+| 7 | symlink (stow) or copy? | **hybrid** — link for what only the user edits, copy for what Omarchy rewrites (§10) |
 
 ---
 
-## 11. Resultado da revisão (dual-r, 2026-08-24)
+## 9. Known risks, unresolved
 
-Duas lentes independentes e cegas uma à outra — `gpt-5.6-sol`/xhigh via
-AgentRelay (modelo comprovado por `codex-argv:-m`) e `dual-opus-reasoner`
-nativo (`model: opus`, `effort: max`; versão numerada não comprovada pelo
-harness). Todo P0/P1 solo foi verificado no código antes de entrar aqui.
+- **The golden image ages.** A VM built in August tests restores against an
+  August Omarchy. It needs a rebuild policy.
+- **None of this helps if the user disables the plugin.** The CLI plus a systemd
+  timer survives; the plugin does not. Maybe the systemd timer should be the
+  primary mechanism and the plugin merely its face.
+- **A 5-minute interval with git** still produces many commits on a day of heavy
+  dotfile work, even with the diff check. Automatic squash? A separate branch?
+- **Selective restore** (the most requested item from CONTEXT §5) is sketched as
+  groups, but restoring *one group* onto a live system can leave it in a mixed,
+  inconsistent state.
 
-### 11.1 O laço circular (P0)
+---
 
-A §4 dizia: *o timer dispara uma verificação, não um backup; sem diff, nada
-acontece.* Isso funciona para grupos em modo `link`, onde o arquivo vivo **é** o
-repo. Para grupos em modo **`copy`** — `shell.json`, `hypr/*.lua`, plugins, os
-críticos — não existe diff algum enquanto ninguém copiou. O ciclo se fecha em si
-mesmo: sem coleta → sem diff → sem backup → sem coleta.
+## 10. Prior art: `omadot`, and the symlink vs. copy question
 
-**Correção — o ciclo tem quatro tempos:**
+[`tomhayes/omadot`](https://github.com/tomhayes/omadot) — a thin GNU Stow
+wrapper for Omarchy (56 stars, last pushed 2026-04-27, no license). Two verbs:
+`get <pkg>` moves `~/.config/<pkg>` to `~/.dotfiles/<pkg>/.config/<pkg>` and
+symlinks it back; `put <pkg>` re-stows it on a new machine.
+
+What it does **not** do and OmaBackup must: scheduling, reminders, destinations
+(git is manual; no Drive, drive or directory), verification of any kind, and any
+awareness of Omarchy 4 (`shell.json`, the triple plugin strategy, `.lua` vs
+inert `.conf`).
+
+What it gets right, and is worth stealing: **it removes the sync step.** If
+`~/.config/nvim` *is* the repo, there is no `sync.sh` for anyone to forget to
+run. That attacks lesson #1 at the root, structurally, instead of with a
+reminder.
+
+### The experiment that settles it
+
+The stow model only holds if the system's writers respect the link. Measured on
+this machine, in an isolated environment:
+
+| writer | mechanism | link survives |
+|--------|-----------|:---:|
+| Quickshell `FileView { atomicWrites: true }` (`shell.qml:130`) | writes through the link | **yes** |
+| `omarchy-shell-config` → `commit()` (`mktemp` + `mv`) | replaces the inode | **no** |
+
+The second one backs `omarchy bar move`, `omarchy bar set` and
+`omarchy plugin enable/disable`. A stow-managed `shell.json` is silently
+disconnected from the repo **the first time you move a widget in the bar** — and
+the symptom is exactly August's: backup green, content stale.
+
+### Decision: hybrid, with the failure mode made visible
+
+- **Symlink (stow)** for what only the user edits: `nvim`, `bashrc`,
+  `alacritty`, `ghostty`, `tmux`, `starship`, `.XCompose`. No sync step.
+- **Copy** for what Omarchy itself rewrites: `shell.json`, `hypr/*.lua`,
+  `~/.local/state/omarchy/`, and everything generated (package lists, systemd
+  units). `plugins/` is **not** a plain rsync copy — it keeps the triple
+  strategy from §2.1; that is how the first version of `sync.sh` tripped over
+  itself.
+- The group manifest (§2) gains a `mode: link | copy` column.
+- **T1 verification (§5.1) now checks link integrity**: is every path declared
+  `mode: link` still a symlink pointing into the repo? If it stopped being one →
+  a red alert in the panel, with the repair command.
+
+That converts stow's characteristic silent failure into a visible one, which is
+the point of the whole product.
+
+Note: `stow` is **not installed** on this machine. If link mode is adopted,
+either it becomes a dependency, or the CLI does its own `ln -s` — stow's
+directory layout is simple enough not to justify the dependency.
+
+---
+
+## 11. Review results (dual-r, 2026-08-24)
+
+Two independent lenses, blind to each other — `gpt-5.6-sol`/xhigh via
+AgentRelay (model proven by `codex-argv:-m`) and a native `dual-opus-reasoner`
+(`model: opus`, `effort: max`; the numbered version was not proven by the
+harness). Every solo P0/P1 was verified against the code before landing here.
+
+### 11.1 The circular loop (P0)
+
+§4 said: *the timer fires a check, not a backup; no diff, nothing happens.* That
+works for `mode: link` groups, where the live file **is** the repo. For
+**`mode: copy`** groups — `shell.json`, `hypr/*.lua`, plugins, the critical ones
+— there is no diff at all until something has been copied. The loop closes on
+itself: no collect → no diff → no backup → no collect.
+
+**Fix — the cycle has four beats:**
 
 ```
-collect  → staging em ~/.local/state/omabackup/staging (rsync, sem tocar no repo)
-diff     → staging vs. worktree do repo, normalizado (jq -S nos .json)
-verify   → T1 cobertura + T2 sintaxe sobre o staging
-commit   → só se o diff for não-vazio E a verificação passar
+collect  → staging in ~/.local/state/omabackup/staging (rsync, repo untouched)
+diff     → staging vs. the repo worktree, normalized (jq -S on .json)
+verify   → T1 coverage + T2 syntax over the staging area
+commit   → only if the diff is non-empty AND verification passes
 ```
 
-Normalizado porque os dois escritores do `shell.json` serializam diferente —
-`omarchy-shell-config` usa `jq -S` (chaves ordenadas), o Quickshell usa
-`JSON.stringify(payload, null, 2)` (ordem de inserção). Sem normalizar, trocar
-um widget de lugar reescreve o arquivo inteiro no diff.
+Normalized because `shell.json`'s two writers serialize differently —
+`omarchy-shell-config` uses `jq -S` (sorted keys), Quickshell uses
+`JSON.stringify(payload, null, 2)` (insertion order). Without normalizing,
+moving one widget rewrites the whole file in the diff.
 
-### 11.2 O que muda de decisão
+### 11.2 What changes
 
-| § | Decisão v0 | Decisão v1 | Por quê |
-|---|-----------|-----------|---------|
-| 1 | plugin agenda, CLI executa | **systemd timer é primário**; o plugin é só a cara e um botão | `omarchy-update-restart:51` roda `omarchy-restart-shell` no fim de todo update: o agendador morre no evento que existe pra vigiar |
-| 1 | estado no shell | estado em `~/.local/state/omabackup/` | restaurar `shell.json` de ontem **desabilita o próprio OmaBackup** — plugin de terceiro está ativo sse seu id aparece no `shell.json`, e não há deep-merge |
-| 4 | watcher em `~/.local/share/omarchy/version` | **descartado** | é symlink pra `/usr/share/omarchy`; muda só depois que o pacman trocou o pacote, e reporta `4.0.0.alpha` enquanto `omarchy-version` reporta `4.0.0-1` |
-| 4 | gatilho pré-upgrade via hook | **não existe hook pre-update** | `omarchy-update:47-49` = pacotes → migrações → `omarchy-hook post-update`. Os hooks disponíveis são battery-low, font-set, post-boot, post-update, pre-refresh-pacman, theme-set |
-| 5.1 | probes por diretório conhecido | **resolução transitiva** | `~/.local/state/omarchy/toggles/hypr/flags.lua` e `current/theme/hyprland.lua` são Lua vivo fora do escopo declarado, carregados via `package.path` |
-| 5.1 | cobertura de plugin via `listPlugins` | dirigida pelo **diretório**, `listPlugins` só enriquece | `listPlugins` inclui first-party (ruído permanente) e omite plugin com manifest inválido — justo o que mais precisa de backup |
-| 5.3 | golden via deferred provisioning | **pacstrap** é o único caminho não-interativo | `omarchy-provision-owner:551` bloqueia em `read -r -t 0.2 _ </dev/tty` dentro de `while true`, e a seguir pede username/senha/hostname/timezone em `gum` |
-| 6 | scanner sobre o bundle | scanner sobre **`git log -p --all`** também | o bundle carrega o histórico completo; um segredo commitado e removido depois viaja em todo backup sem passar pelo scanner |
-| 10 | `mode: link|copy` por arquivo | por arquivo **+ teste de propriedade por release** | a sobrevivência do symlink é por-escritor, não por-arquivo: `omarchy-shell-config:59` usa `mv` (destrói), a migração `1785189600.sh:53` usa `cat >` com o comentário explícito *"so a tmux.conf symlinked out of a dotfiles repo keeps pointing where it pointed"* (preserva) |
-| 10 | "alerta vermelho com o comando de reparo" | **copiar-o-vivo-pro-repo, então relinkar** | o reparo ingênuo (`ln -sf`) apaga exatamente a edição que quebrou o link |
+| § | v0 decision | v1 decision | why |
+|---|-------------|-------------|-----|
+| 1 | the plugin schedules, the CLI executes | **the systemd timer is primary**; the plugin is just the face and a button | `omarchy-update-restart:51` runs `omarchy-restart-shell` at the end of every update: the scheduler dies during the event it exists to watch |
+| 1 | state in the shell | state in `~/.local/state/omabackup/` | restoring yesterday's `shell.json` **disables OmaBackup itself** — a third-party plugin is enabled iff its id appears in `shell.json`, and there is no deep merge |
+| 4 | watcher on `~/.local/share/omarchy/version` | **dropped** | it is a symlink to `/usr/share/omarchy`; it only changes after pacman has already swapped the package, and it reads `4.0.0.alpha` while `omarchy-version` reads `4.0.0-1` |
+| 4 | pre-upgrade trigger via a hook | **there is no pre-update hook** | `omarchy-update:47-49` is packages → migrations → `omarchy-hook post-update`. The available hooks are battery-low, font-set, post-boot, post-update, pre-refresh-pacman, theme-set |
+| 5.1 | probes over known directories | **transitive resolution** | `~/.local/state/omarchy/toggles/hypr/flags.lua` and `current/theme/hyprland.lua` are live Lua outside the declared scope, loaded via `package.path` |
+| 5.1 | plugin coverage via `listPlugins` | driven by the **directory**, with `listPlugins` only enriching | `listPlugins` includes first-party plugins (permanent noise) and omits any plugin with an invalid manifest — precisely the one that most needs backing up |
+| 5.3 | golden via deferred provisioning | **pacstrap** is the only non-interactive path | `omarchy-provision-owner:551` blocks on `read -r -t 0.2 _ </dev/tty` inside a `while true`, then asks for username/password/hostname/timezone through `gum` |
+| 6 | scanner over the bundle | scanner over **`git log -p --all`** as well | the bundle carries the full history; a secret committed and later removed travels in every backup without passing the scanner |
+| 10 | `mode: link\|copy` per file | per file **plus a property test per release** | symlink survival is per-writer, not per-file: `omarchy-shell-config:59` uses `mv` (destroys), migration `1785189600.sh:53` uses `cat >` with the explicit comment *"so a tmux.conf symlinked out of a dotfiles repo keeps pointing where it pointed"* (preserves) |
+| 10 | "red alert with the repair command" | **copy the live file into the repo, then relink** | the naive repair (`ln -sf`) erases the very edit that broke the link |
 
-### 11.3 Bug no `sync.sh` de hoje (não é só design)
+### 11.3 A bug in today's `sync.sh` (not just design)
 
-`sync.sh:157` decide que um plugin está sujo com `git status --porcelain`, mas
-`sync.sh:161` grava o patch com `git diff` — que **não inclui staged nem
-untracked**. Provado por construção:
+`sync.sh:157` decides a plugin is dirty using `git status --porcelain`, but
+`sync.sh:161` writes the patch with `git diff` — which includes **neither
+staged nor untracked** changes. Proven by construction:
 
 ```
 status --porcelain : M  Widget.qml ?? Helper.qml
-git diff           : 0 linhas   ← o que vai pro patch
-git diff HEAD      : 7 linhas
+git diff           : 0 lines   ← what goes into the patch
+git diff HEAD      : 7 lines
 ```
 
-O plugin é marcado "git + patch local" com um patch vazio. Correção:
-`git diff HEAD` mais captura explícita dos untracked
+The plugin is marked "git + local patch" with an empty patch. The fix is
+`git diff HEAD` plus explicit capture of untracked files
 (`git ls-files --others --exclude-standard`).
 
-E o manifesto guarda só `id url`, sem commit. Se o upstream avançar, o restore
-instala outro código e o patch não aplica. Precisa de SHA.
+And the manifest stored only `id url`, no commit. If upstream moves, the restore
+installs different code and the patch will not apply. It needs a SHA.
 
-### 11.4 O problema do ovo e da galinha nos destinos
+### 11.4 The chicken-and-egg problem in the destinations
 
-`bootstrap.sh:19-26` decifra `secrets/rclone.conf.age` **de dentro do repo
-clonado**. Ou seja: o Google Drive só é alcançável depois de você já ter o repo
-do GitHub. Se o GitHub for o que você perdeu, a credencial pra baixar o bundle
-do Drive está dentro do bundle do Drive.
+`bootstrap.sh:19-26` decrypts `secrets/rclone.conf.age` **from inside the cloned
+repo**. Which means Google Drive is only reachable once you already have the
+repo from GitHub. If GitHub is what you lost, the credential for fetching the
+Drive bundle is inside the Drive bundle.
 
-Consequência para a §3: cada destino precisa ser **restaurável a partir apenas
-do seu próprio identificador**, e a T3 precisa exercitar um destino diferente a
-cada rodada (par = bundle local, ímpar = clone do remote, e assim por diante),
-exigindo que todos tenham passado nos últimos N dias antes de o painel ficar
-verde. Caminho não exercitado não funciona.
+Consequence for §3: each destination must be **restorable from its own
+identifier alone**, and T3 must exercise a different destination each round
+(even = local bundle, odd = clone from the remote), requiring all of them to
+have passed within the last N days before the panel goes green. A path that is
+not exercised does not work.
 
-Relacionado: o grupo `secrets` usa `age -p` (passphrase interativa,
-`secrets/README.md:13`). Nenhum timer consegue atualizá-lo. Ou vira
-`age -R recipients.txt` — e aí a chave privada precisa de uma história de
-custódia que este doc não tem — ou é explicitamente manual, com data de
-validade visível no painel.
+Related: the `secrets` group uses `age -p` (an interactive passphrase,
+`secrets/README.md:13`). No timer can refresh it. Either it becomes
+`age -R recipients.txt` — and then the private key needs a custody story this
+document does not have — or it is explicitly manual, with an expiry date visible
+in the panel.
 
-### 11.5 O gatilho pré-upgrade, agora que se sabe que o hook não existe
+### 11.5 The pre-upgrade trigger, now that we know the hook does not exist
 
-Três opções, nenhuma limpa:
+Three options, none clean:
 
-1. **Pacman hook `PreTransaction` em `Target=omarchy`** — é o único ponto
-   genuinamente anterior à mutação. Exige root uma vez, o que colide com a
-   decisão §8 nº 4 ("o plugin nunca pede sudo"). A colisão é entre *instalar*
-   com sudo uma vez e *rodar* com sudo sempre; só a segunda é o que a regra do
-   Omarchy proíbe.
-2. **Wrapper/alias em `omarchy update`** — contornável por qualquer outra rota
-   (`pacman -Syu` atualiza o pacote `omarchy` direto).
-3. **`snapper -c home create`** — `omarchy-update:36` já roda
-   `omarchy-snapshot create` **antes** dos pacotes; `/` e `/home` são btrfs e o
-   snapper está instalado. Barato, local, e não substitui o off-site.
+1. **A pacman `PreTransaction` hook on `Target=omarchy`** — the only point
+   genuinely before the mutation. Requires root once, which collides with
+   decision §8 #4 ("the plugin never asks for sudo"). The collision is between
+   *installing* with sudo once and *running* with sudo always; only the second
+   is what Omarchy's rule forbids.
+2. **A wrapper or alias on `omarchy update`** — bypassable by any other route
+   (`pacman -Syu` updates the `omarchy` package directly).
+3. **`snapper -c home create`** — `omarchy-update:36` already runs
+   `omarchy-snapshot create` **before** the packages; `/` and `/home` are btrfs
+   and snapper is installed. Cheap, local, and no substitute for off-site.
 
-E mesmo um gatilho perfeito não cobre tudo: migrações também rodam **no login**
-e por retry (`omarchy-migrate:79`), desacopladas do `omarchy update`. Um
-`pacman -Syu` comum atualiza o pacote; as migrações reescrevem `input.lua` e
-`bindings.lua` no login seguinte sem nenhum gatilho disparar. O probe certo é
-`omarchy-migrate --pending` dentro do T1.
+And even a perfect trigger would not cover everything: migrations also run **at
+login** and on retry (`omarchy-migrate:79`), decoupled from `omarchy update`. An
+ordinary `pacman -Syu` updates the package; the migrations rewrite `input.lua`
+and `bindings.lua` at the next login without any §4 trigger firing. The right
+probe is `omarchy-migrate --pending` inside T1.
 
-### 11.6 Restauração seletiva: bloqueada até haver grafo
+### 11.6 Selective restore: blocked until there is a graph
 
-Três razões independentes, qualquer uma bastando:
+Three independent reasons, any one sufficient:
 
-1. **Lua não degrada, aborta.** `hyprland.lua:14-26` tem seis `require` de topo,
-   nenhum protegido por `pcall`. Restaurar só o grupo `compositor` com um
-   `looknfeel.lua` que referencia algo que o grupo `state` traria → erro em
-   `require` → bindings, autostart e toggles não carregam. O `.conf` antigo era
-   tolerante linha a linha; o Lua não é.
-2. **Restaurar `shell` desliga o OmaBackup** (§11.2).
-3. **Marcadores de migração.** São 439 em `~/.local/state/omarchy/migrations`.
-   Sem eles, o restore roda todas as migrações contra a config recém-restaurada.
-   Com eles, migrações legítimas da versão nova são puladas pra sempre.
+1. **Lua does not degrade, it aborts.** `hyprland.lua:14-26` has six top-level
+   `require` calls, none guarded by `pcall`. Restoring only the `compositor`
+   group with a `looknfeel.lua` referencing something the `state` group would
+   have brought → an error in `require` → bindings, autostart and toggles never
+   load. The old `.conf` tolerated failure line by line; Lua does not.
+2. **Restoring `shell` disables OmaBackup** (§11.2).
+3. **Migration markers.** There are 439 in
+   `~/.local/state/omarchy/migrations`. Without them a restore runs every
+   migration against the config you just restored. With them, legitimate
+   migrations for the new version are skipped forever.
 
-### 11.7 A metade que faltava do invariante
+### 11.7 The missing half of the invariant
 
-A §0 define cobertura numa direção só: *o backup contém o que o sistema lê?*
-Falta a simétrica: *o backup contém **apenas** isso?* O repo já é a prova —
-`configs/hypr.backup/`, `configs/waybar.backup/`, `configs/walker.backup/`,
-os `.bak` do Quattro, `.user.system-monitor.bak.20260820042654/`. Um bootstrap a
-partir daqui hoje ressuscita tudo isso.
+§0 defines coverage in one direction: *does the backup contain what the system
+reads?* The symmetric half is missing: *does it contain **only** that?* The repo
+is the proof — `configs/hypr.backup/`, `configs/waybar.backup/`,
+`configs/walker.backup/`, the Quattro-era `.bak` files,
+`.user.system-monitor.bak.20260820042654/`. A bootstrap from here today
+resurrects all of it.
 
-O incidente de agosto foi **as duas metades ao mesmo tempo**: `.conf` presentes
-e mortos + `.lua` ausentes. O design v0 só endereçava a segunda.
+The August incident was **both halves at once**: `.conf` files present and dead
+plus `.lua` files absent. The v0 design addressed only the second.
 
-E uma terceira, que o Sol levantou e é a mais desconfortável: **cobertura não é
-equivalência semântica.** Depois do upgrade, os `hyprland.lua` gerados eram
-templates vazios porém válidos. Copiá-los deixaria a T1 verde com zero
-customização preservada. A T1 precisa comparar contra o *último estado
-conhecido-bom*, não só contra a existência do caminho.
-
----
-
-## 12. Decisões v2 — o alcance de restauração substitui a corrida contra o upgrade
-
-Três decisões tomadas depois da revisão. A segunda reorganiza o produto.
-
-### 12.1 O OmaBackup declara o que sabe restaurar; não persegue o upgrade
-
-**Decisão:** manter o backup sempre atualizado (o ciclo de quatro tempos da
-§11.1 dá isso) e mover a garantia de segurança do *momento da captura* para o
-*momento da restauração*. O OmaBackup declara um conjunto de versões-alvo que
-sabe restaurar — hoje Omarchy 3.x e 4.x. Numa máquina fora desse conjunto, ele
-**não tenta**.
-
-O que isso resolve, e é muito:
-
-- A §11.5 (gatilho pré-upgrade) deixa de ser o item de maior valor do produto e
-  vira conveniência. Não é preciso hook `PreTransaction`, não é preciso sudo,
-  não é preciso interceptar `omarchy-update`, e a decisão §8 nº 4 ("o plugin
-  nunca pede sudo") deixa de estar em conflito com nada.
-- O modo de falha de agosto passa a ser impossível **por construção**: um backup
-  no formato `.conf` restaurado num Omarchy que lê `.lua` é recusado com motivo,
-  em vez de aplicado e descoberto quebrado horas depois.
-- O aviso "vem upgrade aí" não precisa de gancho: `omarchy-update-available` já
-  é um poll. O widget passa a dizer *"há upgrade disponível e ele te leva pra
-  fora do alcance que o OmaBackup sabe restaurar"* — informativo, nunca
-  bloqueante.
-
-O que isso custa: o produto pode se recusar a ajudar justamente no dia mais
-difícil (máquina nova com Omarchy 5.x, backup de 4.x). O pagamento é a §12.2.
-
-### 12.2 Eixo novo: acoplamento de versão
-
-Mais importante que `link` vs `copy`. Determina o que sobrevive a uma versão
-desconhecida.
-
-| grupo | acoplado ao Omarchy? | por quê |
-|-------|:---:|---------|
-| `compositor` | **sim** | o formato mudou de `.conf` pra `.lua` no 3→4 |
-| `shell` | **sim** | schema `version: 1`, ids de widget, convenção de settings |
-| `plugins` | **sim** | API do Quickshell e do `PluginRegistry` |
-| `state` | **sim** | toggles, tema ativo, marcadores de migração |
-| `terminal` | não | alacritty, ghostty, tmux e starship não sabem o que é Omarchy |
-| `editor` | não | idem |
-| `shellrc` | não | idem |
-| `desktop` | não | freedesktop, não Omarchy |
-| `scripts` | não | scripts próprios |
-| `packages` | parcial | nomes de pacote mudam devagar; falha é visível e reparável |
-| `systemd` | parcial | idem |
-
-Numa máquina fora do alcance, o restore **aplica os desacoplados e põe os
-acoplados em quarentena**, com relatório do que ficou de fora e onde está.
-Você recupera shell, editor, terminal, scripts e pacotes — a maior parte do dia
-a dia — e reconstrói a mão só a config do desktop, que é o que mudou de formato.
-
-Isso também dá o corte que faltava na §11.6: existe uma fronteira **de
-princípio** para restauração parcial (acoplado vs. desacoplado), em vez de um
-grafo inventado. Dentro do bloco acoplado continua tudo-ou-nada — a cadeia de
-`require` sem `pcall` não admite meio-termo.
-
-### 12.3 Identidade de compatibilidade: o marcador de migração, não a string de versão
-
-O bundle grava três coisas:
-
-| campo | fonte | exemplo |
-|-------|-------|---------|
-| versão | `omarchy-version` | `4.0.0-1` |
-| canal | `omarchy-channel-current` | `stable` |
-| **marca-d'água de migração** | maior nome em `~/.local/state/omarchy/migrations` | `1786643346` (2026-08-13) |
-
-A marca-d'água é o identificador melhor: são timestamps unix, ordenam sem
-ambiguidade, e nesta máquina existem 439 deles cobrindo de 2025-06-28 a
-2026-08-13 (contra apenas 78 migrações ainda presentes no pacote — o pacote poda,
-o estado acumula).
-
-Ela resolve a pergunta que a §11.6 tinha deixado em aberto:
-
-| situação | o que fazer com os marcadores |
-|----------|-------------------------------|
-| alvo == origem | restaurar os marcadores: o estado de migração é idêntico |
-| alvo > origem, dentro do alcance | **não** restaurar: deixar `omarchy-migrate` correr pra frente — é exatamente para isto que ele existe |
-| alvo fora do alcance | não restaurar nada do bloco acoplado |
-
-### 12.4 O que a verificação afirma — e o que vira nota
-
-**Decisão:** o assert verifica que **o arquivo de config está presente e
-íntegro**. Hardware não é objeto de teste.
-
-Monitores, rotação, EDID e modos viram uma **nota** no painel — "esta máquina
-tinha 3 monitores, o ASUS com `transform 3`" — informação para o humano
-conferir depois do restore, nunca um assert que falha.
-
-A consequência honesta: **isso esvazia o caso de uso do QEMU.** Se o assert é
-"os arquivos estão no lugar e fazem parse", não é preciso bootar um sistema —
-um container Arch descartável faz o mesmo em segundos:
-
-```
-podman run --rm -v bundle:/b:ro archlinux \
-  → restaura em $HOME falso → luac -p, jq, bash -n, omarchy plugin validate
-  → confere: todo caminho que o T1 declarou coberto chegou lá?
-```
-
-A VM só volta a valer se um dia quisermos afirmar "o compositor subiu" — o que
-a decisão acima diz explicitamente que não é o objetivo. Então a §5.3 encolhe
-para **T3 = container** e o QEMU sai do caminho crítico; se for construído, é
-com `pacstrap` (§11.2), nunca com deferred provisioning.
+And a third, raised by the Sol lens and the most uncomfortable: **coverage is
+not semantic equivalence.** After the upgrade the generated `hyprland.lua` files
+were empty but valid. Copying them would leave T1 green with zero customization
+preserved. T1 has to compare against the *last known-good state*, not merely
+against the existence of a path.
 
 ---
 
-## 13. Correção da §12.4 — o container não substitui a VM
+## 12. v2 decisions — a declared restore range replaces racing the upgrade
 
-A §12.4 concluiu que, se o assert é "o arquivo está presente e faz parse", não
-haveria por que bootar um sistema. **Está errado**, e a decisão §12.1 (alcance
-de restauração) torna o erro pior, não menor.
+Three decisions taken after the review. The second one reorganizes the product.
 
-Duas necessidades distintas foram coladas numa só:
+### 12.1 OmaBackup declares what it can restore; it does not chase the upgrade
 
-| | pergunta | quem responde | quem lê |
+**Decision:** keep the backup always current (the four-beat cycle from §11.1
+provides that) and move the safety guarantee from the *moment of capture* to the
+*moment of restore*. OmaBackup declares a set of target versions it knows how to
+restore onto — today Omarchy 3.x and 4.x. On a machine outside that set, it
+**does not try**.
+
+What this solves, and it is a lot:
+
+- §11.5 (the pre-upgrade trigger) stops being the highest-value item in the
+  product and becomes a convenience. No `PreTransaction` hook, no sudo, no
+  intercepting `omarchy-update`, and decision §8 #4 ("the plugin never asks for
+  sudo") is no longer in conflict with anything.
+- August's failure mode becomes impossible **by construction**: a backup in
+  `.conf` format restored onto an Omarchy that reads `.lua` is refused with a
+  reason, instead of applied and discovered broken hours later.
+- The "an upgrade is coming" warning needs no hook: `omarchy-update-available`
+  is already a poll. The widget now says *"an update is available and it takes
+  you outside the range OmaBackup knows how to restore"* — informative, never
+  blocking.
+
+What it costs: the product can refuse to help on the hardest day (a new machine
+running Omarchy 5.x, with a 4.x backup). §12.2 is how that is paid for.
+
+### 12.2 A new axis: version coupling
+
+More important than `link` vs `copy`. It determines what survives an unknown
+version.
+
+| group | coupled to Omarchy? | why |
+|-------|:---:|-----|
+| `compositor` | **yes** | the format changed from `.conf` to `.lua` in 3 → 4 |
+| `shell` | **yes** | `version: 1` schema, widget ids, settings conventions |
+| `plugins` | **yes** | the Quickshell and `PluginRegistry` API |
+| `state` | **yes** | toggles, active theme, migration markers |
+| `terminal` | no | alacritty, ghostty, tmux and starship do not know what Omarchy is |
+| `editor` | no | same |
+| `shellrc` | no | same |
+| `desktop` | no | freedesktop, not Omarchy |
+| `scripts` | no | your own scripts |
+| `packages` | partial | package names change slowly; failure is visible and fixable |
+| `systemd` | partial | same |
+
+On a machine outside the range, a restore **applies the uncoupled groups and
+quarantines the coupled ones**, with a report of what was left out and where it
+is. You get back shell, editor, terminal, scripts and packages — most of the
+day-to-day — and rebuild by hand only the desktop config, which is what changed
+format.
+
+This also provides the cut §11.6 was missing: there is a **principled** boundary
+for partial restore (coupled vs. uncoupled) instead of an invented graph. Inside
+the coupled block it stays all-or-nothing — a chain of `require` without `pcall`
+admits no middle ground.
+
+### 12.3 Compatibility identity: the migration marker, not the version string
+
+The bundle records three things:
+
+| field | source | example |
+|-------|--------|---------|
+| version | `omarchy-version` | `4.0.0-1` |
+| channel | `omarchy-channel-current` | `stable` |
+| **migration watermark** | the highest name in `~/.local/state/omarchy/migrations` | `1786643346` (2026-08-13) |
+
+The watermark is the better identifier: they are unix timestamps, they order
+unambiguously, and on this machine there are 439 of them spanning 2025-06-28 to
+2026-08-13 (against only 78 migrations still shipped in the package — the
+package prunes, the state accumulates).
+
+It answers the question §11.6 left open:
+
+| situation | what to do with the markers |
+|-----------|-----------------------------|
+| target == source | restore the markers: migration state is identical |
+| target > source, inside the range | **do not** restore them: let `omarchy-migrate` run forward — that is exactly what it exists for |
+| target outside the range | restore nothing from the coupled block |
+
+### 12.4 What verification asserts — and what becomes a note
+
+**Decision:** the assert checks that **the config file is present and intact**.
+Hardware is not a test subject.
+
+Monitors, rotation, EDID and modes become a **note** in the panel — "this
+machine had 3 monitors, the ASUS with `transform 3`" — information for a human
+to check after a restore, never an assert that fails.
+
+---
+
+## 13. Correcting §12.4 — the container does not replace the VM
+
+§12.4 concluded that if the assert is "the file is present and parses", there
+would be no reason to boot a system. **That is wrong**, and decision §12.1 (the
+restore range) makes the error worse, not smaller.
+
+Two distinct needs had been glued into one:
+
+| | question | who answers | who reads |
 |---|---|---|---|
-| **T3** | os arquivos chegaram e fazem parse? | container | máquina |
-| **T4** | isto vira um desktop que funciona? | **VM** | **humano** |
+| **T3** | did the files arrive and do they parse? | a container | the machine |
+| **T4** | does this become a working desktop? | a **VM** | a **human** |
 
-O container responde a primeira. Não responde a segunda, e sobretudo **não
-deixa ver**. O incidente de agosto passaria por T3 com nota máxima: os `.lua`
-gerados eram válidos, parseavam, estavam no lugar. O que faltava só aparecia
-olhando a tela.
+The container answers the first. It does not answer the second, and above all it
+**does not let you look**. The August incident would pass T3 with top marks: the
+generated `.lua` files were valid, they parsed, they were in place. What was
+missing only showed on screen.
 
-### 13.1 Por que a §12.1 aumenta a necessidade da VM
+### 13.1 Why §12.1 increases the need for a VM
 
-A tabela de alcance (`supported_targets = ["3.*", "4.*"]`) é uma **afirmação que
-precisa ser ganha**, não uma constante. Duas perguntas dependem dela e nenhuma
-tem resposta analítica:
+The range table (`supportedTargets = ["3.*", "4.*"]`) is an **assertion that has
+to be earned**, not a constant. Two questions depend on it and neither has an
+analytical answer:
 
-1. **Como se acrescenta `5.x` à lista?** Bootando um Omarchy 5.x, restaurando o
-   bundle e olhando o resultado. Não há outro jeito honesto.
-2. **O recorte da quarentena (§12.2) está certo?** "Estes 7 grupos são
-   independentes de versão" é hipótese. Se `ghostty` ou algum `.desktop` acabar
-   dependendo de algo que o Omarchy 5 mudou, quem descobre é a VM.
+1. **How do you add `5.x` to the list?** By booting an Omarchy 5.x, restoring
+   the bundle and looking at the result. There is no other honest way.
+2. **Is the quarantine cut (§12.2) right?** "These 7 groups are
+   version-independent" is a hypothesis. If `ghostty` or some `.desktop` turns
+   out to depend on something Omarchy 5 changed, the VM is what finds out.
 
-Ou seja: a VM deixa de ser um teste de regressão semanal e passa a ser **o
-mecanismo pelo qual o alcance de restauração é estendido**. Roda uma vez por
-release maior do Omarchy, com humano no circuito — frequência baixa, valor alto.
+So the VM stops being a weekly regression test and becomes **the mechanism by
+which the restore range is extended**. It runs once per major Omarchy release,
+with a human in the loop — low frequency, high value.
 
-### 13.2 Como o usuário vê
+### 13.2 How the user sees it
 
-`screendump` do QMP, medido nesta máquina (QEMU 11.1.0):
+QMP `screendump`, measured on this machine (QEMU 11.1.0):
 
 ```
-{"execute":"screendump","arguments":{"filename":"/out/tela.ppm"}}
+{"execute":"screendump","arguments":{"filename":"/out/screen.ppm"}}
 → {"return": {}}
 ```
 
-Propriedade decisiva: **a captura vem do lado do host, sem cooperação do
-convidado.** Verificado bootando uma VM sem disco — o convidado não subiu e a
-captura saiu mesmo assim, mostrando a tela de falha de boot. Se o Hyprland não
-levantar depois do restore, você vê *a tela de erro*, não um arquivo vazio.
+The decisive property: **the capture comes from the host side, with no
+cooperation from the guest.** Verified by booting a VM with no disk — the guest
+never came up and the capture succeeded anyway, showing the boot-failure screen.
+If Hyprland does not start after a restore, you see *the error screen*, not an
+empty file.
 
-Um `grim` dentro do convidado não teria essa propriedade: desktop quebrado,
-nenhuma captura, nenhum diagnóstico — cego exatamente quando importa.
+A `grim` inside the guest would not have that property: broken desktop, no
+capture, no diagnosis — blind exactly when it matters.
 
-O ciclo:
+The cycle:
 
 ```
-qemu-img create -f qcow2 -b golden-<versão>.qcow2 -F qcow2 run.qcow2
+qemu-img create -f qcow2 -b golden-<version>.qcow2 -F qcow2 run.qcow2
 qemu-system-x86_64 -display none -qmp unix:/tmp/qmp.sock -vnc :1 \
   -virtfs local,path=<bundle>,mount_tag=oma,security_model=mapped-xattr ...
-  → unit oneshot: restaura o bundle, roda install.sh, chega no SDDM/Hyprland
-  → QMP screendump → tela.png
-  → T3 (container) já rodou antes; aqui a saída é a IMAGEM, não um exit code
+  → oneshot unit: restore the bundle, run install.sh, reach SDDM/Hyprland
+  → QMP screendump → screen.png
+  → T3 (the container) already ran; here the output is the IMAGE, not an exit code
 ```
 
-O `-vnc :1` fica aberto: quando a imagem parada não bastar, você entra e clica.
+The `-vnc :1` stays open: when a still frame is not enough, you go in and click.
 
-### 13.3 O que a VM entrega — e o que continua não sendo assert
+### 13.3 What the VM delivers — and what still is not an assert
 
-Coerente com a decisão §12.4 sobre hardware: **a captura não é um assert.** Não
-existe comparação de pixels, não existe "falhou porque mudou". É **evidência que
-um humano olha** — a mesma categoria da nota sobre monitores.
+Consistent with decision §12.4 about hardware: **the capture is not an assert.**
+There is no pixel comparison, no "failed because it changed". It is **evidence a
+human looks at** — the same category as the note about monitors.
 
-O painel ganha, ao lado dos tiers:
+The panel gains, alongside the tiers:
 
-- miniatura da última captura
-- versão-alvo em que ela foi tirada
-- data
-- e, quando a versão-alvo está fora do alcance atual, o botão que promove essa
-  versão para `supported_targets` — a decisão fica registrada com a imagem que a
-  justificou
+- a thumbnail of the last capture
+- the target version it was taken on
+- the date
+- and, when that target version is outside the current range, the button that
+  promotes it into `supportedTargets` — so the decision is recorded together
+  with the image that justified it
 
-### 13.4 Custo, honestamente
+### 13.4 The cost, honestly
 
-Voltam a ser necessários: uma golden image por versão de Omarchy que se queira
-suportar, e a construção dela (`pacstrap`, §11.2 — deferred provisioning
-continua fora, bloqueia em formulário `gum`). O que **não** volta é a frequência:
-T3 em container roda todo dia, sozinho; T4 em VM roda quando sai um Omarchy novo
-ou quando você está inseguro. A §12.4 estava certa em tirar a VM do caminho
-crítico — errada em tirá-la do produto.
+What comes back: one golden image per Omarchy version you want to support, and
+the work of building it (`pacstrap`, §11.2 — deferred provisioning stays out, it
+blocks on a `gum` form). What does **not** come back is the frequency: T3 in a
+container runs every day, on its own; T4 in a VM runs when a new Omarchy ships
+or when you feel uneasy. §12.4 was right to take the VM off the critical path —
+wrong to take it out of the product.

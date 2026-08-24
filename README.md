@@ -1,77 +1,80 @@
 # OmaBackup
 
-Backup de dotfiles para Omarchy 4 que responde a uma pergunta diferente da
-usual. Não *"o backup está íntegro?"* — o `hyprland.conf` de agosto de 2026
-estava íntegro, válido e completo, e por isso mesmo inútil quando o Hyprland
-passou a ler `.lua`. A pergunta é:
+Dotfile backup for Omarchy 4 that answers a different question than usual.
+Not *"is the backup intact?"* — the `hyprland.conf` from August 2026 was
+intact, valid and complete, and useless for exactly that reason once Hyprland
+started reading `.lua`. The question is:
 
-> **O backup contém os arquivos que este sistema, agora, de fato lê?**
+> **Does the backup contain the files this system, right now, actually reads?**
 
-E a segunda, que decide se restaurar é seguro:
+And a second one, which decides whether restoring is safe at all:
 
-> **Esta máquina está numa versão que o OmaBackup sabe restaurar?**
+> **Is this machine on a version OmaBackup knows how to restore onto?**
 
-## Estado
+## Status
 
-Etapa 1 de 6. Funciona hoje: `status`, `collect`, `verify`.
+Stage 1 of 6. Working today: `status`, `collect`, `verify`.
 
 ```bash
-./bin/omabackup status     # versão do Omarchy, alcance, grupos
-./bin/omabackup collect    # coleta os grupos para o staging
-./bin/omabackup verify     # checa cobertura; --json para consumo programático
+./bin/omabackup status     # Omarchy version, restore range, groups
+./bin/omabackup collect    # collect the groups into staging
+./bin/omabackup verify     # check coverage; --json for programmatic use
 ./test/run.sh              # 18 specs
 ```
 
-O plugin QML (`Service.qml`, `BarWidget.qml`, `Panel.qml`) é placeholder até a
-etapa 5 — carrega sem ocupar espaço na barra e sem poder derrubar o shell.
+The QML plugin (`Service.qml`, `BarWidget.qml`, `Panel.qml`) is a placeholder
+until stage 5 — it loads without taking room in the bar and without any way to
+bring the shell down.
 
-## Como funciona
+## How it works
 
-O ciclo tem quatro tempos, e o primeiro não é opcional:
+The cycle has four beats, and the first one is not optional:
 
 ```
-collect → staging   diff → contra o repo   verify → cobertura + sintaxe   commit
+collect -> staging   diff -> against the repo   verify -> coverage + syntax   commit
 ```
 
-Sem `collect` não existe diff para grupos em `mode: copy` — e um agendador que
-só dispara `verify` nunca salvaria `shell.json` nem `hypr/*.lua`.
+Without `collect` there is no diff for `mode: copy` groups — and a scheduler
+that only fires `verify` would never save `shell.json` or `hypr/*.lua`.
 
-### O manifesto de grupos
+### The group manifest
 
-`groups.default.json` descreve o que é salvo, em três eixos:
+`groups.default.json` describes what gets saved, along three axes:
 
-| eixo | valores | decide |
-|------|---------|--------|
-| `mode` | `link` · `copy` · `gen` · `triple` | como capturar |
-| `coupled` | `true` · `false` | se entra em quarentena num Omarchy fora do alcance |
-| `critical` | `true` · `false` | peso no relatório |
+| axis | values | decides |
+|------|--------|---------|
+| `mode` | `link` · `copy` · `gen` · `triple` | how to capture it |
+| `coupled` | `true` · `false` | whether it is quarantined on an Omarchy outside the restore range |
+| `critical` | `true` · `false` | weight in the report |
 
-`link` é para o que só você edita (o arquivo vivo *é* o repo, sem passo de
-sync). `copy` é para o que o Omarchy reescreve. `triple` é só para os plugins:
-git limpo grava URL+commit, git sujo grava também o patch, sem remote vira
-cópia integral. Sem isso o staging engordaria 6,6 MB de código que já vive no
-GitHub — ou perderia a customização local.
+`link` is for what only you edit (the live file *is* the repo, no sync step).
+`copy` is for what Omarchy rewrites. `triple` is for plugins only: a clean git
+checkout stores URL + commit, a dirty one also stores the patch, and one
+without a remote is copied in full. Without this, staging would grow by 6.6 MB
+of code that already lives on GitHub — or lose the local customization.
 
-**Um campo declarado que o coletor não implementa aborta o `collect`.** Falhar
-alto é o ponto: as três primeiras versões ignoraram `exclude`, `trackedOnly` e
-`mode: triple` em silêncio, e o staging foi de 1,3 MB para 84 MB sem avisar.
+**A declared field the collector does not implement aborts `collect`.** Failing
+loudly is the point: the first three versions silently ignored `exclude`,
+`trackedOnly` and `mode: triple`, and staging went from 1.3 MB to 84 MB without
+a word.
 
-### Cobertura (T1)
+### Coverage (T1)
 
-A sonda do compositor resolve o grafo de `require` a partir do arquivo que o
-Hyprland *diz* ter carregado, atravessa os módulos do pacote e cobra cobertura
-só dos arquivos do usuário. É assim que `~/.local/state/omarchy/toggles/hypr/flags.lua`
-aparece — Lua vivo fora de `~/.config/hypr`, que uma varredura por diretório
-não acharia.
+The compositor probe resolves the `require` graph starting from the file
+Hyprland *says* it loaded, traverses the package's own modules, and demands
+coverage only for the user's files. That is how
+`~/.local/state/omarchy/toggles/hypr/flags.lua` shows up — live Lua outside
+`~/.config/hypr`, which a directory scan would never find.
 
-Exclusões deliberadas ficam em `excluded[]`, cada uma com o motivo versionado
-junto. Um verificador que nasce com uma dúzia de avisos ensina a ser ignorado.
+Deliberate exclusions live in `excluded[]`, each with its reason versioned
+alongside. A checker born with a dozen warnings teaches you to ignore it.
 
-## Projeto
+## Design
 
-O desenho, a revisão que o derrubou duas vezes e as decisões estão em
-[`docs/DESIGN.md`](docs/DESIGN.md).
+The design, the review that knocked it down twice, and the decisions that came
+out of it are in [`docs/DESIGN.md`](docs/DESIGN.md). The incident that started
+it all is in [`docs/CONTEXT.md`](docs/CONTEXT.md).
 
-## Licença
+## License
 
 MIT
