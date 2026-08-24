@@ -27,6 +27,46 @@ die() { printf '%somabackup: %s%s\n' "$RED" "$*" "$NC" >&2; exit 1; }
 _tilde() { printf '%s' "${1/#$HOME/\~}"; }
 _expand() { printf '%s' "${1/#\~/$HOME}"; }
 
+# `uname -n`, never `hostname`: the latter ships in `inetutils`, which nothing
+# on a stock Omarchy requires -- on this machine it is "Explicitly installed /
+# Required By: None", present only because somebody typed it. `uname` is
+# coreutils, which `base` requires, so it cannot be missing. This name goes into
+# the bundle filename AND into the pattern retention deletes by, so a machine
+# without inetutils would have written one name and pruned by another.
+_hostname() { uname -n 2>/dev/null || printf 'unknown-host'; }
+
+# What this tool needs that a stock Omarchy does not guarantee.
+#
+# `jq` and `git` are direct dependencies of the `omarchy` package itself, so
+# they exist anywhere this plugin can be installed. coreutils, findutils, sed,
+# gawk, tar and systemd come from Arch `base`. `rsync` and `zstd` come from
+# neither -- no omarchy script uses either one -- so a clean install can lack
+# them. Checked per command rather than up front: `verify` is the one that has
+# to work on a recovery tty, and refusing to report coverage because the machine
+# cannot compress an archive would be its own kind of nonsense.
+_pkg_for() {
+    case "$1" in
+        rsync) printf 'rsync' ;;
+        zstd)  printf 'zstd' ;;
+        jq)    printf 'jq' ;;
+        git)   printf 'git' ;;
+        tar)   printf 'tar' ;;
+        *)     printf '%s' "$1" ;;
+    esac
+}
+
+require_tools() {
+    local t missing=() pkgs=()
+    for t in "$@"; do
+        command -v "$t" >/dev/null 2>&1 || { missing+=("$t"); pkgs+=("$(_pkg_for "$t")"); }
+    done
+    (( ${#missing[@]} )) || return 0
+    printf '%somabackup: missing required %s: %s%s\n' \
+        "$RED" "$([[ ${#missing[@]} -gt 1 ]] && echo tools || echo tool)" "${missing[*]}" "$NC" >&2
+    printf '  install with: %spacman -S %s%s\n' "$CYAN" "${pkgs[*]}" "$NC" >&2
+    exit 1
+}
+
 finding() {
     FINDINGS+=("$1"$'\t'"$2"$'\t'"$3"$'\t'"$4"$'\t'"${5:-}")
 }
@@ -288,6 +328,7 @@ _rsync_excludes() {
 # beats (collect -> diff -> verify -> commit): without staging there is no diff
 # for mode:copy groups, and the cycle would close on itself. See docs/DESIGN.md §11.1.
 cmd_collect() {
+    require_tools jq git rsync
     assert_manifest_understood
     # Staging represents "what should be backed up right now", not an
     # accumulating cache: without wiping it first, a path a group used to
@@ -428,6 +469,7 @@ collect_generated() {
 # human able to `git status`/`git diff` before anything is committed --
 # --commit is opt-in, everything else always leaves the tree for review.
 cmd_sync() {
+    require_tools jq git rsync
     local repo="${OMABACKUP_REPO:-}" commit=0
     # sync owns --commit. A global flag loop would have to know every
     # subcommand's vocabulary, and would then accept --commit in silence from
@@ -546,6 +588,7 @@ cmd_sync() {
 # Separate verb from `push` on purpose: building is cheap and local, sending is
 # slow and fallible, and only one of them should be able to fail at 3am.
 cmd_bundle() {
+    require_tools jq git tar zstd
     local repo="${OMABACKUP_REPO:-}" reused=0 path
     while (($#)); do
         case "$1" in
@@ -586,6 +629,7 @@ cmd_bundle() {
 # is what the timer calls. With an argument: that one, ignoring backoff, because
 # a human retrying on purpose should not serve out a penalty.
 cmd_push() {
+    require_tools jq git tar zstd
     local repo="${OMABACKUP_REPO:-}" rc=0 id detail bundle name
     local -a explicit=()
     while (($#)); do

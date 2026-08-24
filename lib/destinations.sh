@@ -139,11 +139,11 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
     mkdir -p "$dir" 2>/dev/null || { printf 'cannot create %s' "$dir"; return 1; }
     cp "$bundle" "$dir/$name.tmp" 2>/dev/null && mv "$dir/$name.tmp" "$dir/$name" 2>/dev/null \
         || { rm -f "$dir/$name.tmp" 2>/dev/null; printf 'cannot write into %s' "$dir"; return 1; }
-    [[ -f "$dir/$DEST_STAMP" ]] || printf '%s\n%s\n' "$id" "$(hostname)" >"$dir/$DEST_STAMP" 2>/dev/null
+    [[ -f "$dir/$DEST_STAMP" ]] || printf '%s\n%s\n' "$id" "$(_hostname)" >"$dir/$DEST_STAMP" 2>/dev/null
     # Only now, with the new copy confirmed on disk. "Delete the old, upload the
     # new" is how you arrive at zero copies.
     [[ -f "$dir/$name" ]] || { printf 'copy vanished after write'; return 1; }
-    removed="$(prune_bundles "$dir" "$(hostname)" "$(dest_field "$id" keep)" 2>/dev/null)" || removed=0
+    removed="$(prune_bundles "$dir" "$(_hostname)" "$(dest_field "$id" keep)" 2>/dev/null)" || removed=0
     printf '%s' "${removed:-0}"
 }
 

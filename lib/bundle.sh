@@ -25,7 +25,7 @@
 bundle_name() {
     local repo="$1" ts
     ts="$(git -C "$repo" show -s --format=%cd --date=format-local:%Y%m%d-%H%M%S HEAD 2>/dev/null)"
-    printf 'omabackup-%s-%s.tar.zst' "$(hostname)" "${ts:-00000000-000000}"
+    printf 'omabackup-%s-%s.tar.zst' "$(_hostname)" "${ts:-00000000-000000}"
 }
 
 _tool_commit() {
@@ -44,7 +44,7 @@ _bundle_manifest() {
     [[ -n "$vdoc" ]] || vdoc='{}'
 
     jq -n \
-        --arg host "$(hostname)" \
+        --arg host "$(_hostname)" \
         --arg created "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
         --arg toolcommit "$(_tool_commit)" \
         --arg head "$(git -C "$repo" rev-parse HEAD 2>/dev/null)" \
