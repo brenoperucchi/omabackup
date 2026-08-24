@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "brenoperucchi.omabackup",
+  "name": "OmaBackup",
+  "version": "0.1.0",
+  "author": "brenoperucchi",
+  "license": "MIT",
+  "description": "Backup de dotfiles que avisa quando parou de cobrir o que o sistema lê, e recusa restaurar em versões que não sabe restaurar.",
+  "kinds": ["service", "bar-widget", "panel"],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaBackup",
+    "description": "Estado do backup: cobertura, destinos e alcance de restauração",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "staleAfterIntervals": 3
+    },
+    "schema": [
+      {
+        "key": "staleAfterIntervals",
+        "type": "number",
+        "label": "Marcar como atrasado depois de N intervalos"
+      }
+    ]
+  }
+}

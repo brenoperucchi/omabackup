@@ -1,0 +1,175 @@
+{
+  "schemaVersion": 1,
+  "_comment": [
+    "mode:    link = o arquivo vivo É o repo (sem passo de sync)",
+    "         copy = o Omarchy reescreve isto; copiar pro staging",
+    "         gen  = derivado do sistema, não é arquivo copiado",
+    "coupled: true  = acoplado à versão do Omarchy; entra em quarentena",
+    "                 num alvo fora de supported_targets",
+    "         false = restaura em qualquer versão"
+  ],
+  "supportedTargets": [
+    "3.*",
+    "4.*"
+  ],
+  "excluded": [
+    {
+      "path": "~/.local/state/omarchy/current/theme",
+      "reason": "o tema vem no pacote do Omarchy; restaura de theme.name + omarchy-theme-set. São 18MB de wallpaper."
+    },
+    {
+      "path": "~/.local/state/nvim",
+      "reason": "cache, undo e lockfile do lazy.nvim; reconstruído por :Lazy sync."
+    },
+    {
+      "path": "~/.config/nvim/lazy-lock.json",
+      "reason": "gerado pelo lazy.nvim a cada sync; ruído de diff constante."
+    }
+  ],
+  "groups": [
+    {
+      "id": "compositor",
+      "label": "Hyprland",
+      "mode": "copy",
+      "coupled": true,
+      "critical": true,
+      "paths": [
+        "~/.config/hypr"
+      ],
+      "probe": "hypr-lua"
+    },
+    {
+      "id": "shell",
+      "label": "Omarchy shell",
+      "mode": "copy",
+      "coupled": true,
+      "critical": true,
+      "paths": [
+        "~/.config/omarchy/shell.json"
+      ],
+      "probe": "shell-json"
+    },
+    {
+      "id": "plugins",
+      "label": "Plugins do shell",
+      "mode": "triple",
+      "coupled": true,
+      "critical": true,
+      "paths": [
+        "~/.config/omarchy/plugins"
+      ],
+      "probe": "plugins"
+    },
+    {
+      "id": "state",
+      "label": "Estado do Omarchy",
+      "mode": "copy",
+      "coupled": true,
+      "critical": true,
+      "paths": [
+        "~/.local/state/omarchy/toggles",
+        "~/.local/state/omarchy/migrations",
+        "~/.local/state/omarchy/current/theme.name",
+        "~/.local/state/omarchy/current/background"
+      ],
+      "probe": "migrations"
+    },
+    {
+      "id": "shellrc",
+      "label": "Shell do usuário",
+      "mode": "link",
+      "coupled": false,
+      "critical": true,
+      "paths": [
+        "~/.bashrc",
+        "~/.bash_profile",
+        "~/.inputrc",
+        "~/.XCompose"
+      ]
+    },
+    {
+      "id": "terminal",
+      "label": "Terminal",
+      "mode": "link",
+      "coupled": false,
+      "critical": false,
+      "paths": [
+        "~/.config/alacritty",
+        "~/.config/ghostty",
+        "~/.config/kitty",
+        "~/.config/tmux",
+        "~/.config/starship.toml"
+      ]
+    },
+    {
+      "id": "editor",
+      "label": "Editores",
+      "mode": "link",
+      "coupled": false,
+      "critical": false,
+      "paths": [
+        "~/.config/nvim",
+        "~/.config/opencode"
+      ],
+      "exclude": [
+        "lazy/**",
+        "mason/**",
+        "node_modules/**",
+        ".git/**"
+      ]
+    },
+    {
+      "id": "desktop",
+      "label": "Desktop",
+      "mode": "copy",
+      "coupled": false,
+      "critical": false,
+      "paths": [
+        "~/.local/share/applications",
+        "~/.config/mimeapps.list",
+        "~/.config/user-dirs.dirs"
+      ]
+    },
+    {
+      "id": "scripts",
+      "label": "Scripts pessoais",
+      "mode": "copy",
+      "coupled": false,
+      "critical": false,
+      "paths": [
+        "~/.local/bin",
+        "~/bin"
+      ],
+      "trackedOnly": true
+    },
+    {
+      "id": "packages",
+      "label": "Pacotes",
+      "mode": "gen",
+      "coupled": false,
+      "critical": true,
+      "generator": "packages",
+      "probe": "packages"
+    },
+    {
+      "id": "systemd",
+      "label": "Serviços",
+      "mode": "gen",
+      "coupled": false,
+      "critical": false,
+      "generator": "systemd"
+    },
+    {
+      "id": "secrets",
+      "label": "Segredos",
+      "mode": "copy",
+      "coupled": false,
+      "critical": false,
+      "enabled": false,
+      "allowList": [
+        "~/.config/rclone/rclone.conf"
+      ],
+      "note": "age -p é interativo: nenhum timer atualiza este grupo (design §11.4)"
+    }
+  ]
+}
