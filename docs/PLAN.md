@@ -3,8 +3,10 @@
 The living document. `CONTEXT.md` is the incident that started this;
 `DESIGN.md` is the architecture and the review that reshaped it twice; this
 file is where we are right now and what comes next. Update it at the end of
-a work session, especially before switching to a fresh Claude Code session
-rooted in this directory — it is what lets that session pick up cold.
+a work session, especially before switching agent or tool (Claude Code,
+Codex, a fresh terminal, another machine) — it is what lets a cold session,
+regardless of which coding agent is reading it, pick up where the last one
+left off. Read this file first, in full, before touching any code.
 
 Last updated: 2026-08-24.
 
