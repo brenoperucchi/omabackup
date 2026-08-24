@@ -14,6 +14,9 @@ GROUPS_FILE="${OMABACKUP_GROUPS:-$OMABACKUP_ROOT/groups.default.json}"
 # Machine identity, not project data: a NAS path or a drive UUID has no place
 # in the public manifest. Same class as OMABACKUP_REPO.
 DESTINATIONS_FILE="${OMABACKUP_DESTINATIONS:-$HOME/.config/omabackup/destinations.json}"
+# Versioned, unlike destinations: secret shapes are generic, and §6 wants the
+# exceptions reviewable by whoever reads the repo next.
+SECRETS_DENY_FILE="${OMABACKUP_SECRETS_DENY:-$OMABACKUP_ROOT/secrets.deny.json}"
 STAGING="$OMABACKUP_STATE/staging"
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
@@ -723,6 +726,11 @@ cmd_push() {
     done
     [[ -n "$repo" && -d "$repo/.git" ]] || die "OMABACKUP_REPO must point at a git repo (got: ${repo:-unset})"
     assert_destinations_understood
+    # Before anything is built or sent, and covering github too: the git push
+    # carries the same commit the bundle does, so gating only the bundle would
+    # leave the default destination as the one hole (docs/DESIGN.md §6).
+    assert_deny_understood "$SECRETS_DENY_FILE"
+    report_secrets "$repo" "$SECRETS_DENY_FILE" || exit 1
 
     local -a targets=()
     if (( ${#explicit[@]} )); then
@@ -789,6 +797,7 @@ source "$OMABACKUP_ROOT/lib/plugin-capture.sh"
 source "$OMABACKUP_ROOT/lib/publish.sh"
 source "$OMABACKUP_ROOT/lib/bundle.sh"
 source "$OMABACKUP_ROOT/lib/destinations.sh"
+source "$OMABACKUP_ROOT/lib/secrets.sh"
 
 # Two levels: the loop below owns only what every command understands and
 # hands the rest, in order, to the command itself. It used to consume and shift

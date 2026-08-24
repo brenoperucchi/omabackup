@@ -245,6 +245,23 @@ cheap and disposable, not worth version-controlling.
 
 ---
 
+### The deny-list scanner is in (§6 closed)
+
+`secrets.deny.json` (versioned, unlike destinations — secret shapes are generic
+and §6 wants the exceptions reviewable) + `lib/secrets.sh`, gating `push` for
+every destination including `github`, since the git push carries the same commit
+the bundle does. It **blocks**, never warns: §6's reasoning was that a leak is
+irreversible and a warning nobody reads is lesson #1, and that got stronger once
+push became an unattended hourly timer — there is nobody at 03:00 to read one.
+
+Scanned with `git grep` against HEAD, not the working tree: HEAD is exactly what
+both destinations send. Nine patterns, each requiring a `reason` (a rule nobody
+can justify is a rule somebody forces past). Half the specs are false-positive
+cases — a chromium `--password-store` flag, `hide_token_restore`, a variable
+reference, an empty default, age ciphertext — because a scanner that fires on
+ordinary config teaches you to reach for `--force`, which is the same failure one
+step later. Clean against the real 739-file repo.
+
 ### It runs by itself now
 
 Both timers are live on this machine: `omabackup-sync` every 15 min
@@ -264,20 +281,15 @@ been dropped in silence since the beginning.
 
 ## Immediate next actions
 
-1. **The secret scanner (DESIGN.md §6).** Agreed as defence in depth rather
-   than a gate, but it is now the only thing between an unattended hourly push
-   and a credential that lands in a config file. The `secrets` group is
-   `enabled: false`, so nothing collects credentials on purpose — the risk is a
-   token pasted into something already covered.
-2. **Configure a real `dir` destination**, once there is an actual path to name
+1. **Configure a real `dir` destination**, once there is an actual path to name
    (external disk, NAS mount, a Drive folder synced by something else).
    `~/.config/omabackup/destinations.json` is deliberately still absent: there
    is no path to point it at that would not be invented. `github` works and
    runs hourly meanwhile.
-3. **Removable-drive trigger.** A udev rule calling `omabackup push <id>` when a
+2. **Removable-drive trigger.** A udev rule calling `omabackup push <id>` when a
    `dir` destination's mount point appears (DESIGN.md §4.4). Not a new
    destination type.
-4. Expand `Panel.qml` to show destinations and the schedule — `status --json`
+3. Expand `Panel.qml` to show destinations and the schedule — `status --json`
    already carries both `destinations` and `scheduler` for it to read.
 
 ## Open questions for the user, not yet decided
