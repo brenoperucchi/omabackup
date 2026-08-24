@@ -204,6 +204,16 @@ Panel {
     collectProc.running = true
   }
 
+  // "Fazer backup agora" from the mockup. The plugin still writes nothing and
+  // runs no git itself (DESIGN.md §1) -- it asks the CLI, exactly as the timer
+  // does, and re-reads when the CLI is done.
+  property bool syncing: false
+  function syncNow() {
+    if (root.cliMissing || root.syncing) return
+    root.syncing = true
+    syncProc.running = true
+  }
+
   function applyReport(text) {
     // A CLI that dies mid-write, an empty stdout, a future schema: none of
     // these may throw out of here.
@@ -263,6 +273,15 @@ Panel {
     stdout: StdioCollector { onStreamFinished: statusProc.buffer = text }
     onExited: function(code) {
       if (statusProc.buffer.trim() !== "") root.applyStatus(statusProc.buffer)
+    }
+  }
+
+  Process {
+    id: syncProc
+    command: root.cli === "" ? ["true"] : [root.cli, "sync", "--commit"]
+    onExited: function(code) {
+      root.syncing = false
+      root.refresh()
     }
   }
 
@@ -358,12 +377,51 @@ Panel {
           width: flick.width
           spacing: Style.space(10)
 
-          Text {
+          Row {
             width: parent.width
-            text: root.headline
-            color: root.failCount > 0 ? Color.urgent : Color.foreground
-            font.family: Style.font.family
-            font.pixelSize: Style.font.title
+            spacing: Style.space(6)
+
+            // The state dot the mockup carries beside the headline: one glance,
+            // one colour. Omarchy's palette has no green on purpose, so "fine"
+            // is the muted ink rather than a reassuring tick -- colour here
+            // always means there is something to do.
+            Rectangle {
+              width: Style.space(8)
+              height: width
+              radius: width / 2
+              anchors.verticalCenter: parent.verticalCenter
+              color: root.failCount > 0 ? Color.urgent
+                   : (!root.scheduled || root.stale || root.destAlerts.length > 0) ? Color.accent
+                   : root.warnCount > 0 ? Color.accent
+                   : Color.muted
+            }
+
+            Text {
+              text: root.headline
+              color: root.failCount > 0 ? Color.urgent : Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.title
+            }
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.space(6)
+
+            Button {
+              text: root.syncing ? "backing up…" : "Back up now"
+              bordered: true
+              focusable: true
+              enabled: !root.cliMissing && !root.syncing
+              onClicked: root.syncNow()
+            }
+            Button {
+              text: "Check again"
+              bordered: true
+              focusable: true
+              enabled: !root.cliMissing && !root.checking
+              onClicked: root.refresh()
+            }
           }
 
           Text {
