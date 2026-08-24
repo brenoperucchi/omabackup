@@ -533,18 +533,24 @@ Panel {
           // ── what is saved ─────────────────────────────────────────────────
           // The question the interface could not answer: you had to open
           // groups.default.json to find out what this tool actually keeps.
-          PanelSectionHeader {
-            visible: root.groups.length > 0
-            text: "Groups"
-          }
+          PanelSeparator { width: parent.width; visible: root.groups.length > 0 }
 
-          Text {
-            visible: root.groups.length > 0 && root.coveredFiles > 0
+          // Header and total on one line, the way the mockup reads: the section
+          // says what it is on the left and how much of it there is on the right.
+          Item {
+            visible: root.groups.length > 0
             width: parent.width
-            text: root.coveredFiles + " files · " + root.humanSize(root.coveredBytes)
-            color: Color.muted
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+            implicitHeight: gHdr.implicitHeight
+            PanelSectionHeader { id: gHdr; anchors.left: parent.left; text: "Groups" }
+            Text {
+              anchors.right: parent.right
+              anchors.verticalCenter: gHdr.verticalCenter
+              visible: root.coveredFiles > 0
+              text: root.coveredFiles + " files  ·  " + root.humanSize(root.coveredBytes)
+              color: Color.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
           }
 
           // Two columns: eleven groups in one made the panel a scroll with
@@ -554,50 +560,54 @@ Panel {
             id: groupGrid
             width: column.width
             columns: 2
-            columnSpacing: Style.space(10)
-            rowSpacing: Style.space(6)
-            readonly property real cellWidth:
-              (width - columnSpacing) / 2
+            columnSpacing: Style.space(8)
+            rowSpacing: Style.space(2)
+            readonly property real cellWidth: (width - columnSpacing) / 2
 
             Repeater {
               model: root.groups
-              Column {
+              // Toggle is omarchy's own row for "a named thing, described,
+              // that is on or off" -- which is exactly a backup group. The
+              // checkbox reflects `enabled` from the manifest; making it
+              // clickable needs a CLI verb that does not exist yet, so it
+              // reports rather than sets.
+              Item {
                 required property var modelData
                 width: groupGrid.cellWidth
-                spacing: Style.space(1)
+                implicitHeight: tog.implicitHeight
 
-                Text {
-                  width: parent.width
-                  text: modelData.label || modelData.id || ""
-                  color: modelData.critical ? Color.foreground : Color.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                  elide: Text.ElideRight
+                Toggle {
+                  id: tog
+                  width: parent.width - modePill.width - Style.space(4)
+                  label: parent.modelData.label || parent.modelData.id || ""
+                  description: root.groupDetail(parent.modelData)
+                               + (parent.modelData.coupled ? "  ·  tied to this version" : "")
+                  checked: parent.modelData.enabled !== false
+                  accent: (typeof parent.modelData.files === "number"
+                           && parent.modelData.files === 0) ? Color.urgent : Color.accent
                 }
-                Text {
-                  width: parent.width
-                  // Mode rides with the detail rather than sitting in its own
-                  // column: half the width is not enough for a right-aligned
-                  // badge without crowding the count it sits beside.
-                  text: root.groupDetail(modelData)
-                        + (modelData.mode ? "  ·  " + modelData.mode : "")
-                  color: (typeof modelData.files === "number" && modelData.files === 0)
-                         ? Color.accent : Color.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
-                }
-                Text {
-                  // Coupling decides whether a restore is permitted onto a
-                  // different Omarchy at all (DESIGN.md §12.2), so it stays
-                  // beside the group rather than in a footnote.
-                  visible: modelData.coupled === true
-                  width: parent.width
-                  text: "tied to this Omarchy version"
-                  color: Color.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
+
+                // The mode badge, uppercase and boxed like the mockup's pills.
+                Rectangle {
+                  id: modePill
+                  anchors.right: parent.right
+                  anchors.top: parent.top
+                  anchors.topMargin: Style.space(6)
+                  width: pillText.implicitWidth + Style.space(6)
+                  height: pillText.implicitHeight + Style.space(2)
+                  radius: Style.space(3)
+                  color: "transparent"
+                  border.width: 1
+                  border.color: Color.muted
+                  opacity: 0.7
+                  Text {
+                    id: pillText
+                    anchors.centerIn: parent
+                    text: (parent.parent.modelData.mode || "").toUpperCase()
+                    color: Color.muted
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                  }
                 }
               }
             }
@@ -607,6 +617,8 @@ Panel {
           // Coverage says the backup holds the right files. This says whether
           // any of it ever left the machine -- the question nothing answered
           // before, and the one a dead disk asks.
+          PanelSeparator { width: parent.width }
+
           PanelSectionHeader {
             visible: root.destinations.length > 0
             text: "Destinations"
@@ -685,6 +697,8 @@ Panel {
           }
 
           // ── config ────────────────────────────────────────────────────────
+          PanelSeparator { width: parent.width }
+
           PanelSectionHeader { text: "Config" }
 
           Grid {
