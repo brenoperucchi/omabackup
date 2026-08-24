@@ -18,6 +18,11 @@ DESTINATIONS_FILE="${OMABACKUP_DESTINATIONS:-$HOME/.config/omabackup/destination
 # exceptions reviewable by whoever reads the repo next.
 SECRETS_DENY_FILE="${OMABACKUP_SECRETS_DENY:-$OMABACKUP_ROOT/secrets.deny.json}"
 STAGING="$OMABACKUP_STATE/staging"
+LAST_SYNC_FILE="$OMABACKUP_STATE/last-sync"
+# A day. DESIGN.md §4 offers schedules from 5 minutes to daily, and the CLI
+# cannot see which one the timer uses -- but a full day with no successful run
+# is worth surfacing on any of them, and it tolerates a laptop shut overnight.
+STALE_AFTER_SEC=86400
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
 CYAN=$'\033[0;36m'; DIM=$'\033[2m'; NC=$'\033[0m'
@@ -37,6 +42,38 @@ _expand() { printf '%s' "${1/#\~/$HOME}"; }
 # the bundle filename AND into the pattern retention deletes by, so a machine
 # without inetutils would have written one name and pruned by another.
 _hostname() { uname -n 2>/dev/null || printf 'unknown-host'; }
+
+# §4: "the badge does not clear itself: a stale backup stays visible until it is
+# dealt with." The panel could already say "nothing is scheduled"; it could not
+# say "the timer exists and the last successful run was three days ago", which
+# is the worse of the two because everything stays green while it happens.
+#
+# Recorded on any successful sync, not only on one that committed: a run that
+# found nothing to do still proves the backup is working, and counting only
+# commits would call a healthy idle machine stale.
+record_sync_success() {
+    mkdir -p "$(dirname "$LAST_SYNC_FILE")" 2>/dev/null || return 0
+    printf '%s' "$(date +%s)" >"$LAST_SYNC_FILE.tmp" 2>/dev/null \
+        && mv "$LAST_SYNC_FILE.tmp" "$LAST_SYNC_FILE" 2>/dev/null
+    return 0
+}
+
+# Prints the age in seconds, or nothing when it has never run.
+last_sync_age() {
+    local at
+    [[ -s "$LAST_SYNC_FILE" ]] || return 1
+    at="$(cat "$LAST_SYNC_FILE" 2>/dev/null)"
+    [[ "$at" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$(( $(date +%s) - at ))"
+}
+
+is_stale() {
+    local age
+    # Never having run is stale. Reporting it as fresh would make a machine that
+    # has never backed anything up look exactly like one that just did.
+    age="$(last_sync_age)" || return 0
+    (( age > STALE_AFTER_SEC ))
+}
 
 # What this tool needs that a stock Omarchy does not guarantee.
 #
@@ -224,6 +261,7 @@ cmd_verify() {
 
     probe_link_integrity
     probe_scheduled
+    probe_stale
     report
 }
 
@@ -235,6 +273,19 @@ cmd_verify() {
 #
 # A warning, not a failure: `verify` has to keep working from inside a bundle
 # and on a recovery tty, where no user session exists to ask.
+probe_stale() {
+    local age
+    if ! age="$(last_sync_age)"; then
+        finding warn schedule never-run \
+            "never run: no backup has succeeded on this machine yet -- start one with: omabackup sync --commit" ""
+    elif (( age > STALE_AFTER_SEC )); then
+        finding warn schedule stale \
+            "last successful backup was $(( age / 3600 ))h ago" ""
+    else
+        finding pass schedule fresh "last successful backup $(( age / 60 ))m ago" ""
+    fi
+}
+
 probe_scheduled() {
     if scheduler_active; then
         finding pass scheduler scheduled "scheduled: the backup runs unattended" ""
@@ -573,6 +624,7 @@ cmd_sync() {
             || die "git status failed in $(_tilde "$repo")"
     fi
     if [[ -z "$dirty" ]]; then
+        record_sync_success
         printf '\n  %sup to date%s -- nothing changed since the last sync\n' "$DIM" "$NC"
         return 0
     fi
@@ -580,6 +632,7 @@ cmd_sync() {
     printf '\n%s\n' "$dirty" | sed 's/^/  /'
 
     if (( ! commit )); then
+        record_sync_success
         printf '\n  review with %sgit -C %s status%s / %sdiff%s, then rerun with --commit\n' \
             "$CYAN" "$(_tilde "$repo")" "$NC" "$CYAN" "$NC"
         return 0
@@ -597,6 +650,7 @@ cmd_sync() {
     git -C "$repo" add -- "${written[@]}" \
         || die "git add failed in $(_tilde "$repo")"
     if git -C "$repo" diff --cached --quiet -- "${written[@]}"; then
+        record_sync_success
         printf '  %sup to date%s -- nothing of ours left to commit\n' "$DIM" "$NC"
         return 0
     fi
@@ -604,6 +658,7 @@ cmd_sync() {
         -m "omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)" \
         -- "${written[@]}" \
         || die "git commit failed in $(_tilde "$repo")"
+    record_sync_success
     printf '  %scommitted%s\n' "$GREEN" "$NC"
 }
 
@@ -798,9 +853,13 @@ cmd_status() {
               --argjson t "$(jq '.supportedTargets' "$GROUPS_FILE")" \
               --argjson d "$(destinations_json 2>/dev/null || echo '[]')" \
               --argjson sch "$(scheduler_active && echo true || echo false)" \
+              --argjson stale "$(is_stale && echo true || echo false)" \
+              --argjson lastsync "$([[ -s "$LAST_SYNC_FILE" ]] && cat "$LAST_SYNC_FILE" || echo null)" \
+              --argjson age "$(last_sync_age || echo null)" \
               '{schemaVersion:1, omarchy:{version:$v,channel:$c,migrationWatermark:$m},
                 supportedTargets:$t, staging:$s, destinations:$d,
-                scheduler:{active:$sch, fix:"omabackup install"}}'
+                scheduler:{active:$sch, fix:"omabackup install"},
+                stale:$stale, lastSync:$lastsync, lastSyncAgeSec:$age}'
     else
         printf '  Omarchy %s (%s) - migration watermark %s\n' "$ov" "$oc" "$om"
         printf '  restore range: %s\n' "$(jq -r '.supportedTargets|join(", ")' "$GROUPS_FILE")"

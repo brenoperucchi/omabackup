@@ -39,6 +39,26 @@ Panel {
   }
   // Absent scheduler key means an older CLI, not an unscheduled machine: do not
   // invent an alarm out of a missing field.
+  // §4: the badge does not clear itself. "nothing is scheduled" was already
+  // here; this is the worse sibling -- a timer that exists and has been failing
+  // quietly, which leaves every other number on this panel out of date while
+  // the panel stays green.
+  readonly property bool staleKnown:
+    statusDoc !== null && statusDoc.stale !== undefined && statusDoc.stale !== null
+  readonly property bool stale: staleKnown ? (statusDoc.stale === true) : false
+  readonly property var lastSyncAge:
+    statusDoc && statusDoc.lastSyncAgeSec !== undefined ? statusDoc.lastSyncAgeSec : null
+  readonly property bool neverSynced: staleKnown && statusDoc.lastSync === null
+
+  readonly property string staleText: {
+    if (!stale) return ""
+    if (neverSynced) return "No backup has ever completed on this machine."
+    if (lastSyncAge === null) return "The last backup is out of date."
+    var h = Math.floor(lastSyncAge / 3600)
+    if (h < 48) return "Last successful backup was " + h + "h ago."
+    return "Last successful backup was " + Math.floor(h / 24) + " days ago."
+  }
+
   readonly property bool schedulerKnown:
     statusDoc !== null && statusDoc.scheduler !== undefined && statusDoc.scheduler !== null
   readonly property bool scheduled: schedulerKnown ? (statusDoc.scheduler.active === true) : true
@@ -73,6 +93,8 @@ Panel {
                                    : report === null ? "not checked yet"
                                    : failCount > 0 ? failCount + (failCount === 1 ? " failure" : " failures")
                                    : !scheduled ? "not scheduled"
+                                   : neverSynced ? "never run"
+                                   : stale ? "out of date"
                                    : destAlerts.length > 0 ? "not sent"
                                    : warnCount > 0 ? warnCount + (warnCount === 1 ? " warning" : " warnings")
                                    : "covered"
@@ -380,6 +402,21 @@ Panel {
             width: parent.width
             text: "No destination configured. The backup exists only on this machine."
             color: Color.accent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          // A stale backup outranks the destination list below it: if nothing
+          // has completed for a day, every timestamp under Destinations is
+          // describing a machine that has since moved on.
+          Text {
+            visible: root.stale
+            width: parent.width
+            text: "!  " + root.staleText
+                  + (root.neverSynced ? "\nRun  omabackup sync --commit  to start."
+                                      : "\nCheck  systemctl --user status omabackup-sync")
+            color: Color.urgent
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
