@@ -110,3 +110,54 @@ publish_staging "$STG3" "$REPO3" >/dev/null
 
 it "a file that disappeared from the machine is left in the repo"
 [[ -f "$REPO3/configs/gone/file.txt" ]] && ok || fail "publish deleted a file it never touched"
+
+# ── symlinks are content too ──────────────────────────────────────────────────
+# publish walked staging with `find -type f`, which excludes symlinks, so every
+# staged link was silently dropped. A dotfiles tree is full of them: this
+# machine stages ~/.config/nvim/lua/plugins/theme.lua and
+# ~/.local/state/omarchy/current/background as links, and the destination repo
+# tracks four. They were frozen at whatever the previous tool left, and a theme
+# change that repointed one would never have reached the backup -- the same
+# "declared but never actually saved" failure the whole project exists to catch.
+STG4="$(mktemp -d)"; REPO4="$(mktemp -d)"; git init -q "$REPO4"
+mkdir -p "$STG4/.config/app"
+printf 'real\n' >"$STG4/.config/app/target.txt"
+ln -s target.txt "$STG4/.config/app/link.txt"
+ln -s /nowhere/outside/theme.lua "$STG4/.config/app/dangling.lua"
+printf '#!/bin/sh\necho hi\n' >"$STG4/.config/app/script.sh"
+chmod +x "$STG4/.config/app/script.sh"
+publish_staging "$STG4" "$REPO4" >/dev/null
+
+it "a staged symlink reaches the repo"
+[[ -L "$REPO4/configs/app/link.txt" ]] && ok || fail "the symlink was dropped or flattened into a copy"
+
+it "and arrives as a link, not as a copy of what it pointed at"
+assert_eq "$(readlink "$REPO4/configs/app/link.txt" 2>/dev/null)" "target.txt"
+
+it "a symlink pointing outside the tree survives too, target string intact"
+assert_eq "$(readlink "$REPO4/configs/app/dangling.lua" 2>/dev/null)" "/nowhere/outside/theme.lua"
+
+it "the executable bit survives the trip"
+[[ -x "$REPO4/configs/app/script.sh" ]] && ok || fail "mode was not preserved"
+
+it "and ordinary files still publish alongside them"
+assert_contains "$(cat "$REPO4/configs/app/target.txt" 2>/dev/null)" "real"
+
+# ── publishing is not allowed to cost a process per file ─────────────────────
+# _publish_file used `rsync` for single regular files. Measured here: an rsync
+# spawn is ~44ms against ~0.5ms for cp, so 597 staged files spent 27 of a sync's
+# 33 seconds paying startup cost 597 times. That is what made a 5-minute timer
+# indefensible. The bound below is deliberately loose -- it is there to catch an
+# 85x regression, not to police milliseconds.
+STG5="$(mktemp -d)"; REPO5="$(mktemp -d)"; git init -q "$REPO5"
+mkdir -p "$STG5/.config/many"
+for i in $(seq 1 300); do printf 'file %s\n' "$i" >"$STG5/.config/many/f$i.txt"; done
+PUB_START="$(date +%s)"
+publish_staging "$STG5" "$REPO5" >/dev/null
+PUB_ELAPSED=$(( $(date +%s) - PUB_START ))
+
+it "300 files publish in well under the old per-file rsync cost"
+(( PUB_ELAPSED < 10 )) && ok || fail "took ${PUB_ELAPSED}s -- a process per file is back"
+
+it "and all 300 actually arrived"
+assert_eq "$(find "$REPO5/configs/many" -type f | wc -l)" "300"

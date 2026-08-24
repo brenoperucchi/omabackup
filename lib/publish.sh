@@ -50,10 +50,21 @@ map_to_repo() {
 _publish_file() {
     local src="$1" dst="$2"
     mkdir -p "$(dirname "$dst")" || return 1
-    if [[ "$dst" == *.json ]] && jq -e . "$src" >/dev/null 2>&1; then
+    # A symlink is content: copied as a link, never followed. Publishing what it
+    # points at would silently turn a link into a fat copy of somebody else's
+    # file, and a link pointing outside the tree would either fail or drag in
+    # something that was never declared.
+    if [[ -L "$src" ]]; then
+        rm -f "$dst" 2>/dev/null
+        cp -P "$src" "$dst"
+    elif [[ "$dst" == *.json ]] && jq -e . "$src" >/dev/null 2>&1; then
         jq -S . "$src" >"$dst.tmp" && mv "$dst.tmp" "$dst"
     else
-        rsync -a "$src" "$dst"
+        # `cp -p`, not `rsync`. rsync costs ~44ms to start against cp's ~0.5ms,
+        # and this runs once per staged file: 597 files spent 27 of a sync's 33
+        # seconds paying rsync startup, which is what made a frequent timer
+        # indefensible. rsync buys nothing for a single regular file.
+        cp -p "$src" "$dst"
     fi
 }
 
@@ -94,12 +105,17 @@ publish_staging() {
     local staging="$1" repo="$2" table="${3:-}" list="${4:-}" f pf pid rel dst failed=0
     local -a written=()
 
+    # `-type f -o -type l`: a plain `-type f` excludes symlinks, and every staged
+    # link was therefore dropped without a word. This machine stages
+    # ~/.config/nvim/lua/plugins/theme.lua and .../current/background as links,
+    # and the destination repo tracks four -- all frozen at whatever the previous
+    # tool left behind.
     while IFS= read -r -d '' f; do
         rel="${f#"$staging"/}"
         [[ "$rel" == .generated/* || "$rel" == .plugins/* ]] && continue
         dst="$(map_to_repo "$rel" "$table")" || continue
         if _publish_file "$f" "$repo/$dst"; then written+=("$dst"); else failed=$((failed + 1)); fi
-    done < <(find "$staging" -type f -print0 2>/dev/null)
+    done < <(find "$staging" \( -type f -o -type l \) -print0 2>/dev/null)
 
     if [[ -d "$staging/.generated" ]]; then
         for f in "$staging"/.generated/*; do
