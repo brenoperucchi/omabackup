@@ -110,6 +110,14 @@ dest_in_backoff() {
 # data-loss event into a no-op with an error.
 DEST_STAMP='.omabackup-destination'
 
+# One definition of what this tool's own filenames look like, because two
+# drifted apart: adding the short sha to the published name updated the pattern
+# retention deletes by and left the one deciding ownership behind, so a folder
+# holding our own bundles read as foreign and was never stamped -- and so never
+# pruned. The sha group is optional so bundles written before it existed are
+# still recognised as ours.
+DEST_NAME_TAIL='[0-9]{8}-[0-9]{6}(-[0-9a-f]{12})?\.tar\.zst'
+
 prune_bundles() {  # prune_bundles <dir> <host> <keep> -> prints how many it removed
     local dir="$1" host="$2" keep="$3" f n=0 removed=0
     [[ "$keep" =~ ^[0-9]+$ ]] && (( keep >= 1 )) || { printf 'refusing to prune with keep=%s\n' "$keep" >&2; return 1; }
@@ -124,7 +132,7 @@ prune_bundles() {  # prune_bundles <dir> <host> <keep> -> prints how many it rem
     local hre; hre="$(printf '%s' "$host" | sed 's/[][\\.^$*+?(){}|\/]/\\&/g')"
     local -a found=()
     mapfile -t found < <(find "$dir" -maxdepth 1 -type f -regextype posix-extended \
-        -regex ".*/omabackup-${hre}-[0-9]{8}-[0-9]{6}(-[0-9a-f]{12})?\.tar\.zst" \
+        -regex ".*/omabackup-${hre}-${DEST_NAME_TAIL}" \
         -printf '%f\n' 2>/dev/null | sort -r)
     for f in "${found[@]:-}"; do
         [[ -n "$f" ]] || continue
@@ -146,7 +154,7 @@ _dir_is_ours() {
     while IFS= read -r -d '' f; do
         base="${f##*/}"
         [[ "$base" == "$DEST_STAMP" || "$base" == "$just" ]] && continue
-        [[ "$base" =~ ^omabackup-.+-[0-9]{8}-[0-9]{6}\.tar\.zst$ ]] && continue
+        [[ "$base" =~ ^omabackup-.+-${DEST_NAME_TAIL}$ ]] && continue
         return 1
     done < <(find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
     return 0

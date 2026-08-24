@@ -262,3 +262,26 @@ OMABACKUP_ROOT="$PWD" bash -c '
   prune_bundles "$1" "my.box" 1' _ "$MH" >/dev/null 2>&1
 [[ -f "$MH/omabackup-myxbox-20200101-000000.tar.zst" ]] \
     && ok || fail "the dot matched any character and ate another host's backup"
+
+# ── the two regexes must agree on our own filename ─────────────────────────
+# They did not. Adding the short sha to the published name updated the pattern
+# retention deletes by and left the one _dir_is_ours uses to decide ownership
+# behind, so a folder holding this tool's own bundles read as foreign: never
+# stamped, therefore never pruned, therefore growing forever. The realistic
+# case is the one the specs above already promise -- two machines sharing a
+# NAS folder, the second arriving to find the first's bundles.
+SH2="$(mktemp -d)"; SR2="$SH2/repo"; _dest_repo "$SR2"
+SNAS2="$SH2/nas"; mkdir -p "$SNAS2"
+printf 'x\n' >"$SNAS2/omabackup-otherbox-20200101-000000-0123456789ab.tar.zst"
+cat >"$SH2/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$SNAS2","keep":1}]}
+JSON
+_dest_env "$SH2" "$SR2" push nas >/dev/null
+
+it "a folder holding only omabackup bundles is recognised as ours"
+[[ -f "$SNAS2/.omabackup-destination" ]] \
+    && ok || fail "our own sha-suffixed filename read as a foreign file"
+
+it "and the other machine's bundle is still not deleted"
+[[ -f "$SNAS2/omabackup-otherbox-20200101-000000-0123456789ab.tar.zst" ]] \
+    && ok || fail "pruned another host"
