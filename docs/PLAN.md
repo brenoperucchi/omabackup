@@ -21,7 +21,7 @@ Last updated: 2026-08-24.
 | 2 | Normalized diff, `sync` (collect → publish → verify → commit), destinations, systemd timer | **done** |
 | 3 | T3 — fast syntax/parse check in a disposable container | not started |
 | 4 | `restore` with the version-coupling quarantine (§12.2 of DESIGN.md) | not started |
-| 5 | QML plugin (`Panel.qml`) reading `verify --json` | **done**, installed live |
+| 5 | QML plugin (`Panel.qml`) — coverage, groups, destinations, schedule | **done**, installed live |
 | 6 | T4 — visual restore check in a VM (QMP screendump) | not started |
 
 Stages don't have to land in this order — 5 landed before 2 on purpose, to
@@ -40,7 +40,7 @@ proved the isolated test harness actually isolates.
   QML plugin, the group manifest, the docs. `git log`: `626a40d` → `2cf9bd1` →
   `f4f3466` → `3c705d5` → `d7f63dc` → `6713239` → `741be00` → `8a329fa` →
   `e6db1c1` → … → `acc9c17` → `30532dd` → `d5e9751` → `58e3bbb` → `bedeea1` →
-  `f0732db` → … → `2b57015` → `6981927` → … → `eee6113`, all pushed. 231 specs.
+  `f0732db` → … → `2b57015` → `6981927` → … → `2ab0ae1`, all pushed. 254 specs.
 - **`~/Devs/omarchy-personal`** — private, GitHub, the user's actual dotfiles.
   This is `OMABACKUP_REPO`: where `sync` publishes staged content. It is NOT
   where OmaBackup's own code lives — never put backup *data* in the public
@@ -103,6 +103,41 @@ the filesystem, the same way regardless of what is mounted there, never over a
 network API. A "removable drive" trigger is not a new type either — it is a
 `dir` destination whose path is a mount point, fired by udev instead of the
 timer. DESIGN.md §1, §3, §4 and §11.4 updated to match.
+
+### The panel is finished, against the mockup
+
+`Panel.qml` now answers the four questions DESIGN.md §1 asked of it. The mockup
+is at https://claude.ai/code/artifact/59338df5-c4d4-4ebc-95dd-e107242ae80c —
+worth opening before touching the file, since it is the only place the intended
+shape is drawn.
+
+| view | state |
+|------|-------|
+| verification | the findings list, since stage 5 |
+| destinations | `cd70fb4` — id, type, last sent, error/backoff |
+| schedule | `cd70fb4` + `ebd4bed` — not scheduled, never run, out of date |
+| groups | `2ab0ae1` — label, coverage, mode, coupling |
+
+"Estado do Omarchy" is a group row in the mockup, not a section of its own.
+
+Three of the mockup's seven widget states were deliberately **not** built, and
+should stay unbuilt unless the reasoning changes:
+
+- **Com alterações** — its premise died when the commit became automatic. There
+  is no longer a window in which uncommitted changes sit waiting for review.
+- **Enviando** — transient; the panel polls, it does not watch.
+- **Aguardando volume** — needs the removable `dir` destination, which does not
+  exist because no path has been named to point it at.
+
+**Pré-upgrade** is missing and is worth building, but it is CLI work rather than
+QML: the mockup itself records that `omarchy-update` exposes no pre-update hook,
+so only a pacman `PreTransaction` hook arrives before the mutation. §4 calls it
+the highest-value item in the product. It competes with `restore`, and `restore`
+should win — a pre-upgrade backup nobody can restore is worth less.
+
+The panel also gained a state the mockup never had, because it was discovered
+after the mockup was drawn: **not scheduled**. `omarchy plugin add` runs no hook,
+so a fresh install has no timers at all.
 
 ### Three mistakes this project keeps making
 
