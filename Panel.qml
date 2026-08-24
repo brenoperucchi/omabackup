@@ -75,6 +75,48 @@ Panel {
     return out
   }
 
+  // ── what is covered, per group ───────────────────────────────────────────
+  // From verify --json, counted by collect rather than recomputed here: collect
+  // is what decides which files enter the backup, and a second implementation
+  // of that decision would eventually disagree with the first.
+  readonly property var groups: {
+    if (!report || !report.groups) return []
+    return report.groups
+  }
+  readonly property int coveredFiles: {
+    var t = 0
+    for (var i = 0; i < groups.length; i++) {
+      var g = groups[i]
+      if (g && typeof g.files === "number") t += g.files
+    }
+    return t
+  }
+  readonly property real coveredBytes: {
+    var t = 0
+    for (var i = 0; i < groups.length; i++) {
+      var g = groups[i]
+      if (g && typeof g.bytes === "number") t += g.bytes
+    }
+    return t
+  }
+
+  function humanSize(b) {
+    if (typeof b !== "number") return "?"
+    if (b < 1024) return b + " B"
+    if (b < 1048576) return Math.round(b / 1024) + " KB"
+    return (Math.round(b / 104857.6) / 10) + " MB"
+  }
+
+  // "not collected yet" is not "covers nothing". Zero means collect ran and
+  // found nothing there, which is the phantom coverage this tool exists to
+  // catch; unknown means it has not looked.
+  function groupDetail(g) {
+    if (!g) return ""
+    if (typeof g.files !== "number") return "not collected yet"
+    if (g.files === 0) return "covers nothing"
+    return g.files + (g.files === 1 ? " file · " : " files · ") + humanSize(g.bytes)
+  }
+
   readonly property int failCount: report && report.counts ? (report.counts.fail || 0) : 0
   readonly property int warnCount: report && report.counts ? (report.counts.warn || 0) : 0
   readonly property int passCount: report && report.counts ? (report.counts.pass || 0) : 0
@@ -354,6 +396,66 @@ Panel {
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+          }
+
+          // ── what is saved ─────────────────────────────────────────────────
+          // The question the interface could not answer: you had to open
+          // groups.default.json to find out what this tool actually keeps.
+          PanelSectionHeader {
+            visible: root.groups.length > 0
+            text: "Groups"
+          }
+
+          Text {
+            visible: root.groups.length > 0 && root.coveredFiles > 0
+            width: parent.width
+            text: root.coveredFiles + " files · " + root.humanSize(root.coveredBytes)
+            color: Color.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+          }
+
+          Repeater {
+            model: root.groups
+            Row {
+              required property var modelData
+              width: column.width
+              spacing: Style.space(2)
+
+              Column {
+                width: parent.width - modeBadge.width - Style.space(2)
+                spacing: Style.space(1)
+                Text {
+                  width: parent.width
+                  text: modelData.label || modelData.id || ""
+                  color: modelData.critical ? Color.foreground : Color.muted
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                  elide: Text.ElideRight
+                }
+                Text {
+                  width: parent.width
+                  text: root.groupDetail(modelData)
+                        // Coupling decides whether a restore is allowed onto a
+                        // different Omarchy at all (DESIGN.md §12.2), so it
+                        // belongs next to the group, not in a footnote.
+                        + (modelData.coupled ? "  ·  tied to this Omarchy version" : "")
+                  color: (typeof modelData.files === "number" && modelData.files === 0)
+                         ? Color.accent : Color.muted
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+              }
+
+              Text {
+                id: modeBadge
+                text: modelData.mode || ""
+                color: Color.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+            }
           }
 
           // ── where it goes ──────────────────────────────────────────────────

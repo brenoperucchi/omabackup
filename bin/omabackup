@@ -19,6 +19,13 @@ DESTINATIONS_FILE="${OMABACKUP_DESTINATIONS:-$HOME/.config/omabackup/destination
 SECRETS_DENY_FILE="${OMABACKUP_SECRETS_DENY:-$OMABACKUP_ROOT/secrets.deny.json}"
 STAGING="$OMABACKUP_STATE/staging"
 LAST_SYNC_FILE="$OMABACKUP_STATE/last-sync"
+# What each group actually covers, written by collect and read by verify --json
+# for the panel's Grupos section. Written rather than recomputed: collect is
+# what decides which files enter the backup -- excludes, tracked-only rules and
+# all -- and counting them a second time elsewhere would be the same fact stated
+# twice, which is how the scripts group once vanished and how retention once
+# stopped. The number here is the staged set, by construction.
+COVERAGE_FILE="$OMABACKUP_STATE/coverage.json"
 # A day. DESIGN.md §4 offers schedules from 5 minutes to daily, and the CLI
 # cannot see which one the timer uses -- but a full day with no successful run
 # is worth surfacing on any of them, and it tolerates a laptop shut overnight.
@@ -307,11 +314,13 @@ report() {
 
     if (( JSON )); then
         printf '%s\n' "${FINDINGS[@]:-}" | jq -R -s --arg v "$ov" --arg c "$oc" --arg m "$om" \
+            --argjson groups "$(groups_json 2>/dev/null || echo '[]')" \
             --argjson pass "$pass" --argjson warn "$warn" --argjson fail "$fail" '
             split("\n") | map(select(length>0) | split("\t")
               | {level:.[0], group:.[1], code:.[2], message:.[3], path:(.[4] // "")})
             | {schemaVersion:1,
                omarchy:{version:$v, channel:$c, migrationWatermark:$m},
+               groups:$groups,
                ok:($fail == 0),
                counts:{pass:$pass, warn:$warn, fail:$fail},
                findings:.}'
@@ -399,6 +408,22 @@ _rsync_excludes() {
 # Collects into staging, NEVER straight into the repo. This is the first of four
 # beats (collect -> diff -> verify -> commit): without staging there is no diff
 # for mode:copy groups, and the cycle would close on itself. See docs/DESIGN.md §11.1.
+# The list names each generator writes, so coverage can attribute them. Kept
+# beside collect_generated, which is what actually creates these.
+_generated_files() {
+    case "$1" in
+        packages) printf 'pkgs-explicit.txt pkgs-aur.txt pkgs-arch.txt' ;;
+        systemd)  printf 'systemd-user.txt systemd-system.txt' ;;
+    esac
+}
+
+# _staged_size <dir> -> "<files>\t<bytes>" for what is under it right now.
+_staged_size() {
+    [[ -d "$1" || -f "$1" ]] || { printf '0\t0'; return 0; }
+    find "$1" \( -type f -o -type l \) -printf '%s\n' 2>/dev/null \
+        | awk '{n++; b+=$1} END{printf "%d\t%d", n+0, b+0}'
+}
+
 cmd_collect() {
     require_tools jq git rsync
     assert_manifest_understood
@@ -455,11 +480,73 @@ cmd_collect() {
         (( JSON )) || printf '  %s✓%s %s\n' "$GREEN" "$NC" "$id"
     done < <(groups_ids)
 
+    write_coverage
+
     if (( JSON )); then
         jq -n --arg s "$STAGING" --argjson n "$n" '{schemaVersion:1, staging:$s, entries:$n}'
     else
         printf '\n  %d paths in %s\n' "$n" "$(_tilde "$STAGING")"
     fi
+}
+
+# Counted off the staging tree, which is the backup's own content: whatever a
+# group's paths, excludes and tracked-only rules produced, without asking a
+# second implementation to agree.
+write_coverage() {
+    local id p e dest files bytes gf gb rows=""
+    while read -r id; do
+        [[ -n "$id" ]] || continue
+        gf=0; gb=0
+        case "$(group_field "$id" mode)" in
+            # Every generator writes into the same .generated/ directory, so
+            # counting the directory gave each group the whole of it -- packages
+            # and systemd both reporting a number neither of them owned. Counted
+            # per generator instead, from the same names collect_generated writes.
+            gen)    local gen_id f
+                    gen_id="$(group_field "$id" generator)"
+                    for f in $(_generated_files "$gen_id"); do
+                        IFS=$'\t' read -r files bytes <<<"$(_staged_size "$STAGING/.generated/$f")"
+                        gf=$((gf + files)); gb=$((gb + bytes))
+                    done ;;
+            triple) dest="$STAGING/.plugins"
+                    IFS=$'\t' read -r gf gb <<<"$(_staged_size "$dest")" ;;
+            *)      while read -r p; do
+                        [[ -n "$p" ]] || continue
+                        e="$(_expand "$p")"
+                        dest="$STAGING/${e#$HOME/}"
+                        IFS=$'\t' read -r files bytes <<<"$(_staged_size "$dest")"
+                        gf=$((gf + files)); gb=$((gb + bytes))
+                    done < <(group_paths "$id") ;;
+        esac
+        rows+="$(printf '%s\t%s\t%s' "$id" "$gf" "$gb")"$'\n'
+    done < <(groups_ids)
+
+    mkdir -p "$(dirname "$COVERAGE_FILE")" 2>/dev/null || return 0
+    printf '%s' "$rows" | jq -R -s --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+        '{schemaVersion:1, at:$at,
+          groups: (split("\n") | map(select(length>0) | split("\t")
+                   | {id:.[0], files:(.[1]|tonumber), bytes:(.[2]|tonumber)}))}' \
+        >"$COVERAGE_FILE.tmp" 2>/dev/null \
+        && mv "$COVERAGE_FILE.tmp" "$COVERAGE_FILE" 2>/dev/null
+    return 0
+}
+
+# The manifest's description of each group, joined to what collect measured.
+# Counts are null when nothing has been collected yet -- verify has to run
+# inside a bundle and on a recovery tty, where no staging exists, and an unknown
+# count must not read as zero: zero means collect ran and found nothing, which
+# is the phantom coverage this project was built after.
+groups_json() {
+    local cov='{"groups":[]}'
+    [[ -s "$COVERAGE_FILE" ]] && cov="$(cat "$COVERAGE_FILE" 2>/dev/null)"
+    jq -n --argjson m "$(jq '[.groups[] | select(.enabled != false)
+                             | {id, label, mode, coupled:(.coupled // false),
+                                critical:(.critical // false),
+                                paths:((.paths // []) | length)}]' "$GROUPS_FILE")" \
+          --argjson c "$cov" '
+        [ $m[] as $g
+        | ($c.groups // [] | map(select(.id == $g.id)) | first) as $x
+        | $g + {files: ($x.files // null), bytes: ($x.bytes // null)} ]'
 }
 
 # The triple strategy: clean git -> URL+sha only; dirty git -> plus a patch;
