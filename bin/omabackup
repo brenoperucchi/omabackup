@@ -309,6 +309,15 @@ cmd_collect() {
             [[ -n "$p" ]] || continue
             e="$(_expand "$p")"
             [[ -e "$e" || -L "$e" ]] || continue
+            # A path both declared by a group and listed in `excluded` is the
+            # manifest contradicting itself. The exclusion wins: translating
+            # patterns only ever covered descendants of the transfer root, so
+            # naming the root itself used to be resolved silently in favour of
+            # copying the whole thing.
+            if is_excluded "$e"; then
+                finding info "$id" path-excluded "declared but excluded on purpose: $p" "$e"
+                continue
+            fi
             dest="$STAGING/${e#$HOME/}"
             mkdir -p "$(dirname "$dest")"
             # Per path, not per group: the exclude patterns have to be relative
@@ -376,12 +385,16 @@ collect_tracked_only() {
     fi
     sub="$(group_tracked_repo_path "$id" "$declared")"
     mkdir -p "$dest"
-    while IFS= read -r f; do
+    # -z, always: without it git quotes anything outside ASCII, so a tracked
+    # `ação.sh` comes back as "scripts/local-bin/a\303\247\303\243o.sh" -- quotes
+    # included -- the direct-child test never matches, and the file quietly
+    # stops being backed up.
+    while IFS= read -r -d '' f; do
         [[ -n "$f" ]] || continue
         base="${f##*/}"
         [[ "$f" == "$sub/$base" ]] || continue   # direct children only: the repo keeps a flat directory
         [[ -f "$live/$base" ]] && { rsync -aL "$live/$base" "$dest/"; n=$((n + 1)); }
-    done < <(git -C "$repo" ls-files -- "$sub" 2>/dev/null)
+    done < <(git -C "$repo" ls-files -z -- "$sub" 2>/dev/null)
     # A declared path the repo tracks nothing under backs up nothing while
     # reporting "up to date" -- the phantom coverage verify exists to shout about.
     (( n > 0 )) || finding warn "$id" tracked-empty "nothing tracked under $sub: $(_tilde "$live") backs up nothing yet" "$live"
@@ -426,7 +439,9 @@ cmd_sync() {
 
     JSON=0 cmd_collect >/dev/null
     local list="$OMABACKUP_STATE/last-publish"
-    local n; n="$(publish_staging "$STAGING" "$repo" "$(tracked_path_map)" "$list")"
+    local n
+    n="$(publish_staging "$STAGING" "$repo" "$(tracked_path_map)" "$list")" \
+        || die "publish could not write into $(_tilde "$repo") -- refusing to commit a partial backup"
     printf '  %spublished%s %d files into %s\n\n' "$GREEN" "$NC" "$n" "$(_tilde "$repo")"
 
     local -a published=()
@@ -479,9 +494,15 @@ cmd_sync() {
     fi
 
     # Scoped to what publish just wrote: a repo-wide status reports edits the
-    # user left mid-review as though this tool had made them.
+    # user left mid-review as though this tool had made them. The exit status
+    # matters as much as the output -- a git that fails prints nothing, and
+    # empty output is indistinguishable from a clean tree, so an unchecked
+    # failure here became "up to date" and exit 0.
     local dirty=""
-    (( ${#written[@]} )) && dirty="$(git -C "$repo" status --porcelain -- "${written[@]}")"
+    if (( ${#written[@]} )); then
+        dirty="$(git -C "$repo" status --porcelain -- "${written[@]}")" \
+            || die "git status failed in $(_tilde "$repo")"
+    fi
     if [[ -z "$dirty" ]]; then
         printf '\n  %sup to date%s -- nothing changed since the last sync\n' "$DIM" "$NC"
         return 0
@@ -498,13 +519,21 @@ cmd_sync() {
     # Every git call is checked. The script runs under `set -uo pipefail`
     # without -e, so an unchecked failure here fell straight through to
     # "committed" -- the one message a backup tool must never print falsely.
+    #
+    # Both `add` and `commit` carry the pathspec. Scoping only the add was not
+    # enough: `git commit` with no pathspec commits the whole index, so anything
+    # the user had already staged rode along under this tool's message. With the
+    # pathspec, git builds the commit from HEAD plus these paths alone and
+    # leaves the rest of the index exactly as the user left it.
     git -C "$repo" add -- "${written[@]}" \
         || die "git add failed in $(_tilde "$repo")"
-    if git -C "$repo" diff --cached --quiet; then
+    if git -C "$repo" diff --cached --quiet -- "${written[@]}"; then
         printf '  %sup to date%s -- nothing of ours left to commit\n' "$DIM" "$NC"
         return 0
     fi
-    git -C "$repo" commit -q -m "omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)" \
+    git -C "$repo" commit -q \
+        -m "omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)" \
+        -- "${written[@]}" \
         || die "git commit failed in $(_tilde "$repo")"
     printf '  %scommitted%s\n' "$GREEN" "$NC"
 }
@@ -539,7 +568,12 @@ ARGS=()
 while (($#)); do
     case "$1" in
         --json)   JSON=1; shift ;;
-        --groups) ONLY="${2:-}"; shift 2 ;;
+        # `shift 2` with one argument left fails, so $# never reaches zero and
+        # the loop spins forever. A flag is never a value either, or
+        # `--groups --commit` swallows the command's own flag in silence.
+        --groups)
+            (($# >= 2)) && [[ "$2" != -* ]] || die "--groups needs a value"
+            ONLY="$2"; shift 2 ;;
         -h|--help) CMD=help; shift ;;
         *) ARGS+=("$1"); shift ;;
     esac

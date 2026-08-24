@@ -193,3 +193,55 @@ assert_contains "$(cat "$ST/.local/share/applications/real.desktop" 2>/dev/null)
 
 it "a name merely sitting in the repo directory, untracked, is not"
 [[ ! -e "$ST/.local/share/applications/junk.desktop" ]] && ok || fail "an untracked name in the repo directory pulled its live counterpart in"
+
+# -- and non-ASCII names survive the trip ------------------------------------------
+# `git ls-files` without -z quotes anything outside ASCII: a tracked script
+# called `ação.sh` comes back as "scripts/local-bin/a\303\247\303\243o.sh",
+# quotes and all, so the direct-child test never matched and the file silently
+# stopped being backed up. Not a hypothetical in a pt-BR home directory.
+H="$(mktemp -d)"; G="$H/g.json"; R="$H/repo"
+mkdir -p "$R/scripts/local-bin" "$H/.local/bin"
+git init -q "$R"; git -C "$R" config user.email t@t; git -C "$R" config user.name t
+printf 'v1\n' >"$R/scripts/local-bin/ação.sh"
+printf 'v1\n' >"$R/scripts/local-bin/plain.sh"
+git -C "$R" add -A; git -C "$R" commit -qm base
+printf 'v2\n' >"$H/.local/bin/ação.sh"
+printf 'v2\n' >"$H/.local/bin/plain.sh"
+cat >"$G" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"scripts","label":"Scripts","mode":"copy","coupled":false,"critical":false,
+  "paths":[{"live":"~/.local/bin","trackedRepoPath":"scripts/local-bin"}]}]}
+JSON
+OMABACKUP_REPO="$R" _env "$H" "$G" collect >/dev/null
+ST="$H/.state/staging"
+
+it "a tracked name with non-ASCII characters is staged"
+assert_contains "$(cat "$ST/.local/bin/ação.sh" 2>/dev/null)" "v2"
+
+it "and its plain-ASCII sibling still is too"
+assert_contains "$(cat "$ST/.local/bin/plain.sh" 2>/dev/null)" "v2"
+
+# -- a declared path that is itself excluded ---------------------------------------
+# The exclusion translation only ever looked at descendants of the transfer
+# root, so a path that is both declared by a group and listed in `excluded` was
+# collected in full -- the manifest contradicting itself, resolved silently in
+# favour of copying.
+H="$(mktemp -d)"; G="$H/g.json"
+mkdir -p "$H/.config/keep" "$H/.config/drop"
+printf 'yes\n' >"$H/.config/keep/f.txt"
+printf 'no\n'  >"$H/.config/drop/f.txt"
+cat >"$G" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],
+ "excluded":[{"path":"~/.config/drop","reason":"declared by a group but dead weight"}],
+ "groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/keep","~/.config/drop"]}]}
+JSON
+_env "$H" "$G" collect >/dev/null
+ST="$H/.state/staging"
+
+it "a declared path that is itself excluded is not collected"
+[[ ! -e "$ST/.config/drop" ]] && ok || fail "the excluded path was collected wholesale"
+
+it "and its declared sibling still is"
+assert_contains "$(cat "$ST/.config/keep/f.txt" 2>/dev/null)" "yes"

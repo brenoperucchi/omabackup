@@ -88,6 +88,32 @@ assert_not_contains "$(git -C "$SR3" show --name-only --format= HEAD 2>/dev/null
 it "and leaves that edit untouched in the working tree"
 assert_contains "$(git -C "$SR3" status --porcelain)" "notes.txt"
 
+# -- and the same when the user already staged it ---------------------------------
+# Scoping `git add` is not enough: `git commit` with no pathspec commits the
+# whole index, so anything the user had already `git add`ed rode along under the
+# tool's own commit message. The first version of the spec above only edited the
+# working tree, which is exactly why this survived -- a green spec that did not
+# test the real thing.
+SH3b="$(mktemp -d)"; SR3b="$SH3b/repo"; SG3b="$SH3b/g.json"
+mkdir -p "$SH3b/.config/app"
+printf 'x\n' >"$SH3b/.config/app/f.txt"
+_dest_repo "$SR3b"
+printf 'mine\n' >"$SR3b/notes.txt"
+git -C "$SR3b" add -A && git -C "$SR3b" commit -qm notes
+printf 'half-finished edit\n' >"$SR3b/notes.txt"
+git -C "$SR3b" add notes.txt          # the user staged their own work
+cp "$SG" "$SG3b"
+_sync_env "$SH3b" "$SR3b" "$SG3b" sync --commit >/dev/null
+
+it "sync --commit keeps an unrelated STAGED change out of the commit"
+assert_not_contains "$(git -C "$SR3b" show --name-only --format= HEAD 2>/dev/null)" "notes.txt"
+
+it "and leaves it staged, neither committed nor reverted"
+assert_contains "$(git -C "$SR3b" diff --cached --name-only 2>/dev/null)" "notes.txt"
+
+it "while still committing what the backup published"
+assert_contains "$(git -C "$SR3b" show --name-only --format= HEAD 2>/dev/null)" "configs/app/f.txt"
+
 # -- verify is the product, not a commit-time formality ---------------------------
 # A link-mode group whose paths stopped being symlinks is the August incident in
 # miniature: the repo silently stopped receiving. A sync that does not say so is
@@ -202,3 +228,76 @@ assert_not_contains "$OUT7" "committed"
 
 it "and leaves no commit behind"
 assert_eq "$(_commits "$SR7")" "1"
+
+# -- a git that fails mid-flow must not read as "nothing changed" -----------------
+# `dirty="$(git status ...)"` never checked its exit status, so any failure --
+# ARG_MAX on a long pathspec, a broken index, a repo yanked mid-run -- produced
+# empty output, which is indistinguishable from a clean tree. The tool then
+# printed "up to date" and exited 0: a backup reporting success for a git it
+# could not even talk to.
+REAL_GIT="$(command -v git)"
+_faking_git() {  # _faking_git <dir> <subcommand-to-fail>
+    mkdir -p "$1"
+    { printf '#!/bin/bash\n'
+      printf 'for a in "$@"; do [[ "$a" == %q ]] && exit 128; done\n' "$2"
+      printf 'exec %q "$@"\n' "$REAL_GIT"
+    } >"$1/git"
+    chmod +x "$1/git"
+}
+
+SHA="$(mktemp -d)"; SRA="$SHA/repo"; SGA="$SHA/g.json"
+mkdir -p "$SHA/.config/app"
+printf 'x\n' >"$SHA/.config/app/f.txt"
+_dest_repo "$SRA"
+cp "$SG" "$SGA"
+_faking_git "$SHA/fakebin" status
+OUTA="$(PATH="$SHA/fakebin:$PATH" _sync_env "$SHA" "$SRA" "$SGA" sync --commit)"
+RCA=$?
+
+it "a git status that fails is not reported as up to date"
+assert_not_contains "$OUTA" "up to date"
+
+it "and the sync fails loudly instead of exiting clean"
+[[ $RCA -ne 0 ]] && ok || fail "sync exited 0 despite git status failing"
+
+# -- publish that cannot write must not report success ----------------------------
+# _publish_file's failures were dropped on the floor: the file was simply left
+# out of the written list and publish_staging still ended on its success printf.
+SHB="$(mktemp -d)"; SRB="$SHB/repo"; SGB="$SHB/g.json"
+mkdir -p "$SHB/.config/app"
+printf 'x\n' >"$SHB/.config/app/f.txt"
+_dest_repo "$SRB"
+printf 'not a directory\n' >"$SRB/configs"   # publish needs configs/ to be a dir
+cp "$SG" "$SGB"
+OUTB="$(_sync_env "$SHB" "$SRB" "$SGB" sync --commit)"
+RCB=$?
+
+it "a publish that cannot write its destination fails the sync"
+[[ $RCB -ne 0 ]] && ok || fail "sync exited 0 despite publish being unable to write"
+
+it "and says so rather than announcing a commit"
+assert_not_contains "$OUTB" "committed"
+
+# -- a flag that takes a value must not hang when the value is missing ------------
+# `--groups` did `shift 2` unconditionally. With one argument left the shift
+# fails, $# never reaches zero, and `while (($#))` spins forever.
+SHC="$(mktemp -d)"; SGC="$SHC/g.json"
+cp "$SG" "$SGC"
+timeout 5 env HOME="$SHC" OMABACKUP_GROUPS="$SGC" OMABACKUP_STATE="$SHC/.state" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" verify --groups >/dev/null 2>&1
+RCC=$?
+
+it "--groups with no value fails instead of hanging forever"
+[[ $RCC -ne 124 ]] && ok || fail "the argument loop spun forever (timed out)"
+
+OUTD="$(timeout 5 env HOME="$SHC" OMABACKUP_GROUPS="$SGC" OMABACKUP_STATE="$SHC/.state" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" verify --groups 2>&1)"
+
+it "and says what was missing"
+assert_contains "$OUTD" "--groups"
+
+OUTE="$(timeout 5 env HOME="$SHC" OMABACKUP_GROUPS="$SGC" OMABACKUP_STATE="$SHC/.state" \
+    OMABACKUP_REPO="$SHC" XDG_RUNTIME_DIR=/nonexistent "$OB" sync --groups --commit 2>&1)"
+
+it "a flag is never swallowed as another flag's value"
+assert_contains "$OUTE" "--groups"

@@ -49,7 +49,7 @@ map_to_repo() {
 # file in the diff. See docs/DESIGN.md §11.1.
 _publish_file() {
     local src="$1" dst="$2"
-    mkdir -p "$(dirname "$dst")"
+    mkdir -p "$(dirname "$dst")" || return 1
     if [[ "$dst" == *.json ]] && jq -e . "$src" >/dev/null 2>&1; then
         jq -S . "$src" >"$dst.tmp" && mv "$dst.tmp" "$dst"
     else
@@ -85,54 +85,62 @@ _generated_repo_name() {
 # Local plugins record the files rsync copied, never the directory: rsync runs
 # without --delete, so committing the directory would also commit anything the
 # user has under configs/omarchy/plugins/<id>/ that this tool never wrote.
+# A write that fails is a file that is not backed up. Every failure is counted
+# and the function returns non-zero, so cmd_sync can refuse to commit rather
+# than reporting success over a partial publish -- the old version dropped the
+# failure and fell through to its own success printf. `find -print0` throughout,
+# because a newline in a filename would otherwise split one path into two.
 publish_staging() {
-    local staging="$1" repo="$2" table="${3:-}" list="${4:-}" f pf pid rel dst
+    local staging="$1" repo="$2" table="${3:-}" list="${4:-}" f pf pid rel dst failed=0
     local -a written=()
 
-    while IFS= read -r f; do
+    while IFS= read -r -d '' f; do
         rel="${f#"$staging"/}"
         [[ "$rel" == .generated/* || "$rel" == .plugins/* ]] && continue
         dst="$(map_to_repo "$rel" "$table")" || continue
-        _publish_file "$f" "$repo/$dst" && written+=("$dst")
-    done < <(find "$staging" -type f 2>/dev/null)
+        if _publish_file "$f" "$repo/$dst"; then written+=("$dst"); else failed=$((failed + 1)); fi
+    done < <(find "$staging" -type f -print0 2>/dev/null)
 
     if [[ -d "$staging/.generated" ]]; then
         for f in "$staging"/.generated/*; do
             [[ -f "$f" ]] || continue
             dst="$(_generated_repo_name "$f")" || continue
-            _publish_file "$f" "$repo/$dst" && written+=("$dst")
+            if _publish_file "$f" "$repo/$dst"; then written+=("$dst"); else failed=$((failed + 1)); fi
         done
     fi
 
     if [[ -d "$staging/.plugins" ]]; then
-        [[ -f "$staging/.plugins/manifest.txt" ]] && \
-            _publish_file "$staging/.plugins/manifest.txt" "$repo/lists/omarchy-plugins.txt" && \
-            written+=("lists/omarchy-plugins.txt")
+        if [[ -f "$staging/.plugins/manifest.txt" ]]; then
+            if _publish_file "$staging/.plugins/manifest.txt" "$repo/lists/omarchy-plugins.txt"
+            then written+=("lists/omarchy-plugins.txt"); else failed=$((failed + 1)); fi
+        fi
         if [[ -d "$staging/.plugins/patches" ]]; then
-            mkdir -p "$repo/patches/omarchy-plugins"
+            mkdir -p "$repo/patches/omarchy-plugins" || failed=$((failed + 1))
             for f in "$staging"/.plugins/patches/*.patch; do
                 [[ -f "$f" ]] || continue
-                cp "$f" "$repo/patches/omarchy-plugins/${f##*/}" \
-                    && written+=("patches/omarchy-plugins/${f##*/}")
+                if cp "$f" "$repo/patches/omarchy-plugins/${f##*/}"
+                then written+=("patches/omarchy-plugins/${f##*/}"); else failed=$((failed + 1)); fi
             done
         fi
         if [[ -d "$staging/.plugins/local" ]]; then
             for f in "$staging"/.plugins/local/*/; do
                 [[ -d "$f" ]] || continue
                 pid="${f%/}"; pid="${pid##*/}"
-                mkdir -p "$repo/configs/omarchy/plugins/$pid"
-                rsync -a --exclude '.git/' "$f" "$repo/configs/omarchy/plugins/$pid/" || continue
-                while IFS= read -r pf; do
+                mkdir -p "$repo/configs/omarchy/plugins/$pid" || { failed=$((failed + 1)); continue; }
+                rsync -a --exclude '.git/' "$f" "$repo/configs/omarchy/plugins/$pid/" \
+                    || { failed=$((failed + 1)); continue; }
+                while IFS= read -r -d '' pf; do
                     [[ -n "$pf" ]] || continue
                     written+=("configs/omarchy/plugins/$pid/${pf#"$f"}")
-                done < <(find "$f" -type f -not -path '*/.git/*' 2>/dev/null)
+                done < <(find "$f" -type f -not -path '*/.git/*' -print0 2>/dev/null)
             done
         fi
     fi
 
     if [[ -n "$list" ]]; then
-        : >"$list"
-        (( ${#written[@]} )) && printf '%s\0' "${written[@]}" >"$list"
+        : >"$list" || return 1
+        (( ${#written[@]} )) && { printf '%s\0' "${written[@]}" >"$list" || return 1; }
     fi
     printf '%s' "${#written[@]}"
+    (( failed == 0 ))
 }
