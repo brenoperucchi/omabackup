@@ -59,6 +59,31 @@ Panel {
     return "Last successful backup was " + Math.floor(h / 24) + " days ago."
   }
 
+  // Where this machine is pointed. All of it is machine identity rather than
+  // project data -- the repo receiving the backup, the destinations file, the
+  // deny-list, the schedule -- so none of it is in the public manifest, and the
+  // only other way to know is to read four files in three directories.
+  readonly property var config: statusDoc && statusDoc.config ? statusDoc.config : null
+  readonly property string syncSchedule:
+    statusDoc && statusDoc.scheduler && statusDoc.scheduler.sync ? statusDoc.scheduler.sync : ""
+  readonly property string pushSchedule:
+    statusDoc && statusDoc.scheduler && statusDoc.scheduler.push ? statusDoc.scheduler.push : ""
+
+  function shortPath(p) {
+    if (!p) return "—"
+    var h = Quickshell.env("HOME")
+    return (h && p.indexOf(h) === 0) ? "~" + p.substring(h.length) : p
+  }
+  // systemd's calendar syntax is precise and unreadable. The panel says what it
+  // means; `systemctl --user list-timers` is there for the exact expression.
+  function humanSchedule(c) {
+    if (!c) return "not scheduled"
+    var m = c.match(/\*:00\/(\d+):00/)
+    if (m) return "every " + m[1] + " min"
+    if (c.indexOf("*:00:00") >= 0) return "hourly"
+    return c
+  }
+
   readonly property bool schedulerKnown:
     statusDoc !== null && statusDoc.scheduler !== undefined && statusDoc.scheduler !== null
   readonly property bool scheduled: schedulerKnown ? (statusDoc.scheduler.active === true) : true
@@ -352,7 +377,7 @@ Panel {
 
           PanelSectionHeader {
             visible: root.alerts.length > 0
-            text: "Needs attention"
+            text: "Verification"
           }
 
           Repeater {
@@ -555,11 +580,54 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
-          PanelSectionHeader { text: "Keys" }
+          // ── config ────────────────────────────────────────────────────────
+          PanelSectionHeader { text: "Config" }
+
+          Grid {
+            id: cfgGrid
+            width: column.width
+            columns: 2
+            columnSpacing: Style.space(10)
+            rowSpacing: Style.space(2)
+
+            component CfgRow: Row {
+              property string k: ""
+              property string v: ""
+              width: (cfgGrid.width - cfgGrid.columnSpacing) / 2
+              spacing: Style.space(4)
+              Text {
+                id: keyLabel
+                // A fixed label column, not a binding onto a sibling's implicit
+                // width: that reads the child list positionally and breaks the
+                // moment anything is inserted before it.
+                width: Style.space(52)
+                text: parent.k
+                color: Color.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+              }
+              Text {
+                width: parent.width - parent.spacing - keyLabel.width
+                horizontalAlignment: Text.AlignRight
+                text: parent.v
+                color: Color.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideLeft
+              }
+            }
+
+            CfgRow { k: "sync";     v: root.humanSchedule(root.syncSchedule) }
+            CfgRow { k: "push";     v: root.humanSchedule(root.pushSchedule) }
+            CfgRow { k: "repo";     v: root.config ? root.shortPath(root.config.repo) : "—" }
+            CfgRow { k: "state";    v: root.config ? root.shortPath(root.config.state) : "—" }
+            CfgRow { k: "targets";  v: root.config ? root.shortPath(root.config.destinationsFile) : "—" }
+            CfgRow { k: "secrets";  v: root.config ? root.shortPath(root.config.denyList) : "—" }
+          }
 
           Text {
             width: parent.width
-            text: "r  check coverage again\nc  collect into staging"
+            text: "r  check again      c  collect into staging"
             color: Color.muted
             font.family: Style.font.family
             font.pixelSize: Style.font.caption

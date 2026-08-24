@@ -760,6 +760,16 @@ SYSTEMCTL="${OMABACKUP_SYSTEMCTL:-systemctl}"
 UNIT_DIR="$HOME/.config/systemd/user"
 TIMER_UNITS=(omabackup-sync.timer omabackup-push.timer)
 
+# The interval systemd is actually running, asked of systemd. Repeating it in
+# QML or in a constant here would be the same fact in two places, which is how
+# four things in this project have already drifted apart.
+timer_schedule() {
+    local out
+    out="$("$SYSTEMCTL" --user show "$1" -p TimersCalendar --value 2>/dev/null)" || return 1
+    [[ -n "$out" ]] || return 1
+    printf '%s' "$out" | sed -n 's/.*OnCalendar=\([^;]*\).*/\1/p' | sed 's/[[:space:]]*$//'
+}
+
 scheduler_active() {
     local t
     for t in "${TIMER_UNITS[@]}"; do
@@ -943,9 +953,18 @@ cmd_status() {
               --argjson stale "$(is_stale && echo true || echo false)" \
               --argjson lastsync "$([[ -s "$LAST_SYNC_FILE" ]] && cat "$LAST_SYNC_FILE" || echo null)" \
               --argjson age "$(last_sync_age || echo null)" \
+              --argjson syncsched "$(timer_schedule omabackup-sync.timer | jq -R 'select(length>0)' || echo null)" \
+              --argjson pushsched "$(timer_schedule omabackup-push.timer | jq -R 'select(length>0)' || echo null)" \
+              --arg repo "${OMABACKUP_REPO:-}" \
+              --arg destfile "$DESTINATIONS_FILE" \
+              --arg denyfile "$SECRETS_DENY_FILE" \
+              --arg statedir "$OMABACKUP_STATE" \
               '{schemaVersion:1, omarchy:{version:$v,channel:$c,migrationWatermark:$m},
                 supportedTargets:$t, staging:$s, destinations:$d,
-                scheduler:{active:$sch, fix:"omabackup install"},
+                scheduler:{active:$sch, fix:"omabackup install",
+                           sync:$syncsched, push:$pushsched},
+                config:{repo:$repo, destinationsFile:$destfile,
+                        denyList:$denyfile, state:$statedir},
                 stale:$stale, lastSync:$lastsync, lastSyncAgeSec:$age}'
     else
         printf '  Omarchy %s (%s) - migration watermark %s\n' "$ov" "$oc" "$om"
