@@ -429,6 +429,38 @@ cmd_sync() {
     local n; n="$(publish_staging "$STAGING" "$repo" "$(tracked_path_map)" "$list")"
     printf '  %spublished%s %d files into %s\n\n' "$GREEN" "$NC" "$n" "$(_tilde "$repo")"
 
+    local -a published=()
+    [[ -s "$list" ]] && mapfile -d '' -t published <"$list"
+
+    # A file published into a path the destination repo ignores was written to
+    # somewhere it can never be committed from: the backup reports success and
+    # stores nothing. `git add -A` skipped those in silence; a scoped `git add`
+    # refuses the entire batch over one of them. Neither is the answer -- drop
+    # them from what gets staged and say so, because it is a coverage hole, not
+    # a git error. Found by backing up ~/.config/opencode/.gitignore, whose
+    # rules then applied inside the dotfiles repo to its own siblings.
+    #
+    # Ignore rules do not apply to files the repo already tracks, so a tracked
+    # path matching .gitignore stages normally and must not be dropped here.
+    local -a written=() ignored=()
+    local f
+    if (( ${#published[@]} )); then
+        local -A is_tracked=() is_ignored=()
+        while IFS= read -r -d '' f; do is_tracked["$f"]=1; done \
+            < <(git -C "$repo" ls-files -z 2>/dev/null)
+        while IFS= read -r -d '' f; do
+            [[ -n "${is_tracked[$f]:-}" ]] || is_ignored["$f"]=1
+        done < <(printf '%s\0' "${published[@]}" | git -C "$repo" check-ignore -z --stdin 2>/dev/null)
+        for f in "${published[@]}"; do
+            if [[ -n "${is_ignored[$f]:-}" ]]; then ignored+=("$f"); else written+=("$f"); fi
+        done
+    fi
+    if (( ${#ignored[@]} )); then
+        finding warn publish repo-ignored \
+            "${#ignored[@]} published, then dropped because the repo ignores them (e.g. ${ignored[0]})" \
+            "${ignored[0]}"
+    fi
+
     # Verify runs on every sync, once, before any decision about committing.
     # The incident this tool exists for is "nothing changed and the coverage
     # broke" (docs/CONTEXT.md), so returning early on a clean tree without
@@ -440,9 +472,6 @@ cmd_sync() {
     # blocking publish would block the fix.
     local verified=1
     JSON=0 cmd_verify || verified=0
-
-    local -a written=()
-    [[ -s "$list" ]] && mapfile -d '' -t written <"$list"
 
     if (( ! verified )); then
         printf '\n%somabackup: coverage failed -- not committing%s\n' "$RED" "$NC" >&2

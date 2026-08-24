@@ -140,6 +140,51 @@ assert_contains "$(cat "$SR6/scripts/local-bin/my-script" 2>/dev/null)" "new ver
 it "an untracked shim in the same directory does not"
 [[ ! -e "$SR6/scripts/local-bin/npm" ]] && ok || fail "an untracked shim was published"
 
+# -- a destination repo that ignores what we publish ------------------------------
+# `git add -A` skipped ignored paths in silence; a scoped `git add` refuses the
+# whole batch over one of them. Neither is right: the file was published into a
+# place it can never be committed from, so it is a coverage hole, and the way
+# omabackup found this was by backing up ~/.config/opencode/.gitignore, whose
+# rules then applied inside the dotfiles repo and ignored its own siblings.
+SH8="$(mktemp -d)"; SR8="$SH8/repo"; SG8="$SH8/g.json"
+mkdir -p "$SH8/.config/app"
+printf 'x\n' >"$SH8/.config/app/f.txt"
+printf 'noise\n' >"$SH8/.config/app/ignored.txt"
+_dest_repo "$SR8"
+printf 'ignored.txt\n' >"$SR8/.gitignore"
+git -C "$SR8" add -A && git -C "$SR8" commit -qm ignore
+cp "$SG" "$SG8"
+OUT8="$(_sync_env "$SH8" "$SR8" "$SG8" sync --commit)"
+
+it "one ignored file does not abort the whole commit"
+assert_contains "$(git -C "$SR8" log --oneline 2>/dev/null)" "omabackup: sync"
+
+it "the rest of the group is committed normally"
+assert_contains "$(git -C "$SR8" show --name-only --format= HEAD 2>/dev/null)" "configs/app/f.txt"
+
+it "the ignored file is left out of the commit, not forced in"
+assert_not_contains "$(git -C "$SR8" show --name-only --format= HEAD 2>/dev/null)" "ignored.txt"
+
+it "and it is reported as a coverage hole rather than swallowed"
+assert_contains "$OUT8" "the repo ignores"
+
+# -- a file matching .gitignore but already tracked is still committed -------------
+# Ignore rules do not apply to tracked files, so treating "matches .gitignore"
+# as "cannot be added" would silently stop backing up a file the repo does track.
+SH9="$(mktemp -d)"; SR9="$SH9/repo"; SG9="$SH9/g.json"
+mkdir -p "$SH9/.config/app"
+printf 'updated\n' >"$SH9/.config/app/f.txt"
+_dest_repo "$SR9"
+mkdir -p "$SR9/configs/app"
+printf 'old\n' >"$SR9/configs/app/f.txt"
+printf 'f.txt\n' >"$SR9/.gitignore"
+git -C "$SR9" add -f configs/app/f.txt .gitignore && git -C "$SR9" commit -qm tracked
+cp "$SG" "$SG9"
+_sync_env "$SH9" "$SR9" "$SG9" sync --commit >/dev/null
+
+it "a tracked file matching .gitignore is still committed"
+assert_contains "$(git -C "$SR9" show HEAD:configs/app/f.txt 2>/dev/null)" "updated"
+
 # -- a git that refuses must not be reported as a success -------------------------
 # The script runs under `set -uo pipefail` without -e: an unchecked `git commit`
 # that fails still falls through to the success message.
