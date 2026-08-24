@@ -8,6 +8,33 @@
 
 set -uo pipefail
 
+# Machine config, read by everyone rather than by systemd alone.
+#
+# OMABACKUP_REPO lives in ~/.config/omabackup/env, and until now only the units
+# loaded it, through EnvironmentFile=. Every other caller got nothing: a human
+# in a terminal, and the QML panel running `status --json`, both saw no repo --
+# so no github destination and an empty repo field, on a machine that had been
+# backing up hourly all day. One fact, loaded in one place, absent everywhere
+# else.
+#
+# Parsed as KEY=VALUE data, never sourced. systemd's EnvironmentFile is not a
+# script, and sourcing it would hand anything able to write that path a shell
+# running as the user, on a timer. An already-set variable always wins, so an
+# explicit override still overrides.
+_load_env_file() {
+    local f="${OMABACKUP_ENV:-$HOME/.config/omabackup/env}" line k v
+    [[ -r "$f" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*[#$] ]] && continue
+        [[ "$line" =~ ^[[:space:]]*(OMABACKUP_[A-Z0-9_]+)=(.*)$ ]] || continue
+        k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
+        v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+        [[ -n "${!k:-}" ]] && continue
+        export "$k=$v"
+    done <"$f"
+}
+_load_env_file
+
 OMABACKUP_ROOT="${OMABACKUP_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 OMABACKUP_STATE="${OMABACKUP_STATE:-$HOME/.local/state/omabackup}"
 GROUPS_FILE="${OMABACKUP_GROUPS:-$OMABACKUP_ROOT/groups.default.json}"
