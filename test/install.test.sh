@@ -155,3 +155,21 @@ HOME="$SH2" OMABACKUP_ROOT="$SROOT2" OMABACKUP_GROUPS="$SROOT2/groups.default.js
   OMABACKUP_REPO="$SR2" XDG_RUNTIME_DIR=/nonexistent bash "$SROOT2/bin/omabackup" install >/dev/null 2>&1
 EXECLINE="$(grep ExecStart "$SH2/.config/systemd/user/omabackup-sync.service" 2>/dev/null)"
 [[ "$EXECLINE" == *"'"*"a b"*"'"* ]] && ok || fail "unquoted path with a space: $EXECLINE"
+
+it "and systemd itself accepts that unit, rather than splitting the path"
+# Asserting the string contains quotes only proves the string contains quotes.
+# The question is what systemd does with it, so ask systemd. It is silent on a
+# unit it accepts; an unquoted path with a space resolves to the fragment before
+# the space, which does not exist, and it says so.
+SDOUT="$(systemd-analyze --user verify "$SH2/.config/systemd/user/omabackup-sync.service" 2>&1 \
+         | grep -v 'not found' || true)"
+assert_eq "$SDOUT" ""
+
+it "and it does complain when the path is split, so the check above can fail"
+# Guards the assertion itself: without this, "systemd said nothing" would also
+# pass for a unit systemd never had an opinion about.
+SPLIT="$(mktemp -d)/split.service"
+{ printf '[Unit]\nDescription=probe\n[Service]\nType=oneshot\n'
+  printf 'ExecStart=%s/bin/omabackup sync\n' "$SROOT2"
+} >"$SPLIT"
+assert_contains "$(systemd-analyze --user verify "$SPLIT" 2>&1)" "not executable"
