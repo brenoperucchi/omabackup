@@ -44,6 +44,21 @@ assert_deny_understood() {
         , ((.exceptions // [])[] | select((.match // "") == "" or (.reason // "") == "")
             | "exception \(.id // "?") needs both match and reason")
         ] | .[]' "$file" 2>/dev/null)"
+    # An exception is cut out of the line before the pattern is retried, so one
+    # that overlaps a credential shape would blank that shape out wherever it
+    # appeared -- a single line quietly switching off a detector. Checked here,
+    # where being wrong costs a message rather than a leak.
+    local exid exm pid pre pci
+    while IFS=$'\t' read -r exid exm; do
+        [[ -n "$exm" ]] || continue
+        while IFS=$'\t' read -r pid pre pci; do
+            [[ -n "$pid" && -n "$pre" ]] || continue
+            if [[ "$pci" == true ]]; then printf '%s' "$exm" | grep -qiE -e "$pre"
+            else printf '%s' "$exm" | grep -qE -e "$pre"; fi \
+                && bad="${bad:+$bad$'\n'}exception $exid matches pattern $pid and would disable it"
+        done < <(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' "$file" 2>/dev/null)
+    done < <(jq -r '(.exceptions // [])[] | "\(.id)\t\(.match)"' "$file" 2>/dev/null)
+
     [[ -z "$bad" ]] && return 0
     printf '%somabackup: the deny-list declares what the scanner cannot honor:%s\n' "$RED" "$NC" >&2
     while IFS= read -r line; do printf '  %s\n' "$line" >&2; done <<<"$bad"
@@ -74,7 +89,9 @@ scan_secrets() {
     local repo="$1" file="$2" id re ci hit rc=0
     [[ -f "$file" ]] || return 1
 
-    DENY_EXCEPTIONS=()
+    # `local` here, not a bare global: bash scopes dynamically, so _still_matches
+    # still sees it, and nothing survives the call to collide with a later one.
+    local -a DENY_EXCEPTIONS=()
     mapfile -t DENY_EXCEPTIONS < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
 
     # Every reachable commit, because that is exactly what `git bundle --all`

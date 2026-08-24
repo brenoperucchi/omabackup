@@ -276,3 +276,36 @@ it "and a deny-list with no patterns at all is refused rather than trusted"
 EMPTYF="$(mktemp)"; printf '{"schemaVersion":1,"patterns":[],"exceptions":[]}\n' >"$EMPTYF"
 scan_secrets "$NR" "$EMPTYF" >/dev/null 2>&1 \
     && fail "an empty rule set scanned clean" || ok
+
+# ── an exception must not be able to disable a rule ────────────────────────
+# _still_matches cuts excepted text out of the line and retries the pattern, so
+# an exception that overlaps a credential shape would blank out that shape
+# wherever it appeared -- a one-line entry silently switching off a detector.
+# Caught at validation, where the cost of being wrong is a message instead of a
+# leak.
+AH="$(mktemp -d)"; AR="$AH/repo"; _sec_repo "$AR" "" ""
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$AH/destinations.json"
+cat >"$AH/selfdefeating.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"aws","regex":"\\bAKIA[0-9A-Z]{16}\\b","reason":"AWS key id"}],
+ "exceptions":[{"id":"oops","match":"AKIAIOSFODNN7EXAMPLE","reason":"looks harmless, is the whole key"}]}
+JSON
+
+it "an exception matching one of the deny patterns is refused"
+assert_contains "$(OMABACKUP_SECRETS_DENY="$AH/selfdefeating.json" _sec_env "$AH" "$AR" push 2>&1)" \
+    "oops"
+
+it "while an exception that matches nothing dangerous is accepted"
+cat >"$AH/fine.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"aws","regex":"\\bAKIA[0-9A-Z]{16}\\b","reason":"AWS key id"}],
+ "exceptions":[{"id":"flag","match":"--password-store=gnome-libsecret","reason":"a keyring flag"}]}
+JSON
+assert_not_contains "$(OMABACKUP_SECRETS_DENY="$AH/fine.json" _sec_env "$AH" "$AR" push 2>&1)" \
+    "cannot honor"
+
+# ── the scanner leaves no state behind ─────────────────────────────────────
+it "scanning does not leak its exception list into the caller"
+unset DENY_EXCEPTIONS 2>/dev/null || true
+scan_secrets "$AR" "$PWD/secrets.deny.json" >/dev/null 2>&1
+[[ -z "${DENY_EXCEPTIONS+set}" ]] && ok || fail "DENY_EXCEPTIONS survived the call"
