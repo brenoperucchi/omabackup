@@ -53,8 +53,8 @@ _bundle_manifest() {
         --argjson dirty "$([[ -n "$dirty" ]] && echo true || echo false)" \
         --argjson dirtyCount "$(printf '%s' "$dirty" | grep -c . || true)" \
         --argjson remotes "$(git -C "$repo" remote -v 2>/dev/null \
-            | awk '$3=="(fetch)"{printf "%s{\"name\":\"%s\",\"url\":\"%s\"}", (n++?",":""), $1, $2} END{printf ""}' \
-            | sed 's/^/[/; s/$/]/')" \
+            | awk '$3=="(fetch)"{print $1"\t"$2}' \
+            | jq -R -s 'split("\n") | map(select(length>0) | split("\t") | {name:.[0], url:.[1]})')" \
         --arg ov "$ov" --arg oc "$oc" --arg om "$om" \
         --argjson targets "$(jq '.supportedTargets' "$GROUPS_FILE")" \
         --argjson groups "$(jq '[.groups[] | {id, mode, coupled: (.coupled // false),

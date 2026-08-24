@@ -11,6 +11,9 @@ set -uo pipefail
 OMABACKUP_ROOT="${OMABACKUP_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 OMABACKUP_STATE="${OMABACKUP_STATE:-$HOME/.local/state/omabackup}"
 GROUPS_FILE="${OMABACKUP_GROUPS:-$OMABACKUP_ROOT/groups.default.json}"
+# Machine identity, not project data: a NAS path or a drive UUID has no place
+# in the public manifest. Same class as OMABACKUP_REPO.
+DESTINATIONS_FILE="${OMABACKUP_DESTINATIONS:-$HOME/.config/omabackup/destinations.json}"
 STAGING="$OMABACKUP_STATE/staging"
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
@@ -574,13 +577,75 @@ cmd_bundle() {
     fi
 }
 
+# ── push ─────────────────────────────────────────────────────────────────────
+# Separate verb from `sync` on purpose. Committing is local and fast; sending is
+# slow and fallible, and the two must not share an exit code -- a NAS that is
+# down at 3am cannot be allowed to look like a backup that failed to record.
+#
+# With no argument: every enabled destination whose backoff has expired, which
+# is what the timer calls. With an argument: that one, ignoring backoff, because
+# a human retrying on purpose should not serve out a penalty.
+cmd_push() {
+    local repo="${OMABACKUP_REPO:-}" rc=0 id detail bundle name
+    local -a explicit=()
+    while (($#)); do
+        case "$1" in
+            -*) die "unknown flag for push: $1" ;;
+            *)  explicit+=("$1"); shift ;;
+        esac
+    done
+    [[ -n "$repo" && -d "$repo/.git" ]] || die "OMABACKUP_REPO must point at a git repo (got: ${repo:-unset})"
+    assert_destinations_understood
+
+    local -a targets=()
+    if (( ${#explicit[@]} )); then
+        targets=("${explicit[@]}")
+    else
+        mapfile -t targets < <(dest_ids)
+        dest_has_github && targets+=(github)
+    fi
+    (( ${#targets[@]} )) || { printf '  %sno destinations configured%s\n' "$DIM" "$NC"; return 0; }
+
+    # Built once and shared: content-addressed, so a tick with no new commit
+    # reuses it and every destination receives the identical artifact.
+    bundle="$(build_bundle "$repo" "$OMABACKUP_STATE/bundles")" \
+        || die "could not build a bundle from $(_tilde "$repo")"
+    name="$(bundle_name "$repo")"
+
+    for id in "${targets[@]}"; do
+        [[ -n "$id" ]] || continue
+        if (( ! ${#explicit[@]} )) && dest_in_backoff "$id"; then
+            printf '  %s·%s %-11s %sin backoff until %s%s\n' "$DIM" "$NC" "$id" "$DIM" \
+                "$(date -d "@$(dest_state "$id" '.nextAttemptAt')" '+%H:%M' 2>/dev/null)" "$NC"
+            continue
+        fi
+        if detail="$(push_destination "$id" "$bundle" "$name")"; then
+            _dest_record_success "$id" "${detail:-0}"
+            printf '  %s✓%s %-11s %s%s%s\n' "$GREEN" "$NC" "$id" "$DIM" \
+                "$([[ "${detail:-0}" -gt 0 ]] 2>/dev/null && echo "sent, pruned ${detail}" || echo "sent")" "$NC"
+        else
+            _dest_record_failure "$id" "${detail:-unknown error}"
+            printf '  %s✗%s %-11s %s\n' "$RED" "$NC" "$id" "${detail:-unknown error}"
+            rc=1
+        fi
+    done
+    return $rc
+}
+
 cmd_status() {
     local ov oc om; IFS=$'\t' read -r ov oc om <<<"$(omarchy_identity)"
     if (( JSON )); then
+        # Destinations belong here, never in verify --json. verify's exit code
+        # gates the commit (cmd_sync), so folding a stale NAS into it would let
+        # a disconnected drive block the source of truth -- the inverse of §3's
+        # "one destination failing does not invalidate the others". This
+        # document reports recorded state and never probes the network, so the
+        # panel can poll it as often as it likes.
         jq -n --arg v "$ov" --arg c "$oc" --arg m "$om" --arg s "$STAGING" \
               --argjson t "$(jq '.supportedTargets' "$GROUPS_FILE")" \
+              --argjson d "$(destinations_json 2>/dev/null || echo '[]')" \
               '{schemaVersion:1, omarchy:{version:$v,channel:$c,migrationWatermark:$m},
-                supportedTargets:$t, staging:$s}'
+                supportedTargets:$t, staging:$s, destinations:$d}'
     else
         printf '  Omarchy %s (%s) - migration watermark %s\n' "$ov" "$oc" "$om"
         printf '  restore range: %s\n' "$(jq -r '.supportedTargets|join(", ")' "$GROUPS_FILE")"
@@ -594,6 +659,7 @@ source "$OMABACKUP_ROOT/lib/probes.sh"
 source "$OMABACKUP_ROOT/lib/plugin-capture.sh"
 source "$OMABACKUP_ROOT/lib/publish.sh"
 source "$OMABACKUP_ROOT/lib/bundle.sh"
+source "$OMABACKUP_ROOT/lib/destinations.sh"
 
 # Two levels: the loop below owns only what every command understands and
 # hands the rest, in order, to the command itself. It used to consume and shift
@@ -627,6 +693,7 @@ case "$CMD" in
     collect) reject_flags collect "${ARGS[@]}"; cmd_collect ;;
     sync)    cmd_sync "${ARGS[@]}" ;;
     bundle)  cmd_bundle "${ARGS[@]}" ;;
+    push)    cmd_push "${ARGS[@]}" ;;
     status)  reject_flags status "${ARGS[@]}"; cmd_status ;;
     ""|help)
         cat <<'USAGE'
