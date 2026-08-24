@@ -25,6 +25,36 @@ Panel {
   property string lastError: ""
   property var report: null
 
+  // ── and from `omabackup status --json`, deliberately a second document ────
+  // Not folded into verify: verify's exit code is meaningful -- non-zero means
+  // coverage broke, and cmd_sync refuses to commit on it. A destination in
+  // there would let an unplugged drive block the git commit, the inverse of
+  // DESIGN.md §3's "one destination failing does not invalidate the others".
+  // status always exits 0 and never probes the network, so polling it is free.
+  property var statusDoc: null
+
+  readonly property var destinations: {
+    if (!statusDoc || !statusDoc.destinations) return []
+    return statusDoc.destinations
+  }
+  // Absent scheduler key means an older CLI, not an unscheduled machine: do not
+  // invent an alarm out of a missing field.
+  readonly property bool schedulerKnown:
+    statusDoc !== null && statusDoc.scheduler !== undefined && statusDoc.scheduler !== null
+  readonly property bool scheduled: schedulerKnown ? (statusDoc.scheduler.active === true) : true
+
+  // A destination that has errored, or that has never once succeeded, is the
+  // "committed but never left the machine" state nothing used to report.
+  readonly property var destAlerts: {
+    var out = []
+    for (var i = 0; i < destinations.length; i++) {
+      var d = destinations[i]
+      if (!d) continue
+      if (d.lastError || !d.lastSuccess) out.push(d)
+    }
+    return out
+  }
+
   readonly property int failCount: report && report.counts ? (report.counts.fail || 0) : 0
   readonly property int warnCount: report && report.counts ? (report.counts.warn || 0) : 0
   readonly property int passCount: report && report.counts ? (report.counts.pass || 0) : 0
@@ -35,10 +65,15 @@ Panel {
   // Omarchy's palette has no green on purpose, and neither does this widget:
   // "up to date" is the absence of colour. Colour means there is something to do.
   readonly property color barText: bar ? bar.barForeground : Color.foreground
+  // Ordered by how badly it needs a human. "not scheduled" ranks above a
+  // warning count because nothing running the backup makes every other number
+  // on this panel stale -- it is the August incident one level up.
   readonly property string headline: cliMissing ? "not configured"
                                    : lastError !== "" ? "check failed"
                                    : report === null ? "not checked yet"
                                    : failCount > 0 ? failCount + (failCount === 1 ? " failure" : " failures")
+                                   : !scheduled ? "not scheduled"
+                                   : destAlerts.length > 0 ? "not sent"
                                    : warnCount > 0 ? warnCount + (warnCount === 1 ? " warning" : " warnings")
                                    : "covered"
 
@@ -60,6 +95,19 @@ Panel {
     root.lastError = ""
     verifyProc.buffer = ""
     verifyProc.running = true
+    if (!statusProc.running) { statusProc.buffer = ""; statusProc.running = true }
+  }
+
+  function applyStatus(text) {
+    // Destinations must never be able to break the coverage view. An older CLI
+    // with no `destinations` key, a half-written document, anything: the panel
+    // loses the destination section and keeps everything else.
+    try {
+      var parsed = JSON.parse(text)
+      if (parsed && typeof parsed === "object") root.statusDoc = parsed
+    } catch (e) {
+      root.statusDoc = null
+    }
   }
 
   function collect() {
@@ -116,6 +164,16 @@ Panel {
       root.checking = false
       if (verifyProc.buffer.trim() === "") root.lastError = "no output from " + root.cli
       else root.applyReport(verifyProc.buffer)
+    }
+  }
+
+  Process {
+    id: statusProc
+    property string buffer: ""
+    command: root.cli === "" ? ["true"] : [root.cli, "status", "--json"]
+    stdout: StdioCollector { onStreamFinished: statusProc.buffer = text }
+    onExited: function(code) {
+      if (statusProc.buffer.trim() !== "") root.applyStatus(statusProc.buffer)
     }
   }
 
@@ -270,6 +328,72 @@ Panel {
             visible: root.lastError !== ""
             width: parent.width
             text: root.lastError
+            color: Color.urgent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          // ── where it goes ──────────────────────────────────────────────────
+          // Coverage says the backup holds the right files. This says whether
+          // any of it ever left the machine -- the question nothing answered
+          // before, and the one a dead disk asks.
+          PanelSectionHeader {
+            visible: root.destinations.length > 0
+            text: "Destinations"
+          }
+
+          Repeater {
+            model: root.destinations
+            Column {
+              required property var modelData
+              width: column.width
+              spacing: Style.space(1)
+
+              Text {
+                width: parent.width
+                text: (modelData.lastError ? "✗  " : modelData.lastSuccess ? "·  " : "!  ")
+                      + (modelData.id || "") + "  " + (modelData.type || "")
+                color: modelData.lastError ? Color.urgent
+                     : modelData.lastSuccess ? Color.foreground : Color.accent
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+              }
+              Text {
+                width: parent.width
+                text: modelData.lastError && modelData.lastError.message
+                        ? modelData.lastError.message
+                        : modelData.lastSuccess
+                          ? "last sent " + String(modelData.lastSuccess).replace("T", " ").replace("Z", " UTC")
+                          : "never sent -- this copy does not exist yet"
+                color: Color.muted
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+            }
+          }
+
+          Text {
+            visible: root.statusDoc !== null && root.destinations.length === 0
+            width: parent.width
+            text: "No destination configured. The backup exists only on this machine."
+            color: Color.accent
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+          }
+
+          // ── and whether anything runs it ───────────────────────────────────
+          // omarchy runs no hook on plugin install, so the timers cannot install
+          // themselves. A fresh machine shows the widget and backs up nothing;
+          // that has to be visible here rather than discovered later.
+          Text {
+            visible: root.schedulerKnown && !root.scheduled
+            width: parent.width
+            text: "!  Nothing is scheduled to run the backup.\n"
+                  + "Run  omabackup install  to start the timers."
             color: Color.urgent
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
