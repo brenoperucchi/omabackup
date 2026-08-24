@@ -25,11 +25,16 @@
 bundle_name() {
     local repo="$1" ts
     ts="$(git -C "$repo" show -s --format=%cd --date=format-local:%Y%m%d-%H%M%S HEAD 2>/dev/null)"
-    printf 'omabackup-%s-%s.tar.zst' "$(_hostname)" "${ts:-00000000-000000}"
+    local sha; sha="$(git -C "$repo" rev-parse --short=12 HEAD 2>/dev/null)"
+    # The short sha is not decoration: the timestamp resolves to one second, so
+    # two commits made inside the same second produced the same filename and the
+    # destination's `mv` replaced one backup with the other. The name stays
+    # deterministic -- same head, same name at every destination.
+    printf 'omabackup-%s-%s-%s.tar.zst' "$(_hostname)" "${ts:-00000000-000000}" "${sha:-unknown}"
 }
 
 _tool_commit() {
-    git -C "$OMABACKUP_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown'
+    printf '%s' "${OMABACKUP_TOOL_ID:-$(git -C "$OMABACKUP_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')}"
 }
 
 # _bundle_manifest <repo> <staging> — everything a restore needs, in one file.
@@ -132,6 +137,22 @@ Verify integrity before trusting any of it:
 DOC
 }
 
+# bundle_cache_path <repo> <cache_dir>
+# Keyed on more than HEAD. The artifact also carries the tool, the manifest and
+# every ref (`git bundle --all`), so a tool upgrade or a deleted branch used to
+# reuse a bundle that no longer described the machine -- while claiming, in its
+# own manifest, to be "the tool that produced this". Callers ask this rather
+# than rebuilding the path themselves, which silently went wrong the moment the
+# key stopped being HEAD alone.
+bundle_cache_path() {
+    local repo="$1" cache="$2" head key
+    head="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || return 1
+    [[ -n "$head" ]] || return 1
+    key="$(printf '%s\n%s\n%s\n' "$head" "$(_tool_commit)" \
+            "$(git -C "$repo" show-ref 2>/dev/null | sha256sum)" | sha256sum | cut -c1-16)"
+    printf '%s/%s.tar.zst' "$cache" "$key"
+}
+
 # build_bundle <repo> <cache_dir>
 # Content-addressed by HEAD: the same commit yields the same artifact, so a
 # timer that fires with nothing new to say does no work. Prints the path.
@@ -141,7 +162,7 @@ build_bundle() {
     [[ -n "$head" ]] || return 1
 
     mkdir -p "$cache" || return 1
-    out="$cache/${head:0:12}.tar.zst"
+    out="$(bundle_cache_path "$repo" "$cache")" || return 1
     if [[ -f "$out" ]]; then printf '%s' "$out"; return 0; fi
 
     # A shallow repo or one leaning on alternates produces a bundle that cannot
@@ -170,8 +191,17 @@ build_bundle() {
 
     tar -C "$stage" -cf - . 2>/dev/null | zstd -q -19 -T0 -o "$out.tmp" 2>/dev/null \
         || { rm -rf "$stage" "$out.tmp"; return 1; }
-    mv "$out.tmp" "$out" || { rm -rf "$stage"; return 1; }
+    mv "$out.tmp" "$out" || { rm -rf "$stage" "$out.tmp"; return 1; }
     rm -rf "$stage"
+    # Proved here, not in whichever command happened to ask. verify_bundle used
+    # to live in cmd_bundle alone, so `push` -- the verb that actually sends --
+    # built or reused an artifact and shipped it unchecked. Restorability is a
+    # property of the artifact.
+    if ! verify_bundle "$out"; then
+        rm -f "$out"
+        printf 'omabackup: the bundle did not survive its own restore check\n' >&2
+        return 1
+    fi
     printf '%s' "$out"
 }
 

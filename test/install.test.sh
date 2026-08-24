@@ -131,3 +131,27 @@ JSTATUS="$(HOME="$JH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$JH/g.json" \
 
 it "and reports false when nothing runs it"
 assert_eq "$(printf '%s' "$JSTATUS" | jq -r '.scheduler.active' 2>/dev/null)" "false"
+
+# ── a path is not a sed script ─────────────────────────────────────────────
+# ExecStart was built with `sed "s#...#$OMABACKUP_ROOT#"`, so a `#` in the path
+# was a syntax error and a space produced an unquoted, invalid ExecStart.
+it "install survives a tool path containing sed's own delimiter"
+SH1="$(mktemp -d)"; SS1="$SH1/stub"; _stub_systemctl "$SS1" inactive
+SR1="$SH1/repo"; mkdir -p "$SR1"; git init -q "$SR1"
+SROOT="$SH1/a#b"; cp -r bin lib systemd groups.default.json secrets.deny.json "$SH1/" 2>/dev/null
+mkdir -p "$SROOT"; cp -r "$SH1/bin" "$SH1/lib" "$SH1/systemd" "$SH1/groups.default.json" "$SH1/secrets.deny.json" "$SROOT/" 2>/dev/null
+HOME="$SH1" OMABACKUP_ROOT="$SROOT" OMABACKUP_GROUPS="$SROOT/groups.default.json" \
+  OMABACKUP_STATE="$SH1/.state" OMABACKUP_SYSTEMCTL="$SS1/systemctl" \
+  OMABACKUP_REPO="$SR1" XDG_RUNTIME_DIR=/nonexistent bash "$SROOT/bin/omabackup" install >/dev/null 2>&1
+assert_contains "$(grep ExecStart "$SH1/.config/systemd/user/omabackup-sync.service" 2>/dev/null)" "a#b"
+
+it "and a path containing a space produces a quoted ExecStart systemd accepts"
+SH2="$(mktemp -d)"; SS2="$SH2/stub"; _stub_systemctl "$SS2" inactive
+SR2="$SH2/repo"; mkdir -p "$SR2"; git init -q "$SR2"
+SROOT2="$SH2/a b"; mkdir -p "$SROOT2"
+cp -r bin lib systemd groups.default.json secrets.deny.json "$SROOT2/" 2>/dev/null
+HOME="$SH2" OMABACKUP_ROOT="$SROOT2" OMABACKUP_GROUPS="$SROOT2/groups.default.json" \
+  OMABACKUP_STATE="$SH2/.state" OMABACKUP_SYSTEMCTL="$SS2/systemctl" \
+  OMABACKUP_REPO="$SR2" XDG_RUNTIME_DIR=/nonexistent bash "$SROOT2/bin/omabackup" install >/dev/null 2>&1
+EXECLINE="$(grep ExecStart "$SH2/.config/systemd/user/omabackup-sync.service" 2>/dev/null)"
+[[ "$EXECLINE" == *"'"*"a b"*"'"* ]] && ok || fail "unquoted path with a space: $EXECLINE"

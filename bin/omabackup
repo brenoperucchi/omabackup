@@ -626,6 +626,29 @@ scheduler_active() {
     return 0
 }
 
+# A path is not a sed script and not a shell word. The first version built
+# ExecStart with `sed "s#...#$OMABACKUP_ROOT#"`, so a `#` in the path was a sed
+# syntax error and a space produced an ExecStart systemd parses as two
+# arguments. Read the line in bash, single-quote the path when it needs it.
+_rewrite_execstart() {
+    local file="$1" line exe
+    exe="$OMABACKUP_ROOT/bin/omabackup"
+    # systemd single-quoting: the only character that cannot appear inside is
+    # a single quote itself, and a path holding one is refused rather than
+    # mangled into something that would run the wrong program.
+    if [[ "$exe" == *"'"* ]]; then
+        die "the tool path contains a single quote, which systemd cannot express: $exe"
+    fi
+    [[ "$exe" == *[[:space:]]* ]] && exe="'$exe'"
+    while IFS= read -r line; do
+        if [[ "$line" == ExecStart=* ]]; then
+            printf 'ExecStart=%s %s\n' "$exe" "${line##*/bin/omabackup }"
+        else
+            printf '%s\n' "$line"
+        fi
+    done <"$file"
+}
+
 cmd_install() {
     reject_flags install "$@"
     local repo="${OMABACKUP_REPO:-}" u src
@@ -645,8 +668,7 @@ cmd_install() {
     for u in omabackup-sync.service omabackup-sync.timer \
              omabackup-push.service omabackup-push.timer; do
         [[ -f "$src/$u" ]] || die "missing unit template: $u"
-        sed "s#^ExecStart=.*/bin/omabackup #ExecStart=$OMABACKUP_ROOT/bin/omabackup #" \
-            "$src/$u" >"$UNIT_DIR/$u" || die "cannot write $(_tilde "$UNIT_DIR/$u")"
+        _rewrite_execstart "$src/$u" >"$UNIT_DIR/$u" || die "cannot write $(_tilde "$UNIT_DIR/$u")"
     done
 
     # Never clobber this: the user may have added their own variables, and it
@@ -684,15 +706,11 @@ cmd_bundle() {
     [[ -n "$repo" && -d "$repo/.git" ]] || die "OMABACKUP_REPO must point at a git repo (got: ${repo:-unset})"
 
     local cache="$OMABACKUP_STATE/bundles"
-    [[ -f "$cache/$(git -C "$repo" rev-parse HEAD 2>/dev/null | cut -c1-12).tar.zst" ]] && reused=1
-
+    # §11.4 is checked inside build_bundle now, so `push` gets the same proof
+    # rather than only whoever typed `bundle`.
+    [[ -f "$(bundle_cache_path "$repo" "$cache" 2>/dev/null)" ]] && reused=1
     path="$(build_bundle "$repo" "$cache")" \
-        || die "could not build a bundle from $(_tilde "$repo")"
-
-    # §11.4 is a check here, not a claim: the artifact has to prove it clones,
-    # that both halves agree, and that the tool inside it runs.
-    verify_bundle "$path" \
-        || die "the bundle did not survive its own restore check: $(_tilde "$path")"
+        || die "could not build a verifiable bundle from $(_tilde "$repo")"
 
     if (( JSON )); then
         jq -n --arg p "$path" --arg n "$(bundle_name "$repo")" \

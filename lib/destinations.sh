@@ -118,9 +118,14 @@ prune_bundles() {  # prune_bundles <dir> <host> <keep> -> prints how many it rem
         printf 'omabackup: refusing to prune a directory with no %s stamp: %s\n' "$DEST_STAMP" "$dir" >&2
         return 1
     fi
+    # The hostname goes into a regular expression, so it has to be escaped: a
+    # dot is ordinary in a hostname and matches any character in an ERE, which
+    # widened retention to other machines' bundles.
+    local hre; hre="$(printf '%s' "$host" | sed 's/[][\\.^$*+?(){}|\/]/\\&/g')"
     local -a found=()
     mapfile -t found < <(find "$dir" -maxdepth 1 -type f -regextype posix-extended \
-        -regex ".*/omabackup-${host}-[0-9]{8}-[0-9]{6}\.tar\.zst" -printf '%f\n' 2>/dev/null | sort -r)
+        -regex ".*/omabackup-${hre}-[0-9]{8}-[0-9]{6}(-[0-9a-f]{12})?\.tar\.zst" \
+        -printf '%f\n' 2>/dev/null | sort -r)
     for f in "${found[@]:-}"; do
         [[ -n "$f" ]] || continue
         n=$((n + 1))
@@ -132,6 +137,21 @@ prune_bundles() {  # prune_bundles <dir> <host> <keep> -> prints how many it rem
 }
 
 # ── drivers ──────────────────────────────────────────────────────────────────
+# _dir_is_ours <dir> <name-just-written>
+# True when the directory holds nothing this tool did not put there. Anything
+# else -- a thesis, another tool's exports, a home directory -- is a sign the
+# path is wrong or shared, and neither is a place to be deleting from.
+_dir_is_ours() {
+    local dir="$1" just="$2" f base
+    while IFS= read -r -d '' f; do
+        base="${f##*/}"
+        [[ "$base" == "$DEST_STAMP" || "$base" == "$just" ]] && continue
+        [[ "$base" =~ ^omabackup-.+-[0-9]{8}-[0-9]{6}\.tar\.zst$ ]] && continue
+        return 1
+    done < <(find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    return 0
+}
+
 _push_dir() {  # _push_dir <id> <bundle> <publish-name>
     local id="$1" bundle="$2" name="$3" dir removed
     dir="$(dest_field "$id" path)"
@@ -139,7 +159,15 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
     mkdir -p "$dir" 2>/dev/null || { printf 'cannot create %s' "$dir"; return 1; }
     cp "$bundle" "$dir/$name.tmp" 2>/dev/null && mv "$dir/$name.tmp" "$dir/$name" 2>/dev/null \
         || { rm -f "$dir/$name.tmp" 2>/dev/null; printf 'cannot write into %s' "$dir"; return 1; }
-    [[ -f "$dir/$DEST_STAMP" ]] || printf '%s\n%s\n' "$id" "$(_hostname)" >"$dir/$DEST_STAMP" 2>/dev/null
+    # The stamp is what lets retention delete here, so it can only be granted to
+    # a directory this tool actually owns: empty, or holding nothing but its own
+    # bundles. The first version stamped whatever path the config named and then
+    # pruned it, which meant the protection documented as "the rule that matters
+    # most" wrote its own permission on the way in. Point this at ~/Documents now
+    # and bundles still arrive -- nothing is ever deleted there.
+    if [[ ! -f "$dir/$DEST_STAMP" ]] && _dir_is_ours "$dir" "$name"; then
+        printf '%s\n%s\n' "$id" "$(_hostname)" >"$dir/$DEST_STAMP" 2>/dev/null
+    fi
     # Only now, with the new copy confirmed on disk. "Delete the old, upload the
     # new" is how you arrive at zero copies.
     [[ -f "$dir/$name" ]] || { printf 'copy vanished after write'; return 1; }

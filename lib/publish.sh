@@ -64,7 +64,11 @@ _publish_file() {
         # and this runs once per staged file: 597 files spent 27 of a sync's 33
         # seconds paying rsync startup, which is what made a frequent timer
         # indefensible. rsync buys nothing for a single regular file.
-        cp -p "$src" "$dst"
+        # --remove-destination because plain cp FOLLOWS a symlink already at
+        # the destination and writes through it: with a repo path that is a link
+        # pointing outside the repo, publish overwrote somebody else's file
+        # instead of replacing the link. The link is unlinked first now.
+        cp -p --remove-destination "$src" "$dst"
     fi
 }
 
@@ -148,7 +152,7 @@ publish_staging() {
                 while IFS= read -r -d '' pf; do
                     [[ -n "$pf" ]] || continue
                     written+=("configs/omarchy/plugins/$pid/${pf#"$f"}")
-                done < <(find "$f" -type f -not -path '*/.git/*' -print0 2>/dev/null)
+                done < <(find "$f" \( -type f -o -type l \) -not -path "*/.git/*" -print0 2>/dev/null)
             done
         fi
     fi

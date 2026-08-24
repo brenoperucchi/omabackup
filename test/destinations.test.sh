@@ -201,3 +201,64 @@ DRC7=$?
 
 it "and a destination in error leaves verify's exit code alone"
 [[ $DRC7 -eq 0 ]] && ok || fail "a broken destination made verify fail (exit $DRC7)"
+
+# ── the stamp has to survive contact with _push_dir ─────────────────────────
+# It did not. `_push_dir` created `.omabackup-destination` in whatever directory
+# the config named, and *then* pruned -- so the protection documented as "the
+# rule that matters most" stamped its own permission on the way in. The spec
+# above never caught it because it calls prune_bundles directly and never goes
+# through the driver, which is the same green-but-proves-nothing failure this
+# suite has hit three times now.
+#
+# The rule now: a directory holding files this tool did not put there is never
+# stamped, so it is never pruned. A NAS folder shared with real data keeps
+# receiving bundles and simply never has anything deleted from it.
+PH="$(mktemp -d)"; PR="$PH/repo"; _dest_repo "$PR"
+PDOCS="$PH/somebodys-documents"; mkdir -p "$PDOCS"
+printf 'a thesis\n' >"$PDOCS/thesis.odt"
+printf 'x\n' >"$PDOCS/omabackup-$HOSTN-20200101-000000.tar.zst"
+printf 'x\n' >"$PDOCS/omabackup-$HOSTN-20200102-000000.tar.zst"
+cat >"$PH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"oops","type":"dir","path":"$PDOCS","keep":1}]}
+JSON
+_dest_env "$PH" "$PR" push oops >/dev/null
+
+it "a directory with unrelated content is never stamped"
+[[ ! -f "$PDOCS/.omabackup-destination" ]] \
+    && ok || fail "the driver stamped its own permission to delete"
+
+it "so nothing in a wrongly-configured directory is deleted"
+assert_eq "$(find "$PDOCS" -maxdepth 1 -name "omabackup-$HOSTN-*.tar.zst" | wc -l)" "3"
+
+it "and the unrelated file is untouched"
+[[ -f "$PDOCS/thesis.odt" ]] && ok || fail "deleted a file that was never ours"
+
+it "the bundle still arrives -- refusing to prune is not refusing to back up"
+[[ -n "$(find "$PDOCS" -maxdepth 1 -newer "$PDOCS/thesis.odt" -name 'omabackup-*.tar.zst' 2>/dev/null)" ]] \
+    && ok || fail "nothing was written"
+
+# ── an empty directory is ours to own ───────────────────────────────────────
+QH="$(mktemp -d)"; QR="$QH/repo"; _dest_repo "$QR"
+QNAS="$QH/nas"
+cat >"$QH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$QNAS","keep":1}]}
+JSON
+_dest_env "$QH" "$QR" push nas >/dev/null
+
+it "a fresh directory is stamped and managed normally"
+[[ -f "$QNAS/.omabackup-destination" ]] && ok || fail "a directory we created was not stamped"
+
+# ── a hostname is not a regular expression ─────────────────────────────────
+# ${host} went raw into the ERE, so a dot -- ordinary in a hostname -- matches
+# any character and widens retention to other machines' bundles.
+it "a hostname with a regex metacharacter does not match another host"
+MH="$(mktemp -d)/nas"; mkdir -p "$MH"
+printf 'stamped\n' >"$MH/.omabackup-destination"
+printf 'x\n' >"$MH/omabackup-my.box-20200101-000000.tar.zst"
+printf 'x\n' >"$MH/omabackup-my.box-20200102-000000.tar.zst"
+printf 'x\n' >"$MH/omabackup-myxbox-20200101-000000.tar.zst"   # a DIFFERENT machine
+OMABACKUP_ROOT="$PWD" bash -c '
+  source lib/bundle.sh; source lib/destinations.sh
+  prune_bundles "$1" "my.box" 1' _ "$MH" >/dev/null 2>&1
+[[ -f "$MH/omabackup-myxbox-20200101-000000.tar.zst" ]] \
+    && ok || fail "the dot matched any character and ate another host's backup"

@@ -141,3 +141,71 @@ cat >"$DH/deny2.json" <<'JSON'
 {"schemaVersion":1,"patterns":[{"id":"x","regex":"y"}],"exceptions":[]}
 JSON
 assert_contains "$(OMABACKUP_SECRETS_DENY="$DH/deny2.json" _sec_env "$DH" "$DR" push 2>&1)" "reason"
+
+# ── the scanner must cover what the bundle actually carries ──────────────────
+# It scanned `git grep HEAD` while the bundle ships `git bundle --all HEAD`.
+# Reproduced: commit a private key, remove it in the next commit, and the
+# scanner reports clean while the key stays recoverable from the artifact that
+# leaves the machine. A secret you believe you deleted still ships.
+HH="$(mktemp -d)"; HR="$HH/repo"
+mkdir -p "$HR"; git init -q "$HR"
+git -C "$HR" config user.email t@t; git -C "$HR" config user.name t
+printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\n' >"$HR/leak.txt"
+git -C "$HR" add -A && git -C "$HR" commit -qm oops
+git -C "$HR" rm -q leak.txt && git -C "$HR" commit -qm removed
+
+it "a secret removed from HEAD but alive in history is still found"
+[[ -n "$(scan_secrets "$HR" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "history was not scanned -- the bundle ships --all"
+
+it "and a secret on a branch that is not HEAD is found"
+BR2="$(mktemp -d)/repo"; mkdir -p "$BR2"; git init -q "$BR2"
+git -C "$BR2" config user.email t@t; git -C "$BR2" config user.name t
+printf 'clean\n' >"$BR2/f.txt"; git -C "$BR2" add -A; git -C "$BR2" commit -qm one
+git -C "$BR2" checkout -q -b side
+printf 'token = ghp_016C7869C1D4C2E7B0F9A2B3D4E5F60718293A4B\n' >"$BR2/s.txt"
+git -C "$BR2" add -A; git -C "$BR2" commit -qm side
+git -C "$BR2" checkout -q master 2>/dev/null || git -C "$BR2" checkout -q main
+[[ -n "$(scan_secrets "$BR2" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "another ref was not scanned -- git bundle --all carries it"
+
+# ── an exception explains one thing, it does not clear the line ─────────────
+# Exceptions were plain substrings tested against the whole matched line, so an
+# innocent phrase anywhere on it swallowed a real credential beside it.
+ER="$(mktemp -d)/repo"; mkdir -p "$ER"; git init -q "$ER"
+git -C "$ER" config user.email t@t; git -C "$ER" config user.name t
+printf 'set hide_token_restore on # aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n' >"$ER/f.conf"
+git -C "$ER" add -A && git -C "$ER" commit -qm x
+
+it "an excepted phrase does not clear a real credential sharing its line"
+[[ -n "$(scan_secrets "$ER" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "the exception swallowed the AWS key next to it"
+
+it "but the excepted phrase alone still passes"
+ER2="$(mktemp -d)/repo"; mkdir -p "$ER2"; git init -q "$ER2"
+git -C "$ER2" config user.email t@t; git -C "$ER2" config user.name t
+printf 'set hide_token_restore on\n' >"$ER2/f.conf"
+git -C "$ER2" add -A && git -C "$ER2" commit -qm x
+[[ -z "$(scan_secrets "$ER2" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "the exception stopped working"
+
+# ── a gate that cannot run must not read as "clean" ─────────────────────────
+# Missing deny-list, unreadable JSON, a regex git rejects: each produced no
+# output, which was indistinguishable from finding nothing, and the push went
+# out. A security gate fails closed or it is not a gate.
+FH="$(mktemp -d)"; FR="$FH/repo"; _sec_repo "$FR" "" ""
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$FH/destinations.json"
+
+it "push refuses when the deny-list is missing entirely"
+OUT_MISS="$(OMABACKUP_SECRETS_DENY="$FH/nope.json" _sec_env "$FH" "$FR" push 2>&1)"
+assert_contains "$OUT_MISS" "deny-list"
+
+it "push refuses when the deny-list cannot be parsed"
+printf 'not json at all\n' >"$FH/broken.json"
+OUT_BROKEN="$(OMABACKUP_SECRETS_DENY="$FH/broken.json" _sec_env "$FH" "$FR" push 2>&1)"
+assert_contains "$OUT_BROKEN" "deny-list"
+
+it "push refuses when a pattern is a regex git will not accept"
+printf '%s\n' '{"schemaVersion":1,"patterns":[{"id":"bad","regex":"[unclosed","reason":"deliberately invalid"}],"exceptions":[]}' >"$FH/badre.json"
+OUT_BADRE="$(OMABACKUP_SECRETS_DENY="$FH/badre.json" _sec_env "$FH" "$FR" push 2>&1)"
+assert_contains "$OUT_BADRE" "bad"

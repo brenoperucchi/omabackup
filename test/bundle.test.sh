@@ -187,3 +187,39 @@ printf 'third\n' >"$BR3/configs/app/f.txt"
 git -C "$BR3" add -A && git -C "$BR3" commit -qm three
 _bundle_env "$BH3" "$BR3" bundle >/dev/null
 assert_eq "$(find "$BH3/.state/bundles" -name '*.tar.zst' | wc -l)" "2"
+
+# ── what leaves the machine is verified, not just what `bundle` builds ──────
+# verify_bundle lived in cmd_bundle alone, so `push` -- the verb that actually
+# sends -- built or reused an artifact and shipped it unchecked. The proof of
+# restorability belongs to the artifact, not to one command that happens to ask.
+it "building an artifact verifies it, whoever asked for it"
+BV="$(mktemp -d)"; BVR="$BV/repo"; _bundle_repo "$BVR"
+OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+  OMABACKUP_STATE="$BV/.state" HOME="$BV" XDG_RUNTIME_DIR=/nonexistent \
+  bash -c 'source lib/bundle.sh; source lib/publish.sh; declare -f verify_bundle >/dev/null' \
+  && grep -q 'verify_bundle' <(sed -n '/^build_bundle/,/^}/p' lib/bundle.sh) \
+  && ok || fail "build_bundle does not prove its own output"
+
+# ── the cache key has to cover what the artifact depends on ────────────────
+# Keyed on HEAD alone, a tool upgrade reused a bundle carrying the previous
+# tool, previous manifest and a stale verify document -- while claiming to be
+# "the tool that produced this".
+it "a different tool version does not reuse the previous artifact"
+BC="$(mktemp -d)"; BCR="$BC/repo"; _bundle_repo "$BCR"
+_bundle_env "$BC" "$BCR" bundle >/dev/null
+BEFORE="$(find "$BC/.state/bundles" -name '*.tar.zst' | wc -l)"
+OMABACKUP_TOOL_ID=pretend-a-new-version _bundle_env "$BC" "$BCR" bundle >/dev/null
+AFTER="$(find "$BC/.state/bundles" -name '*.tar.zst' | wc -l)"
+assert_eq "$BEFORE/$AFTER" "1/2"
+
+# ── two commits in the same second must not share a filename ───────────────
+# The published name was host + timestamp to the second, so `mv` silently
+# replaced one backup with another.
+it "the published name distinguishes commits made in the same second"
+BN="$(mktemp -d)"; BNR="$BN/repo"; _bundle_repo "$BNR"
+N1="$(OMABACKUP_ROOT="$PWD" bash -c 'source lib/bundle.sh; bundle_name "$1"' _ "$BNR")"
+printf 'again\n' >>"$BNR/configs/app/f.txt"
+GIT_COMMITTER_DATE="$(git -C "$BNR" show -s --format=%cI HEAD)" \
+  git -C "$BNR" -c user.email=t@t -c user.name=t commit -q -am two --date="$(git -C "$BNR" show -s --format=%cI HEAD)"
+N2="$(OMABACKUP_ROOT="$PWD" bash -c 'source lib/bundle.sh; bundle_name "$1"' _ "$BNR")"
+[[ "$N1" != "$N2" ]] && ok || fail "both commits produce the same filename: $N1"

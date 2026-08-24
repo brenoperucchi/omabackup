@@ -6,15 +6,20 @@
 # warning nobody reads. That reasoning got stronger once push became an
 # unattended hourly timer: there is nobody there at 03:00 to read anything.
 #
-# Scanned with `git grep` against HEAD rather than the working tree, because
-# HEAD is precisely what both destinations send: `git push` sends the commit,
-# and the bundle's readable half is `git archive HEAD`. Scanning the working
-# tree would check content that is not leaving and miss content that is.
+# Scope is every commit reachable from every ref, not HEAD. The first version
+# scanned `git grep HEAD` while the bundle ships `git bundle --all HEAD`, so a
+# key committed once and deleted in the next commit reported clean and left the
+# machine anyway. A secret is in the artifact from the moment it is committed;
+# deleting the file does not take it back out.
 #
 # Patterns are deliberately high-signal -- shapes that are a credential or
 # nothing. One that fires on ordinary config teaches you to reach for --force,
 # which is the same failure one step later, so the false-positive specs matter
 # as much as the detection ones.
+#
+# Everything here fails closed. A missing deny-list, unparseable JSON or a regex
+# git rejects used to produce no output, which is indistinguishable from finding
+# nothing, and the push went out. A gate that cannot run is not a gate.
 
 KNOWN_DENY_FIELDS='["id","regex","reason","ignoreCase"]'
 KNOWN_EXCEPTION_FIELDS='["id","match","reason"]'
@@ -23,7 +28,10 @@ KNOWN_EXCEPTION_FIELDS='["id","match","reason"]'
 # worse than no rule, because it reads as protection.
 assert_deny_understood() {
     local file="$1" bad line
-    [[ -f "$file" ]] || return 0
+    [[ -f "$file" ]] \
+        || die "no deny-list at $(_tilde "$file"): refusing to push without a secret scan (docs/DESIGN.md §6)"
+    jq -e . "$file" >/dev/null 2>&1 \
+        || die "the deny-list at $(_tilde "$file") is not valid JSON: refusing to push unscanned"
     bad="$(jq -r --argjson p "$KNOWN_DENY_FIELDS" --argjson e "$KNOWN_EXCEPTION_FIELDS" '
         [ ((.patterns // [])[] | . as $r | (keys[] | select(. as $f | $p | index($f) | not))
             | "unknown field \(.) in pattern \($r.id // "?")")
@@ -42,43 +50,74 @@ assert_deny_understood() {
     exit 1
 }
 
-# scan_secrets <repo> <deny-file>
-# Prints one `<rule-id>\t<file>:<line>\t<text>` per hit, nothing when clean.
-scan_secrets() {
-    local repo="$1" file="$2" id re hit line
-    [[ -f "$file" ]] || return 0
+# _still_matches <line> <regex> <ignore-case>
+# An exception explains one phrase; it does not clear the line it sits on. The
+# excepted substrings are cut out and the pattern is retried against what is
+# left, so `hide_token_restore` beside an AWS key no longer swallows the key.
+_still_matches() {
+    local line="$1" re="$2" ci="$3" ex
+    for ex in "${DENY_EXCEPTIONS[@]:-}"; do
+        [[ -n "$ex" ]] || continue
+        line="${line//"$ex"/ }"
+    done
+    if [[ "$ci" == true ]]; then
+        printf '%s' "$line" | grep -qiE -e "$re"
+    else
+        printf '%s' "$line" | grep -qE -e "$re"
+    fi
+}
 
-    local -a exceptions=()
-    mapfile -t exceptions < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
+# scan_secrets <repo> <deny-file>
+# Prints `<rule-id>\t<commit>:<file>:<line>:<text>` per hit, nothing when clean.
+# Returns non-zero if the scan itself could not be carried out.
+scan_secrets() {
+    local repo="$1" file="$2" id re ci hit rc=0
+    [[ -f "$file" ]] || return 1
+
+    DENY_EXCEPTIONS=()
+    mapfile -t DENY_EXCEPTIONS < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
+
+    # Every reachable commit, because that is exactly what `git bundle --all`
+    # packs. Empty for a repo with no commits, which is not an error.
+    local -a revs=()
+    mapfile -t revs < <(git -C "$repo" rev-list --all 2>/dev/null)
+    (( ${#revs[@]} )) || return 0
 
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
-        # Per pattern, not globally: `git grep -E` is POSIX ERE and has no inline
-        # (?i), and turning -i on for everything would make AKIA match "akia" in
-        # prose. Declared in the rule, so the rule says what it means.
+        # Per pattern, not globally: `git grep -E` is POSIX ERE with no inline
+        # (?i), and -i everywhere would make AKIA match "akia" in prose.
         local -a gflags=(-I -n -E)
         [[ "$ci" == true ]] && gflags+=(-i)
-        # -I skips binary; -n gives the line; HEAD scopes it to what is committed.
+        local out grc
+        out="$(git -C "$repo" grep "${gflags[@]}" -e "$re" "${revs[@]}" 2>&1)"; grc=$?
+        # git grep: 0 found, 1 nothing found, anything else is a broken pattern
+        # or a broken repo -- and must never read as "clean".
+        if (( grc > 1 )); then
+            printf '%somabackup: pattern %s could not be scanned: %s%s\n' \
+                "$RED" "$id" "$(printf '%s' "$out" | head -1)" "$NC" >&2
+            rc=1
+            continue
+        fi
         while IFS= read -r hit; do
             [[ -n "$hit" ]] || continue
-            # `git grep HEAD` prefixes matches with `HEAD:`; drop it so the path
-            # reads the way the user knows it.
-            hit="${hit#HEAD:}"
-            local excepted=0 ex
-            for ex in "${exceptions[@]:-}"; do
-                [[ -n "$ex" ]] || continue
-                [[ "$hit" == *"$ex"* ]] && { excepted=1; break; }
-            done
-            (( excepted )) && continue
+            _still_matches "$hit" "$re" "$ci" || continue
             printf '%s\t%s\n' "$id" "$hit"
-        done < <(git -C "$repo" grep "${gflags[@]}" -e "$re" HEAD 2>/dev/null)
+        done <<<"$out"
     done < <(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' "$file" 2>/dev/null)
+    return $rc
 }
 
-# Prints the report and returns non-zero when anything was found.
+# Prints the report and returns non-zero when anything was found OR when the
+# scan could not run. Both are reasons not to send.
 report_secrets() {  # report_secrets <repo> <deny-file>
-    local hits id rest
-    hits="$(scan_secrets "$1" "$2")"
+    local hits id rest rc=0
+    hits="$(scan_secrets "$1" "$2")" || rc=1
+    if (( rc )); then
+        printf '%somabackup: push blocked -- the secret scan could not complete%s\n' "$RED" "$NC" >&2
+        printf '  A gate that cannot run is not a gate (docs/DESIGN.md §6).\n' >&2
+        return 1
+    fi
     [[ -n "$hits" ]] || return 0
 
     printf '%somabackup: push blocked -- the deny-list matched what is about to leave this machine%s\n' \
@@ -88,7 +127,8 @@ report_secrets() {  # report_secrets <repo> <deny-file>
         printf '  %s%s%s  %s\n' "$YELLOW" "$id" "$NC" "$(printf '%s' "$rest" | head -c 160)" >&2
     done <<<"$hits"
     printf '\n  A leak is irreversible, so this blocks rather than warns (docs/DESIGN.md §6).\n' >&2
-    printf '  Remove the credential, or add a justified entry to %s.\n' \
+    printf '  This scans every reachable commit: deleting the file does not remove it\n' >&2
+    printf '  from history. Rewrite the history, or add a justified entry to %s.\n' \
         "$(_tilde "$SECRETS_DENY_FILE")" >&2
     return 1
 }

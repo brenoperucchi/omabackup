@@ -161,3 +161,40 @@ it "300 files publish in well under the old per-file rsync cost"
 
 it "and all 300 actually arrived"
 assert_eq "$(find "$REPO5/configs/many" -type f | wc -l)" "300"
+
+# ── the destination may itself be a symlink ─────────────────────────────────
+# `cp -p` follows a symlink that already exists at the destination and writes
+# through it. With a repo path that is a link pointing outside the repo, publish
+# overwrote somebody else's file instead of replacing the link -- reproduced.
+STG6="$(mktemp -d)"; REPO6="$(mktemp -d)"; OUTSIDE="$(mktemp -d)"
+git init -q "$REPO6"
+mkdir -p "$REPO6/configs/app"
+printf 'belongs to someone else\n' >"$OUTSIDE/target.txt"
+ln -s "$OUTSIDE/target.txt" "$REPO6/configs/app/f.txt"
+mkdir -p "$STG6/.config/app"
+printf 'backup content\n' >"$STG6/.config/app/f.txt"
+publish_staging "$STG6" "$REPO6" >/dev/null
+
+it "publishing over a symlinked destination does not write outside the repo"
+assert_eq "$(cat "$OUTSIDE/target.txt")" "belongs to someone else"
+
+it "and replaces the link with the real file instead"
+[[ -f "$REPO6/configs/app/f.txt" && ! -L "$REPO6/configs/app/f.txt" ]] \
+    && ok || fail "the destination is still a symlink"
+
+it "with the content the backup meant to store"
+assert_contains "$(cat "$REPO6/configs/app/f.txt")" "backup content"
+
+# ── a symlink inside a local plugin is content too ──────────────────────────
+# The main loop learned this; the local-plugin branch kept `find -type f` and
+# so copied links with rsync while leaving them out of the list that gets
+# committed. Written but never staged is the same silence one directory over.
+STG7="$(mktemp -d)"; REPO7="$(mktemp -d)"; git init -q "$REPO7"
+mkdir -p "$STG7/.plugins/local/user.thing"
+printf 'return {}\n' >"$STG7/.plugins/local/user.thing/Widget.qml"
+ln -s Widget.qml "$STG7/.plugins/local/user.thing/alias.qml"
+LIST7="$(mktemp)"
+publish_staging "$STG7" "$REPO7" "" "$LIST7" >/dev/null
+
+it "a symlink inside a local plugin is recorded for commit, not just copied"
+assert_contains "$(tr '\0' '\n' <"$LIST7")" "alias.qml"
