@@ -153,8 +153,17 @@ _dir_is_ours() {
     local dir="$1" just="$2" f base
     while IFS= read -r -d '' f; do
         base="${f##*/}"
-        [[ "$base" == "$DEST_STAMP" || "$base" == "$just" ]] && continue
-        [[ "$base" =~ ^omabackup-.+-${DEST_NAME_TAIL}$ ]] && continue
+        [[ "$base" == "$just" ]] && continue
+        # Our own bundles, and our own half-written ones. _push_dir writes
+        # "<name>.tmp" before renaming, so an interrupted push leaves one behind
+        # -- and counting it as foreign locked the tool out of its own
+        # destination permanently, silently ending retention there.
+        [[ "$base" =~ ^omabackup-.+-${DEST_NAME_TAIL}(\.tmp)?$ ]] && continue
+        # Hidden entries are filesystem machinery, not somebody's work:
+        # .snapshots on btrfs/ZFS, .Trash-1000, .stfolder from syncthing. A NAS
+        # share is exactly the destination this feature exists for, and treating
+        # its own plumbing as foreign content meant retention never ran there.
+        [[ "$base" == .* ]] && continue
         return 1
     done < <(find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
     return 0
@@ -165,6 +174,9 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
     dir="$(dest_field "$id" path)"
     [[ -n "$dir" ]] || { printf 'no path configured'; return 1; }
     mkdir -p "$dir" 2>/dev/null || { printf 'cannot create %s' "$dir"; return 1; }
+    # A .tmp from an interrupted push is ours and nobody else's; leaving it to
+    # accumulate is how a destination fills with half-written archives.
+    find "$dir" -maxdepth 1 -type f -name '*.tar.zst.tmp' -delete 2>/dev/null
     cp "$bundle" "$dir/$name.tmp" 2>/dev/null && mv "$dir/$name.tmp" "$dir/$name" 2>/dev/null \
         || { rm -f "$dir/$name.tmp" 2>/dev/null; printf 'cannot write into %s' "$dir"; return 1; }
     # The stamp is what lets retention delete here, so it can only be granted to

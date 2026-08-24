@@ -285,3 +285,51 @@ it "a folder holding only omabackup bundles is recognised as ours"
 it "and the other machine's bundle is still not deleted"
 [[ -f "$SNAS2/omabackup-otherbox-20200101-000000-0123456789ab.tar.zst" ]] \
     && ok || fail "pruned another host"
+
+# ── our own leftovers must not lock us out of our own directory ────────────
+# _push_dir writes "<name>.tmp" and then renames. An interrupted push leaves
+# that .tmp behind, and _dir_is_ours counted it as a foreign file -- so the
+# directory read as somebody else's forever after, and retention silently
+# stopped running there. The tool poisoning its own destination.
+TH="$(mktemp -d)"; TR="$TH/repo"; _dest_repo "$TR"
+TNAS="$TH/nas"; mkdir -p "$TNAS"
+printf 'half-written\n' >"$TNAS/omabackup-$HOSTN-20200101-000000-abc123456789.tar.zst.tmp"
+cat >"$TH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$TNAS","keep":1}]}
+JSON
+_dest_env "$TH" "$TR" push nas >/dev/null
+
+it "an interrupted write of our own does not make the directory foreign"
+[[ -f "$TNAS/.omabackup-destination" ]] \
+    && ok || fail "our own .tmp locked us out of our own destination"
+
+it "and the stale .tmp is cleaned up rather than left to accumulate"
+[[ -z "$(find "$TNAS" -maxdepth 1 -name '*.tar.zst.tmp' 2>/dev/null)" ]] \
+    && ok || fail "the leftover is still there"
+
+# ── filesystem machinery is not somebody's documents ───────────────────────
+# A NAS share or a synced folder carries .snapshots, .Trash-1000, .stfolder.
+# Treating those as foreign content meant retention never ran on exactly the
+# kind of directory this feature exists for.
+UH="$(mktemp -d)"; UR="$UH/repo"; _dest_repo "$UR"
+UNAS="$UH/nas"; mkdir -p "$UNAS/.snapshots" "$UNAS/.stfolder"
+cat >"$UH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$UNAS","keep":1}]}
+JSON
+_dest_env "$UH" "$UR" push nas >/dev/null
+
+it "hidden filesystem machinery does not mark the directory as somebody else's"
+[[ -f "$UNAS/.omabackup-destination" ]] \
+    && ok || fail ".snapshots blocked a legitimate NAS destination"
+
+# ── but visible content someone put there still does ──────────────────────
+VH="$(mktemp -d)"; VR="$VH/repo"; _dest_repo "$VR"
+VDOCS="$VH/documents"; mkdir -p "$VDOCS/holiday-photos"
+cat >"$VH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"oops","type":"dir","path":"$VDOCS","keep":1}]}
+JSON
+_dest_env "$VH" "$VR" push oops >/dev/null
+
+it "a directory holding someone's own folders is still refused"
+[[ ! -f "$VDOCS/.omabackup-destination" ]] \
+    && ok || fail "stamped a directory full of somebody's work"
