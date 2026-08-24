@@ -69,6 +69,23 @@ Panel {
   readonly property string pushSchedule:
     statusDoc && statusDoc.scheduler && statusDoc.scheduler.push ? statusDoc.scheduler.push : ""
 
+  // "last backup 8m ago", the way the mockup's header reads it.
+  function agoText(sec) {
+    if (typeof sec !== "number") return "never"
+    if (sec < 90) return "just now"
+    if (sec < 5400) return Math.round(sec / 60) + "m ago"
+    if (sec < 172800) return Math.round(sec / 3600) + "h ago"
+    return Math.round(sec / 86400) + "d ago"
+  }
+
+  readonly property string summaryLine: {
+    var bits = []
+    bits.push("last backup " + agoText(lastSyncAge))
+    if (groups.length > 0) bits.push(groups.length + " groups")
+    if (coveredFiles > 0) bits.push(coveredFiles + " files")
+    return bits.join("  ·  ")
+  }
+
   function shortPath(p) {
     if (!p) return "—"
     var h = Quickshell.env("HOME")
@@ -377,31 +394,60 @@ Panel {
           width: flick.width
           spacing: Style.space(10)
 
-          Row {
+          // The header the mockup opens with: who this is, then the state, then
+          // one line summarising the machine. Without the name the panel drops
+          // you straight into a verdict with nothing saying whose verdict it is.
+          Item {
             width: parent.width
-            spacing: Style.space(6)
+            implicitHeight: headRow.implicitHeight
 
-            // The state dot the mockup carries beside the headline: one glance,
-            // one colour. Omarchy's palette has no green on purpose, so "fine"
-            // is the muted ink rather than a reassuring tick -- colour here
-            // always means there is something to do.
-            Rectangle {
-              width: Style.space(8)
-              height: width
-              radius: width / 2
-              anchors.verticalCenter: parent.verticalCenter
-              color: root.failCount > 0 ? Color.urgent
-                   : (!root.scheduled || root.stale || root.destAlerts.length > 0) ? Color.accent
-                   : root.warnCount > 0 ? Color.accent
-                   : Color.muted
+            Row {
+              id: headRow
+              spacing: Style.space(6)
+              anchors.left: parent.left
+
+              // One glance, one colour. Omarchy's palette has no green on
+              // purpose and neither does this: "fine" is muted ink rather than
+              // a reassuring tick, so colour here always means work to do.
+              Rectangle {
+                width: Style.space(8)
+                height: width
+                radius: width / 2
+                anchors.verticalCenter: parent.verticalCenter
+                color: root.failCount > 0 ? Color.urgent
+                     : (!root.scheduled || root.stale || root.destAlerts.length > 0) ? Color.accent
+                     : root.warnCount > 0 ? Color.accent
+                     : Color.muted
+              }
+
+              Text {
+                text: "OmaBackup"
+                color: Color.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.title
+              }
             }
 
             Text {
+              anchors.right: parent.right
+              anchors.verticalCenter: headRow.verticalCenter
               text: root.headline
-              color: root.failCount > 0 ? Color.urgent : Color.foreground
+              color: root.failCount > 0 ? Color.urgent
+                   : (!root.scheduled || root.stale || root.destAlerts.length > 0) ? Color.accent
+                   : Color.muted
               font.family: Style.font.family
-              font.pixelSize: Style.font.title
+              font.pixelSize: Style.font.bodySmall
             }
+          }
+
+          Text {
+            visible: root.statusDoc !== null
+            width: parent.width
+            text: root.summaryLine
+            color: Color.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
           }
 
           Row {
