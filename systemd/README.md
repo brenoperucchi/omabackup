@@ -19,20 +19,25 @@ trains you to ignore the one alarm this project exists to make you not ignore.
 ## Install
 
 ```sh
-mkdir -p ~/.config/systemd/user
-cp systemd/omabackup-*.{service,timer} ~/.config/systemd/user/
-
-# Machine identity: which repo receives the backup.
-mkdir -p ~/.config/omabackup
-echo "OMABACKUP_REPO=$HOME/Devs/omarchy-personal" > ~/.config/omabackup/env
-
-systemctl --user daemon-reload
-systemctl --user enable --now omabackup-sync.timer omabackup-push.timer
+OMABACKUP_REPO=~/Devs/omarchy-personal omabackup install
 ```
 
-`ExecStart` points at the installed plugin
-(`~/.config/omarchy/plugins/brenoperucchi.omabackup/bin/omabackup`). Point it at
-a working copy instead if you are developing.
+That writes both units, records the repo in `~/.config/omabackup/env`, reloads
+systemd and enables the timers. It is idempotent, and it never overwrites an
+`env` file you have edited.
+
+**This step cannot be automatic.** `omarchy plugin add` clones and enables a
+plugin and runs no hook from it — a sound refusal to execute code fetched from
+a URL. So a fresh install gets the bar widget and the CLI and *no automation at
+all* until this runs. Which is why `omabackup verify` warns
+`nothing is scheduled to run the backup` until it does, and `status --json`
+carries `.scheduler.active` for the panel: a backup nothing runs is a backup
+that does not happen, and that must never be a silent state.
+
+`ExecStart` is rewritten to whichever copy of the tool ran `install`. Run it
+from the installed plugin for a real setup; running it from a working copy wires
+the timers to that checkout, which is what you want while developing and not
+what you want otherwise.
 
 ## Check on it
 

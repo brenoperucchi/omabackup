@@ -220,7 +220,25 @@ cmd_verify() {
     done < <(groups_ids)
 
     probe_link_integrity
+    probe_scheduled
     report
+}
+
+# A backup nothing runs is a backup that does not happen. The plugin cannot
+# install its own timers (omarchy runs no plugin hook, deliberately), so the
+# gap between "installed" and "actually running" is real and silent -- the
+# August incident one level up: the panel would report coverage and save
+# nothing, forever.
+#
+# A warning, not a failure: `verify` has to keep working from inside a bundle
+# and on a recovery tty, where no user session exists to ask.
+probe_scheduled() {
+    if scheduler_active; then
+        finding pass scheduler scheduled "scheduled: the backup runs unattended" ""
+    else
+        finding warn scheduler not-scheduled \
+            "nothing is scheduled to run the backup -- fix with: omabackup install" ""
+    fi
 }
 
 report() {
@@ -586,6 +604,68 @@ cmd_sync() {
     printf '  %scommitted%s\n' "$GREEN" "$NC"
 }
 
+# ── install ──────────────────────────────────────────────────────────────────
+# `omarchy plugin add` clones and enables a plugin and runs no hook from it --
+# a sound refusal to execute code fetched from a URL, but it means the timers
+# can never install themselves. A fresh install therefore gets the bar widget
+# and the CLI and no automation whatsoever: the panel reports coverage
+# beautifully and backs up nothing. This verb is the one manual step, and
+# `verify` complains until it has been run.
+SYSTEMCTL="${OMABACKUP_SYSTEMCTL:-systemctl}"
+UNIT_DIR="$HOME/.config/systemd/user"
+TIMER_UNITS=(omabackup-sync.timer omabackup-push.timer)
+
+scheduler_active() {
+    local t
+    for t in "${TIMER_UNITS[@]}"; do
+        "$SYSTEMCTL" --user is-active "$t" >/dev/null 2>&1 || return 1
+    done
+    return 0
+}
+
+cmd_install() {
+    reject_flags install "$@"
+    local repo="${OMABACKUP_REPO:-}" u src
+    [[ -n "$repo" && -d "$repo/.git" ]] \
+        || die "OMABACKUP_REPO must point at the git repo that receives the backup (got: ${repo:-unset}).
+  Run:  OMABACKUP_REPO=~/path/to/dotfiles omabackup install"
+
+    src="$OMABACKUP_ROOT/systemd"
+    [[ -d "$src" ]] || die "unit templates not found: $(_tilde "$src")"
+    mkdir -p "$UNIT_DIR" || die "cannot create $(_tilde "$UNIT_DIR")"
+
+    # ExecStart is rewritten to whichever copy of the tool is running install.
+    # The templates name the installed plugin path, which is right for the
+    # common case and wrong for every working copy -- and a timer wired to a
+    # directory that does not exist fails in a way nobody would connect back
+    # to here.
+    for u in omabackup-sync.service omabackup-sync.timer \
+             omabackup-push.service omabackup-push.timer; do
+        [[ -f "$src/$u" ]] || die "missing unit template: $u"
+        sed "s#^ExecStart=.*/bin/omabackup #ExecStart=$OMABACKUP_ROOT/bin/omabackup #" \
+            "$src/$u" >"$UNIT_DIR/$u" || die "cannot write $(_tilde "$UNIT_DIR/$u")"
+    done
+
+    # Never clobber this: the user may have added their own variables, and it
+    # is the one file here that is theirs rather than ours.
+    mkdir -p "$HOME/.config/omabackup"
+    if [[ -f "$HOME/.config/omabackup/env" ]]; then
+        printf '  %skept%s %s %s(already configured)%s\n' \
+            "$DIM" "$NC" "$(_tilde "$HOME/.config/omabackup/env")" "$DIM" "$NC"
+    else
+        printf 'OMABACKUP_REPO=%s\n' "$repo" >"$HOME/.config/omabackup/env" \
+            || die "cannot write the environment file"
+    fi
+
+    "$SYSTEMCTL" --user daemon-reload || die "systemctl daemon-reload failed"
+    "$SYSTEMCTL" --user enable --now "${TIMER_UNITS[@]}" >/dev/null 2>&1 \
+        || die "could not enable the timers"
+
+    printf '  %s✓%s installed and scheduled %s(sync every 15m, push hourly)%s\n' \
+        "$GREEN" "$NC" "$DIM" "$NC"
+    printf '  check with: %ssystemctl --user list-timers omabackup-\*%s\n' "$CYAN" "$NC"
+}
+
 # ── bundle ───────────────────────────────────────────────────────────────────
 # The artifact every destination other than `github` receives (DESIGN.md §3).
 # Separate verb from `push` on purpose: building is cheap and local, sending is
@@ -691,8 +771,10 @@ cmd_status() {
         jq -n --arg v "$ov" --arg c "$oc" --arg m "$om" --arg s "$STAGING" \
               --argjson t "$(jq '.supportedTargets' "$GROUPS_FILE")" \
               --argjson d "$(destinations_json 2>/dev/null || echo '[]')" \
+              --argjson sch "$(scheduler_active && echo true || echo false)" \
               '{schemaVersion:1, omarchy:{version:$v,channel:$c,migrationWatermark:$m},
-                supportedTargets:$t, staging:$s, destinations:$d}'
+                supportedTargets:$t, staging:$s, destinations:$d,
+                scheduler:{active:$sch, fix:"omabackup install"}}'
     else
         printf '  Omarchy %s (%s) - migration watermark %s\n' "$ov" "$oc" "$om"
         printf '  restore range: %s\n' "$(jq -r '.supportedTargets|join(", ")' "$GROUPS_FILE")"
@@ -739,6 +821,7 @@ case "$CMD" in
     verify)  reject_flags verify "${ARGS[@]}"; cmd_verify ;;
     collect) reject_flags collect "${ARGS[@]}"; cmd_collect ;;
     sync)    cmd_sync "${ARGS[@]}" ;;
+    install) cmd_install "${ARGS[@]}" ;;
     bundle)  cmd_bundle "${ARGS[@]}" ;;
     push)    cmd_push "${ARGS[@]}" ;;
     status)  reject_flags status "${ARGS[@]}"; cmd_status ;;
