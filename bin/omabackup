@@ -37,7 +37,16 @@ groups_ids() {
         | .[].id' "$GROUPS_FILE"
 }
 group_field() { jq -r --arg id "$1" --arg f "$2" '.groups[] | select(.id==$id) | .[$f] // empty' "$GROUPS_FILE"; }
-group_paths() { jq -r --arg id "$1" '.groups[] | select(.id==$id) | (.paths // [])[]' "$GROUPS_FILE"; }
+group_paths() {
+    jq -r --arg id "$1" '.groups[] | select(.id==$id) |
+        (.paths // [])[] | if type=="object" then .live else . end' "$GROUPS_FILE"
+}
+# The repo subdirectory a trackedOnly path should be checked against, e.g.
+# ~/.local/bin -> scripts/local-bin. Empty when the entry has no override.
+group_tracked_repo_path() {
+    jq -r --arg id "$1" --arg live "$2" '.groups[] | select(.id==$id) |
+        (.paths // [])[] | select(type=="object" and .live==$live) | .trackedRepoPath // empty' "$GROUPS_FILE"
+}
 
 # Every path declared by any group, expanded. Probes use this to answer
 # "is this file covered by anyone?".
@@ -194,16 +203,20 @@ report() {
 # copied 6.6MB of third-party plugin code despite mode:triple, and 62MB of
 # node_modules despite exclude. Same shape as the bug recorded in
 # docs/CONTEXT.md §4: "a generic loop overrides specific handling".
-KNOWN_FIELDS='["id","label","mode","coupled","critical","paths","probe","enabled","exclude","trackedOnly","generator","allowList","note"]'
+KNOWN_FIELDS='["id","label","mode","coupled","critical","paths","probe","enabled","exclude","generator","allowList","note"]'
 KNOWN_MODES='["link","copy","gen","triple"]'
 
 assert_manifest_understood() {
     local bad line
-    bad="$(jq -r --argjson k "$KNOWN_FIELDS" --argjson m "$KNOWN_MODES" '
+    local path_fields='["live","trackedRepoPath"]'
+    bad="$(jq -r --argjson k "$KNOWN_FIELDS" --argjson m "$KNOWN_MODES" --argjson pf "$path_fields" '
         [ (.groups[] | . as $g | (keys[] | select(. as $f | $k | index($f) | not)
             | "unknown field \(.) in group \($g.id)"))
         , (.groups[] | select(.mode as $x | $m | index($x) | not)
             | "unknown mode \(.mode) in group \(.id)")
+        , (.groups[] | . as $g | ((.paths // [])[] | select(type=="object") | keys[]
+            | select(. as $f | $pf | index($f) | not))
+            | "unknown path field \(.) in group \($g.id)")
         ] | .[]' "$GROUPS_FILE")"
     [[ -z "$bad" ]] && return 0
     printf '%somabackup: the manifest declares what the collector cannot honor:%s\n' "$RED" "$NC" >&2
@@ -235,6 +248,13 @@ _rsync_excludes() {
 # for mode:copy groups, and the cycle would close on itself. See docs/DESIGN.md §11.1.
 cmd_collect() {
     assert_manifest_understood
+    # Staging represents "what should be backed up right now", not an
+    # accumulating cache: without wiping it first, a path a group used to
+    # declare (or a name a trackedOnly path used to match) lingers forever and
+    # publish_staging happily republishes it. Proven by the desktop group's
+    # first run, before trackedRepoPath existed, leaving 63 stray files behind
+    # that a later, correct collect kept finding and republishing.
+    rm -rf "$STAGING"
     mkdir -p "$STAGING"
     local id mode p e dest n=0
     while read -r id; do
@@ -246,7 +266,6 @@ cmd_collect() {
         esac
 
         local -a ex=(); mapfile -t ex < <(_rsync_excludes "$id")
-        local tracked_only; tracked_only="$(group_field "$id" trackedOnly)"
 
         while read -r p; do
             [[ -n "$p" ]] || continue
@@ -254,8 +273,12 @@ cmd_collect() {
             [[ -e "$e" || -L "$e" ]] || continue
             dest="$STAGING/${e#$HOME/}"
             mkdir -p "$(dirname "$dest")"
-            if [[ "$tracked_only" == "true" ]]; then
-                collect_tracked_only "$e" "$dest" || continue
+            # Tracked-only is a per-path decision, not a per-group one: a
+            # group can mix a directory that should only pull already-tracked
+            # names (desktop entries) with a plain file that should always
+            # copy (mimeapps.list).
+            if [[ -n "$(group_tracked_repo_path "$id" "$p")" ]]; then
+                collect_tracked_only "$e" "$dest" "$id" "$p" || continue
             elif [[ -d "$e" && ! -L "$e" ]]; then
                 rsync -a --exclude '.git/' "${ex[@]}" "$e/" "$dest/"
             else
@@ -297,17 +320,20 @@ collect_triple() {
 # configured there is nothing to infer, so it warns and skips instead of
 # dragging in 15MB of shims.
 collect_tracked_only() {
-    local live="$1" dest="$2" repo="${OMABACKUP_REPO:-}" base f n=0
+    local live="$1" dest="$2" id="$3" declared="$4" repo="${OMABACKUP_REPO:-}" refdir sub base f n=0
     if [[ -z "$repo" || ! -d "$repo" ]]; then
-        finding warn scripts no-repo "trackedOnly needs OMABACKUP_REPO; skipped $(_tilde "$live")" "$live"
+        finding warn "$id" no-repo "trackedOnly needs OMABACKUP_REPO; skipped $(_tilde "$live")" "$live"
         (( JSON )) || printf '  %s!%s %s %s(trackedOnly without a repo: skipped)%s\n' "$YELLOW" "$NC" "$(_tilde "$live")" "$DIM" "$NC"
         return 1
     fi
+    sub="$(group_tracked_repo_path "$id" "$declared")"
+    refdir="$repo${sub:+/$sub}"
+    [[ -d "$refdir" ]] || return 0
     mkdir -p "$dest"
     while read -r f; do
         base="$(basename "$f")"
         [[ -f "$live/$base" ]] && { rsync -aL "$live/$base" "$dest/"; n=$((n + 1)); }
-    done < <(find "$repo" -maxdepth 1 -type f 2>/dev/null)
+    done < <(find "$refdir" -maxdepth 1 -type f 2>/dev/null)
     return 0
 }
 
@@ -328,6 +354,52 @@ collect_generated() {
     (( JSON )) || printf '  %s✓%s %s %s(generated)%s\n' "$GREEN" "$NC" "$id" "$DIM" "$NC"
 }
 
+# ── sync ─────────────────────────────────────────────────────────────────────
+# The four beats in one command: collect -> publish (staging into the repo
+# tree) -> verify -> commit only if the tree is actually dirty and verify
+# passes. Same philosophy as sync.sh: publish never runs alone without a
+# human able to `git status`/`git diff` before anything is committed --
+# --commit is opt-in, everything else always leaves the tree for review.
+cmd_sync() {
+    local repo="${OMABACKUP_REPO:-}"
+    [[ -n "$repo" && -d "$repo/.git" ]] || die "OMABACKUP_REPO must point at a git repo (got: ${repo:-unset})"
+
+    JSON=0 cmd_collect >/dev/null
+    local n; n="$(publish_staging "$STAGING" "$repo")"
+    printf '  %spublished%s %d files into %s
+' "$GREEN" "$NC" "$n" "$(_tilde "$repo")"
+
+    local dirty; dirty="$(git -C "$repo" status --porcelain)"
+    if [[ -z "$dirty" ]]; then
+        printf '  %sup to date%s -- nothing changed since the last sync
+' "$DIM" "$NC"
+        return 0
+    fi
+
+    printf '
+%s
+' "$dirty" | sed 's/^/  /'
+
+    if [[ "${1:-}" != "--commit" ]]; then
+        printf '
+  review with %sgit -C %s status%s / %sdiff%s, then rerun with --commit
+'             "$CYAN" "$(_tilde "$repo")" "$NC" "$CYAN" "$NC"
+        return 0
+    fi
+
+    if ! JSON=0 cmd_verify >/dev/null; then
+        printf '%somabackup: verify failed, not committing%s
+' "$RED" "$NC" >&2
+        JSON=0 cmd_verify
+        return 1
+    fi
+
+    git -C "$repo" add -A
+    git -C "$repo" commit -q -m "omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)"
+    printf '  %scommitted%s
+' "$GREEN" "$NC"
+}
+
 cmd_status() {
     local ov oc om; IFS=$'\t' read -r ov oc om <<<"$(omarchy_identity)"
     if (( JSON )); then
@@ -346,6 +418,7 @@ cmd_status() {
 # ── entry point ──────────────────────────────────────────────────────────────
 source "$OMABACKUP_ROOT/lib/probes.sh"
 source "$OMABACKUP_ROOT/lib/plugin-capture.sh"
+source "$OMABACKUP_ROOT/lib/publish.sh"
 
 CMD="${1:-}"; shift || true
 while (($#)); do
@@ -362,6 +435,7 @@ done
 case "$CMD" in
     verify)  cmd_verify ;;
     collect) cmd_collect ;;
+    sync)    cmd_sync "${1:-}" ;;
     status)  cmd_status ;;
     ""|help)
         cat <<'USAGE'

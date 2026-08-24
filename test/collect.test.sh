@@ -11,6 +11,35 @@ _env() {  # _env <home> <groups> <cmd...>
         XDG_RUNTIME_DIR=/nonexistent "$OB" "$@" 2>&1
 }
 
+# -- tracked-only is per-path, not per-group -------------------------------------
+H="$(mktemp -d)"; G="$H/g.json"; R="$H/repo"
+mkdir -p "$R/dotfiles/.local-share-applications" "$H/.local/share/applications" "$H/.config"
+printf 'seen\n' >"$R/dotfiles/.local-share-applications/kept.desktop"
+printf 'kept\n'  >"$H/.local/share/applications/kept.desktop"
+printf 'new\n'   >"$H/.local/share/applications/never-tracked.desktop"
+printf 'icon\n'  >"$H/.local/share/applications/icon.png"
+printf 'x=y\n'   >"$H/.config/mimeapps.list"
+cat >"$G" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"desktop","label":"Desktop","mode":"copy","coupled":false,"critical":false,
+  "paths":[{"live":"~/.local/share/applications","trackedRepoPath":"dotfiles/.local-share-applications"},
+           "~/.config/mimeapps.list"]}]}
+JSON
+OMABACKUP_REPO="$R" _env "$H" "$G" collect >/dev/null
+ST="$H/.state/staging"
+
+it "a tracked-only path only stages what the repo already tracks"
+assert_contains "$(cat "$ST/.local/share/applications/kept.desktop" 2>/dev/null)" "kept"
+
+it "a tracked-only path never stages a name the repo never tracked"
+[[ ! -e "$ST/.local/share/applications/never-tracked.desktop" ]] && ok || fail "an untracked desktop entry was staged"
+
+it "a tracked-only path never stages an unrelated file type"
+[[ ! -e "$ST/.local/share/applications/icon.png" ]] && ok || fail "a non-desktop file was staged"
+
+it "a sibling plain-file path in the same group still copies normally"
+assert_contains "$(cat "$ST/.config/mimeapps.list" 2>/dev/null)" "x=y"
+
 # -- exclude is honored -----------------------------------------------------------
 H="$(mktemp -d)"; G="$H/g.json"
 mkdir -p "$H/.config/app/node_modules/pacote" "$H/.config/app/src"
@@ -81,3 +110,26 @@ cat >"$G" <<'JSON'
 JSON
 it "an unknown mode aborts collect"
 assert_contains "$(_env "$H" "$G" collect)" "telepathy"
+
+# -- staging never accumulates stale content --------------------------------------
+# A path a group used to declare, or a trackedOnly name that stopped matching,
+# must not survive into the next collect: staging mirrors "right now", it is
+# not an accumulating cache.
+H="$(mktemp -d)"; G="$H/g.json"
+mkdir -p "$H/.config/app"
+printf 'x\n' >"$H/.config/app/keep.txt"
+cat >"$G" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/app"]}]}
+JSON
+_env "$H" "$G" collect >/dev/null
+mkdir -p "$H/.state/staging/.config/leftover"
+printf 'stale\n' >"$H/.state/staging/.config/leftover/ghost.txt"
+_env "$H" "$G" collect >/dev/null
+
+it "a second collect wipes what an earlier run staged and no longer applies"
+[[ ! -e "$H/.state/staging/.config/leftover" ]] && ok || fail "stale staging content survived a fresh collect"
+
+it "a second collect still restages what is actually declared"
+assert_contains "$(cat "$H/.state/staging/.config/app/keep.txt" 2>/dev/null)" "x"

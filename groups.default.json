@@ -125,7 +125,10 @@
       "coupled": false,
       "critical": false,
       "paths": [
-        "~/.local/share/applications",
+        {
+          "live": "~/.local/share/applications",
+          "trackedRepoPath": "dotfiles/.local-share-applications"
+        },
         "~/.config/mimeapps.list",
         "~/.config/user-dirs.dirs"
       ]
@@ -137,10 +140,15 @@
       "coupled": false,
       "critical": false,
       "paths": [
-        "~/.local/bin",
-        "~/bin"
-      ],
-      "trackedOnly": true
+        {
+          "live": "~/.local/bin",
+          "trackedRepoPath": "scripts/local-bin"
+        },
+        {
+          "live": "~/bin",
+          "trackedRepoPath": "scripts/bin"
+        }
+      ]
     },
     {
       "id": "packages",

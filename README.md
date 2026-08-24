@@ -71,9 +71,10 @@ alongside. A checker born with a dozen warnings teaches you to ignore it.
 
 ## Design
 
-The design, the review that knocked it down twice, and the decisions that came
-out of it are in [`docs/DESIGN.md`](docs/DESIGN.md). The incident that started
-it all is in [`docs/CONTEXT.md`](docs/CONTEXT.md).
+[`docs/PLAN.md`](docs/PLAN.md) is the living status: where things stand, what's
+next, what a fresh session needs to know. [`docs/DESIGN.md`](docs/DESIGN.md) is
+the architecture and the review that reshaped it twice. [`docs/CONTEXT.md`](docs/CONTEXT.md)
+is the incident that started it all.
 
 ## License
 
