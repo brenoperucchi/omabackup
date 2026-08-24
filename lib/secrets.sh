@@ -97,6 +97,20 @@ scan_secrets() {
     local -a revs=()
     mapfile -t revs <<<"$revlist"
 
+    # Read with its status checked, and refused when it yields nothing. jq used to
+    # run inside a process substitution, so an unreadable deny-list produced zero
+    # patterns, the loop never ran, and the function returned success -- a clean
+    # bill of health from a rule set it could not read. cmd_push validates first,
+    # but a scanner must not depend on its caller having been careful.
+    local patterns
+    patterns="$(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' \
+                "$file" 2>/dev/null)" || return 1
+    if [[ -z "$patterns" ]]; then
+        printf '%somabackup: the deny-list yielded no patterns -- refusing to call this clean%s\n' \
+            "$RED" "$NC" >&2
+        return 1
+    fi
+
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
         # Per pattern, not globally: `git grep -E` is POSIX ERE with no inline
@@ -118,7 +132,22 @@ scan_secrets() {
             _still_matches "$hit" "$re" "$ci" || continue
             printf '%s\t%s\n' "$id" "$hit"
         done <<<"$out"
-    done < <(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' "$file" 2>/dev/null)
+
+        # `git grep <rev>` reads the tree at that commit and nothing else, but
+        # `git bundle --all` packs the commit objects and the annotated tag
+        # objects too -- so a token pasted into a commit message shipped and
+        # scanned clean. Messages and tag bodies are text that leaves the
+        # machine; they get the same patterns.
+        local msgs
+        msgs="$(git -C "$repo" log --format='%H%n%B' --all 2>/dev/null
+                git -C "$repo" for-each-ref --format='%(refname) %(contents)' refs/tags 2>/dev/null)"
+        while IFS= read -r hit; do
+            [[ -n "$hit" ]] || continue
+            _still_matches "$hit" "$re" "$ci" || continue
+            printf '%s\tcommit-message: %s\n' "$id" "$hit"
+        done < <(if [[ "$ci" == true ]]; then printf '%s' "$msgs" | grep -iE -e "$re"
+                 else printf '%s' "$msgs" | grep -E -e "$re"; fi)
+    done <<<"$patterns"
     return $rc
 }
 

@@ -233,3 +233,46 @@ YR="$(mktemp -d)/repo"; git init -q "$YR"
 it "a repository with no commits scans clean without an error"
 scan_secrets "$YR" "$PWD/secrets.deny.json" >/dev/null 2>&1 \
     && ok || fail "an empty repo was treated as a scan failure"
+
+# ── a commit message is content too ────────────────────────────────────────
+# `git grep <rev>` searches the tree at that commit. It does not read the commit
+# message, or an annotated tag's own object -- and `git bundle --all` packs both.
+# A token pasted into a commit message shipped and scanned clean. Found by
+# review, not by me: I had reasoned about which commits to scan and never about
+# which parts of one.
+MR="$(mktemp -d)/repo"; mkdir -p "$MR"; git init -q "$MR"
+git -C "$MR" config user.email t@t; git -C "$MR" config user.name t
+printf 'ok\n' >"$MR/f.txt"; git -C "$MR" add -A
+git -C "$MR" commit -q -m "fix: with token ghp_016C7869C1D4C2E7B0F9A2B3D4E5F60718293A4B"
+
+it "a secret in a commit message is found"
+[[ -n "$(scan_secrets "$MR" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "commit messages are packed by git bundle and were never read"
+
+it "and one in an annotated tag is found too"
+TR="$(mktemp -d)/repo"; mkdir -p "$TR"; git init -q "$TR"
+git -C "$TR" config user.email t@t; git -C "$TR" config user.name t
+printf 'ok\n' >"$TR/f.txt"; git -C "$TR" add -A; git -C "$TR" commit -qm clean
+git -C "$TR" tag -a v1 -m "release, key AKIAIOSFODNN7EXAMPLE"
+[[ -n "$(scan_secrets "$TR" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "an annotated tag object is packed and was never read"
+
+# ── a deny-list that yields no patterns is not a clean bill of health ──────
+# jq ran inside a process substitution, so an unreadable deny-list produced zero
+# patterns, the loop never ran, and the function returned success. cmd_push
+# happens to validate first, but the scanner must not depend on its caller
+# having been careful.
+NR="$(mktemp -d)/repo"; mkdir -p "$NR"; git init -q "$NR"
+git -C "$NR" config user.email t@t; git -C "$NR" config user.name t
+printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\n' >"$NR/leak"
+git -C "$NR" add -A && git -C "$NR" commit -qm x
+BADF="$(mktemp)"; printf '{"patterns": [BROKEN\n' >"$BADF"
+
+it "an unreadable deny-list makes the scan fail, not pass"
+scan_secrets "$NR" "$BADF" >/dev/null 2>&1 \
+    && fail "zero patterns read reported as clean, over a real private key" || ok
+
+it "and a deny-list with no patterns at all is refused rather than trusted"
+EMPTYF="$(mktemp)"; printf '{"schemaVersion":1,"patterns":[],"exceptions":[]}\n' >"$EMPTYF"
+scan_secrets "$NR" "$EMPTYF" >/dev/null 2>&1 \
+    && fail "an empty rule set scanned clean" || ok
