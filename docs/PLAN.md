@@ -18,7 +18,7 @@ Last updated: 2026-08-24.
 |---|-------|--------|
 | 0 | Fix `sync.sh`'s plugin-capture bugs in `omarchy-personal` (regression specs first) | **done** |
 | 1 | `omabackup` repo created; group manifest; `collect`; `verify` (T1 coverage) | **done** |
-| 2 | Normalized diff, `sync` (collect → publish → verify → commit), destinations, systemd timer | **in progress** |
+| 2 | Normalized diff, `sync` (collect → publish → verify → commit), destinations, systemd timer | **done** |
 | 3 | T3 — fast syntax/parse check in a disposable container | not started |
 | 4 | `restore` with the version-coupling quarantine (§12.2 of DESIGN.md) | not started |
 | 5 | QML plugin (`Panel.qml`) reading `verify --json` | **done**, installed live |
@@ -39,8 +39,8 @@ proved the isolated test harness actually isolates.
 - **`~/Devs/omabackup`** (this repo) — public, GitHub, code only: the CLI, the
   QML plugin, the group manifest, the docs. `git log`: `626a40d` → `2cf9bd1` →
   `f4f3466` → `3c705d5` → `d7f63dc` → `6713239` → `741be00` → `8a329fa` →
-  `e6db1c1` → `fe103e6` → `6aa8008` → `81eb7c2` → `ab5d352` → `acc9c17`, all
-  pushed. 134 specs.
+  `e6db1c1` → … → `acc9c17` → `30532dd` → `d5e9751` → `58e3bbb` → `bedeea1` →
+  `f0732db` → `b3e29d3` → `ed08571`, all pushed. 169 specs.
 - **`~/Devs/omarchy-personal`** — private, GitHub, the user's actual dotfiles.
   This is `OMABACKUP_REPO`: where `sync` publishes staged content. It is NOT
   where OmaBackup's own code lives — never put backup *data* in the public
@@ -245,23 +245,40 @@ cheap and disposable, not worth version-controlling.
 
 ---
 
+### It runs by itself now
+
+Both timers are live on this machine: `omabackup-sync` every 15 min
+(`sync --commit`), `omabackup-push` hourly. Installed with `omabackup install`,
+which is the one manual step that exists and cannot be removed — `omarchy plugin
+add` runs no hook from a plugin, deliberately, so the timers can never install
+themselves. Which is exactly why *not* being scheduled is a reported state:
+`verify` warns `nothing is scheduled to run the backup` and `status --json`
+carries `.scheduler.active`. A backup nothing runs is a backup that does not
+happen, and that must never be silent.
+
+Measuring to pick the interval paid for itself twice: `sync` took **33.6s**,
+of which publish was 27 — one `rsync` spawn per staged file, ~44ms each against
+`cp`'s 0.5ms. Now 4.3s. And the same measurement exposed that publish walked
+staging with `find -type f`, which excludes symlinks, so every staged link had
+been dropped in silence since the beginning.
+
 ## Immediate next actions
 
-1. **Configure a real `dir` destination**, once the user names an actual path
-   (external disk, NAS mount, a Drive folder synced by something else) —
-   nothing is written to `~/.config/omabackup/destinations.json` yet, on
-   purpose: there is no path to point it at that wasn't invented.
-2. **Removable-drive trigger.** A udev rule that calls `omabackup push <id>`
-   when a `dir` destination's mount point appears (DESIGN.md §4.4). Not a new
-   destination type — see above.
-3. Write the systemd user units + timers: `omabackup-sync.timer` (frequent,
-   calls `sync --commit`) and `omabackup-push.timer` (hourly/daily, calls
-   `push`), kept separate on purpose — a dead NAS turning `push` red must not
-   read as the coverage timer failing (DESIGN.md §11.2: the timer is primary,
-   the plugin is just its face).
-4. Only after 1–3: expand `Panel.qml`'s UI to show destinations and the
-   schedule, since there would finally be real data for those views to show —
-   `status --json` already carries a `destinations` array for it to read.
+1. **The secret scanner (DESIGN.md §6).** Agreed as defence in depth rather
+   than a gate, but it is now the only thing between an unattended hourly push
+   and a credential that lands in a config file. The `secrets` group is
+   `enabled: false`, so nothing collects credentials on purpose — the risk is a
+   token pasted into something already covered.
+2. **Configure a real `dir` destination**, once there is an actual path to name
+   (external disk, NAS mount, a Drive folder synced by something else).
+   `~/.config/omabackup/destinations.json` is deliberately still absent: there
+   is no path to point it at that would not be invented. `github` works and
+   runs hourly meanwhile.
+3. **Removable-drive trigger.** A udev rule calling `omabackup push <id>` when a
+   `dir` destination's mount point appears (DESIGN.md §4.4). Not a new
+   destination type.
+4. Expand `Panel.qml` to show destinations and the schedule — `status --json`
+   already carries both `destinations` and `scheduler` for it to read.
 
 ## Open questions for the user, not yet decided
 
