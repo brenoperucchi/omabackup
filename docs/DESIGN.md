@@ -33,7 +33,7 @@ to run all the time.
 ```
 ┌─ omabackup (bash CLI, ~/.local/bin) ─────────────────────┐
 │  collect · classify · scan-secrets · verify · pack       │
-│  push (git | rclone | dir | removable) · restore         │
+│  push (github | dir) · restore                           │
 │  every subcommand accepts --json                         │
 └──────────────────────────▲───────────────────────────────┘
                            │ Quickshell.Io.Process (JSON on stdout)
@@ -110,14 +110,29 @@ three divergent formats to reconcile later.
 | destination | mechanism | retention | note |
 |-------------|-----------|-----------|------|
 | `github` | `git commit` + `push` | git history | default; diff and blame for free |
-| `gdrive` | `rclone copy` to a remote | last N | the `GoogleDrive:` remote is **already configured** on this machine |
-| `dir` | `cp` to a path (NAS, disk) | last N | |
-| `removable` | same as `dir`, triggered by a mount | last N | matched by UUID; "waiting for the drive" badge |
+| `dir` | `cp` to a path | last N | any filesystem path — NAS, external disk, pendrive, a Drive/Dropbox sync folder someone else's daemon maintains |
+
+**Deliberately no API-backed destination (no `rclone`, no cloud SDK).** Where a
+backup ends up beyond git — a pendrive, an external SSD, a NAS mount, a Google
+Drive folder synced by `rclone mount` or the vendor's own desktop client — is
+not this tool's decision to make, and the storage landscape is too wide to
+chase: this project cannot become the thing that maintains N cloud-provider
+integrations. What every one of those has in common is that the OS already
+presents them as a path. `dir` is the one destination type, and it is enough:
+OmaBackup writes bytes to a path over the filesystem, exactly once, the same
+way for a pendrive as for a synced cloud folder — never over a network API.
+Revisit only if a real gap shows up in practice; a dedicated destination type
+is not worth building ahead of that need.
+
+A removable drive is not a separate destination type — it is a `dir`
+destination whose `path` happens to be a mount point, triggered by udev instead
+of by the timer (§4) when that mount appears. Same driver, same retention,
+same state file; only the trigger differs.
 
 The bundle is `omabackup-<host>-<YYYYMMDD-HHMMSS>.tar.zst`, containing a
 `git bundle` of the repo (full history, clonable) plus the worktree in the clear
-(readable without git) plus a `manifest.json` with versions, groups and the
-verification result.
+(readable without git) plus the tool itself plus a `manifest.json` with
+versions, groups and the verification result.
 
 Each destination records: enabled, last success, last error, backoff.
 
@@ -142,7 +157,8 @@ Triggers beyond the timer, in order of value:
    highest risk is the moment of lowest attention).
 2. **After a plugin mutation** — following `omarchy plugin add/update/remove`.
 3. **On suspend/shutdown** — optional.
-4. **When the configured removable drive is mounted.**
+4. **When a `dir` destination's path is a mount point and that mount appears**
+   (udev). Not a distinct destination type — see §3.
 
 Exponential backoff per destination on failure. The badge does not clear itself:
 a stale backup stays visible until it is dealt with.
@@ -401,11 +417,21 @@ repo**. Which means Google Drive is only reachable once you already have the
 repo from GitHub. If GitHub is what you lost, the credential for fetching the
 Drive bundle is inside the Drive bundle.
 
+*(§3 later dropped the API-backed `gdrive` destination entirely — every
+non-`github` destination is a plain filesystem path now, so this specific
+credential loop does not apply to OmaBackup's own destinations. Recorded here
+as the reasoning that produced the "restorable from its own identifier alone"
+requirement below, which still holds regardless of mechanism.)*
+
 Consequence for §3: each destination must be **restorable from its own
-identifier alone**, and T3 must exercise a different destination each round
-(even = local bundle, odd = clone from the remote), requiring all of them to
-have passed within the last N days before the panel goes green. A path that is
-not exercised does not work.
+identifier alone**. For `dir`, that already holds — the bundle in §11.4's
+sense needs nothing but itself (§bundle: it carries the tool, the history and
+the readable content together, and checks its own restorability on write). For
+`github`, restoring means having a GitHub credential, which is exactly the kind
+of external dependency `dir` was chosen to avoid. T3 should still exercise both
+paths periodically (even = local bundle from a destination, odd = clone from
+GitHub), requiring both to have passed within the last N days before the panel
+goes green. A path that is not exercised does not work.
 
 Related: the `secrets` group uses `age -p` (an interactive passphrase,
 `secrets/README.md:13`). No timer can refresh it. Either it becomes

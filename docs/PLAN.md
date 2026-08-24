@@ -37,7 +37,8 @@ proved the isolated test harness actually isolates.
 - **`~/Devs/omabackup`** (this repo) — public, GitHub, code only: the CLI, the
   QML plugin, the group manifest, the docs. `git log`: `626a40d` → `2cf9bd1` →
   `f4f3466` → `3c705d5` → `d7f63dc` → `6713239` → `741be00` → `8a329fa` →
-  `e6db1c1` → `fe103e6` → `6aa8008`, all pushed. 81 specs.
+  `e6db1c1` → `fe103e6` → `6aa8008` → `81eb7c2` → `ab5d352` → `acc9c17`, all
+  pushed. 134 specs.
 - **`~/Devs/omarchy-personal`** — private, GitHub, the user's actual dotfiles.
   This is `OMABACKUP_REPO`: where `sync` publishes staged content. It is NOT
   where OmaBackup's own code lives — never put backup *data* in the public
@@ -74,6 +75,32 @@ Two things that deliberately did *not* go in, both correct:
 - Three files under `configs/opencode/` the destination repo ignores — see
   defect 8. They are a real coverage hole, now reported as a warning on every
   sync rather than skipped in silence.
+
+### Destinations: `bundle` and `push` exist, `gdrive` was cut
+
+`ab5d352` built `omabackup bundle`: `git bundle --all HEAD` + `git archive
+HEAD` (never the working tree — measured 1.0MB against 66MB, the difference
+being untracked caches) + the tool itself + a self-sufficient `manifest.json`,
+content-addressed by HEAD, self-verified by extracting and cloning offline on
+every build. 416KB on this machine. `acc9c17` built `push`: destinations
+config outside the repo (`~/.config/omabackup/destinations.json`, machine
+identity, not project data), per-destination state with epoch-based backoff,
+five-rule retention (the sharpest one: refuses to prune any directory missing
+an `.omabackup-destination` stamp), and — the gap that mattered most — an
+actual `git push`. There had never been one; every push this project made,
+including several in this session, was typed by hand.
+
+**`gdrive` as an API-backed destination was cut, not deferred.** DESIGN.md §3
+originally listed `rclone copy` to a Drive remote as its own destination type.
+Decided against: which storage a backup ends up on beyond git — pendrive,
+external disk, NAS, a Drive/Dropbox folder someone else's daemon syncs — is not
+this tool's decision to make, and chasing every cloud provider's API is not a
+fight worth having. The OS already presents all of those as a path. `dir` is
+the one destination type, and it is enough: `push` writes bytes to a path over
+the filesystem, the same way regardless of what is mounted there, never over a
+network API. A "removable drive" trigger is not a new type either — it is a
+`dir` destination whose path is a mount point, fired by udev instead of the
+timer. DESIGN.md §1, §3, §4 and §11.4 updated to match.
 
 ### What the reviews found (read before touching `sync`)
 
@@ -218,29 +245,29 @@ cheap and disposable, not worth version-controlling.
 
 ## Immediate next actions
 
-1. **Reinstall the live plugin.** `~/.config/omarchy/plugins/brenoperucchi.omabackup`
-   is a clone pinned at `3c705d5` — five commits behind, so the bar is running
-   the CLI from before every fix above. `git -C ... pull` is enough. That pin is
-   also what `lists/omarchy-plugins.txt` recorded in `2d8e526`, so the next sync
-   after reinstalling will correctly update it.
-2. Add the other destinations from DESIGN.md §3 (`rclone` for Drive, a plain
-   directory, a removable-drive watcher) — `github` (the git commit itself)
-   is the only one that exists so far.
-3. Write the systemd user unit + timer that calls `omabackup sync --commit`
-   on a schedule, replacing the QML `Timer`'s role as anything more than a
-   cheap read-only `verify` poll (DESIGN.md §11.2: the timer must be primary,
-   the plugin is just its face). `sync` now exits non-zero on broken coverage,
-   so the unit fails visibly instead of reporting a green backup.
+1. **Configure a real `dir` destination**, once the user names an actual path
+   (external disk, NAS mount, a Drive folder synced by something else) —
+   nothing is written to `~/.config/omabackup/destinations.json` yet, on
+   purpose: there is no path to point it at that wasn't invented.
+2. **Removable-drive trigger.** A udev rule that calls `omabackup push <id>`
+   when a `dir` destination's mount point appears (DESIGN.md §4.4). Not a new
+   destination type — see above.
+3. Write the systemd user units + timers: `omabackup-sync.timer` (frequent,
+   calls `sync --commit`) and `omabackup-push.timer` (hourly/daily, calls
+   `push`), kept separate on purpose — a dead NAS turning `push` red must not
+   read as the coverage timer failing (DESIGN.md §11.2: the timer is primary,
+   the plugin is just its face).
 4. Only after 1–3: expand `Panel.qml`'s UI to show destinations and the
-   schedule, since there would finally be real data for those views to show.
+   schedule, since there would finally be real data for those views to show —
+   `status --json` already carries a `destinations` array for it to read.
 
 ## Open questions for the user, not yet decided
 
-- Which of the four destinations (github/gdrive/dir/removable) beyond GitHub
-  should actually be wired up first?
+- What path should the first `dir` destination actually point at?
 - Should the systemd timer auto-commit (`sync --commit` unattended) or only
   auto-collect-and-diff, leaving commit to a manual action/keypress until
-  there is more trust in the pipeline?
+  there is more trust in the pipeline? Same question now applies to `push`
+  separately, since it runs on its own timer.
 - `omabackup`'s two oldest commit messages are in Portuguese (the rest of the
   repo was translated retroactively). Rewriting history is now a worse deal
   than it was: the installed plugin is a clone of this branch and pulls from
