@@ -36,7 +36,8 @@ proved the isolated test harness actually isolates.
 
 - **`~/Devs/omabackup`** (this repo) — public, GitHub, code only: the CLI, the
   QML plugin, the group manifest, the docs. `git log`: `626a40d` → `2cf9bd1` →
-  `f4f3466` → `3c705d5`, all pushed.
+  `f4f3466` → `3c705d5` → `d7f63dc` → `6713239` → `741be00` → `8a329fa` →
+  `e6db1c1`, all pushed. 67 specs.
 - **`~/Devs/omarchy-personal`** — private, GitHub, the user's actual dotfiles.
   This is `OMABACKUP_REPO`: where `sync` publishes staged content. It is NOT
   where OmaBackup's own code lives — never put backup *data* in the public
@@ -44,34 +45,46 @@ proved the isolated test harness actually isolates.
 
 ### Stage 2 is committed, then corrected
 
-`d7f63dc` landed the stage-2 work. A review of that commit (Codex via the agent
-relay, then verified line by line here) found six defects in it, fixed across
-two commits: `6713239` (collect/publish) and the one that follows it (the sync
-flow). 59 specs pass. See "What the review found" below — the short version is
+`d7f63dc` landed the stage-2 work. Reviewing that commit — Codex via the agent
+relay, then verified line by line and reproduced here — found **eight** defects
+in it, fixed across four commits: `6713239` (collect/publish), `741be00` (the
+sync flow), `8a329fa` (the excluded list), `e6db1c1` (paths the destination repo
+ignores). 67 specs pass. See "What the review found" below; the short version is
 that `d7f63dc`'s own commit message described a flow that could not execute.
 
-### Pending in `omarchy-personal` — regenerate it, do not review it as it stands
+### The first real `sync --commit` has happened
 
-Running `OMABACKUP_REPO=~/Devs/omarchy-personal ./bin/omabackup sync` (no
-`--commit`) has already written into that repo's working tree: 13 modified
-files, nothing untracked. **Nobody has run `--commit` yet** — nobody *could*,
-which is defect 1 below.
+`omarchy-personal` is at `2d8e526 omabackup: sync 2026-08-24 13:29 UTC`, pushed,
+working tree clean. 12 files: shell.json (the bar widget from stage 5), the
+package and systemd lists, the plugin manifest, and four JSON files whose only
+change is `jq -S` key order — a one-time cost, since both sides are normalized
+from here on.
 
-That working tree was written by the buggy `publish`, so **do not review it as
-the tool's output**. It is missing the entire `scripts` group (defect 2), and
-anything it pulled in through a tracked-only path was decided by directory
-listing rather than the git index (defect 6). Re-run `sync` with the corrected
-code first, then review the diff that produces. Get an explicit go-ahead before
-the first real `--commit` through this tool; after that first one, later runs
-are just normal `sync.sh`-style updates and don't need the same ceremony.
+**The ceremony is over.** Later runs are ordinary `sync.sh`-style updates and do
+not need a human gate the way that first one did.
+
+Two things that deliberately did *not* go in, both correct:
+
+- `configs/nvim/lazy-lock.json` — the manifest excludes it, and as of `8a329fa`
+  the exclusion actually works. It is still *tracked* in `omarchy-personal` from
+  the sync.sh era, so it sits frozen at its old committed state. Open question:
+  `git rm --cached` it, or leave the stale snapshot?
+- Three files under `configs/opencode/` the destination repo ignores — see
+  defect 8. They are a real coverage hole, now reported as a warning on every
+  sync rather than skipped in silence.
 
 ### What the review of `d7f63dc` found (read before touching `sync`)
 
-Six defects, all reproduced before being fixed, all now covered by specs. The
+Eight defects, all reproduced before being fixed, all now covered by specs. The
 lesson worth carrying: the suite was **40/40 green** the whole time, because it
 exercised `publish_staging` as a shell function and never the command a human
 types. `test/sync.test.sh` exists so that cannot happen again — every spec in
 it drives the CLI the way the systemd timer will.
+
+Defects 7 and 8 were not in the original review. They surfaced *because* of the
+first six fixes — 7 from actually reading the diff the corrected tool produced,
+8 from defect 5's error checking turning a two-year silence into a hard stop on
+the first real `--commit`. Fixing a silent failure is how you find the next one.
 
 1. **`--commit` was unreachable, twice over.** The global flag loop killed it
    as an unknown flag; and even past that, the loop `shift`ed every argument
@@ -101,6 +114,24 @@ it drives the CLI the way the systemd timer will.
    Junk in the repo directory pulled its live counterpart in and then
    perpetuated itself. It asks `git ls-files` now, and refuses to guess outside
    a git worktree rather than falling back to the listing.
+7. **The manifest-wide `excluded` list never reached rsync.** Its entries are
+   full paths (`~/.config/nvim/lazy-lock.json`) and were handed over with only
+   the leading `~/` stripped — but rsync matches against the transfer root, so
+   under a root of `~/.config/nvim` the pattern `.config/nvim/lazy-lock.json`
+   matched nothing. The file the manifest calls "constant diff noise" was backed
+   up on every run. A group's own relative `exclude` patterns always worked,
+   which is why this hid. Patterns are now built per path, relative to the root
+   and anchored.
+8. **A path the destination repo ignores was silently never stored.**
+   `git add -A` skipped ignored paths without a word. On this machine that is
+   three files under `configs/opencode/` — and the loop is worth remembering:
+   `~/.config/opencode/.gitignore` is itself backed up, landing inside the
+   dotfiles repo where its rules then ignore its own siblings, including the
+   copy of itself. Backing the file up is what stops it being stored. They are
+   now dropped from the commit *and reported*, never `git add -f`: the
+   .gitignore is the user's, and a backup tool does not overrule it. Files the
+   repo already tracks are exempt, since ignore rules do not apply to them —
+   there is a spec for that specifically.
 
 ### Bugs found and fixed in the stage-2 pass itself (read before touching `publish_staging`)
 
@@ -153,10 +184,11 @@ cheap and disposable, not worth version-controlling.
 
 ## Immediate next actions
 
-1. Re-run `sync` against `~/Devs/omarchy-personal` with the corrected code and
-   review the diff it produces — the working tree there right now is the buggy
-   publish's output, not the tool's. Then get the user's go-ahead, run
-   `sync --commit` (which finally works), confirm the commit and push.
+1. **Reinstall the live plugin.** `~/.config/omarchy/plugins/brenoperucchi.omabackup`
+   is a clone pinned at `3c705d5` — five commits behind, so the bar is running
+   the CLI from before every fix above. `git -C ... pull` is enough. That pin is
+   also what `lists/omarchy-plugins.txt` recorded in `2d8e526`, so the next sync
+   after reinstalling will correctly update it.
 2. Add the other destinations from DESIGN.md §3 (`rclone` for Drive, a plain
    directory, a removable-drive watcher) — `github` (the git commit itself)
    is the only one that exists so far.
@@ -176,5 +208,13 @@ cheap and disposable, not worth version-controlling.
   auto-collect-and-diff, leaving commit to a manual action/keypress until
   there is more trust in the pipeline?
 - `omabackup`'s two oldest commit messages are in Portuguese (the rest of the
-  repo was translated retroactively). Rewrite history (force-push, low risk
-  this early) or leave them as a record of how the project started?
+  repo was translated retroactively). Rewriting history is now a worse deal
+  than it was: the installed plugin is a clone of this branch and pulls from
+  it, so a force-push breaks it for zero gain. Leaning toward leaving them as a
+  record of how the project started.
+- `configs/nvim/lazy-lock.json` is excluded by the manifest but still tracked
+  in `omarchy-personal` from the sync.sh era, frozen at a stale state.
+  `git rm --cached` it, or keep the old snapshot?
+- The three `configs/opencode/` files the repo ignores: adjust that
+  `.gitignore` so the backup can store them, accept the hole and let the
+  warning stand, or declare them excluded so the warning stops being noise?
