@@ -301,8 +301,11 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(360))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(520))
+    // Sized against omarchy's own info panel, which is the house reference for
+    // a panel with this much to say: it uses 430 wide and 560 tall. A little
+    // wider here because the group list runs in two columns.
+    contentWidth: panel.fittedContentWidth(Style.space(470))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -415,16 +418,25 @@ Panel {
             font.pixelSize: Style.font.caption
           }
 
-          Repeater {
-            model: root.groups
-            Row {
-              required property var modelData
-              width: column.width
-              spacing: Style.space(2)
+          // Two columns: eleven groups in one made the panel a scroll with
+          // nothing else visible at once, which defeats a panel whose job is
+          // showing several answers side by side.
+          Grid {
+            id: groupGrid
+            width: column.width
+            columns: 2
+            columnSpacing: Style.space(10)
+            rowSpacing: Style.space(6)
+            readonly property real cellWidth:
+              (width - columnSpacing) / 2
 
+            Repeater {
+              model: root.groups
               Column {
-                width: parent.width - modeBadge.width - Style.space(2)
+                required property var modelData
+                width: groupGrid.cellWidth
                 spacing: Style.space(1)
+
                 Text {
                   width: parent.width
                   text: modelData.label || modelData.id || ""
@@ -435,25 +447,29 @@ Panel {
                 }
                 Text {
                   width: parent.width
+                  // Mode rides with the detail rather than sitting in its own
+                  // column: half the width is not enough for a right-aligned
+                  // badge without crowding the count it sits beside.
                   text: root.groupDetail(modelData)
-                        // Coupling decides whether a restore is allowed onto a
-                        // different Omarchy at all (DESIGN.md §12.2), so it
-                        // belongs next to the group, not in a footnote.
-                        + (modelData.coupled ? "  ·  tied to this Omarchy version" : "")
+                        + (modelData.mode ? "  ·  " + modelData.mode : "")
                   color: (typeof modelData.files === "number" && modelData.files === 0)
                          ? Color.accent : Color.muted
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
-                  wrapMode: Text.WordWrap
+                  elide: Text.ElideRight
                 }
-              }
-
-              Text {
-                id: modeBadge
-                text: modelData.mode || ""
-                color: Color.muted
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
+                Text {
+                  // Coupling decides whether a restore is permitted onto a
+                  // different Omarchy at all (DESIGN.md §12.2), so it stays
+                  // beside the group rather than in a footnote.
+                  visible: modelData.coupled === true
+                  width: parent.width
+                  text: "tied to this Omarchy version"
+                  color: Color.muted
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
               }
             }
           }
