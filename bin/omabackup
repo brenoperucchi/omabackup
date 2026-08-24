@@ -392,43 +392,72 @@ collect_generated() {
 # human able to `git status`/`git diff` before anything is committed --
 # --commit is opt-in, everything else always leaves the tree for review.
 cmd_sync() {
-    local repo="${OMABACKUP_REPO:-}"
+    local repo="${OMABACKUP_REPO:-}" commit=0
+    # sync owns --commit. A global flag loop would have to know every
+    # subcommand's vocabulary, and would then accept --commit in silence from
+    # `verify` and `status`; restore's --target/--dry-run will want the same.
+    while (($#)); do
+        case "$1" in
+            --commit) commit=1; shift ;;
+            *) die "unknown flag for sync: $1" ;;
+        esac
+    done
     [[ -n "$repo" && -d "$repo/.git" ]] || die "OMABACKUP_REPO must point at a git repo (got: ${repo:-unset})"
 
     JSON=0 cmd_collect >/dev/null
-    local n; n="$(publish_staging "$STAGING" "$repo" "$(tracked_path_map)")"
-    printf '  %spublished%s %d files into %s
-' "$GREEN" "$NC" "$n" "$(_tilde "$repo")"
+    local list="$OMABACKUP_STATE/last-publish"
+    local n; n="$(publish_staging "$STAGING" "$repo" "$(tracked_path_map)" "$list")"
+    printf '  %spublished%s %d files into %s\n\n' "$GREEN" "$NC" "$n" "$(_tilde "$repo")"
 
-    local dirty; dirty="$(git -C "$repo" status --porcelain)"
-    if [[ -z "$dirty" ]]; then
-        printf '  %sup to date%s -- nothing changed since the last sync
-' "$DIM" "$NC"
-        return 0
-    fi
+    # Verify runs on every sync, once, before any decision about committing.
+    # The incident this tool exists for is "nothing changed and the coverage
+    # broke" (docs/CONTEXT.md), so returning early on a clean tree without
+    # checking is precisely the failure being guarded against -- and the timer
+    # (docs/DESIGN.md §11.2) runs with no audience, so broken coverage has to
+    # become a failed unit rather than a green backup nobody reads. It runs
+    # after publish, never before: the prescribed repair for a link that
+    # stopped feeding the repo is to copy the live file in and relink, so
+    # blocking publish would block the fix.
+    local verified=1
+    JSON=0 cmd_verify || verified=0
 
-    printf '
-%s
-' "$dirty" | sed 's/^/  /'
+    local -a written=()
+    [[ -s "$list" ]] && mapfile -d '' -t written <"$list"
 
-    if [[ "${1:-}" != "--commit" ]]; then
-        printf '
-  review with %sgit -C %s status%s / %sdiff%s, then rerun with --commit
-'             "$CYAN" "$(_tilde "$repo")" "$NC" "$CYAN" "$NC"
-        return 0
-    fi
-
-    if ! JSON=0 cmd_verify >/dev/null; then
-        printf '%somabackup: verify failed, not committing%s
-' "$RED" "$NC" >&2
-        JSON=0 cmd_verify
+    if (( ! verified )); then
+        printf '\n%somabackup: coverage failed -- not committing%s\n' "$RED" "$NC" >&2
         return 1
     fi
 
-    git -C "$repo" add -A
-    git -C "$repo" commit -q -m "omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)"
-    printf '  %scommitted%s
-' "$GREEN" "$NC"
+    # Scoped to what publish just wrote: a repo-wide status reports edits the
+    # user left mid-review as though this tool had made them.
+    local dirty=""
+    (( ${#written[@]} )) && dirty="$(git -C "$repo" status --porcelain -- "${written[@]}")"
+    if [[ -z "$dirty" ]]; then
+        printf '\n  %sup to date%s -- nothing changed since the last sync\n' "$DIM" "$NC"
+        return 0
+    fi
+
+    printf '\n%s\n' "$dirty" | sed 's/^/  /'
+
+    if (( ! commit )); then
+        printf '\n  review with %sgit -C %s status%s / %sdiff%s, then rerun with --commit\n' \
+            "$CYAN" "$(_tilde "$repo")" "$NC" "$CYAN" "$NC"
+        return 0
+    fi
+
+    # Every git call is checked. The script runs under `set -uo pipefail`
+    # without -e, so an unchecked failure here fell straight through to
+    # "committed" -- the one message a backup tool must never print falsely.
+    git -C "$repo" add -- "${written[@]}" \
+        || die "git add failed in $(_tilde "$repo")"
+    if git -C "$repo" diff --cached --quiet; then
+        printf '  %sup to date%s -- nothing of ours left to commit\n' "$DIM" "$NC"
+        return 0
+    fi
+    git -C "$repo" commit -q -m "omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)" \
+        || die "git commit failed in $(_tilde "$repo")"
+    printf '  %scommitted%s\n' "$GREEN" "$NC"
 }
 
 cmd_status() {
@@ -451,23 +480,33 @@ source "$OMABACKUP_ROOT/lib/probes.sh"
 source "$OMABACKUP_ROOT/lib/plugin-capture.sh"
 source "$OMABACKUP_ROOT/lib/publish.sh"
 
+# Two levels: the loop below owns only what every command understands and
+# hands the rest, in order, to the command itself. It used to consume and shift
+# everything, which made `sync --commit` doubly impossible -- it died here as an
+# unknown flag, and even past that the shifting left $# at zero, so cmd_sync
+# was always called with an empty string and could never take the branch.
 CMD="${1:-}"; shift || true
+ARGS=()
 while (($#)); do
     case "$1" in
         --json)   JSON=1; shift ;;
         --groups) ONLY="${2:-}"; shift 2 ;;
         -h|--help) CMD=help; shift ;;
-        *) die "unknown flag: $1" ;;
+        *) ARGS+=("$1"); shift ;;
     esac
 done
+
+# A command with no flags of its own still has to refuse, or `verify --commit`
+# would look like it did something.
+reject_flags() { local c="$1"; shift; (($# == 0)) || die "unknown flag for $c: $1"; }
 
 [[ -f "$GROUPS_FILE" ]] || die "group manifest not found: $GROUPS_FILE"
 
 case "$CMD" in
-    verify)  cmd_verify ;;
-    collect) cmd_collect ;;
-    sync)    cmd_sync "${1:-}" ;;
-    status)  cmd_status ;;
+    verify)  reject_flags verify "${ARGS[@]}"; cmd_verify ;;
+    collect) reject_flags collect "${ARGS[@]}"; cmd_collect ;;
+    sync)    cmd_sync "${ARGS[@]}" ;;
+    status)  reject_flags status "${ARGS[@]}"; cmd_status ;;
     ""|help)
         cat <<'USAGE'
 omabackup <command> [--json] [--groups a,b]

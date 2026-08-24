@@ -42,31 +42,67 @@ proved the isolated test harness actually isolates.
   where OmaBackup's own code lives — never put backup *data* in the public
   repo, never put OmaBackup *code* in the private one.
 
-### Uncommitted in `omabackup` (stage 2, in progress)
+### Stage 2 is committed, then corrected
 
-```
- M bin/omabackup            cmd_sync, per-path trackedOnly, staging wipe fix
- M groups.default.json      desktop/scripts use {live, trackedRepoPath} paths
- M test/collect.test.sh     regressions for the two bugs below
-?? lib/publish.sh           staging -> repo mapping (mirrors sync.sh's layout)
-?? test/publish.test.sh     16 specs for the mapping
-```
+`d7f63dc` landed the stage-2 work. A review of that commit (Codex via the agent
+relay, then verified line by line here) found six defects in it, fixed across
+two commits: `6713239` (collect/publish) and the one that follows it (the sync
+flow). 59 specs pass. See "What the review found" below — the short version is
+that `d7f63dc`'s own commit message described a flow that could not execute.
 
-40/40 specs pass (`./test/run.sh`). Not yet committed — do that before anything
-else in the next session, referencing the two bugs this pass found (below).
-
-### Pending in `omarchy-personal` (needs a human decision, not a next step)
+### Pending in `omarchy-personal` — regenerate it, do not review it as it stands
 
 Running `OMABACKUP_REPO=~/Devs/omarchy-personal ./bin/omabackup sync` (no
-`--commit`) has already written into that repo's working tree. `git status`
-there shows 13 legitimate modified files (shell.json, package lists, systemd
-lists, nvim/opencode lockfiles, the plugin manifest with sha pins) and nothing
-untracked. **Nobody has run `--commit` yet.** Review that diff with the user
-and get an explicit go-ahead before the first real commit through this tool —
-after that first one, later runs are just normal `sync.sh`-style updates and
-don't need the same ceremony.
+`--commit`) has already written into that repo's working tree: 13 modified
+files, nothing untracked. **Nobody has run `--commit` yet** — nobody *could*,
+which is defect 1 below.
 
-### Bugs found and fixed this pass (read before touching `publish_staging`)
+That working tree was written by the buggy `publish`, so **do not review it as
+the tool's output**. It is missing the entire `scripts` group (defect 2), and
+anything it pulled in through a tracked-only path was decided by directory
+listing rather than the git index (defect 6). Re-run `sync` with the corrected
+code first, then review the diff that produces. Get an explicit go-ahead before
+the first real `--commit` through this tool; after that first one, later runs
+are just normal `sync.sh`-style updates and don't need the same ceremony.
+
+### What the review of `d7f63dc` found (read before touching `sync`)
+
+Six defects, all reproduced before being fixed, all now covered by specs. The
+lesson worth carrying: the suite was **40/40 green** the whole time, because it
+exercised `publish_staging` as a shell function and never the command a human
+types. `test/sync.test.sh` exists so that cannot happen again — every spec in
+it drives the CLI the way the systemd timer will.
+
+1. **`--commit` was unreachable, twice over.** The global flag loop killed it
+   as an unknown flag; and even past that, the loop `shift`ed every argument
+   away, so `cmd_sync "${1:-}"` always received an empty string. The commit
+   branch had never once executed. Fixed with a two-level parser: the global
+   loop owns only `--json`/`--groups`/`--help` and hands the rest, in order, to
+   the command, which owns its own flags. `restore` will need the same shape.
+2. **The `scripts` group was collected and then silently dropped.**
+   `map_to_repo` refused `.local/bin`/`bin` with a comment claiming collect had
+   already written them into the repo — it had not; collect only ever writes
+   into staging. The manifest already declared the destinations as
+   `trackedRepoPath`; publish now reads that table instead of duplicating one
+   entry and refusing the rest.
+3. **`verify` never ran on a plain `sync`.** It sat inside the `--commit`
+   branch, behind the clean-tree early return — so with defect 1, it had never
+   run as part of a sync at all. It now runs on every sync, once, after publish
+   and before any commit decision, and a coverage failure exits non-zero even
+   without `--commit`. The timer runs with no audience: broken coverage has to
+   become a failed unit, not a green backup nobody reads.
+4. **`git add -A`** would have swept a human's mid-review edits into a commit
+   labelled `omabackup: sync`. `publish_staging` now records exactly the files
+   it wrote, and both the dirty check and `git add` are scoped to that list.
+5. **No git call was checked.** The script runs `set -uo pipefail` without
+   `-e`, so a failed `commit` fell straight through to printing `committed` —
+   the one message a backup tool must never print falsely.
+6. **"Tracked" meant "present in the directory"** (`find`), not tracked by git.
+   Junk in the repo directory pulled its live counterpart in and then
+   perpetuated itself. It asks `git ls-files` now, and refuses to guess outside
+   a git worktree rather than falling back to the listing.
+
+### Bugs found and fixed in the stage-2 pass itself (read before touching `publish_staging`)
 
 1. **Staging must be wiped every `collect`, not accumulated.** The desktop
    group's first (buggy) version staged 63 stray files — every `.desktop`,
@@ -117,19 +153,19 @@ cheap and disposable, not worth version-controlling.
 
 ## Immediate next actions
 
-1. Commit the stage-2 work above (`bin/omabackup`, `groups.default.json`,
-   `lib/publish.sh`, the two test files) with a message citing both bugs and
-   the specs that caught them.
-2. Get the user's go-ahead on the pending `omarchy-personal` diff, run
-   `sync --commit`, confirm the commit and push look right.
-3. Add the other destinations from DESIGN.md §3 (`rclone` for Drive, a plain
+1. Re-run `sync` against `~/Devs/omarchy-personal` with the corrected code and
+   review the diff it produces — the working tree there right now is the buggy
+   publish's output, not the tool's. Then get the user's go-ahead, run
+   `sync --commit` (which finally works), confirm the commit and push.
+2. Add the other destinations from DESIGN.md §3 (`rclone` for Drive, a plain
    directory, a removable-drive watcher) — `github` (the git commit itself)
    is the only one that exists so far.
-4. Write the systemd user unit + timer that calls `omabackup sync --commit`
+3. Write the systemd user unit + timer that calls `omabackup sync --commit`
    on a schedule, replacing the QML `Timer`'s role as anything more than a
    cheap read-only `verify` poll (DESIGN.md §11.2: the timer must be primary,
-   the plugin is just its face).
-5. Only after 2–4: expand `Panel.qml`'s UI to show destinations and the
+   the plugin is just its face). `sync` now exits non-zero on broken coverage,
+   so the unit fails visibly instead of reporting a green backup.
+4. Only after 1–3: expand `Panel.qml`'s UI to show destinations and the
    schedule, since there would finally be real data for those views to show.
 
 ## Open questions for the user, not yet decided
