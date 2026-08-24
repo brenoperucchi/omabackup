@@ -8,8 +8,9 @@ Documentation=https://github.com/brenoperucchi/omabackup
 # is content-addressed by HEAD, so a tick with no new commit reuses the existing
 # artifact and each destination driver sends the same bytes it already sent.
 # Backoff per destination handles the rest.
-OnBootSec=10min
-OnUnitActiveSec=1h
+# OnCalendar rather than monotonic, so Persistent= actually applies -- see the
+# note in omabackup-sync.timer.
+OnCalendar=hourly
 Persistent=true
 RandomizedDelaySec=5min
 

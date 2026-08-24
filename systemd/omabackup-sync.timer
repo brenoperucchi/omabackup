@@ -3,18 +3,22 @@ Description=OmaBackup: sync dotfile coverage on a schedule
 Documentation=https://github.com/brenoperucchi/omabackup
 
 [Timer]
-# 15 minutes. Measured cost of one sync on this machine is ~4s (collect 5.5s ->
-# publish is now cp rather than a per-file rsync), so this is well under 1% duty
-# cycle. §4 offers 5 minutes and it would now be affordable; 15 is the same
-# protection with a quieter history, since nothing happens at all when nothing
-# changed -- no diff, no commit, no traffic.
-OnBootSec=3min
-OnUnitActiveSec=15min
+# Every 15 minutes. Measured cost of one sync on this machine is ~4s (collect
+# 5.5s -> publish is now cp rather than a per-file rsync), so this is well under
+# 1% duty cycle. §4 offers 5 minutes and it would now be affordable; 15 is the
+# same protection with a quieter history, since nothing happens at all when
+# nothing changed -- no diff, no commit, no traffic.
+#
+# OnCalendar, not OnBootSec/OnUnitActiveSec, specifically so Persistent= below
+# means something: systemd.timer(5) says it "only has an effect on timers
+# configured with OnCalendar=". The first version of this file used monotonic
+# triggers and claimed the catch-up behaviour in a comment it did not have.
+OnCalendar=*:0/15
 
-# A laptop that was asleep at the scheduled moment has to catch up on wake.
-# Without this, the machine most likely to be closed mid-upgrade is the one that
-# silently skips its backup -- lesson #2, the moment of highest risk is the
-# moment of lowest attention.
+# A laptop asleep at the scheduled moment catches up on wake. Without it, the
+# machine most likely to be closed mid-upgrade is exactly the one that silently
+# skips its backup -- lesson #2, the moment of highest risk is the moment of
+# lowest attention.
 Persistent=true
 
 # Do not have every timer on the machine fire at the same second.
