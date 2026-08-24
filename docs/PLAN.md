@@ -37,7 +37,7 @@ proved the isolated test harness actually isolates.
 - **`~/Devs/omabackup`** (this repo) — public, GitHub, code only: the CLI, the
   QML plugin, the group manifest, the docs. `git log`: `626a40d` → `2cf9bd1` →
   `f4f3466` → `3c705d5` → `d7f63dc` → `6713239` → `741be00` → `8a329fa` →
-  `e6db1c1`, all pushed. 67 specs.
+  `e6db1c1` → `fe103e6` → `6aa8008`, all pushed. 81 specs.
 - **`~/Devs/omarchy-personal`** — private, GitHub, the user's actual dotfiles.
   This is `OMABACKUP_REPO`: where `sync` publishes staged content. It is NOT
   where OmaBackup's own code lives — never put backup *data* in the public
@@ -45,12 +45,14 @@ proved the isolated test harness actually isolates.
 
 ### Stage 2 is committed, then corrected
 
-`d7f63dc` landed the stage-2 work. Reviewing that commit — Codex via the agent
-relay, then verified line by line and reproduced here — found **eight** defects
-in it, fixed across four commits: `6713239` (collect/publish), `741be00` (the
-sync flow), `8a329fa` (the excluded list), `e6db1c1` (paths the destination repo
-ignores). 67 specs pass. See "What the review found" below; the short version is
-that `d7f63dc`'s own commit message described a flow that could not execute.
+`d7f63dc` landed the stage-2 work. Two rounds of review — Codex via the agent
+relay, each finding verified and reproduced here before being fixed — turned up
+**fifteen** defects, across five fix commits: `6713239` (collect/publish),
+`741be00` (the sync flow), `8a329fa` (the excluded list), `e6db1c1` (paths the
+destination repo ignores), `6aa8008` (the second review's seven). 81 specs pass.
+See "What the reviews found" below; the short version is that `d7f63dc`'s own
+commit message described a flow that could not execute, and that fixing each
+silent failure is what exposed the next one.
 
 ### The first real `sync --commit` has happened
 
@@ -73,18 +75,25 @@ Two things that deliberately did *not* go in, both correct:
   defect 8. They are a real coverage hole, now reported as a warning on every
   sync rather than skipped in silence.
 
-### What the review of `d7f63dc` found (read before touching `sync`)
+### What the reviews found (read before touching `sync`)
 
-Eight defects, all reproduced before being fixed, all now covered by specs. The
-lesson worth carrying: the suite was **40/40 green** the whole time, because it
-exercised `publish_staging` as a shell function and never the command a human
+Fifteen defects, all reproduced before being fixed, all now covered by specs.
+The lesson worth carrying: the suite was **40/40 green** the whole time, because
+it exercised `publish_staging` as a shell function and never the command a human
 types. `test/sync.test.sh` exists so that cannot happen again — every spec in
 it drives the CLI the way the systemd timer will.
 
-Defects 7 and 8 were not in the original review. They surfaced *because* of the
-first six fixes — 7 from actually reading the diff the corrected tool produced,
-8 from defect 5's error checking turning a two-year silence into a hard stop on
-the first real `--commit`. Fixing a silent failure is how you find the next one.
+Read the ordering as a chain, not a list. Defects 7 and 8 were not in the first
+review: 7 came from reading the diff the corrected tool produced, 8 from defect
+5's error checking turning a long silence into a hard stop on the very first
+real `--commit`. Defects 9–15 came from a *second* review of the first four fix
+commits. Fixing a silent failure is how you find the next one.
+
+And defect 9 is the one to remember: the fix for defect 4 was incomplete in
+exactly the way defect 4 itself was, and **the spec written alongside it is what
+hid that** — it edited the working tree but never staged, so it passed while
+proving nothing. A green spec that does not exercise the real path is worse than
+no spec, because it stops anyone from looking.
 
 1. **`--commit` was unreachable, twice over.** The global flag loop killed it
    as an unknown flag; and even past that, the loop `shift`ed every argument
@@ -132,6 +141,31 @@ the first real `--commit`. Fixing a silent failure is how you find the next one.
    .gitignore is the user's, and a backup tool does not overrule it. Files the
    repo already tracks are exempt, since ignore rules do not apply to them —
    there is a spec for that specifically.
+
+From the second review (`6aa8008`), on the fixes above:
+
+9. **`git commit` still committed the whole index.** Scoping `git add` was half
+   the job: a bare `git commit` commits everything staged, so work the user had
+   already `git add`ed rode along under this tool's message. Both calls carry
+   the pathspec now. See the note above about the spec that hid this.
+10. **`git status`'s exit code was never checked.** A git that fails prints
+    nothing, and empty output looks exactly like a clean tree — so any failure
+    became "up to date" and exit 0. Specs use a `git` shim that fails on one
+    subcommand; it is the only way to make git fail deterministically.
+11. **`publish_staging` swallowed write failures** and still ended on its
+    success `printf`. It counts them, returns non-zero, and `sync` refuses to
+    commit a partial backup.
+12. **`--groups` with no value hung the process forever.** `shift 2` with one
+    argument left fails, so `$#` never reached zero. It also swallowed the next
+    flag as its value, losing `--commit` from `sync --groups --commit`.
+13. **`git ls-files` without `-z`** quotes non-ASCII names, so a tracked
+    `ação.sh` came back as `"scripts/local-bin/a\303\247\303\243o.sh"` and
+    silently stopped being backed up. Not hypothetical in this home directory.
+14. **A path both declared and `excluded` was collected in full** — pattern
+    translation only covered descendants of the transfer root, so naming the
+    root itself was resolved silently in favour of copying.
+15. **`find` without `-print0`** in `publish_staging` split a filename
+    containing a newline into two paths.
 
 ### Bugs found and fixed in the stage-2 pass itself (read before touching `publish_staging`)
 
