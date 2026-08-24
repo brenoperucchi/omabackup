@@ -60,6 +60,37 @@ it "the manifest exclude keeps node_modules out of staging"
 it "exclude does not take the rest with it"
 assert_contains "$(cat "$H/.state/staging/.config/app/src/main.lua" 2>/dev/null)" "meu"
 
+# -- the global `excluded` list reaches rsync too ----------------------------------
+# A group's own `exclude` patterns are already relative to the path being
+# copied, so they worked. The manifest-wide `excluded` entries are written as
+# full paths (`~/.config/nvim/lazy-lock.json`) and were handed to rsync with
+# only the leading `~/` stripped -- but rsync matches against the transfer root,
+# so `.config/nvim/lazy-lock.json` never matched anything and the file the
+# manifest called "constant diff noise" was backed up on every run.
+H="$(mktemp -d)"; G="$H/g.json"
+mkdir -p "$H/.config/editor/sub"
+printf 'keep\n'  >"$H/.config/editor/init.lua"
+printf 'noise\n' >"$H/.config/editor/lock.json"
+printf 'deep\n'  >"$H/.config/editor/sub/nested.lua"
+cat >"$G" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],
+ "excluded":[{"path":"~/.config/editor/lock.json","reason":"regenerated on every run"}],
+ "groups":[
+ {"id":"editor","label":"Editor","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/editor"]}]}
+JSON
+_env "$H" "$G" collect >/dev/null
+ST="$H/.state/staging"
+
+it "a globally excluded file nested under a declared directory is not staged"
+[[ ! -e "$ST/.config/editor/lock.json" ]] && ok || fail "the excluded file was collected anyway"
+
+it "excluding one file does not take its directory with it"
+assert_contains "$(cat "$ST/.config/editor/init.lua" 2>/dev/null)" "keep"
+
+it "and does not take unrelated nested files either"
+assert_contains "$(cat "$ST/.config/editor/sub/nested.lua" 2>/dev/null)" "deep"
+
 # -- mode:triple does not degrade into a generic copy -----------------------------
 H="$(mktemp -d)"; G="$H/g.json"
 P="$H/.config/omarchy/plugins/acme.dock"

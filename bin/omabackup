@@ -256,12 +256,29 @@ _emit_exclude() {
     return 0
 }
 
+# _rsync_excludes <group-id> <transfer-root>
+# rsync matches exclude patterns against paths relative to the root of the
+# transfer, so the root is required to translate anything written as a full
+# path. A group's own `exclude` entries are already relative ("node_modules/**")
+# and pass through untouched; the manifest-wide `excluded` list is written as
+# full paths and used to be handed over with only the leading `~/` stripped,
+# which produced patterns like `.config/nvim/lazy-lock.json` that could never
+# match under a root of `~/.config/nvim`. The file the manifest called
+# "constant diff noise" was therefore backed up on every single run.
 _rsync_excludes() {
-    local id="$1" pat
+    local id="$1" root="${2:-}" pat ex
     while read -r pat; do _emit_exclude "$pat"; done \
         < <(jq -r --arg id "$id" '.groups[]|select(.id==$id)|(.exclude // [])[]' "$GROUPS_FILE")
-    while read -r pat; do _emit_exclude "${pat/#\~\//}"; done \
-        < <(jq -r '(.excluded // [])[].path' "$GROUPS_FILE")
+    [[ -n "$root" ]] || return 0
+    root="${root%/}"
+    while read -r pat; do
+        [[ -n "$pat" ]] || continue
+        ex="$(_expand "$pat")"
+        # Only what actually lives under this transfer, anchored with a leading
+        # slash so it cannot also match a same-named file deeper in the tree.
+        [[ "$ex" == "$root"/* ]] || continue
+        _emit_exclude "/${ex#"$root"/}"
+    done < <(jq -r '(.excluded // [])[].path' "$GROUPS_FILE")
 }
 
 # Collects into staging, NEVER straight into the repo. This is the first of four
@@ -286,7 +303,7 @@ cmd_collect() {
             triple) collect_triple "$id"; continue ;;
         esac
 
-        local -a ex=(); mapfile -t ex < <(_rsync_excludes "$id")
+        local -a ex=()
 
         while read -r p; do
             [[ -n "$p" ]] || continue
@@ -294,6 +311,9 @@ cmd_collect() {
             [[ -e "$e" || -L "$e" ]] || continue
             dest="$STAGING/${e#$HOME/}"
             mkdir -p "$(dirname "$dest")"
+            # Per path, not per group: the exclude patterns have to be relative
+            # to the directory rsync is about to walk.
+            mapfile -t ex < <(_rsync_excludes "$id" "$e")
             # Tracked-only is a per-path decision, not a per-group one: a
             # group can mix a directory that should only pull already-tracked
             # names (desktop entries) with a plain file that should always
