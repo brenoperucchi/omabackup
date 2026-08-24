@@ -538,6 +538,42 @@ cmd_sync() {
     printf '  %scommitted%s\n' "$GREEN" "$NC"
 }
 
+# ── bundle ───────────────────────────────────────────────────────────────────
+# The artifact every destination other than `github` receives (DESIGN.md §3).
+# Separate verb from `push` on purpose: building is cheap and local, sending is
+# slow and fallible, and only one of them should be able to fail at 3am.
+cmd_bundle() {
+    local repo="${OMABACKUP_REPO:-}" reused=0 path
+    while (($#)); do
+        case "$1" in
+            *) die "unknown flag for bundle: $1" ;;
+        esac
+    done
+    [[ -n "$repo" && -d "$repo/.git" ]] || die "OMABACKUP_REPO must point at a git repo (got: ${repo:-unset})"
+
+    local cache="$OMABACKUP_STATE/bundles"
+    [[ -f "$cache/$(git -C "$repo" rev-parse HEAD 2>/dev/null | cut -c1-12).tar.zst" ]] && reused=1
+
+    path="$(build_bundle "$repo" "$cache")" \
+        || die "could not build a bundle from $(_tilde "$repo")"
+
+    # §11.4 is a check here, not a claim: the artifact has to prove it clones,
+    # that both halves agree, and that the tool inside it runs.
+    verify_bundle "$path" \
+        || die "the bundle did not survive its own restore check: $(_tilde "$path")"
+
+    if (( JSON )); then
+        jq -n --arg p "$path" --arg n "$(bundle_name "$repo")" \
+              --argjson r "$([[ $reused == 1 ]] && echo true || echo false)" \
+              --argjson b "$(stat -c %s "$path" 2>/dev/null || echo 0)" \
+              '{schemaVersion:1, path:$p, publishName:$n, reused:$r, bytes:$b}'
+    else
+        printf '  %s%s%s %s %s(%s, verified restorable)%s\n' \
+            "$GREEN" "$([[ $reused == 1 ]] && echo 'reused' || echo 'built')" "$NC" \
+            "$(_tilde "$path")" "$DIM" "$(du -h "$path" | cut -f1)" "$NC"
+    fi
+}
+
 cmd_status() {
     local ov oc om; IFS=$'\t' read -r ov oc om <<<"$(omarchy_identity)"
     if (( JSON )); then
@@ -557,6 +593,7 @@ cmd_status() {
 source "$OMABACKUP_ROOT/lib/probes.sh"
 source "$OMABACKUP_ROOT/lib/plugin-capture.sh"
 source "$OMABACKUP_ROOT/lib/publish.sh"
+source "$OMABACKUP_ROOT/lib/bundle.sh"
 
 # Two levels: the loop below owns only what every command understands and
 # hands the rest, in order, to the command itself. It used to consume and shift
@@ -589,6 +626,7 @@ case "$CMD" in
     verify)  reject_flags verify "${ARGS[@]}"; cmd_verify ;;
     collect) reject_flags collect "${ARGS[@]}"; cmd_collect ;;
     sync)    cmd_sync "${ARGS[@]}" ;;
+    bundle)  cmd_bundle "${ARGS[@]}" ;;
     status)  reject_flags status "${ARGS[@]}"; cmd_status ;;
     ""|help)
         cat <<'USAGE'
