@@ -7,7 +7,7 @@
 #   3. sem remote  → cópia integral; não existe em nenhum remote de onde puxar
 #
 # Sourceável e sem efeito colateral no import, pra poder ser testado.
-# Regressões em test/plugin-capture.test.sh; contexto em docs/OMABACKUP-DESIGN.md §11.3.
+# Regressões em test/plugin-capture.test.sh; contexto em docs/DESIGN.md §11.3.
 
 # Cópia integral, sem arrastar o histórico git de terceiro.
 _capture_local() {

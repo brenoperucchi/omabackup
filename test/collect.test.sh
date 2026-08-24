@@ -1,6 +1,6 @@
 # Regressões do collect (bin/omabackup collect).
 # O tema é sempre o mesmo: o manifesto declara intenção e o coletor precisa
-# honrá-la, ou recusar em alto e bom som. Contexto: OMABACKUP-CONTEXT §4,
+# honrá-la, ou recusar em alto e bom som. Contexto: docs/CONTEXT.md §4,
 # "loop genérico atropela lógica específica".
 
 OB="$PWD/bin/omabackup"

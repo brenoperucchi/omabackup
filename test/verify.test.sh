@@ -1,6 +1,6 @@
 # Regressões da cobertura (bin/omabackup verify).
 # O caso central é o incidente de 17/08/2026: config íntegra, formato trocado,
-# backup verde e inútil. Contexto: docs OMABACKUP-DESIGN §0 e §11.
+# backup verde e inútil. Contexto: docs/DESIGN.md §0 e §11.
 #
 # Cada caso monta um $HOME falso e um manifesto próprio; nada toca a máquina.
 

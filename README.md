@@ -70,7 +70,7 @@ junto. Um verificador que nasce com uma dúzia de avisos ensina a ser ignorado.
 ## Projeto
 
 O desenho, a revisão que o derrubou duas vezes e as decisões estão em
-`omarchy-personal/docs/OMABACKUP-DESIGN.md`.
+[`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Licença
 
