@@ -7,15 +7,10 @@
   "license": "MIT",
   "description": "Dotfile backup that tells you when it stopped covering what the system reads, and refuses to restore onto versions it does not know.",
   "kinds": [
-    "service",
-    "bar-widget",
-    "panel"
+    "bar-widget"
   ],
-  "keepLoaded": true,
   "entryPoints": {
-    "service": "Service.qml",
-    "barWidget": "BarWidget.qml",
-    "panel": "Panel.qml"
+    "barWidget": "Panel.qml"
   },
   "barWidget": {
     "displayName": "OmaBackup",
@@ -24,13 +19,17 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "staleAfterIntervals": 3
+      "refreshIntervalSec": 900
     },
     "schema": [
       {
-        "key": "staleAfterIntervals",
-        "type": "number",
-        "label": "Mark as stale after N intervals"
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Coverage check interval (seconds)",
+        "min": 60,
+        "max": 86400,
+        "step": 60,
+        "defaultValue": 900
       }
     ]
   }

@@ -650,3 +650,28 @@ blocks on a `gum` form). What does **not** come back is the frequency: T3 in a
 container runs every day, on its own; T4 in a VM runs when a new Omarchy ships
 or when you feel uneasy. §12.4 was right to take the VM off the critical path —
 wrong to take it out of the product.
+
+---
+
+## 14. A crash while testing the harness (2026-08-24)
+
+While validating the Panel.qml against the failure path (§0's August scenario)
+in the isolated harness described in §1, a run with `XDG_RUNTIME_DIR=/nonexistent`
+segfaulted the harness's own `quickshell` process. Root cause, from the crash
+report's backtrace: `QsPaths::linkRunDir()` in Quickshell itself, not this
+plugin's QML — it fails to create the runtime directory and then dereferences
+something built from it anyway. Upstream bug, unrelated to OmaBackup.
+
+The live shell (the one hosting the real bar, dock and menu) was never touched:
+it runs from `/usr/share/omarchy/shell` as its own process, and the harness runs
+from an isolated `-p` path with `Ui`/`Commons` symlinked in, in its own process,
+started separately. `pgrep -x quickshell` during the incident showed the live
+process still running; only the harness instance died.
+
+This is the isolation the harness exists to provide, working as intended: the
+crash CONTEXT.md warns about ("a QML error in one plugin can take down the
+whole quickshell, bar/dock/menu included") happened, and it happened to a
+disposable test process instead of the desktop.
+
+Practical fallout: do not set `XDG_RUNTIME_DIR` to a nonexistent path when
+driving quickshell for testing, isolated harness or not.
