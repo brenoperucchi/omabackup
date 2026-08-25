@@ -56,16 +56,35 @@ assert_deny_understood() {
     # handle this false positive" while the false positive cannot occur. All
     # three shipped exceptions turned out to be exactly that -- the patterns
     # were precise enough never to fire on the lines they excused.
+    #
+    # Reachable means a pattern produces EXACTLY this text, which is what
+    # _still_matches then requires. Asking it as containment -- does some
+    # pattern match anywhere inside the exception -- accepted exceptions that
+    # could never apply: "--password-store=gnome-libsecret" contains a match for
+    # `password-store=[a-z-]+`, so validation passed it, while at scan time the
+    # extracted match is the substring and equality fails. Two halves of one
+    # rule meaning two different things, which is the shape of half the defects
+    # in this file.
     local exid2 exm2 reach
     while IFS=$'\t' read -r exid2 exm2; do
         [[ -n "$exm2" ]] || continue
         reach=0
         while IFS=$'\t' read -r pid pre pci; do
             [[ -n "$pid" && -n "$pre" ]] || continue
-            if [[ "$pci" == true ]]; then printf '%s' "$exm2" | grep -qiE -e "$pre" && reach=1
-            else printf '%s' "$exm2" | grep -qE -e "$pre" && reach=1; fi
+            local -a hits=(); local hit
+            if [[ "$pci" == true ]]; then
+                mapfile -t hits < <(printf '%s' "$exm2" | grep -oiE -e "$pre")
+            else
+                mapfile -t hits < <(printf '%s' "$exm2" | grep -oE -e "$pre")
+            fi
+            for hit in "${hits[@]:-}"; do
+                [[ -n "$hit" ]] || continue
+                if [[ "$pci" == true ]]; then [[ "${hit,,}" == "${exm2,,}" ]] && { reach=1; break; }
+                else [[ "$hit" == "$exm2" ]] && { reach=1; break; }; fi
+            done
+            (( reach )) && break
         done < <(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' "$file" 2>/dev/null)
-        (( reach )) || bad="${bad:+$bad$'\n'}exception $exid2 is unreachable: no pattern produces it"
+        (( reach )) || bad="${bad:+$bad$'\n'}exception $exid2 is unreachable: no pattern produces exactly this text"
     done < <(jq -r '(.exceptions // [])[] | "\(.id)\t\(.match)"' "$file" 2>/dev/null)
 
     [[ -z "$bad" ]] && return 0
@@ -84,9 +103,11 @@ assert_deny_understood() {
 # the line destroyed the key. One innocuous line in a JSON file turned a
 # detector off. Two short exceptions could do it between them.
 #
-# So the test is containment: a match is excused only when some exception
-# CONTAINS that exact matched text -- when it genuinely is the thing the
-# exception was written to explain. A fragment cannot excuse the whole.
+# So the test is equality: a match is excused only when some exception IS that
+# exact matched text. Containment was the first answer and had the same hole one
+# size up -- "exemploAKIA...fim" contains the key, so it excused the key
+# everywhere. assert_deny_understood checks reachability the same way, so an
+# exception that validates is an exception that can fire.
 _still_matches() {
     local line="$1" re="$2" ci="$3" m ex excused
     local -a matches=()
@@ -171,6 +192,38 @@ scan_secrets() {
         return 1
     fi
 
+    # `git grep <rev>` reads the tree at that commit and nothing else, but
+    # `git bundle --all` packs the commit objects and the annotated tag objects
+    # too -- so a token pasted into a commit message shipped and scanned clean.
+    #
+    # Collected once, before the pattern loop, and with both statuses checked.
+    # The first version read them through an unchecked pipeline inside the loop:
+    # a git that failed produced an empty string, every pattern then found
+    # nothing in that empty string, and the scan reported clean with status 0.
+    # A history we could not read is not a history without secrets -- the same
+    # fail-open already closed for rev-list and for the deny-list itself.
+    #
+    # Each line carries its own commit. The first version concatenated every
+    # message into one blob with %H%n%B, which lost the attribution entirely
+    # (a hit named no commit, and the fix for a message is rewriting history --
+    # you cannot rewrite what you cannot locate) and let a match span the seam
+    # between one message and the next.
+    local msgraw msgrc tagraw tagrc msgs
+    msgraw="$(git -C "$repo" log --all --format=$'\x01%H\x02%B' 2>/dev/null)"; msgrc=$?
+    tagraw="$(git -C "$repo" for-each-ref --format='%(refname:short) %(contents)' \
+              refs/tags 2>/dev/null)"; tagrc=$?
+    if (( msgrc != 0 || tagrc != 0 )); then
+        printf '%somabackup: cannot read commit messages or tags in %s -- refusing to call it clean%s\n' \
+            "$RED" "$(_tilde "$repo")" "$NC" >&2
+        return 1
+    fi
+    msgs="$(printf '%s' "$msgraw" | awk -v RS=$'\x01' 'NR>1 {
+                  i = index($0, "\002"); if (i == 0) next
+                  h = substr($0, 1, i - 1); b = substr($0, i + 1)
+                  n = split(b, L, "\n")
+                  for (j = 1; j <= n; j++) if (L[j] != "") print substr(h,1,12) ":" L[j]
+              }')"$'\n'"$tagraw"
+
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
         # Per pattern, not globally: `git grep -E` is POSIX ERE with no inline
@@ -200,25 +253,7 @@ scan_secrets() {
             printf '%s\t%s\n' "$id" "$(printf '%s' "$hit" | tr -c '[:print:]\t' '.' | cut -c1-200)"
         done <<<"$out"
 
-        # `git grep <rev>` reads the tree at that commit and nothing else, but
-        # `git bundle --all` packs the commit objects and the annotated tag
-        # objects too -- so a token pasted into a commit message shipped and
-        # scanned clean.
-        #
-        # Each line carries its own commit. The first version concatenated every
-        # message into one blob with %H%n%B, which lost the attribution entirely
-        # (a hit named no commit, and the fix for a message is rewriting
-        # history -- you cannot rewrite what you cannot locate) and let a match
-        # span the seam between one message and the next.
-        local msgs
-        msgs="$(git -C "$repo" log --all --format=$'\x01%H\x02%B' 2>/dev/null \
-                | awk -v RS=$'\x01' 'NR>1 {
-                      i = index($0, "\002"); if (i == 0) next
-                      h = substr($0, 1, i - 1); b = substr($0, i + 1)
-                      n = split(b, L, "\n")
-                      for (j = 1; j <= n; j++) if (L[j] != "") print substr(h,1,12) ":" L[j]
-                  }'
-                git -C "$repo" for-each-ref --format='%(refname:short) %(contents)' refs/tags 2>/dev/null)"
+        # Commit messages and tag bodies, collected once above.
         while IFS= read -r hit; do
             [[ -n "$hit" ]] || continue
             _still_matches "$hit" "$re" "$ci" || continue

@@ -133,3 +133,37 @@ assert_eq "$(_cov_env "$MFH" verify --json | jq -r '.groups[0].files')" "null"
 it "and collecting again under the new manifest restores real numbers"
 _cov_env "$MFH" collect >/dev/null
 assert_eq "$(_cov_env "$MFH" verify --json | jq -r '.groups[0].files')" "1"
+
+# ── coverage that could not be written must not keep reading as current ─────
+# Every failure branch returned 0 and the caller discarded the status, so a
+# write that failed left the previous collect's numbers in place and collect
+# printed its ticks over them. Nothing downstream tells a stale record from a
+# fresh one: unknown prints as "--", stale prints as fact.
+WFH="$(mktemp -d)"; mkdir -p "$WFH/.config/solo"
+printf 'cc\n' >"$WFH/.config/solo/only.conf"
+cat >"$WFH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"solo","label":"Solo","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/solo"]}]}
+JSON
+_cov_env "$WFH" collect >/dev/null
+
+it "a first collect records real counts"
+assert_eq "$(_cov_env "$WFH" verify --json | jq -r '.groups[0].files')" "1"
+
+# The coverage directory is made unwritable, so the replacement cannot land.
+COVDIR="$WFH/.state/coverage"
+[[ -d "$COVDIR" ]] || COVDIR="$(dirname "$(find "$WFH/.state" -name 'coverage*' | head -1)")"
+printf 'extra\n' >"$WFH/.config/solo/second.conf"
+chmod a-w "$COVDIR"
+WFOUT="$(_cov_env "$WFH" collect 2>&1)"; WFRC=$?
+chmod u+w "$COVDIR"
+
+it "a coverage write that fails says so"
+assert_contains "$WFOUT" "could not record coverage"
+
+it "and the collect itself still succeeds -- what it staged is on disk"
+[[ $WFRC -eq 0 ]] && ok || fail "aborted a collect that worked"
+
+it "while the counts read as unknown rather than as last time's numbers"
+assert_eq "$(_cov_env "$WFH" verify --json | jq -r '.groups[0].files')" "null"

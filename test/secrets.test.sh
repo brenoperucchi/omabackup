@@ -534,3 +534,45 @@ assert_contains "$(OMABACKUP_SECRETS_DENY="$URH/dead.json" _sec_env "$URH" "$URR
 
 it "and the shipped deny-list has no unreachable exceptions of its own"
 assert_eq "$(jq -r '.exceptions | length' "$PWD/secrets.deny.json")" "0"
+
+# ── a history the scanner could not read is not a history without secrets ────
+# Commit messages were collected through an unchecked pipeline: a git that
+# failed produced an empty string, every pattern found nothing in it, and the
+# scan returned 0. The key in the message shipped. rev-list and the deny-list
+# already refused on that shape; this half did not.
+BLH="$(mktemp -d)"; BLR="$BLH/repo"; _sec_repo "$BLR" "" ""
+git -C "$BLR" -c user.email=t@t -c user.name=t \
+    commit -q --allow-empty -m 'chave AKIA1234567890ABCDEF vazada' 2>/dev/null
+mkdir -p "$BLH/fakebin"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == log ]] && exit 128; done\n'
+  printf 'exec %s "$@"\n' "$(command -v git)"
+} >"$BLH/fakebin/git"; chmod +x "$BLH/fakebin/git"
+
+it "the key in a commit message is found while git works"
+assert_contains "$(bash -c '
+    source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_secrets "$1" "$2"' _ "$BLR" "$PWD/secrets.deny.json" 2>&1)" "AKIA1234567890ABCDEF"
+
+BLOUT="$(PATH="$BLH/fakebin:$PATH" bash -c '
+    source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_secrets "$1" "$2"' _ "$BLR" "$PWD/secrets.deny.json" 2>&1)"; BLRC=$?
+
+it "and a git that cannot read the log refuses instead of reporting clean"
+[[ $BLRC -ne 0 ]] && ok || fail "returned success on a history it could not read: ${BLOUT:-<no output>}"
+
+# ── an exception validated by containment could never fire ──────────────────
+# Reachability asked whether some pattern matched anywhere INSIDE the exception
+# while _still_matches requires the exception to BE the match, so an exception
+# carrying extra context passed validation and was dead at scan time.
+CTH="$(mktemp -d)"; CTR="$CTH/repo"; _sec_repo "$CTR" "" ""
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$CTH/destinations.json"
+cat >"$CTH/wider.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"aws","regex":"\\bAKIA[0-9A-Z]{16}\\b","reason":"AWS key id"}],
+ "exceptions":[{"id":"wrapped","match":"exemplo AKIA1234567890ABCDEF fim",
+                "reason":"carries context the pattern never matches"}]}
+JSON
+
+it "an exception that merely contains a match is refused, not silently dead"
+assert_contains "$(OMABACKUP_SECRETS_DENY="$CTH/wider.json" _sec_env "$CTH" "$CTR" push 2>&1)" "wrapped"

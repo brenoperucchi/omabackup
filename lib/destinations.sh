@@ -136,12 +136,21 @@ prune_bundles() {  # prune_bundles <dir> <host> <keep> -> prints how many it rem
     # newer. The key is <timestamp> <1 if sha'd> <name>, so a tie is decided by
     # format age rather than by punctuation.
     local -a found=()
+    # The timestamp is read at a known offset, not searched for. awk's match()
+    # finds the FIRST -YYYYMMDD-HHMMSS in the name, and a hostname that looks
+    # like a timestamp ("box-20200101-000000") owns it: every bundle then sorted
+    # under the same key, the tie fell to the sha column, and a legacy bundle
+    # newer by a day was pruned in favour of a sha'd one older by a day. The
+    # prefix is exactly "omabackup-<host>-", so the 15 characters after it are
+    # the timestamp, whatever the host is called. Its LENGTH is what crosses
+    # into awk: a number needs no quoting and no escape handling, and a
+    # temporary assignment on `mapfile` never reached the process substitution's
+    # environment at all.
+    local off=$(( ${#host} + 11 ))
     mapfile -t found < <(find "$dir" -maxdepth 1 -type f -regextype posix-extended \
         -regex ".*/omabackup-${hre}-${DEST_NAME_TAIL}" \
         -printf '%f\n' 2>/dev/null \
-        | awk '{ ts = $0; sub(/^.*-([0-9]{8}-[0-9]{6})/, "\\1", ts)
-                 match($0, /-[0-9]{8}-[0-9]{6}/)
-                 stamp = substr($0, RSTART + 1, 15)
+        | awk -v off="$off" '{ stamp = substr($0, off + 1, 15)
                  sha = ($0 ~ /-[0-9a-f]{12}\.tar\.zst$/) ? 1 : 0
                  print stamp "\t" sha "\t" $0 }' \
         | sort -r | cut -f3)

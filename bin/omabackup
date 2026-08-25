@@ -563,7 +563,8 @@ cmd_collect() {
         (( JSON )) || printf '  %s✓%s %s\n' "$GREEN" "$NC" "$id"
     done < <(groups_ids)
 
-    write_coverage
+    # Reported, not fatal: what was collected is on disk and valid either way.
+    write_coverage || true
 
     if (( JSON )); then
         jq -n --arg s "$STAGING" --argjson n "$n" '{schemaVersion:1, staging:$s, entries:$n}'
@@ -606,18 +607,41 @@ write_coverage() {
         rows+="$(printf '%s\t%s\t%s' "$id" "$gf" "$gb")"$'\n'
     done < <(groups_ids)
 
-    mkdir -p "$(dirname "$COVERAGE_FILE")" 2>/dev/null || return 0
     # The manifest's content hash rides along. Counts keyed by group id alone
     # survived a manifest edit that kept an id and changed what it covers, and
     # the stale numbers were then shown as if they described the new definition
     # -- five files reported for a group repointed at a directory holding one.
-    printf '%s' "$rows" | jq -R -s --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-        --arg manifest "$(sha256sum "$GROUPS_FILE" 2>/dev/null | cut -c1-16)" \
-        '{schemaVersion:1, at:$at, manifest:$manifest,
-          groups: (split("\n") | map(select(length>0) | split("\t")
-                   | {id:.[0], files:(.[1]|tonumber), bytes:(.[2]|tonumber)}))}' \
-        >"$COVERAGE_FILE.tmp" 2>/dev/null \
-        && mv "$COVERAGE_FILE.tmp" "$COVERAGE_FILE" 2>/dev/null
+    #
+    # A write that fails takes the old record with it. Every status this
+    # function could return was discarded and every failure branch returned 0,
+    # so a full disk left yesterday's counts in place and collect printed its
+    # ticks over them -- and nothing downstream can tell a stale record from a
+    # current one. Unknown counts print as "--"; stale counts print as fact.
+    # This tool exists because coverage that reads as fact and is not is the
+    # failure worth catching.
+    if ! mkdir -p "$(dirname "$COVERAGE_FILE")" 2>/dev/null \
+    || ! printf '%s' "$rows" | jq -R -s --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+           --arg manifest "$(sha256sum "$GROUPS_FILE" 2>/dev/null | cut -c1-16)" \
+           '{schemaVersion:1, at:$at, manifest:$manifest,
+             groups: (split("\n") | map(select(length>0) | split("\t")
+                      | {id:.[0], files:(.[1]|tonumber), bytes:(.[2]|tonumber)}))}' \
+           >"$COVERAGE_FILE.tmp" 2>/dev/null \
+    || ! mv "$COVERAGE_FILE.tmp" "$COVERAGE_FILE" 2>/dev/null; then
+        # Emptied before it is removed. Unlinking needs write permission on the
+        # DIRECTORY, which is exactly what is missing in the case that brought
+        # us here -- so the delete failed and the stale record survived the
+        # branch written to retire it. Truncating needs only the file.
+        : >"$COVERAGE_FILE" 2>/dev/null
+        rm -f "$COVERAGE_FILE.tmp" "$COVERAGE_FILE" 2>/dev/null
+        if [[ -s "$COVERAGE_FILE" ]]; then
+            printf '%somabackup: could not record coverage at %s, and could not retire the old record either -- the counts shown describe an earlier collect%s\n' \
+                "$RED" "$(_tilde "$COVERAGE_FILE")" "$NC" >&2
+        else
+            printf '%somabackup: could not record coverage at %s -- counts read as unknown until the next collect%s\n' \
+                "$YELLOW" "$(_tilde "$COVERAGE_FILE")" "$NC" >&2
+        fi
+        return 1
+    fi
     return 0
 }
 
@@ -1006,9 +1030,41 @@ _shell_started_at() {
 # "Did it restart" was answered by comparing start times, which are
 # second-granular -- so a shell that genuinely restarted within one second read
 # as unchanged and reload refused a reload that had worked.
+#
+# A pid alone was not enough either, on two counts. Pids are reused: the old
+# shell dies, the new one is handed the same number, and reload reports that
+# nothing restarted. And `head -1` picked one of several quickshell processes
+# arbitrarily, so which one answered the question depended on process order.
+# The identity is every quickshell pid paired with its start time in clock
+# ticks since boot (field 22 of /proc/<pid>/stat), sorted. A reused pid carries
+# a different tick count, and a restart moves at least one entry.
+# <pid> -> "<pid>:<start time in clock ticks since boot>". Separate from
+# _shell_identity so it can be asked about a process the test controls: the
+# identity of whatever quickshell happens to be running is not something a spec
+# can assert against.
+_proc_identity() {
+    local pid="$1" st
+    [[ -r "/proc/$pid/stat" ]] || return 1
+    st="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+    # comm can hold spaces and parentheses, so the line is cut after its last
+    # ')' before being split: what remains starts at field 3, making starttime
+    # -- field 22 -- the 20th.
+    st="${st##*) }"
+    st="$(printf '%s' "$st" | cut -d" " -f20)"
+    [[ "$st" =~ ^[0-9]+$ ]] || return 1
+    printf '%s:%s' "$pid" "$st"
+}
+
 _shell_identity() {
     if [[ -n "${OMABACKUP_SHELL_IDENTITY:-}" ]]; then "$OMABACKUP_SHELL_IDENTITY"; return; fi
-    pgrep -x quickshell 2>/dev/null | head -1
+    local pid one id=""
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        one="$(_proc_identity "$pid")" || continue
+        id+="$one "
+    done < <(pgrep -x quickshell 2>/dev/null | sort -n)
+    [[ -n "$id" ]] || return 1
+    printf '%s' "$id"
 }
 
 cmd_reload() {
