@@ -679,10 +679,41 @@ assert_contains "$SEPOUT" "tag:v9"
 
 # A cut whose status nobody read used to stand between the messages and the
 # patterns: when it failed, every message vanished and the push carried on.
+# Asserted through an UNANCHORED pattern and the sha, so what the spec proves is
+# the cut path and not the anchoring fix above it.
 mkdir -p "$SEPH/stub"
 printf '#!/bin/bash\nexit 3\n' >"$SEPH/stub/cut"; chmod +x "$SEPH/stub/cut"
+SEPSHA="$(git -C "$SEPR" rev-parse HEAD)"; SEPSHA="${SEPSHA:0:12}"
 
 it "and the scan does not lean on a cut whose status it never read"
 assert_contains "$(PATH="$SEPH/stub:$PATH" bash -c '
     source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
-    scan_secrets "$1" "$2"' _ "$SEPR" "$SEPH/anchored.json" 2>&1)" "tag:v9"
+    scan_secrets "$1" "$2"' _ "$SEPR" "$PWD/secrets.deny.json" 2>&1)" "$SEPSHA"
+
+# ── a grep that cannot answer must not answer "clean" ───────────────────────
+# _still_matches read grep's output and not its status: through a process
+# substitution "no matches" and "I could not run" were the same empty array, so
+# a grep failing on both halves declared a line holding a key to be clean.
+mkdir -p "$SEPH/badgrep"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do case "$a" in -*o*|-*q*) exit 2;; esac; done\n'
+  printf 'exec %s "$@"\n' "$(command -v grep)"
+} >"$SEPH/badgrep/grep"; chmod +x "$SEPH/badgrep/grep"
+
+it "a line holding a key is a hit even when grep cannot be run on it"
+PATH="$SEPH/badgrep:$PATH" bash -c '
+    source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    DENY_EXCEPTIONS=(); _still_matches "AKIA1234567890ABCDEF" "^AKIA[0-9A-Z]{16}$" false' \
+    >/dev/null 2>&1 && ok || fail "a grep that could not run read as an absence of secrets"
+
+# ── a repository with no commits is not a licence to skip the deny-list ─────
+# The scan returned at the empty commit list, before the patterns were checked
+# and before the tags were read -- and a tag can name a blob. An unreadable
+# deny-list on an empty repository was reported as a clean scan.
+EMH="$(mktemp -d)"; git -C "$EMH" init -q 2>/dev/null
+printf 'not json at all\n' >"$EMH/broken.json"
+
+it "an unreadable deny-list is refused even with nothing committed"
+bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+         scan_secrets "$1" "$2"' _ "$EMH" "$EMH/broken.json" >/dev/null 2>&1 \
+    && fail "called an unscanned empty repository clean" || ok

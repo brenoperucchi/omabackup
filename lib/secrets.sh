@@ -134,12 +134,22 @@ assert_deny_understood() {
 # exception that validates is an exception that can fire.
 _still_matches() {
     local line="$1" re="$2" ci="$3" m ex excused
+    # grep's status is read, not just its output. Through a process
+    # substitution "no matches" and "I could not run" arrived as the same empty
+    # array, and a grep that errored on both halves of this function answered
+    # "clean" for a line carrying a key. A pattern this function cannot apply is
+    # a question it cannot answer, and the answer it must not give is "clean".
+    local raw orc
     local -a matches=()
-    if [[ "$ci" == true ]]; then
-        mapfile -t matches < <(printf '%s' "$line" | grep -oiE -e "$re")
-    else
-        mapfile -t matches < <(printf '%s' "$line" | grep -oE -e "$re")
+    if [[ "$ci" == true ]]; then raw="$(printf '%s' "$line" | grep -oiE -e "$re")"
+    else raw="$(printf '%s' "$line" | grep -oE -e "$re")"; fi
+    orc=$?
+    if (( orc > 1 )); then
+        printf '%somabackup: could not apply a pattern to a line (grep exited %s) -- calling it a hit%s\n' \
+            "$RED" "$orc" "$NC" >&2
+        return 0
     fi
+    mapfile -t matches <<<"$raw"
     # A match the extraction could not produce is not an absence of secrets.
     # With a zero-width pattern grep -o prints nothing, the array comes back
     # empty, and this returned "clean" for a line the pattern had matched.
@@ -148,8 +158,16 @@ _still_matches() {
     local any=0 probe
     for probe in "${matches[@]:-}"; do [[ -n "$probe" ]] && { any=1; break; }; done
     if (( ! any )); then
-        if [[ "$ci" == true ]]; then printf '%s' "$line" | grep -qiE -e "$re" && return 0
-        else printf '%s' "$line" | grep -qE -e "$re" && return 0; fi
+        local qrc
+        if [[ "$ci" == true ]]; then printf '%s' "$line" | grep -qiE -e "$re"
+        else printf '%s' "$line" | grep -qE -e "$re"; fi
+        qrc=$?
+        (( qrc == 0 )) && return 0
+        if (( qrc > 1 )); then
+            printf '%somabackup: could not re-test a line (grep exited %s) -- calling it a hit%s\n' \
+                "$RED" "$qrc" "$NC" >&2
+            return 0
+        fi
         return 1
     fi
 
@@ -202,17 +220,6 @@ scan_secrets() {
     # became "nothing to scan", became "clean", became a push. Empty output with
     # a zero exit is genuinely an empty repo and scans clean; a non-zero exit
     # refuses.
-    local revlist revrc
-    revlist="$(git -C "$repo" rev-list --all 2>/dev/null)"; revrc=$?
-    if (( revrc != 0 )); then
-        printf '%somabackup: cannot list commits in %s -- refusing to call it clean%s\n' \
-            "$RED" "$(_tilde "$repo")" "$NC" >&2
-        return 1
-    fi
-    [[ -n "$revlist" ]] || return 0
-    local -a revs=()
-    mapfile -t revs <<<"$revlist"
-
     # Read with its status checked, and refused when it yields nothing. jq used to
     # run inside a process substitution, so an unreadable deny-list produced zero
     # patterns, the loop never ran, and the function returned success -- a clean
@@ -243,6 +250,20 @@ scan_secrets() {
     # (a hit named no commit, and the fix for a message is rewriting history --
     # you cannot rewrite what you cannot locate) and let a match span the seam
     # between one message and the next.
+    local revlist revrc
+    revlist="$(git -C "$repo" rev-list --all 2>/dev/null)"; revrc=$?
+    if (( revrc != 0 )); then
+        printf '%somabackup: cannot list commits in %s -- refusing to call it clean%s\n' \
+            "$RED" "$(_tilde "$repo")" "$NC" >&2
+        return 1
+    fi
+    # No early return here. A repository with no commits used to leave at this
+    # point, which skipped the deny-list check below and skipped the tags -- a
+    # tag can name a blob, and a deny-list nobody could read was reported as a
+    # clean scan. An empty commit list simply means there are no trees to grep.
+    local -a revs=()
+    [[ -n "$revlist" ]] && mapfile -t revs <<<"$revlist"
+
     local pairs prc trefs tref tbody tl pline msgs
     # -z terminates each entry with NUL, the one byte a commit message cannot
     # carry: \x01 could, and a message holding one split into a record with no
@@ -307,6 +328,7 @@ scan_secrets() {
 
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
+        if (( ${#revs[@]} )); then
         # Per pattern, not globally: `git grep -E` is POSIX ERE with no inline
         # (?i), and -i everywhere would make AKIA match "akia" in prose.
         # -a, not -I: `git grep -I` skips binary blobs and `git bundle` packs
@@ -353,6 +375,7 @@ scan_secrets() {
             line_out="$(printf '%s:%s' "$head" "$hit" | tr -c '[:print:]\t' '.')"
             printf '%s\t%s\n' "$id" "${line_out:0:200}"
         done <<<"$out"
+        fi
 
         # Commit messages and tag bodies, collected once above. grep exits 1
         # for "nothing here" and above 1 for "I could not do it" -- read through
