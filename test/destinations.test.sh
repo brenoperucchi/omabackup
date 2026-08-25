@@ -387,3 +387,24 @@ it "the one kept in a tie is the sha-suffixed name, not the legacy one"
 it "and the older one is the one removed"
 [[ ! -e "$SSH/omabackup-h-20260101-120000.tar.zst" ]] \
     && ok || fail "kept both, or removed the wrong one"
+
+# ── a hostname that looks like a timestamp ─────────────────────────────────
+# The sort key took the FIRST `-YYYYMMDD-HHMMSS` in the filename, so a host
+# whose own name carries that shape hijacked the extraction and retention
+# ordered by the wrong field.
+HNH="$(mktemp -d)/nas"; mkdir -p "$HNH"
+printf 'stamped\n' >"$HNH/.omabackup-destination"
+HN='box-20200101-000000'
+printf 'older\n' >"$HNH/omabackup-$HN-20260101-120000.tar.zst"
+printf 'newer\n' >"$HNH/omabackup-$HN-20260102-120000.tar.zst"
+OMABACKUP_ROOT="$PWD" bash -c '
+  source lib/bundle.sh; source lib/destinations.sh
+  prune_bundles "$1" "$2" 1' _ "$HNH" "$HN" >/dev/null 2>&1
+
+it "a host whose name contains a timestamp still prunes by the real one"
+[[ -f "$HNH/omabackup-$HN-20260102-120000.tar.zst" ]] \
+    && ok || fail "kept the older bundle -- the hostname hijacked the sort key"
+
+it "and the older one is what went"
+[[ ! -e "$HNH/omabackup-$HN-20260101-120000.tar.zst" ]] \
+    && ok || fail "removed the wrong file, or neither"

@@ -45,19 +45,27 @@ assert_deny_understood() {
             | "exception \(.id // "?") needs both match and reason")
         ] | .[]' "$file" 2>/dev/null)" \
         || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
-    # An exception is cut out of the line before the pattern is retried, so one
-    # that overlaps a credential shape would blank that shape out wherever it
-    # appeared -- a single line quietly switching off a detector. Checked here,
-    # where being wrong costs a message rather than a leak.
-    local exid exm pid pre pci
-    while IFS=$'\t' read -r exid exm; do
-        [[ -n "$exm" ]] || continue
+    # There is deliberately no rule against an exception that matches a pattern.
+    # That guard existed for the old cut-and-retest semantics, where an
+    # exception overlapping a secret erased it. With equality an exception
+    # excuses only the identical string, which is the entire point -- and
+    # keeping both rules made every exception impossible: unreachable ones are
+    # refused below, and matching ones would have been refused here.
+
+    # An exception no pattern can produce is not protection: it reads as "we
+    # handle this false positive" while the false positive cannot occur. All
+    # three shipped exceptions turned out to be exactly that -- the patterns
+    # were precise enough never to fire on the lines they excused.
+    local exid2 exm2 reach
+    while IFS=$'\t' read -r exid2 exm2; do
+        [[ -n "$exm2" ]] || continue
+        reach=0
         while IFS=$'\t' read -r pid pre pci; do
             [[ -n "$pid" && -n "$pre" ]] || continue
-            if [[ "$pci" == true ]]; then printf '%s' "$exm" | grep -qiE -e "$pre"
-            else printf '%s' "$exm" | grep -qE -e "$pre"; fi \
-                && bad="${bad:+$bad$'\n'}exception $exid matches pattern $pid and would disable it"
+            if [[ "$pci" == true ]]; then printf '%s' "$exm2" | grep -qiE -e "$pre" && reach=1
+            else printf '%s' "$exm2" | grep -qE -e "$pre" && reach=1; fi
         done < <(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' "$file" 2>/dev/null)
+        (( reach )) || bad="${bad:+$bad$'\n'}exception $exid2 is unreachable: no pattern produces it"
     done < <(jq -r '(.exceptions // [])[] | "\(.id)\t\(.match)"' "$file" 2>/dev/null)
 
     [[ -z "$bad" ]] && return 0
@@ -89,12 +97,28 @@ _still_matches() {
     fi
     (( ${#matches[@]} )) || return 1
 
+    local mm
     for m in "${matches[@]}"; do
         [[ -n "$m" ]] || continue
         excused=0
+        # Equality, not containment. Containment let an exception excuse a
+        # secret it merely enclosed: "exemploAKIA...fim" contains the key, so
+        # the key was excused wherever it appeared -- the same class as the
+        # four-character bypass, needing only a longer string. An exception
+        # must BE the thing it explains.
+        #
+        # Compared the way the rule reads: declaring ignoreCase and then
+        # matching exceptions case-sensitively made a rule mean two different
+        # things in its two halves.
+        mm="$m"
+        [[ "$ci" == true ]] && mm="${m,,}"
         for ex in "${DENY_EXCEPTIONS[@]:-}"; do
             [[ -n "$ex" ]] || continue
-            [[ "$ex" == *"$m"* ]] && { excused=1; break; }
+            if [[ "$ci" == true ]]; then
+                [[ "${ex,,}" == "$mm" ]] && { excused=1; break; }
+            else
+                [[ "$ex" == "$m" ]] && { excused=1; break; }
+            fi
         done
         (( excused )) || return 0
     done

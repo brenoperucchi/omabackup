@@ -291,15 +291,27 @@ cat >"$AH/selfdefeating.json" <<'JSON'
  "exceptions":[{"id":"oops","match":"AKIAIOSFODNN7EXAMPLE","reason":"looks harmless, is the whole key"}]}
 JSON
 
-it "an exception matching one of the deny patterns is refused"
-assert_contains "$(OMABACKUP_SECRETS_DENY="$AH/selfdefeating.json" _sec_env "$AH" "$AR" push 2>&1)" \
-    "oops"
+it "an exception equal to a real key excuses only that key, and nothing else"
+# This assertion inverted when exceptions moved from cut-and-retest to
+# equality. Refusing an exception that matches a pattern made every exception
+# impossible, since an unreachable one is refused too. Under equality the
+# entry excuses exactly the string it names -- deliberate, reviewable, and
+# carrying a reason -- while a different key of the same shape still blocks.
+OTHERR="$(mktemp -d)/repo"; mkdir -p "$OTHERR"; git init -q "$OTHERR"
+git -C "$OTHERR" config user.email t@t; git -C "$OTHERR" config user.name t
+printf 'aws_access_key_id = AKIAZZZZZZZZZZZZZZZZ\n' >"$OTHERR/f.conf"
+git -C "$OTHERR" add -A && git -C "$OTHERR" commit -qm x
+[[ -n "$(scan_secrets "$OTHERR" "$AH/selfdefeating.json" 2>/dev/null)" ]] \
+    && ok || fail "an exception for one key excused a different one"
 
-it "while an exception that matches nothing dangerous is accepted"
+it "while an exception a rule genuinely produces is accepted"
+# This assertion inverted deliberately. An exception matching nothing was once
+# "harmless"; it is now refused, because an entry no pattern can produce reads
+# as protection while protecting nothing.
 cat >"$AH/fine.json" <<'JSON'
 {"schemaVersion":1,
- "patterns":[{"id":"aws","regex":"\\bAKIA[0-9A-Z]{16}\\b","reason":"AWS key id"}],
- "exceptions":[{"id":"flag","match":"--password-store=gnome-libsecret","reason":"a keyring flag"}]}
+ "patterns":[{"id":"flag","ignoreCase":true,"regex":"password-store=[a-z-]+","reason":"fires on the flag"}],
+ "exceptions":[{"id":"chromium","match":"password-store=gnome-libsecret","reason":"a keyring flag"}]}
 JSON
 assert_not_contains "$(OMABACKUP_SECRETS_DENY="$AH/fine.json" _sec_env "$AH" "$AR" push 2>&1)" \
     "cannot honor"
@@ -438,3 +450,87 @@ printf '{"schemaVersion":1,"patterns":"not an array","exceptions":[]}\n' >"$SHAP
 printf '{"schemaVersion":1,"destinations":[]}\n' >"$SHAPEH/destinations.json"
 assert_contains "$(OMABACKUP_SECRETS_DENY="$SHAPEH/shape.json" _sec_env "$SHAPEH" "$SHAPER" push 2>&1)" \
     "deny-list"
+
+# ── an exception must BE the match, not merely contain it ──────────────────
+# Containment let an exception excuse a secret it happened to enclose:
+# "exemploAKIAIOSFODNN7EXAMPLEfim" contains the key, so the key was excused
+# everywhere. Same class as the four-character bypass, needing a longer string.
+WBH="$(mktemp -d)"
+cat >"$WBH/wrapped.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"aws","regex":"\\bAKIA[0-9A-Z]{16}\\b","reason":"AWS key id"}],
+ "exceptions":[{"id":"quoted","match":"exemploAKIAIOSFODNN7EXAMPLEfim","reason":"quoted in prose"}]}
+JSON
+WBR="$(mktemp -d)/repo"; mkdir -p "$WBR"; git init -q "$WBR"
+git -C "$WBR" config user.email t@t; git -C "$WBR" config user.name t
+printf 'aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n' >"$WBR/f.conf"
+git -C "$WBR" add -A && git -C "$WBR" commit -qm x
+
+it "an exception that merely encloses a secret does not excuse it"
+[[ -n "$(scan_secrets "$WBR" "$WBH/wrapped.json" 2>/dev/null)" ]] \
+    && ok || fail "an exception wrapping the key excused it"
+
+# ── a case-insensitive pattern gets case-insensitive exceptions ────────────
+# Declaring ignoreCase and then comparing exceptions case-sensitively is an
+# inconsistency that fails closed -- it blocks what should pass -- but a rule
+# should mean the same thing in both halves.
+CIH="$(mktemp -d)"
+cat >"$CIH/ci.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"t","ignoreCase":true,"regex":"\\bsecret-[a-z0-9]{10}\\b","reason":"test shape"}],
+ "exceptions":[{"id":"doc","match":"secret-abcdefghij","reason":"the documented example"}]}
+JSON
+CIR="$(mktemp -d)/repo"; mkdir -p "$CIR"; git init -q "$CIR"
+git -C "$CIR" config user.email t@t; git -C "$CIR" config user.name t
+printf 'value = SECRET-ABCDEFGHIJ\n' >"$CIR/f.conf"
+git -C "$CIR" add -A && git -C "$CIR" commit -qm x
+
+it "a lowercase exception excuses the uppercase form of an ignoreCase pattern"
+[[ -z "$(scan_secrets "$CIR" "$CIH/ci.json" 2>/dev/null)" ]] \
+    && ok || fail "the exception did not apply to the same rule's other casing"
+
+# ── the shipped chromium exception is actually exercised ───────────────────
+# The old spec asserted this line scans clean, and it did -- but because no
+# pattern matches it at all (the value is unquoted, so generic-assigned-secret
+# never fires). The exception was never reached: the sixth green spec this
+# session that proved nothing. This one makes the pattern match first.
+CXH="$(mktemp -d)"
+cat >"$CXH/cx.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"flagged","ignoreCase":true,"regex":"password-store=[a-z-]+","reason":"deliberately matches the flag"}],
+ "exceptions":[{"id":"chromium","match":"password-store=gnome-libsecret","reason":"a keyring flag, not a secret"}]}
+JSON
+CXR="$(mktemp -d)/repo"; mkdir -p "$CXR"; git init -q "$CXR"
+git -C "$CXR" config user.email t@t; git -C "$CXR" config user.name t
+printf -- '--password-store=gnome-libsecret\n' >"$CXR/f.conf"
+git -C "$CXR" add -A && git -C "$CXR" commit -qm x
+
+it "an exception excuses a match that a pattern really produced"
+[[ -z "$(scan_secrets "$CXR" "$CXH/cx.json" 2>/dev/null)" ]] \
+    && ok || fail "the exception did not excuse a genuine match"
+
+it "and the same rule still fires on a value it does not except"
+printf -- '--password-store=something-else\n' >"$CXR/g.conf"
+git -C "$CXR" add -A && git -C "$CXR" commit -qm y
+[[ -n "$(scan_secrets "$CXR" "$CXH/cx.json" 2>/dev/null)" ]] \
+    && ok || fail "the exception excused everything the rule matched"
+
+# ── an exception no pattern can reach is not protection ────────────────────
+# All three shipped exceptions turned out unreachable: no pattern matches the
+# lines they excuse, because the patterns are precise enough not to fire there.
+# They read as "we handle these false positives" while the false positives do
+# not exist -- the same shape as a rule declared and silently ignored, which
+# this project refuses everywhere else.
+URH="$(mktemp -d)"; URR="$URH/repo"; _sec_repo "$URR" "" ""
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$URH/destinations.json"
+cat >"$URH/dead.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"aws","regex":"\\bAKIA[0-9A-Z]{16}\\b","reason":"AWS key id"}],
+ "exceptions":[{"id":"dead","match":"nothing here resembles a key","reason":"unreachable"}]}
+JSON
+
+it "an exception no pattern can produce is refused"
+assert_contains "$(OMABACKUP_SECRETS_DENY="$URH/dead.json" _sec_env "$URH" "$URR" push 2>&1)" "dead"
+
+it "and the shipped deny-list has no unreachable exceptions of its own"
+assert_eq "$(jq -r '.exceptions | length' "$PWD/secrets.deny.json")" "0"

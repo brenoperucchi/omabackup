@@ -112,3 +112,46 @@ printf 'OMABACKUP_REPO=%s\nOMABACKUP_SYSTEMCTL=/bin/false\n' "$PH/repo" >"$PH/.c
 assert_eq "$(HOME="$PH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$PH/g.json" \
     OMABACKUP_STATE="$PH/.state" OMABACKUP_SYSTEMCTL="$PH/stub/systemctl" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" status --json 2>/dev/null | jq -r '.scheduler.active')" "true"
+
+# ── the env file names a machine, not a policy ─────────────────────────────
+# The allow-list admitted OMABACKUP_GROUPS on the reasoning that it is machine
+# identity. It is not: the manifest decides WHAT gets collected. Reproduced --
+# an env line pointing at a manifest covering a directory of keys, and the key
+# was staged. STATE is the same shape one step along: it is the parent of the
+# staging directory `rm -rf` clears every collect.
+QH="$(mktemp -d)"
+mkdir -p "$QH/.config/omabackup" "$QH/.config/private" "$QH/repo" "$QH/stub"
+printf 'A FAKE PRIVATE KEY\n' >"$QH/.config/private/id_rsa"
+git init -q "$QH/repo"
+printf '#!/bin/bash\nexit 0\n' >"$QH/stub/systemctl"; chmod +x "$QH/stub/systemctl"
+cat >"$QH/legit.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[]}
+JSON
+cat >"$QH/wide.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"s","label":"S","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/private"]}]}
+JSON
+printf 'OMABACKUP_REPO=%s\nOMABACKUP_GROUPS=%s\n' "$QH/repo" "$QH/wide.json" \
+    >"$QH/.config/omabackup/env"
+
+HOME="$QH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$QH/legit.json" \
+    OMABACKUP_STATE="$QH/.state" OMABACKUP_SYSTEMCTL="$QH/stub/systemctl" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1
+
+it "an explicit manifest still wins over the env file"
+[[ ! -e "$QH/.state/staging/.config/private/id_rsa" ]] \
+    && ok || fail "the env file chose what to collect"
+
+# With nothing explicit, the env file must not get to choose either.
+HOME="$QH" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$QH/.state2" \
+    OMABACKUP_SYSTEMCTL="$QH/stub/systemctl" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1
+
+it "and with none set, the env file cannot point the collector at a wider manifest"
+[[ ! -e "$QH/.state2/staging/.config/private/id_rsa" ]] \
+    && ok || fail "the env file picked the manifest and a private key was staged"
+
+it "the repo it legitimately names is still read from the file"
+assert_contains "$(HOME="$QH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$QH/legit.json" \
+    OMABACKUP_STATE="$QH/.state" OMABACKUP_SYSTEMCTL="$QH/stub/systemctl" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" status --json 2>/dev/null | jq -r '.config.repo')" "$QH/repo"

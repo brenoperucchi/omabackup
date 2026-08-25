@@ -29,7 +29,15 @@ set -uo pipefail
 # script, and sourcing it would hand anything able to write that path a shell
 # running as the user, on a timer. An already-set variable always wins, so an
 # explicit override still overrides.
-ENV_FILE_ALLOWED='OMABACKUP_REPO OMABACKUP_STATE OMABACKUP_GROUPS OMABACKUP_DESTINATIONS'
+# REPO and DESTINATIONS only: those name WHERE this machine's backup goes.
+#
+# GROUPS was admitted here on the reasoning that it is machine identity. It is
+# not -- the manifest decides WHAT gets collected, which is policy, and an env
+# line pointing at a wider manifest staged a private key. STATE is the same
+# shape one step along: it is the parent of the staging directory that every
+# collect clears with rm -rf. Both stay settable from the real environment,
+# which is where the specs set them.
+ENV_FILE_ALLOWED='OMABACKUP_REPO OMABACKUP_DESTINATIONS' 
 
 _load_env_file() {
     local f="${OMABACKUP_ENV:-$HOME/.config/omabackup/env}" line k v
@@ -111,6 +119,18 @@ record_sync_success() {
     mkdir -p "$(dirname "$LAST_SYNC_FILE")" 2>/dev/null || return 1
     printf '%s' "$(date +%s)" >"$LAST_SYNC_FILE.tmp" 2>/dev/null || return 1
     mv "$LAST_SYNC_FILE.tmp" "$LAST_SYNC_FILE" 2>/dev/null || return 1
+}
+
+# The stamp itself, only when it is a number. Handing jq the file's raw
+# contents meant a marker holding anything else killed jq and `status --json`
+# emitted NOTHING -- and the panel, which only parses non-empty output, then
+# kept showing whatever it had read last, indefinitely and without an error.
+last_sync_stamp() {
+    local at
+    [[ -s "$LAST_SYNC_FILE" ]] || return 1
+    at="$(cat "$LAST_SYNC_FILE" 2>/dev/null)"
+    [[ "$at" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$at"
 }
 
 # Prints the age in seconds, or nothing when it has never run.
@@ -982,6 +1002,15 @@ _shell_started_at() {
     date -d "$(ps -o lstart= -p "$pid" 2>/dev/null)" +%s 2>/dev/null
 }
 
+# Whether it is the SAME process, asked of the process rather than the clock.
+# "Did it restart" was answered by comparing start times, which are
+# second-granular -- so a shell that genuinely restarted within one second read
+# as unchanged and reload refused a reload that had worked.
+_shell_identity() {
+    if [[ -n "${OMABACKUP_SHELL_IDENTITY:-}" ]]; then "$OMABACKUP_SHELL_IDENTITY"; return; fi
+    pgrep -x quickshell 2>/dev/null | head -1
+}
+
 cmd_reload() {
     reject_flags reload "$@"
     [[ -d "$PLUGIN_DIR" ]] \
@@ -993,8 +1022,9 @@ cmd_reload() {
             || printf '  %s!%s could not pull; reloading what is on disk\n' "$YELLOW" "$NC"
     fi
 
-    local before files
+    local before files before_id
     before="$(_shell_started_at || echo 0)"
+    before_id="$(_shell_identity || echo none)"
     files="$(_newest_plugin_file)"; files="${files:-0}"
 
     # A verb whose whole purpose is verification reported success two ways
@@ -1007,14 +1037,16 @@ cmd_reload() {
 
     # Poll rather than sleep a guessed interval: the restart is asynchronous,
     # and a fixed sleep is what made this unreliable by hand.
-    local i after_at=0
+    local i after_at=0 after_id=none
     for i in 1 2 3 4 5 6 7 8 9 10; do
         sleep 1
         after_at="$(_shell_started_at || echo 0)"
+        after_id="$(_shell_identity || echo none)"
         # Three conditions, not one. The shell has to be RUNNING, it has to
         # have restarted (a different start than before), and it has to be at
         # least as new as the files.
-        (( after_at > 0 && after_at != before && after_at >= files )) && break
+        [[ "$after_id" != none && "$after_id" != "$before_id" ]] \
+            && (( after_at > 0 && after_at >= files )) && break
     done
 
     if (( after_at == 0 )); then
@@ -1023,7 +1055,7 @@ cmd_reload() {
         printf '  start it with: %s%s%s\n' "$CYAN" "$RESTART_SHELL" "$NC" >&2
         return 1
     fi
-    if (( after_at == before )); then
+    if [[ "$after_id" == "$before_id" ]]; then
         printf '%somabackup: the shell did not restart -- it is still the process from before%s\n' \
             "$RED" "$NC" >&2
         return 1
@@ -1151,7 +1183,7 @@ cmd_status() {
               --argjson d "$(destinations_json 2>/dev/null || echo '[]')" \
               --argjson sch "$(scheduler_active && echo true || echo false)" \
               --argjson stale "$(is_stale && echo true || echo false)" \
-              --argjson lastsync "$([[ -s "$LAST_SYNC_FILE" ]] && cat "$LAST_SYNC_FILE" || echo null)" \
+              --argjson lastsync "$(last_sync_stamp || echo null)" \
               --argjson age "$(last_sync_age || echo null)" \
               --argjson syncsched "$(timer_schedule omabackup-sync.timer | jq -R 'select(length>0)' || echo null)" \
               --argjson pushsched "$(timer_schedule omabackup-push.timer | jq -R 'select(length>0)' || echo null)" \

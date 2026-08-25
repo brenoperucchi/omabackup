@@ -109,3 +109,22 @@ printf 'not a number\n' >"$GH/.state/last-sync"
 
 it "a corrupt marker is reported as unreadable, not as never having run"
 assert_contains "$(_stale_env "$GH" "$GH/repo" verify 2>&1)" "unreadable"
+
+# ── a corrupt marker must not silence the whole document ───────────────────
+# `--argjson lastsync` was handed the file's raw contents, so a marker holding
+# anything but a number killed jq and `status --json` emitted NOTHING. The
+# panel only calls applyStatus on non-empty output, so it kept whatever it had
+# read last -- showing yesterday's state indefinitely, with no error anywhere.
+JH="$(_stale_home)"
+_stale_env "$JH" "$JH/repo" sync --commit >/dev/null
+printf 'not a number\n' >"$JH/.state/last-sync"
+JOUT="$(_stale_env "$JH" "$JH/repo" status --json 2>/dev/null)"
+
+it "a corrupt last-sync marker still produces a valid document"
+printf '%s' "$JOUT" | jq -e . >/dev/null 2>&1 && ok || fail "status --json emitted nothing"
+
+it "and reports the marker as unusable rather than as a time"
+assert_eq "$(printf '%s' "$JOUT" | jq -r '.lastSync')" "null"
+
+it "while the rest of the document survives"
+assert_eq "$(printf '%s' "$JOUT" | jq -r '.schemaVersion')" "1"

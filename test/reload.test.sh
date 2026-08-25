@@ -33,9 +33,16 @@ _rl_run() {  # _rl_run <home> <shell-start-epoch-AFTER-restart> [args...]
       printf 'if [[ -s %q ]]; then printf %%s %q; else printf 1; fi\n' "$h/calls.log" "$when"
     } >"$h/stub/probe"
     chmod +x "$h/stub/probe"
+    # "Did it restart" is now asked of the process, not the clock, so the
+    # fixture has to answer as a different process once the restart has run.
+    { printf '#!/bin/bash\n'
+      printf 'if [[ -s %q ]]; then printf 2222; else printf 1111; fi\n' "$h/calls.log"
+    } >"$h/stub/identity"
+    chmod +x "$h/stub/identity"
     HOME="$h" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$PWD/groups.default.json" \
         OMABACKUP_STATE="$h/.state" OMABACKUP_PLUGIN_DIR="$h/plugin" \
         OMABACKUP_RESTART_SHELL="$h/stub/restart" OMABACKUP_SHELL_PROBE="$h/stub/probe" \
+        OMABACKUP_SHELL_IDENTITY="$h/stub/identity" \
         XDG_RUNTIME_DIR=/nonexistent "$OB" reload "$@" 2>&1
 }
 
@@ -147,3 +154,30 @@ HOUT="$(_rl_run "$HH" "$HSAME")"
 it "a shell that never restarted is caught even when it is newer than the files"
 # Same process before and after: the restart did nothing, whatever it returned.
 assert_contains "$HOUT" "did not restart"
+
+# ── a genuine restart landing in the same second ───────────────────────────
+# The check required a start time DIFFERENT from before. Process start times
+# are second-granular, so a shell that really did restart within the same
+# second reads as unchanged, and reload refuses a reload that worked. The
+# fixtures never covered it because they always answered with two distinct
+# values.
+SSH2="$(_rl_home)"
+SSNOW="$(date +%s)"
+touch -d "@$SSNOW" "$SSH2/plugin/Panel.qml"
+# The probe answers the SAME second before and after, while the restart command
+# genuinely ran -- which is exactly the ambiguous case.
+{ printf '#!/bin/bash\n'; printf 'printf %%s %q\n' "$SSNOW"
+} >"$SSH2/stub/probe"; chmod +x "$SSH2/stub/probe"
+# A different process, reported at the same second -- the ambiguous case.
+{ printf '#!/bin/bash\n'
+  printf 'if [[ -s %q ]]; then printf 2222; else printf 1111; fi\n' "$SSH2/calls.log"
+} >"$SSH2/stub/identity"; chmod +x "$SSH2/stub/identity"
+SSOUT="$(HOME="$SSH2" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$SSH2/.state" OMABACKUP_PLUGIN_DIR="$SSH2/plugin" \
+    OMABACKUP_RESTART_SHELL="$SSH2/stub/restart" OMABACKUP_SHELL_PROBE="$SSH2/stub/probe" \
+    OMABACKUP_SHELL_IDENTITY="$SSH2/stub/identity" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" reload 2>&1)"
+SSRC=$?
+
+it "a restart that lands in the same second is not called a failure"
+[[ $SSRC -eq 0 ]] && ok || fail "refused a reload that worked: $SSOUT"
