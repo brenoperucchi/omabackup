@@ -191,15 +191,19 @@ it "a restart that lands in the same second is not called a failure"
 # Asked of a process this spec controls. Asserting on whatever quickshell is
 # running would make the result depend on the machine, and a stub answering for
 # _shell_identity would only prove the stub answers.
-PRID="$(bash -c 'eval "$(sed -n "/^_proc_identity()/,/^}/p" bin/omabackup)"; _proc_identity $$')"
-PRSTAT="$(cut -d" " -f22 <<<"$(sed "s/.*) //" /proc/self/stat)")"
+# Both halves come from the same process, so they can be compared: what the
+# function reports, and field 22 read independently of it.
+PRBOTH="$(bash -c '
+    eval "$(sed -n "/^_proc_identity()/,/^}/p" bin/omabackup)"
+    printf "%s %s" "$(_proc_identity $$)" "$(cut -d" " -f20 <<<"$(sed "s/.*) //" /proc/$$/stat)")"')"
+PRID="${PRBOTH% *}"; PRSTAT="${PRBOTH#* }"
 
 it "a process identity is its pid paired with its start time"
 [[ "$PRID" =~ ^[0-9]+:[0-9]+$ ]] && ok || fail "identity is not <pid>:<starttime>: ${PRID:-<empty>}"
 
-it "and the start time is read from the right field, not from the comm"
-[[ "${PRID##*:}" =~ ^[0-9]+$ && "${PRID##*:}" -gt 0 ]] \
-    && ok || fail "start time is not a positive tick count: ${PRID:-<empty>}"
+it "and the tick count is field 22 of /proc/<pid>/stat, read independently"
+[[ -n "$PRSTAT" && "${PRID##*:}" == "$PRSTAT" ]] \
+    && ok || fail "identity says ${PRID##*:}, /proc says ${PRSTAT:-<empty>}"
 
 it "a pid that does not exist has no identity"
 bash -c 'eval "$(sed -n "/^_proc_identity()/,/^}/p" bin/omabackup)"; _proc_identity 999999' \

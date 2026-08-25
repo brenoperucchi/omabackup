@@ -576,3 +576,35 @@ JSON
 
 it "an exception that merely contains a match is refused, not silently dead"
 assert_contains "$(OMABACKUP_SECRETS_DENY="$CTH/wider.json" _sec_env "$CTH" "$CTR" push 2>&1)" "wrapped"
+
+# ── a pattern that matches everything and reports nothing ───────────────────
+# "^" matches every line and hands grep -o nothing to extract, so the match
+# array came back empty and _still_matches called the line clean -- a live
+# deny-list entry that could never fire. Validation refuses it now, and the
+# scanner fails closed if one ever reaches it anyway.
+ZWH="$(mktemp -d)"; ZWR="$ZWH/repo"; _sec_repo "$ZWR" "" ""
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$ZWH/destinations.json"
+cat >"$ZWH/zerowidth.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"everything","regex":"^","reason":"matches every line"}],
+ "exceptions":[]}
+JSON
+
+it "a pattern that can match the empty string is refused"
+assert_contains "$(OMABACKUP_SECRETS_DENY="$ZWH/zerowidth.json" _sec_env "$ZWH" "$ZWR" push 2>&1)" "everything"
+
+it "and the refusal says why, not just that something is wrong"
+assert_contains "$(OMABACKUP_SECRETS_DENY="$ZWH/zerowidth.json" _sec_env "$ZWH" "$ZWR" push 2>&1)" "empty string"
+
+it "a line the pattern matched is never called clean for want of an extract"
+bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+         DENY_EXCEPTIONS=(); _still_matches "abc AKIA1234567890ABCDEF" "^" false' \
+    && ok || fail "zero-width match read as no match: the scanner failed open"
+
+it "a regex the scanner cannot compile is refused too"
+cat >"$ZWH/broken.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"malformed","regex":"[unclosed","reason":"not a regex"}],
+ "exceptions":[]}
+JSON
+assert_contains "$(OMABACKUP_SECRETS_DENY="$ZWH/broken.json" _sec_env "$ZWH" "$ZWR" push 2>&1)" "malformed"

@@ -65,6 +65,25 @@ assert_deny_understood() {
     # extracted match is the substring and equality fails. Two halves of one
     # rule meaning two different things, which is the shape of half the defects
     # in this file.
+    # A regex that can match the empty string matches every line and hands
+    # grep -o nothing to print -- and "nothing to print" read as "nothing
+    # found". "^" is the short way to write it: live in the deny-list, matching
+    # every line in the repository, reporting none of them. Asked of bash's own
+    # ERE rather than of grep -o, whose handling of a zero-width match turned
+    # out to vary between invocations on this machine; a detector must not rest
+    # on that. An expression bash cannot compile is refused in the same breath.
+    local pid3 pre3 zwrc
+    while IFS=$'\t' read -r pid3 pre3; do
+        [[ -n "$pid3" && -n "$pre3" ]] || continue
+        ( [[ "a" =~ $pre3 ]] ) 2>/dev/null; zwrc=$?
+        if (( zwrc == 2 )); then
+            bad="${bad:+$bad$'\n'}pattern $pid3 is not a regular expression this scanner can compile"
+        elif (( zwrc == 0 )) \
+          && [[ -z "$( [[ "a" =~ $pre3 ]] 2>/dev/null; printf '%s' "${BASH_REMATCH[0]}" )" ]]; then
+            bad="${bad:+$bad$'\n'}pattern $pid3 can match the empty string: it would match every line and report none"
+        fi
+    done < <(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)"' "$file" 2>/dev/null)
+
     local exid2 exm2 reach
     while IFS=$'\t' read -r exid2 exm2; do
         [[ -n "$exm2" ]] || continue
@@ -116,7 +135,18 @@ _still_matches() {
     else
         mapfile -t matches < <(printf '%s' "$line" | grep -oE -e "$re")
     fi
-    (( ${#matches[@]} )) || return 1
+    # A match the extraction could not produce is not an absence of secrets.
+    # With a zero-width pattern grep -o prints nothing, the array comes back
+    # empty, and this returned "clean" for a line the pattern had matched.
+    # assert_deny_understood refuses such patterns now; this is the second lock,
+    # because the scanner must not depend on its caller having validated.
+    local any=0 probe
+    for probe in "${matches[@]:-}"; do [[ -n "$probe" ]] && { any=1; break; }; done
+    if (( ! any )); then
+        if [[ "$ci" == true ]]; then printf '%s' "$line" | grep -qiE -e "$re" && return 0
+        else printf '%s' "$line" | grep -qE -e "$re" && return 0; fi
+        return 1
+    fi
 
     local mm
     for m in "${matches[@]}"; do
@@ -223,6 +253,14 @@ scan_secrets() {
                   n = split(b, L, "\n")
                   for (j = 1; j <= n; j++) if (L[j] != "") print substr(h,1,12) ":" L[j]
               }')"$'\n'"$tagraw"
+    # The awk that splits them carries its own way of failing, and reading it
+    # through an unchecked assignment would restore the fail-open one layer down
+    # from where it was just closed.
+    if (( $? != 0 )); then
+        printf '%somabackup: could not split the commit messages of %s -- refusing to call it clean%s\n' \
+            "$RED" "$(_tilde "$repo")" "$NC" >&2
+        return 1
+    fi
 
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
@@ -253,13 +291,25 @@ scan_secrets() {
             printf '%s\t%s\n' "$id" "$(printf '%s' "$hit" | tr -c '[:print:]\t' '.' | cut -c1-200)"
         done <<<"$out"
 
-        # Commit messages and tag bodies, collected once above.
+        # Commit messages and tag bodies, collected once above. grep exits 1
+        # for "nothing here" and above 1 for "I could not do it" -- read through
+        # a process substitution those were the same answer, and the second one
+        # meant a pattern silently stopped being applied to the history.
+        local mout mrc
+        if [[ "$ci" == true ]]; then mout="$(printf '%s' "$msgs" | grep -iE -e "$re")"
+        else mout="$(printf '%s' "$msgs" | grep -E -e "$re")"; fi
+        mrc=$?
+        if (( mrc > 1 )); then
+            printf '%somabackup: pattern %s could not be applied to the commit messages%s\n' \
+                "$RED" "$id" "$NC" >&2
+            rc=1
+            continue
+        fi
         while IFS= read -r hit; do
             [[ -n "$hit" ]] || continue
             _still_matches "$hit" "$re" "$ci" || continue
             printf '%s\tcommit-message: %s\n' "$id" "$hit"
-        done < <(if [[ "$ci" == true ]]; then printf '%s' "$msgs" | grep -iE -e "$re"
-                 else printf '%s' "$msgs" | grep -E -e "$re"; fi)
+        done <<<"$mout"
     done <<<"$patterns"
     return $rc
 }

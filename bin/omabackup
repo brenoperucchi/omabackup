@@ -576,8 +576,26 @@ cmd_collect() {
 # Counted off the staging tree, which is the backup's own content: whatever a
 # group's paths, excludes and tracked-only rules produced, without asking a
 # second implementation to agree.
+# The record we could not replace describes an earlier collect, and nothing
+# downstream distinguishes it from a current one: unknown counts print as "--",
+# stale counts print as fact. Emptied before it is removed -- unlinking needs
+# write permission on the DIRECTORY, which is exactly what is missing in the
+# case that brings us here, so the delete failed and the stale record survived
+# the branch written to retire it. Truncating needs only the file.
+_retire_coverage() {  # _retire_coverage <why>
+    : >"$COVERAGE_FILE" 2>/dev/null
+    rm -f "$COVERAGE_FILE.tmp" "$COVERAGE_FILE" 2>/dev/null
+    if [[ -s "$COVERAGE_FILE" ]]; then
+        printf '%somabackup: %s, and the old record could not be retired either -- the counts shown describe an earlier collect%s\n' \
+            "$RED" "$1" "$NC" >&2
+    else
+        printf '%somabackup: %s -- counts read as unknown until the next collect%s\n' \
+            "$YELLOW" "$1" "$NC" >&2
+    fi
+}
+
 write_coverage() {
-    local id p e dest files bytes gf gb rows=""
+    local id p e dest files bytes gf gb rows="" failed=0
     while read -r id; do
         [[ -n "$id" ]] || continue
         gf=0; gb=0
@@ -589,23 +607,38 @@ write_coverage() {
             gen)    local gen_id f
                     gen_id="$(group_field "$id" generator)"
                     for f in $(_generated_files "$gen_id"); do
-                        IFS=$'\t' read -r files bytes <<<"$(_staged_size "$STAGING/.generated/$f")"
+                        local gsz
+                        gsz="$(_staged_size "$STAGING/.generated/$f")" || { failed=1; break; }
+                        IFS=$'\t' read -r files bytes <<<"$gsz"
                         gf=$((gf + files)); gb=$((gb + bytes))
                     done ;;
             triple) dest="$STAGING/.plugins"
-                    IFS=$'\t' read -r gf gb <<<"$(_staged_size "$dest")" ;;
+                    local tsz
+                    if tsz="$(_staged_size "$dest")"; then
+                        IFS=$'\t' read -r gf gb <<<"$tsz"
+                    else failed=1; fi ;;
             *)      while read -r p; do
                         [[ -n "$p" ]] || continue
                         e="$(_expand "$p")"
                         dest="$STAGING/${e#$HOME/}"
                         local sz
-                        sz="$(_staged_size "$dest")" || return 1
+                        sz="$(_staged_size "$dest")" || { failed=1; break; }
                         IFS=$'\t' read -r files bytes <<<"$sz"
                         gf=$((gf + files)); gb=$((gb + bytes))
                     done < <(group_paths "$id") ;;
         esac
+        # A size this function could not measure is a row it cannot honestly
+        # write, and every one of these paths used to leave quietly: two threw
+        # the status away outright and the third returned before the record was
+        # retired, so a measurement failure and a clean collect looked alike.
+        (( failed )) && break
         rows+="$(printf '%s\t%s\t%s' "$id" "$gf" "$gb")"$'\n'
     done < <(groups_ids)
+
+    if (( failed )); then
+        _retire_coverage "could not measure what was staged"
+        return 1
+    fi
 
     # The manifest's content hash rides along. Counts keyed by group id alone
     # survived a manifest edit that kept an id and changed what it covers, and
@@ -627,19 +660,7 @@ write_coverage() {
                       | {id:.[0], files:(.[1]|tonumber), bytes:(.[2]|tonumber)}))}' \
            >"$COVERAGE_FILE.tmp" 2>/dev/null \
     || ! mv "$COVERAGE_FILE.tmp" "$COVERAGE_FILE" 2>/dev/null; then
-        # Emptied before it is removed. Unlinking needs write permission on the
-        # DIRECTORY, which is exactly what is missing in the case that brought
-        # us here -- so the delete failed and the stale record survived the
-        # branch written to retire it. Truncating needs only the file.
-        : >"$COVERAGE_FILE" 2>/dev/null
-        rm -f "$COVERAGE_FILE.tmp" "$COVERAGE_FILE" 2>/dev/null
-        if [[ -s "$COVERAGE_FILE" ]]; then
-            printf '%somabackup: could not record coverage at %s, and could not retire the old record either -- the counts shown describe an earlier collect%s\n' \
-                "$RED" "$(_tilde "$COVERAGE_FILE")" "$NC" >&2
-        else
-            printf '%somabackup: could not record coverage at %s -- counts read as unknown until the next collect%s\n' \
-                "$YELLOW" "$(_tilde "$COVERAGE_FILE")" "$NC" >&2
-        fi
+        _retire_coverage "could not record coverage at $(_tilde "$COVERAGE_FILE")"
         return 1
     fi
     return 0

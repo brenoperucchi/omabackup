@@ -167,3 +167,34 @@ it "and the collect itself still succeeds -- what it staged is on disk"
 
 it "while the counts read as unknown rather than as last time's numbers"
 assert_eq "$(_cov_env "$WFH" verify --json | jq -r '.groups[0].files')" "null"
+
+# ── a size that could not be measured is not a size of zero ─────────────────
+# _staged_size returns non-zero when find's walk was partial. Two of the three
+# call sites threw that status away and the third returned before the old record
+# was retired, so a measurement failure and a clean collect looked alike -- and
+# the previous run's numbers stayed on screen as though they described this one.
+SZH="$(mktemp -d)"; mkdir -p "$SZH/.config/app"
+printf 'x\n' >"$SZH/.config/app/one.conf"
+cat >"$SZH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/app"]}]}
+JSON
+_cov_env "$SZH" collect >/dev/null
+
+it "the first collect records a real count"
+assert_eq "$(_cov_env "$SZH" verify --json | jq -r '.groups[0].files')" "1"
+
+# An empty directory the walk cannot enter. It survives the copy -- there is
+# nothing inside to read -- and stops find at the far end.
+mkdir -p "$SZH/.config/app/sealed"; chmod 000 "$SZH/.config/app/sealed"
+SZOUT="$(_cov_env "$SZH" collect 2>&1)"; SZRC=$?
+chmod 755 "$SZH/.config/app/sealed"
+
+it "a walk that could not finish says so instead of counting what it reached"
+assert_contains "$SZOUT" "could not measure what was staged"
+
+it "and the collect still succeeds -- what it staged is on disk"
+[[ $SZRC -eq 0 ]] && ok || fail "aborted a collect that worked: $SZOUT"
+
+it "while last run's numbers are retired rather than left standing"
+assert_eq "$(_cov_env "$SZH" verify --json | jq -r '.groups[0].files')" "null"
