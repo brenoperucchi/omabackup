@@ -20,7 +20,7 @@ Last updated: 2026-08-24.
 | 1 | `omabackup` repo created; group manifest; `collect`; `verify` (T1 coverage) | **done** |
 | 2 | Normalized diff, `sync` (collect → publish → verify → commit), destinations, systemd timer | **done** |
 | 3 | T3 — fast syntax/parse check in a disposable container | not started |
-| 4 | `restore` with the version-coupling quarantine (§12.2 of DESIGN.md) | not started |
+| 4 | `restore` with the version-coupling quarantine (§12.2 of DESIGN.md) | **done** |
 | 5 | QML plugin (`Panel.qml`) — coverage, groups, destinations, schedule | **done**, installed live |
 | 6 | T4 — visual restore check in a VM (QMP screendump) | not started |
 
@@ -370,6 +370,39 @@ of which publish was 27 — one `rsync` spawn per staged file, ~44ms each agains
 staging with `find -type f`, which excludes symlinks, so every staged link had
 been dropped in silence since the beginning.
 
+### Restore exists now
+
+`omabackup restore <artifact.tar.zst>` plans; `--apply` writes. On this machine
+the plan is 601 files across ten groups, plus five generated lists it names and
+refuses to act on -- restoring a package list means installing software, which
+is not a file copy and is not something this tool does on anyone's behalf.
+
+Three things shape it, and all three came out of §12:
+
+- **The artifact's own manifest drives it.** `tool/groups.default.json` ships
+  inside every bundle for exactly this. A restore driven by whatever manifest
+  the machine happens to carry would look for groups the artifact never had and
+  place files by rules written after it.
+- **The verdict is taken before anything is read.** `same` (identical
+  watermark: coupled groups and migration markers both apply), `forward`
+  (inside the declared range, further along: coupled groups apply, markers do
+  not -- `omarchy-migrate` exists to walk that distance), `quarantine` (outside
+  the range, or BEHIND the backup: coupled groups are held, never placed).
+  August's failure is refused by construction rather than discovered hours
+  later.
+- **Nothing is written unless asked, and what is replaced is kept.** A backup
+  that cannot be taken cancels the write. Two restores in the same second get
+  separate directories -- named by the second alone, the second would have
+  overwritten the first's originals in the one place that exists to keep them.
+
+The one honest gap: `map_to_repo` flattens `trackedRepoPath` groups, so if two
+declared directories ever shared a destination, a file there could not be
+traced home. Restore detects that and says `ambiguous` instead of guessing. No
+group in the shipped manifest does it -- `scripts` declares `~/.local/bin` and
+`~/bin` with distinct destinations -- but the first version of the check
+counted a group's paths rather than the paths sharing a destination, and called
+`scripts` ambiguous for having two of anything.
+
 ## Immediate next actions
 
 1. **Configure a real `dir` destination**, once there is an actual path to name
@@ -380,8 +413,10 @@ been dropped in silence since the beginning.
 2. **Removable-drive trigger.** A udev rule calling `omabackup push <id>` when a
    `dir` destination's mount point appears (DESIGN.md §4.4). Not a new
    destination type.
-3. Expand `Panel.qml` to show destinations and the schedule — `status --json`
-   already carries both `destinations` and `scheduler` for it to read.
+3. **T3 and T4** (stages 3 and 6) are the verification of what stage 4 now
+   does: a syntax check in a disposable container, and a visual check in a VM.
+   They are worth more now that there is a restore to verify than they were
+   when there was not.
 
 ## Open questions for the user, not yet decided
 

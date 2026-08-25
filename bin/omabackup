@@ -1290,6 +1290,136 @@ cmd_push() {
     return $rc
 }
 
+# ── restore ──────────────────────────────────────────────────────────────────
+cmd_restore() {
+    local artifact="" apply=0 into="" filter=""
+    while (( $# )); do
+        case "$1" in
+            --apply)  apply=1; shift ;;
+            --into)   [[ -n "${2:-}" ]] || die "--into needs a directory"; into="$2"; shift 2 ;;
+            --groups) [[ -n "${2:-}" ]] || die "--groups needs a value"; filter="$2"; shift 2 ;;
+            --json)   shift ;;
+            -*)       die "unknown flag for restore: $1" ;;
+            *)        [[ -z "$artifact" ]] || die "restore takes one artifact, not two"
+                      artifact="$1"; shift ;;
+        esac
+    done
+    [[ -n "$artifact" ]] || die "restore needs an artifact: omabackup restore <file.tar.zst>"
+    [[ -f "$artifact" ]] || die "no such artifact: $(_tilde "$artifact")"
+    require_tools jq git tar zstd
+
+    # Proved before it is read. An artefact whose checksums do not match, or
+    # whose bundle will not clone, is not a thing to be copying over a live
+    # home directory -- and verify_bundle is the same proof build_bundle makes,
+    # so restore trusts exactly what creation promised.
+    printf '  %schecking the artifact%s\n' "$DIM" "$NC" >&2
+    verify_bundle "$artifact" >/dev/null 2>&1 \
+        || die "this artifact does not verify -- refusing to restore from it"
+
+    local x; x="$(mktemp -d)" || die "could not make a working directory"
+    tar -C "$x" -xf <(zstd -dc "$artifact" 2>/dev/null) 2>/dev/null \
+        || { rm -rf "$x"; die "could not extract $(_tilde "$artifact")"; }
+    [[ -f "$x/manifest.json" ]] || { rm -rf "$x"; die "no manifest in $(_tilde "$artifact")"; }
+
+    # The verdict is about THIS machine, so it is taken before --into moves the
+    # destination anywhere.
+    local verdict why
+    IFS=$'\t' read -r verdict why <<<"$(_restore_verdict "$x/manifest.json")"
+
+    # Described by the manifest that made it. A restore driven by whatever
+    # manifest this machine carries would look for groups the artefact never
+    # had, and would place files by rules written after it.
+    local GROUPS_FILE="$x/tool/groups.default.json"
+    [[ -f "$GROUPS_FILE" ]] || { rm -rf "$x"; die "the artifact carries no manifest of its own"; }
+
+    local HOME="${into:-$HOME}"
+    [[ -z "$into" ]] || mkdir -p "$into" || { rm -rf "$x"; die "could not make $(_tilde "$into")"; }
+
+    local rows; rows="$(restore_rows "$x" "$verdict" "$filter")" \
+        || { rm -rf "$x"; die "could not read the artifact's contents"; }
+
+    local bv bm
+    bv="$(jq -r '.omarchy.version // "unknown"' "$x/manifest.json")"
+    bm="$(jq -r '.omarchy.migrationWatermark // "0"' "$x/manifest.json")"
+    printf '\n  %sfrom%s Omarchy %s, migrated through %s\n' "$DIM" "$NC" "$bv" \
+        "$(date -d "@$bm" '+%Y-%m-%d' 2>/dev/null || printf '%s' "$bm")"
+    case "$verdict" in
+        quarantine) printf '  %s!%s %s\n' "$YELLOW" "$NC" "$why" ;;
+        *)          printf '  %s·%s %s\n' "$DIM" "$NC" "$why" ;;
+    esac
+
+    local a g rel dest nr=0 nq=0 nrep=0 na=0
+    # Unique even against itself. Named by the second alone, two restores in
+    # the same second shared a directory -- and a file replaced by both would
+    # have had its original backup overwritten by the intermediate version, in
+    # the one place that exists to keep originals.
+    local base
+    mkdir -p "$OMABACKUP_STATE/restore" 2>/dev/null \
+        || { rm -rf "$x"; die "could not make $(_tilde "$OMABACKUP_STATE/restore")"; }
+    base="$(mktemp -d "$OMABACKUP_STATE/restore/$(date -u '+%Y%m%d-%H%M%S')-XXXX")" \
+        || { rm -rf "$x"; die "could not make a directory to keep replaced files in"; }
+    local backup="$base/replaced" quar="$base/quarantine"
+
+    while IFS=$'\t' read -r a g rel dest; do
+        [[ -n "$a" ]] || continue
+        case "$a" in
+            restore)   nr=$((nr + 1)) ;;
+            quarantine) nq=$((nq + 1)) ;;
+            report)    nrep=$((nrep + 1)) ;;
+            ambiguous) na=$((na + 1)) ;;
+        esac
+    done <<<"$rows"
+
+    printf '\n'
+    if (( ! apply )); then
+        printf '  %s%s files would be restored%s' "$GREEN" "$nr" "$NC"
+        (( nq )) && printf ', %s%s quarantined%s' "$YELLOW" "$nq" "$NC"
+        (( na )) && printf ', %s%s ambiguous%s' "$YELLOW" "$na" "$NC"
+        (( nrep )) && printf ', %s%s to read yourself%s' "$DIM" "$nrep" "$NC"
+        printf '\n'
+        while IFS=$'\t' read -r a g rel dest; do
+            [[ -n "$a" ]] || continue
+            case "$a" in
+                restore)    printf '    %s→%s %-11s %s\n' "$GREEN" "$NC" "$g" "$(_tilde "$dest")" ;;
+                quarantine) printf '    %s⊘%s %-11s %s %s(coupled, not applied)%s\n' \
+                                "$YELLOW" "$NC" "$g" "$(_tilde "$dest")" "$DIM" "$NC" ;;
+                ambiguous)  printf '    %s?%s %-11s %s %s(the repo flattens several directories into one)%s\n' \
+                                "$YELLOW" "$NC" "$g" "$(_tilde "$dest")" "$DIM" "$NC" ;;
+                report)     printf '    %s·%s %-11s %s %s(a list to act on, not a file to place)%s\n' \
+                                "$DIM" "$NC" "$g" "$rel" "$DIM" "$NC" ;;
+            esac
+        done <<<"$rows"
+        printf '\n  nothing was written. %somabackup restore %s --apply%s to do it\n' \
+            "$CYAN" "$(_tilde "$artifact")" "$NC"
+        rm -rf "$x"
+        return 0
+    fi
+
+    mkdir -p "$backup" || { rm -rf "$x"; die "could not make $(_tilde "$backup")"; }
+    local ok=0 bad=0 qok=0
+    while IFS=$'\t' read -r a g rel dest; do
+        [[ -n "$a" ]] || continue
+        case "$a" in
+            restore)
+                if _restore_one "$x" "$rel" "$dest" "$backup"; then ok=$((ok + 1))
+                else bad=$((bad + 1))
+                     printf '  %s✗%s %s\n' "$RED" "$NC" "$(_tilde "$dest")" >&2; fi ;;
+            quarantine)
+                mkdir -p "$quar/$g/$(dirname "$rel")" 2>/dev/null \
+                    && cp -Pp "$x/worktree/$rel" "$quar/$g/$rel" 2>/dev/null \
+                    && qok=$((qok + 1)) ;;
+        esac
+    done <<<"$rows"
+
+    printf '  %s✓%s restored %s files\n' "$GREEN" "$NC" "$ok"
+    (( bad )) && printf '  %s✗%s %s could not be written\n' "$RED" "$NC" "$bad" >&2
+    (( qok )) && printf '  %s⊘%s %s coupled files held at %s\n' \
+        "$YELLOW" "$NC" "$qok" "$(_tilde "$quar")"
+    printf '  %swhat was replaced is at %s%s\n' "$DIM" "$(_tilde "$backup")" "$NC"
+    rm -rf "$x"
+    (( bad == 0 ))
+}
+
 cmd_status() {
     local ov oc om; IFS=$'\t' read -r ov oc om <<<"$(omarchy_identity)"
     if (( JSON )); then
@@ -1334,6 +1464,7 @@ source "$OMABACKUP_ROOT/lib/publish.sh"
 source "$OMABACKUP_ROOT/lib/bundle.sh"
 source "$OMABACKUP_ROOT/lib/destinations.sh"
 source "$OMABACKUP_ROOT/lib/secrets.sh"
+source "$OMABACKUP_ROOT/lib/restore.sh"
 
 # Two levels: the loop below owns only what every command understands and
 # hands the rest, in order, to the command itself. It used to consume and shift
@@ -1373,6 +1504,7 @@ case "$CMD" in
     bundle)  cmd_bundle "${ARGS[@]}" ;;
     push)    cmd_push "${ARGS[@]}" ;;
     status)  reject_flags status "${ARGS[@]}"; cmd_status ;;
+    restore) cmd_restore "${ARGS[@]}" ;;
     ""|help)
         cat <<'USAGE'
 omabackup <command> [--json] [--groups a,b]
@@ -1383,6 +1515,7 @@ omabackup <command> [--json] [--groups a,b]
   disable   stop them; nothing runs until enable
   collect   collect the groups into staging (does not touch the repo)
   verify    check that the backup covers what the system actually reads
+  restore   plan a restore from an artifact; --apply to write it
 
 The full cycle is collect -> diff -> verify -> commit. `collect` and `verify`
 are the first two; without them there is no diff for mode:copy groups and
