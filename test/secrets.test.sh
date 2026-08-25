@@ -396,3 +396,45 @@ printf 'set hide_token_restore on # aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n' 
 git -C "$BTH" add -A && git -C "$BTH" commit -qm x
 [[ -n "$(scan_secrets "$BTH" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
     && ok || fail "the exception swallowed the key beside it"
+
+# ── a secret inside a binary still ships ───────────────────────────────────
+# `git grep -I` skips binary blobs, and `git bundle` packs them regardless. A
+# credential in a .env compiled into something, a key inside an archive, a
+# config with one stray NUL byte: none were scanned. The patterns are
+# high-signal ASCII shapes, so reading binary as text costs no realistic false
+# positive and closes the hole.
+BINR="$(mktemp -d)/repo"; mkdir -p "$BINR"; git init -q "$BINR"
+git -C "$BINR" config user.email t@t; git -C "$BINR" config user.name t
+printf 'text\x00binary\naws_access_key_id = AKIAIOSFODNN7EXAMPLE\n' >"$BINR/blob.bin"
+git -C "$BINR" add -A && git -C "$BINR" commit -qm x
+
+it "a credential inside a binary blob is found"
+[[ -n "$(scan_secrets "$BINR" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "binary blobs went unscanned while the bundle carried them"
+
+it "and what it prints stays readable rather than dumping the blob"
+# The secret shares its line with control bytes here, so the report has
+# something to sanitise. Checked with tr rather than a bash pattern: a bash
+# string cannot hold a NUL at all, so matching against $'\x00' compares against
+# the empty string and passes for any input -- a check that cannot fail.
+BINR2="$(mktemp -d)/repo"; mkdir -p "$BINR2"; git init -q "$BINR2"
+git -C "$BINR2" config user.email t@t; git -C "$BINR2" config user.name t
+printf 'aws_access_key_id = AKIAIOSFODNN7EXAMPLE \x01\x02\x07 trailing\n' >"$BINR2/blob.bin"
+git -C "$BINR2" add -A && git -C "$BINR2" commit -qm x
+BINOUT="$(scan_secrets "$BINR2" "$PWD/secrets.deny.json" 2>/dev/null)"
+assert_eq "$(printf '%s' "$BINOUT" | tr -d '[:print:]\t\n' | wc -c)" "0"
+
+it "while still reporting the credential it found in there"
+assert_contains "$BINOUT" "AKIAIOSFODNN7EXAMPLE"
+
+# ── the deny-list check cannot pass by failing ─────────────────────────────
+it "a deny-list that is valid JSON but the wrong shape is refused"
+# assert_deny_understood built its findings with a command substitution whose
+# exit status nobody read. This file parses as JSON, so `jq -e .` is happy, but
+# `.patterns[]` errors on a string -- which produced no findings, which read as
+# "nothing wrong with this deny-list".
+SHAPEH="$(mktemp -d)"; SHAPER="$SHAPEH/repo"; _sec_repo "$SHAPER" "" ""
+printf '{"schemaVersion":1,"patterns":"not an array","exceptions":[]}\n' >"$SHAPEH/shape.json"
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$SHAPEH/destinations.json"
+assert_contains "$(OMABACKUP_SECRETS_DENY="$SHAPEH/shape.json" _sec_env "$SHAPEH" "$SHAPER" push 2>&1)" \
+    "deny-list"

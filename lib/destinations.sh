@@ -130,10 +130,21 @@ prune_bundles() {  # prune_bundles <dir> <host> <keep> -> prints how many it rem
     # dot is ordinary in a hostname and matches any character in an ERE, which
     # widened retention to other machines' bundles.
     local hre; hre="$(printf '%s' "$host" | sed 's/[][\\.^$*+?(){}|\/]/\\&/g')"
+    # Sorted on a built key, not the raw filename. Sorting names put a legacy
+    # name (written before bundles carried a short sha) AFTER the sha'd one
+    # within the same second, so `sort -r` kept the older format and pruned the
+    # newer. The key is <timestamp> <1 if sha'd> <name>, so a tie is decided by
+    # format age rather than by punctuation.
     local -a found=()
     mapfile -t found < <(find "$dir" -maxdepth 1 -type f -regextype posix-extended \
         -regex ".*/omabackup-${hre}-${DEST_NAME_TAIL}" \
-        -printf '%f\n' 2>/dev/null | sort -r)
+        -printf '%f\n' 2>/dev/null \
+        | awk '{ ts = $0; sub(/^.*-([0-9]{8}-[0-9]{6})/, "\\1", ts)
+                 match($0, /-[0-9]{8}-[0-9]{6}/)
+                 stamp = substr($0, RSTART + 1, 15)
+                 sha = ($0 ~ /-[0-9a-f]{12}\.tar\.zst$/) ? 1 : 0
+                 print stamp "\t" sha "\t" $0 }' \
+        | sort -r | cut -f3)
     for f in "${found[@]:-}"; do
         [[ -n "$f" ]] || continue
         n=$((n + 1))

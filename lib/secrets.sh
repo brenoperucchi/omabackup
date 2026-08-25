@@ -43,7 +43,8 @@ assert_deny_understood() {
             | "unknown field \(.) in exception \($r.id // "?")")
         , ((.exceptions // [])[] | select((.match // "") == "" or (.reason // "") == "")
             | "exception \(.id // "?") needs both match and reason")
-        ] | .[]' "$file" 2>/dev/null)"
+        ] | .[]' "$file" 2>/dev/null)" \
+        || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
     # An exception is cut out of the line before the pattern is retried, so one
     # that overlaps a credential shape would blank that shape out wherever it
     # appeared -- a single line quietly switching off a detector. Checked here,
@@ -150,7 +151,12 @@ scan_secrets() {
         [[ -n "$id" && -n "$re" ]] || continue
         # Per pattern, not globally: `git grep -E` is POSIX ERE with no inline
         # (?i), and -i everywhere would make AKIA match "akia" in prose.
-        local -a gflags=(-I -n -E)
+        # -a, not -I: `git grep -I` skips binary blobs and `git bundle` packs
+        # them anyway, so a credential inside one shipped unscanned. These
+        # patterns are high-signal ASCII shapes -- random bytes matching
+        # `AKIA[0-9A-Z]{16}` is not a realistic false positive -- so reading
+        # binary as text closes the hole at no practical cost.
+        local -a gflags=(-a -n -E)
         [[ "$ci" == true ]] && gflags+=(-i)
         local out grc
         out="$(git -C "$repo" grep "${gflags[@]}" -e "$re" "${revs[@]}" 2>&1)"; grc=$?
@@ -165,7 +171,9 @@ scan_secrets() {
         while IFS= read -r hit; do
             [[ -n "$hit" ]] || continue
             _still_matches "$hit" "$re" "$ci" || continue
-            printf '%s\t%s\n' "$id" "$hit"
+            # A hit inside a binary would otherwise dump the blob into the
+            # report. Keep it printable and bounded.
+            printf '%s\t%s\n' "$id" "$(printf '%s' "$hit" | tr -c '[:print:]\t' '.' | cut -c1-200)"
         done <<<"$out"
 
         # `git grep <rev>` reads the tree at that commit and nothing else, but

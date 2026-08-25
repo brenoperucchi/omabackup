@@ -367,3 +367,23 @@ _dest_env "$OH" "$OR" push nas >/dev/null
 it "our own interrupted write is still cleaned up in a directory we own"
 [[ -z "$(find "$ONAS" -maxdepth 1 -name '*.tar.zst.tmp' 2>/dev/null)" ]] \
     && ok || fail "our leftover survived"
+
+# ── two bundles in the same second: keep the newer format ──────────────────
+# Retention sorts by filename descending. Within one second that decides by the
+# suffix, and a legacy name (written before bundles carried a short sha) sorts
+# AFTER the sha'd one -- so `sort -r` kept the legacy file and pruned the newer.
+SSH="$(mktemp -d)/nas"; mkdir -p "$SSH"
+printf 'stamped\n' >"$SSH/.omabackup-destination"
+printf 'older format\n' >"$SSH/omabackup-h-20260101-120000.tar.zst"
+printf 'newer format\n' >"$SSH/omabackup-h-20260101-120000-aaaaaaaaaaaa.tar.zst"
+OMABACKUP_ROOT="$PWD" bash -c '
+  source lib/bundle.sh; source lib/destinations.sh
+  prune_bundles "$1" "h" 1' _ "$SSH" >/dev/null 2>&1
+
+it "the one kept in a tie is the sha-suffixed name, not the legacy one"
+[[ -f "$SSH/omabackup-h-20260101-120000-aaaaaaaaaaaa.tar.zst" ]] \
+    && ok || fail "pruned the newer format and kept the older"
+
+it "and the older one is the one removed"
+[[ ! -e "$SSH/omabackup-h-20260101-120000.tar.zst" ]] \
+    && ok || fail "kept both, or removed the wrong one"
