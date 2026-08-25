@@ -227,3 +227,29 @@ PROUT="$(HOME="$PRH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$PWD/groups.default
 
 it "a shell that restarts onto a recycled pid still reads as restarted"
 [[ $PRRC -eq 0 ]] && ok || fail "refused a reload that worked: $PROUT"
+
+# ── which shell answers "is it new enough" ──────────────────────────────────
+# Both halves of that question used to run their own `pgrep -x quickshell |
+# head -1`, which picks by process order. During a restart the outgoing shell
+# and the incoming one are alive together for a moment, the lowest pid is the
+# OLD one, and reload then compared the files against the process being
+# replaced -- printing "the update did not land" for a restart that had landed.
+# Twice in one afternoon, on this machine.
+NEWH="$(mktemp -d)"; mkdir -p "$NEWH/stub"
+# Two live processes: this shell, and one started later.
+sleep 30 & NEWPID=$!
+{ printf '#!/bin/bash\n'; printf 'printf "%%s\\n%%s\\n" %q %q\n' "$$" "$NEWPID"
+} >"$NEWH/stub/pids"; chmod +x "$NEWH/stub/pids"
+NEWSRC="$(sed -n '/^_shell_pids()/,/^}/p;/^_proc_started_at()/,/^}/p;/^_shell_started_at()/,/^}/p' bin/omabackup)"
+NEWMAX="$(OMABACKUP_SHELL_PIDS="$NEWH/stub/pids" bash -c "$NEWSRC"'; _shell_started_at')"
+NEWOLD="$(bash -c "$NEWSRC"'; _proc_started_at "$1"' _ "$$")"
+NEWYOUNG="$(bash -c "$NEWSRC"'; _proc_started_at "$1"' _ "$NEWPID")"
+kill "$NEWPID" 2>/dev/null
+
+it "the start time reported is the newest shell's, not the lowest pid's"
+[[ -n "$NEWMAX" && "$NEWMAX" == "$NEWYOUNG" ]] \
+    && ok || fail "reported $NEWMAX; youngest is $NEWYOUNG, oldest is $NEWOLD"
+
+it "and a pid with no process has no start time"
+bash -c "$NEWSRC"'; _proc_started_at 999999' >/dev/null 2>&1 \
+    && fail "invented a start time for a dead pid" || ok

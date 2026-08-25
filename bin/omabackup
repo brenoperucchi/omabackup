@@ -1040,25 +1040,41 @@ _newest_plugin_file() {
         | sort -rn | head -1 | cut -d. -f1
 }
 
-_shell_started_at() {
-    if [[ -n "${OMABACKUP_SHELL_PROBE:-}" ]]; then "$OMABACKUP_SHELL_PROBE"; return; fi
-    local pid; pid="$(pgrep -x quickshell 2>/dev/null | head -1)" || return 1
-    [[ -n "$pid" ]] || return 1
-    date -d "$(ps -o lstart= -p "$pid" 2>/dev/null)" +%s 2>/dev/null
+# The quickshell processes, in one place. Both questions below used to run
+# their own `pgrep -x quickshell | head -1`, which picks by process order: during
+# a restart the old shell and the new one are both alive for a moment, the lowest
+# pid is the OLD one, and "is the shell at least as new as the files" was then
+# answered about the process being replaced. reload printed "the update did not
+# land" for a restart that had landed.
+_shell_pids() {
+    if [[ -n "${OMABACKUP_SHELL_PIDS:-}" ]]; then "$OMABACKUP_SHELL_PIDS"; return; fi
+    pgrep -x quickshell 2>/dev/null | sort -n
 }
 
-# Whether it is the SAME process, asked of the process rather than the clock.
-# "Did it restart" was answered by comparing start times, which are
-# second-granular -- so a shell that genuinely restarted within one second read
-# as unchanged and reload refused a reload that had worked.
-#
-# A pid alone was not enough either, on two counts. Pids are reused: the old
-# shell dies, the new one is handed the same number, and reload reports that
-# nothing restarted. And `head -1` picked one of several quickshell processes
-# arbitrarily, so which one answered the question depended on process order.
-# The identity is every quickshell pid paired with its start time in clock
-# ticks since boot (field 22 of /proc/<pid>/stat), sorted. A reused pid carries
-# a different tick count, and a restart moves at least one entry.
+# <pid> -> the epoch second it started, or nothing.
+_proc_started_at() {
+    local pid="$1" when
+    when="$(ps -o lstart= -p "$pid" 2>/dev/null)" || return 1
+    [[ -n "$when" ]] || return 1
+    date -d "$when" +%s 2>/dev/null
+}
+
+# The NEWEST shell, not an arbitrary one. The question this answers is whether
+# something is running that is at least as new as the files just written, and
+# the process that answers it is the youngest.
+_shell_started_at() {
+    if [[ -n "${OMABACKUP_SHELL_PROBE:-}" ]]; then "$OMABACKUP_SHELL_PROBE"; return; fi
+    local pid at newest=0
+    while read -r pid; do
+        [[ -n "$pid" ]] || continue
+        at="$(_proc_started_at "$pid")" || continue
+        [[ "$at" =~ ^[0-9]+$ ]] || continue
+        (( at > newest )) && newest="$at"
+    done < <(_shell_pids)
+    (( newest > 0 )) || return 1
+    printf '%s' "$newest"
+}
+
 # <pid> -> "<pid>:<start time in clock ticks since boot>". Separate from
 # _shell_identity so it can be asked about a process the test controls: the
 # identity of whatever quickshell happens to be running is not something a spec
@@ -1083,7 +1099,7 @@ _shell_identity() {
         [[ -n "$pid" ]] || continue
         one="$(_proc_identity "$pid")" || continue
         id+="$one "
-    done < <(pgrep -x quickshell 2>/dev/null | sort -n)
+    done < <(_shell_pids)
     [[ -n "$id" ]] || return 1
     printf '%s' "$id"
 }
