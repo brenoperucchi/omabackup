@@ -870,6 +870,74 @@ cmd_install() {
     printf '  check with: %ssystemctl --user list-timers omabackup-\*%s\n' "$CYAN" "$NC"
 }
 
+# ── reload ───────────────────────────────────────────────────────────────────
+# quickshell reads QML once, at startup, and watches nothing -- there is no
+# reload flag. So updating the installed plugin is two ordered steps: write the
+# files, then restart the shell. Done by hand they raced, repeatedly: the shell
+# came back up a second before the pull finished writing and re-read the old
+# file, so the update did not land while every sign said it had.
+#
+# The check is the point of this verb. Comparing the shell's start time against
+# the newest plugin file is what turns "I restarted it" into "it is running
+# this".
+PLUGIN_DIR="${OMABACKUP_PLUGIN_DIR:-$HOME/.config/omarchy/plugins/brenoperucchi.omabackup}"
+RESTART_SHELL="${OMABACKUP_RESTART_SHELL:-omarchy-restart-shell}"
+# `omarchy-restart-shell`, never `omarchy-refresh-shell`: the second resets
+# shell.json to Omarchy defaults, which would wipe the user's bar configuration
+# including this widget. The names are one word apart.
+
+_newest_plugin_file() {
+    find "$PLUGIN_DIR" -type f -not -path '*/.git/*' -printf '%T@\n' 2>/dev/null \
+        | sort -rn | head -1 | cut -d. -f1
+}
+
+_shell_started_at() {
+    if [[ -n "${OMABACKUP_SHELL_PROBE:-}" ]]; then "$OMABACKUP_SHELL_PROBE"; return; fi
+    local pid; pid="$(pgrep -x quickshell 2>/dev/null | head -1)" || return 1
+    [[ -n "$pid" ]] || return 1
+    date -d "$(ps -o lstart= -p "$pid" 2>/dev/null)" +%s 2>/dev/null
+}
+
+cmd_reload() {
+    reject_flags reload "$@"
+    [[ -d "$PLUGIN_DIR" ]] \
+        || die "the plugin is not installed at $(_tilde "$PLUGIN_DIR")
+  Install it with: omarchy plugin add https://github.com/brenoperucchi/omabackup.git --enable --yes"
+
+    if [[ -d "$PLUGIN_DIR/.git" ]]; then
+        git -C "$PLUGIN_DIR" pull --ff-only -q 2>/dev/null \
+            || printf '  %s!%s could not pull; reloading what is on disk\n' "$YELLOW" "$NC"
+    fi
+
+    local before after files
+    before="$(_shell_started_at || echo 0)"
+    files="$(_newest_plugin_file)"; files="${files:-0}"
+
+    "$RESTART_SHELL" >/dev/null 2>&1 || true
+
+    # Poll rather than sleep a guessed interval: the restart is asynchronous,
+    # and a fixed sleep is what made this unreliable by hand.
+    local i after_at=0
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 1
+        after_at="$(_shell_started_at || echo 0)"
+        (( after_at > files )) && break
+    done
+
+    local head; head="$(git -C "$PLUGIN_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    if (( after_at > files )); then
+        printf '  %s✓%s reloaded %s(%s is live)%s\n' "$GREEN" "$NC" "$DIM" "$head" "$NC"
+        return 0
+    fi
+    printf '%somabackup: the old shell is still running -- the update did not land%s\n' \
+        "$RED" "$NC" >&2
+    printf '  plugin files: %s   shell started: %s\n' \
+        "$(date -d "@$files" '+%H:%M:%S' 2>/dev/null)" \
+        "$(date -d "@$after_at" '+%H:%M:%S' 2>/dev/null)" >&2
+    printf '  try again, or restart it yourself: %s%s%s\n' "$CYAN" "$RESTART_SHELL" "$NC" >&2
+    return 1
+}
+
 # ── bundle ───────────────────────────────────────────────────────────────────
 # The artifact every destination other than `github` receives (DESIGN.md §3).
 # Separate verb from `push` on purpose: building is cheap and local, sending is
@@ -1041,6 +1109,7 @@ case "$CMD" in
     collect) reject_flags collect "${ARGS[@]}"; cmd_collect ;;
     sync)    cmd_sync "${ARGS[@]}" ;;
     install) cmd_install "${ARGS[@]}" ;;
+    reload)  cmd_reload "${ARGS[@]}" ;;
     bundle)  cmd_bundle "${ARGS[@]}" ;;
     push)    cmd_push "${ARGS[@]}" ;;
     status)  reject_flags status "${ARGS[@]}"; cmd_status ;;
@@ -1049,6 +1118,7 @@ case "$CMD" in
 omabackup <command> [--json] [--groups a,b]
 
   status    Omarchy identity, restore range and groups
+  reload    update the installed plugin and restart the shell onto it
   collect   collect the groups into staging (does not touch the repo)
   verify    check that the backup covers what the system actually reads
 
