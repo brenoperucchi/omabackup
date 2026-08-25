@@ -341,8 +341,19 @@ scan_secrets() {
                 # reading. And a tag may name another tag: %(*objecttype) peels
                 # all the way to the final commit or blob, so every tag object
                 # in between had its message read by nobody.
-                local tobj="$robj" ttype tdepth=0
-                while [[ -n "$tobj" ]] && (( tdepth < 32 )); do
+                # Every way out of this loop other than "the chain ended" is
+                # a refusal. The first version broke out on a cat-file that
+                # failed, on an awk that failed and on a chain longer than the
+                # bound -- so a repository this code could not follow ended the
+                # walk quietly and the rest of the chain went unread, which is
+                # the fail-open this whole round has been about.
+                local tobj="$robj" ttype tdepth=0 tarc
+                while [[ -n "$tobj" ]]; do
+                    if (( tdepth >= 32 )); then
+                        printf '%somabackup: the tag chain at %s is deeper than 32 -- refusing to call it clean%s\n' \
+                            "$RED" "$rname" "$NC" >&2
+                        return 1
+                    fi
                     bl="$(git -C "$repo" cat-file tag "$tobj" 2>/dev/null)" \
                         || { printf '%somabackup: cannot read the tag object at %s -- refusing to call it clean%s\n' \
                                  "$RED" "$rname" "$NC" >&2; return 1; }
@@ -350,9 +361,15 @@ scan_secrets() {
                         [[ -n "$bline" ]] || continue
                         pairs+="tag:$rname"$'\t'"$bline"$'\n'
                     done <<<"$bl"
-                    tobj="$(printf '%s' "$bl" | awk '/^object /{print $2; exit}')"
-                    [[ -n "$tobj" ]] || break
-                    ttype="$(git -C "$repo" cat-file -t "$tobj" 2>/dev/null)" || break
+                    tobj="$(printf '%s' "$bl" | awk '/^object /{print $2; exit}')"; tarc=$?
+                    if (( tarc != 0 )) || [[ -z "$tobj" ]]; then
+                        printf '%somabackup: the tag object at %s names no target -- refusing to call it clean%s\n' \
+                            "$RED" "$rname" "$NC" >&2
+                        return 1
+                    fi
+                    ttype="$(git -C "$repo" cat-file -t "$tobj" 2>/dev/null)" \
+                        || { printf '%somabackup: cannot identify what tag %s points at -- refusing to call it clean%s\n' \
+                                 "$RED" "$rname" "$NC" >&2; return 1; }
                     [[ "$ttype" == tag ]] || break
                     tdepth=$((tdepth + 1))
                 done ;;

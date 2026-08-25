@@ -820,3 +820,47 @@ assert_contains "$TAGSCAN" "tag:refs/tags/chain: tag AKIA6666666666666666"
 
 it "and a tag behind a tag has its message read"
 assert_contains "$TAGSCAN" "AKIA7777777777777777"
+
+# ── the ways out of the chain walk that are not "the chain ended" ───────────
+# Every one of them used to be a break: a cat-file that failed, an awk that
+# failed, a chain longer than the bound. The walk stopped quietly, the rest of
+# the chain went unread, and the scan reported clean -- the fail-open this
+# round has been about, reintroduced by the code written to close it.
+DEEPH="$(mktemp -d)"; DEEPR="$DEEPH/repo"; _sec_repo "$DEEPR" "" ""
+DEEPOBJ="$(git -C "$DEEPR" rev-parse HEAD)"; DEEPTYPE=commit
+for i in $(seq 1 34); do
+    DEEPOBJ="$(git -C "$DEEPR" mktag <<TAGOBJ 2>/dev/null
+object $DEEPOBJ
+type $DEEPTYPE
+tag link$i
+tagger t <t@t> 0 +0000
+
+link $i
+TAGOBJ
+)"
+    [[ -n "$DEEPOBJ" ]] || break
+    DEEPTYPE=tag
+done
+git -C "$DEEPR" update-ref refs/tags/deep "$DEEPOBJ" 2>/dev/null
+
+it "a tag chain deeper than the bound is refused, not silently truncated"
+bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+         scan_secrets "$1" "$2"' _ "$DEEPR" "$PWD/secrets.deny.json" >/dev/null 2>&1 \
+    && fail "walked off the end of a chain it could not finish and called it clean" || ok
+
+it "and says the chain is what it could not follow"
+assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                            scan_secrets "$1" "$2"' _ "$DEEPR" "$PWD/secrets.deny.json" 2>&1)" "tag chain"
+
+# A git that cannot say what an object is, in the middle of a healthy chain.
+mkdir -p "$DEEPH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'prev=""; for a in "$@"; do [[ "$prev" == cat-file && "$a" == -t ]] && exit 128; prev="$a"; done\n'
+  printf 'exec %s "$@"\n' "$(command -v git)"
+} >"$DEEPH/stub/git"; chmod +x "$DEEPH/stub/git"
+
+it "a git that cannot identify a tag's target refuses instead of stopping"
+PATH="$DEEPH/stub:$PATH" bash -c '
+    source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_secrets "$1" "$2"' _ "$TAGR" "$PWD/secrets.deny.json" >/dev/null 2>&1 \
+    && fail "a cat-file it could not run read as the end of the chain" || ok
