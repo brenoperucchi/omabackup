@@ -839,7 +839,16 @@ _rewrite_execstart() {
     [[ "$exe" == *[[:space:]]* ]] && exe="'$exe'"
     while IFS= read -r line; do
         if [[ "$line" == ExecStart=* ]]; then
-            printf 'ExecStart=%s %s\n' "$exe" "${line##*/bin/omabackup }"
+            # The arguments are whatever follows the marker. Taking them with
+            # ${line##*/bin/omabackup } silently returned the WHOLE line when
+            # the marker was absent -- a template line carrying no arguments
+            # produced `ExecStart=<new> ExecStart=<old>`, a unit that cannot
+            # start, written without anyone checking.
+            [[ "$line" == *"/bin/omabackup"* ]] \
+                || die "unit template has an ExecStart this does not understand: $line"
+            local rest="${line#*/bin/omabackup}"
+            rest="${rest# }"
+            printf 'ExecStart=%s%s\n' "$exe" "${rest:+ $rest}"
         else
             printf '%s\n' "$line"
         fi
@@ -953,11 +962,17 @@ cmd_reload() {
             || printf '  %s!%s could not pull; reloading what is on disk\n' "$YELLOW" "$NC"
     fi
 
-    local before after files
+    local before files
     before="$(_shell_started_at || echo 0)"
     files="$(_newest_plugin_file)"; files="${files:-0}"
 
-    "$RESTART_SHELL" >/dev/null 2>&1 || true
+    # A verb whose whole purpose is verification reported success two ways
+    # while nothing had happened: an empty directory and a dead shell both read
+    # as 0, and `0 >= 0` was true; and a restart command returning 1 still
+    # passed whenever the running shell already predated the files.
+    if ! "$RESTART_SHELL" >/dev/null 2>&1; then
+        die "the restart command failed: $RESTART_SHELL"
+    fi
 
     # Poll rather than sleep a guessed interval: the restart is asynchronous,
     # and a fixed sleep is what made this unreliable by hand.
@@ -965,11 +980,23 @@ cmd_reload() {
     for i in 1 2 3 4 5 6 7 8 9 10; do
         sleep 1
         after_at="$(_shell_started_at || echo 0)"
-        # >=, not >: mtimes and process start times are second-granular, and
-        # the pull always precedes the restart -- so the same second means it
-        # worked. A strict > failed the verb's own first real use.
-        (( after_at >= files )) && break
+        # Three conditions, not one. The shell has to be RUNNING, it has to
+        # have restarted (a different start than before), and it has to be at
+        # least as new as the files.
+        (( after_at > 0 && after_at != before && after_at >= files )) && break
     done
+
+    if (( after_at == 0 )); then
+        printf '%somabackup: the shell is not running -- nothing is showing this version%s\n' \
+            "$RED" "$NC" >&2
+        printf '  start it with: %s%s%s\n' "$CYAN" "$RESTART_SHELL" "$NC" >&2
+        return 1
+    fi
+    if (( after_at == before )); then
+        printf '%somabackup: the shell did not restart -- it is still the process from before%s\n' \
+            "$RED" "$NC" >&2
+        return 1
+    fi
 
     local head; head="$(git -C "$PLUGIN_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     if (( after_at >= files )); then

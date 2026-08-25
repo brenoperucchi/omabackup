@@ -24,9 +24,14 @@ _rl_home() {
     printf '%s' "$h"
 }
 
-_rl_run() {  # _rl_run <home> <shell-start-epoch> [args...]
+_rl_run() {  # _rl_run <home> <shell-start-epoch-AFTER-restart> [args...]
     local h="$1" when="$2"; shift 2
-    printf '#!/bin/bash\nprintf %%s %q\n' "$when" >"$h/stub/probe"
+    # A real restart changes the process, so the probe must answer differently
+    # before and after: a stub returning one fixed value pretends the same
+    # process was there all along, which is exactly the case reload now refuses.
+    { printf '#!/bin/bash\n'
+      printf 'if [[ -s %q ]]; then printf %%s %q; else printf 1; fi\n' "$h/calls.log" "$when"
+    } >"$h/stub/probe"
     chmod +x "$h/stub/probe"
     HOME="$h" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$PWD/groups.default.json" \
         OMABACKUP_STATE="$h/.state" OMABACKUP_PLUGIN_DIR="$h/plugin" \
@@ -100,4 +105,45 @@ printf '#!/bin/bash\nexit 0\n' >"$EH/stub/restart"; chmod +x "$EH/stub/restart"
 EOUT="$(_rl_run "$EH" "$(( $(date +%s) - 600 ))")"
 
 it "a shell that predates the files is still caught"
-assert_contains "$EOUT" "still running"
+# The restart stub does nothing here, so the process is the same one before and
+# after -- which is the condition reload now names directly.
+assert_contains "$EOUT" "did not restart"
+
+# ── the verification verb was giving false successes ───────────────────────
+# reload exists because doing this by hand kept landing wrong. It then had two
+# ways of reporting success while nothing had happened at all.
+
+FH="$(_rl_home)"; rm -f "$FH/plugin/Panel.qml"; rm -rf "$FH/plugin/.git"
+FOUT="$(_rl_run "$FH" 0)"     # no plugin files, and no shell running
+FRC=$?
+
+it "an empty plugin directory and no shell is not a successful reload"
+# Both sides read 0 and `0 >= 0` was true, so it announced success with nothing
+# running anywhere.
+[[ $FRC -ne 0 ]] && ok || fail "reported success with no files and no shell"
+
+it "and it says the shell is not running rather than inventing a version"
+assert_contains "$FOUT" "not running"
+
+GH="$(_rl_home)"
+printf '#!/bin/bash\nexit 1\n' >"$GH/stub/restart"; chmod +x "$GH/stub/restart"
+GOUT="$(_rl_run "$GH" "$(( $(date +%s) + 3600 ))")"   # restart fails; shell already newer
+GRC=$?
+
+it "a restart command that fails is not a successful reload"
+# The old shell being newer than the files made the comparison pass, so a
+# restart that returned 1 still reported the new version live.
+[[ $GRC -ne 0 ]] && ok || fail "a failed restart reported success"
+
+it "and the failure is named"
+assert_contains "$GOUT" "restart"
+
+# ── the shell must actually have restarted ─────────────────────────────────
+HH="$(_rl_home)"
+HSAME="$(( $(date +%s) + 3600 ))"
+printf '#!/bin/bash\nexit 0\n' >"$HH/stub/restart"; chmod +x "$HH/stub/restart"
+HOUT="$(_rl_run "$HH" "$HSAME")"
+
+it "a shell that never restarted is caught even when it is newer than the files"
+# Same process before and after: the restart did nothing, whatever it returned.
+assert_contains "$HOUT" "did not restart"

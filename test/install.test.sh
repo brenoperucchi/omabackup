@@ -173,3 +173,33 @@ SPLIT="$(mktemp -d)/split.service"
   printf 'ExecStart=%s/bin/omabackup sync\n' "$SROOT2"
 } >"$SPLIT"
 assert_contains "$(systemd-analyze --user verify "$SPLIT" 2>&1)" "not executable"
+
+# ── an ExecStart line without arguments ────────────────────────────────────
+# _rewrite_execstart took the arguments with ${line##*/bin/omabackup }, which
+# depends on that literal marker being present WITH a trailing space. A line
+# carrying no arguments does not match, the expansion returns the whole line
+# unchanged, and the result was
+#   ExecStart=/new/bin/omabackup ExecStart=%h/old/bin/omabackup
+# -- a unit that cannot start, written without anyone checking.
+it "a template line with no arguments does not produce a doubled ExecStart"
+TH="$(mktemp -d)"; TS="$TH/stub"; _stub_systemctl "$TS" inactive
+TR="$TH/repo"; mkdir -p "$TR"; git init -q "$TR"
+TROOT="$TH/tool"; mkdir -p "$TROOT/systemd"
+cp -r bin lib groups.default.json secrets.deny.json "$TROOT/" 2>/dev/null
+for u in omabackup-sync.service omabackup-sync.timer omabackup-push.service omabackup-push.timer; do
+  cp "systemd/$u" "$TROOT/systemd/$u"
+done
+# Strip the arguments from the sync service, as a future template edit might.
+sed -i 's|^ExecStart=.*|ExecStart=%h/x/bin/omabackup|' "$TROOT/systemd/omabackup-sync.service"
+HOME="$TH" OMABACKUP_ROOT="$TROOT" OMABACKUP_GROUPS="$TROOT/groups.default.json" \
+  OMABACKUP_STATE="$TH/.state" OMABACKUP_SYSTEMCTL="$TS/systemctl" \
+  OMABACKUP_REPO="$TR" XDG_RUNTIME_DIR=/nonexistent bash "$TROOT/bin/omabackup" install >/dev/null 2>&1
+# Not `grep -c ... || echo 0`: grep -c PRINTS 0 and EXITS 1 when it matches
+# nothing, so the fallback appends a second zero and the comparison sees "0\n0".
+grep -q '^ExecStart=.*ExecStart=' "$TH/.config/systemd/user/omabackup-sync.service" 2>/dev/null \
+    && fail "the ExecStart line was doubled" || ok
+
+it "and systemd accepts whatever it did write"
+SDOUT="$(systemd-analyze --user verify "$TH/.config/systemd/user/omabackup-sync.service" 2>&1 \
+         | grep -v 'not found' || true)"
+assert_eq "$SDOUT" ""
