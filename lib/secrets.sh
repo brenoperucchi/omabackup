@@ -272,13 +272,17 @@ scan_secrets() {
     # by a second delimiter for the same reason: an \x02 in a message would
     # have hidden everything past it. A record that still arrives without a sha
     # is attributed to the one before rather than discarded.
+    #
+    # Author and committer ride in front of the body. They are packed with the
+    # commit and they are free text -- a token pasted into a name or an address
+    # by some piece of automation ships exactly like one pasted into a message.
     # pipefail is asked for here rather than assumed. bin/omabackup sets it,
     # but this library is sourced directly by the specs and by anything else
     # that cares to, and without it the pipeline reported awk's status: a git
     # that could not read the log became "no messages", became clean.
     local _had_pipefail=0; [[ -o pipefail ]] && _had_pipefail=1
     set -o pipefail
-    pairs="$(git -C "$repo" log --all -z --format='%H%B' 2>/dev/null \
+    pairs="$(git -C "$repo" log --all -z --format='%H%an <%ae>%n%cn <%ce>%n%B' 2>/dev/null \
              | awk 'BEGIN{RS="\000"; last="commit:?"} {
                    h = substr($0, 1, 40); b = substr($0, 41)
                    if (h ~ /^[0-9a-f]{40}$/) last = "commit:" substr(h, 1, 12); else b = $0
@@ -296,32 +300,25 @@ scan_secrets() {
     # straight onto this glued the first of them to the last message line.
     pairs="${pairs:+$pairs$'\n'}"
 
-    # One ref at a time, because "%(refname:short) %(contents)" put the tag name
-    # in front of the body's first line -- so an anchored pattern could not
-    # match a secret that occupied that line, the same defect as git grep's
-    # decoration. Refnames carry no whitespace, so one per line is exact.
-    trefs="$(git -C "$repo" for-each-ref --format='%(refname:short)' refs/tags 2>/dev/null)" \
-        || { printf '%somabackup: cannot list the tags of %s -- refusing to call it clean%s\n' \
-                 "$RED" "$(_tilde "$repo")" "$NC" >&2; return 1; }
-    while read -r tref; do
-        [[ -n "$tref" ]] || continue
-        tbody="$(git -C "$repo" for-each-ref --format='%(contents)' "refs/tags/$tref" 2>/dev/null)" \
-            || { printf '%somabackup: cannot read tag %s -- refusing to call it clean%s\n' \
-                     "$RED" "$tref" "$NC" >&2; return 1; }
-        while IFS= read -r tl; do
-            [[ -n "$tl" ]] || continue
-            pairs+="tag:$tref"$'\t'"$tl"$'\n'
-        done <<<"$tbody"
-    done <<<"$trefs"
-
-    # Objects a ref names directly. `git bundle --all` packs every ref and a ref
-    # is free to name a blob: rev-list lists commits, git grep reads the trees
-    # of commits, and a blob hanging off a tag belongs to neither. It shipped,
-    # and it scanned clean -- cloning the bundle handed the key straight back.
-    # A tag object is peeled, so an annotated tag pointing at a blob is caught
-    # as well; a ref naming a tree is handed to git grep, which reads a tree-ish
-    # of any kind.
+    # One pass over every ref, answered by kind.
+    #
+    # Tags were read from refs/tags alone, so an annotated tag anywhere else --
+    # refs/releases/x is a real convention -- had its message scanned by
+    # nobody. And "%(refname:short) %(contents)" put the tag name in front of
+    # the body's first line, so an anchored pattern could not match a secret
+    # that occupied it: git grep's decoration defect, in another stream.
+    #
+    # `git bundle --all` packs every ref and a ref is free to name a blob:
+    # rev-list lists commits, git grep reads the trees of commits, and a blob
+    # hanging off a tag belongs to neither. It shipped, and it scanned clean --
+    # cloning the bundle handed the key straight back. A tag object is peeled,
+    # so an annotated tag pointing at a blob is caught as well; a ref naming a
+    # tree is handed to git grep, which takes a tree-ish of any kind.
+    #
+    # The refname itself is scanned too. It is text, it is packed, and it
+    # leaves this machine -- which is the whole of what this gate is for.
     local reflist rtype robj rname bl bline
+    local -A seenref=()
     reflist="$(git -C "$repo" for-each-ref \
         --format='%(objecttype) %(objectname) %(refname)%0a%(*objecttype) %(*objectname) %(refname)' \
         2>/dev/null)" \
@@ -329,8 +326,21 @@ scan_secrets() {
                  "$RED" "$(_tilde "$repo")" "$NC" >&2; return 1; }
     while read -r rtype robj rname; do
         [[ -n "$rtype" && -n "$robj" && -n "$rname" ]] || continue
+        if [[ -z "${seenref[$rname]:-}" ]]; then
+            seenref[$rname]=1
+            pairs+="refname"$'\t'"$rname"$'\n'
+        fi
         case "$rtype" in
             tree) revs+=("$robj") ;;
+            tag)
+                bl="$(git -C "$repo" for-each-ref \
+                        --format='%(taggername) %(taggeremail)%0a%(contents)' "$rname" 2>/dev/null)" \
+                    || { printf '%somabackup: cannot read tag %s -- refusing to call it clean%s\n' \
+                             "$RED" "$rname" "$NC" >&2; return 1; }
+                while IFS= read -r bline; do
+                    [[ -n "$bline" ]] || continue
+                    pairs+="tag:$rname"$'\t'"$bline"$'\n'
+                done <<<"$bl" ;;
             blob)
                 bl="$(git -C "$repo" cat-file blob "$robj" 2>/dev/null)" \
                     || { printf '%somabackup: cannot read the blob at %s -- refusing to call it clean%s\n' \
@@ -341,6 +351,19 @@ scan_secrets() {
                 done <<<"$bl" ;;
         esac
     done <<<"$reflist"
+
+    # Path names, which git grep never sees: it searches what a file holds, not
+    # what it is called. A key used as a filename is packed like any other.
+    # rev-list --objects names every reachable object and its path in one pass.
+    local objlist opath
+    objlist="$(git -C "$repo" rev-list --objects --all 2>/dev/null)" \
+        || { printf '%somabackup: cannot list the objects of %s -- refusing to call it clean%s\n' \
+                 "$RED" "$(_tilde "$repo")" "$NC" >&2; return 1; }
+    while IFS= read -r bline; do
+        opath="${bline#* }"
+        [[ -n "$opath" && "$opath" != "$bline" ]] || continue
+        pairs+="path"$'\t'"$opath"$'\n'
+    done <<<"$objlist"
 
     # Split in bash rather than through cut, whose status was thrown away: a cut
     # that failed emptied every message and the push carried on. What is left is

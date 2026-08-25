@@ -675,7 +675,7 @@ it "a key after a separator byte in a commit message is still found"
 assert_contains "$SEPOUT" "$(git -C "$SEPR" rev-parse HEAD | cut -c1-12)"
 
 it "a key on the first line of a tag body is found by an anchored pattern"
-assert_contains "$SEPOUT" "tag:v9"
+assert_contains "$SEPOUT" "tag:refs/tags/v9"
 
 # A cut whose status nobody read used to stand between the messages and the
 # patterns: when it failed, every message vanished and the push carried on.
@@ -745,3 +745,42 @@ assert_contains "$BLBOUT" "blob:refs/tags/wrapped"
 
 it "the finding names the object kind rather than calling everything a message"
 assert_contains "$BLBOUT" "AKIA9999999999999999"
+
+# ── the rest of what the bundle carries ─────────────────────────────────────
+# A commit packs its author and committer, a tag packs its tagger, a ref packs
+# its name and a tree packs its paths. All of it is free text and all of it
+# leaves the machine, and none of it was read: git log took %B, for-each-ref
+# took %(contents) from refs/tags alone, and git grep searches what a file
+# holds rather than what it is called.
+RESTH="$(mktemp -d)"; RESTR="$RESTH/repo"; _sec_repo "$RESTR" "" ""
+GIT_AUTHOR_NAME='AKIA1234567890ABCDEF' GIT_AUTHOR_EMAIL=a@b \
+GIT_COMMITTER_NAME=n GIT_COMMITTER_EMAIL=n@b \
+    git -C "$RESTR" commit -q --allow-empty -m 'a clean message' 2>/dev/null
+printf 'harmless\n' >"$RESTR/AKIA2222222222222222.txt"
+git -C "$RESTR" add . 2>/dev/null
+git -C "$RESTR" -c user.email=t@t -c user.name=t commit -q -m 'add a file' 2>/dev/null
+git -C "$RESTR" update-ref refs/heads/AKIA3333333333333333 HEAD 2>/dev/null
+RESTTAG="$(git -C "$RESTR" mktag <<TAGOBJ 2>/dev/null
+object $(git -C "$RESTR" rev-parse HEAD)
+type commit
+tag r9
+tagger t <t@t> 0 +0000
+
+AKIA4444444444444444
+TAGOBJ
+)"
+[[ -n "$RESTTAG" ]] && git -C "$RESTR" update-ref refs/releases/r9 "$RESTTAG" 2>/dev/null
+RESTOUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                    scan_secrets "$1" "$2"' _ "$RESTR" "$PWD/secrets.deny.json" 2>&1)"
+
+it "a key in a commit author is found"
+assert_contains "$RESTOUT" "AKIA1234567890ABCDEF"
+
+it "a key used as a file name is found, though no file contains it"
+assert_contains "$RESTOUT" "AKIA2222222222222222"
+
+it "a key used as a branch name is found"
+assert_contains "$RESTOUT" "AKIA3333333333333333"
+
+it "an annotated tag outside refs/tags has its message read"
+assert_contains "$RESTOUT" "AKIA4444444444444444"
