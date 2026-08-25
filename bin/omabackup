@@ -17,10 +17,20 @@ set -uo pipefail
 # backing up hourly all day. One fact, loaded in one place, absent everywhere
 # else.
 #
+# An allow-list, not "any OMABACKUP_*". The file may say WHERE this machine's
+# backup lives; it may not say which rules apply to it or which binaries run.
+# Without this, one line pointing OMABACKUP_SECRETS_DENY at a toothless
+# deny-list disabled the secret scanner silently -- reproduced, with a private
+# key reaching the remote. Not a privilege escalation (whoever can write that
+# file can write ~/.bashrc), but a security control a config line switches off
+# without a word is worth refusing on its own.
+#
 # Parsed as KEY=VALUE data, never sourced. systemd's EnvironmentFile is not a
 # script, and sourcing it would hand anything able to write that path a shell
 # running as the user, on a timer. An already-set variable always wins, so an
 # explicit override still overrides.
+ENV_FILE_ALLOWED='OMABACKUP_REPO OMABACKUP_STATE OMABACKUP_GROUPS OMABACKUP_DESTINATIONS'
+
 _load_env_file() {
     local f="${OMABACKUP_ENV:-$HOME/.config/omabackup/env}" line k v
     [[ -r "$f" ]] || return 0
@@ -29,6 +39,14 @@ _load_env_file() {
         [[ "$line" =~ ^[[:space:]]*(OMABACKUP_[A-Z0-9_]+)=(.*)$ ]] || continue
         k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
         v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+        [[ " $ENV_FILE_ALLOWED " == *" $k "* ]] || {
+            # Plain text, no colours and no _tilde: this runs before either
+            # exists, and under `set -u` reaching for them would kill the CLI
+            # on startup for every user with an unusual line in that file.
+            printf 'omabackup: %s ignored in %s -- that file sets where the backup lives, not which rules apply\n' \
+                "$k" "$f" >&2
+            continue
+        }
         [[ -n "${!k:-}" ]] && continue
         export "$k=$v"
     done <"$f"
