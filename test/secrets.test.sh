@@ -632,7 +632,7 @@ it "a key alone on its line is found by an anchored pattern"
 assert_contains "$ANOUT" "key.txt"
 
 it "and the same pattern still finds it in a commit message"
-assert_contains "$ANOUT" "commit-message:"
+assert_contains "$ANOUT" "commit:"
 
 it "the report still names the file and line, not just the pattern"
 assert_contains "$ANOUT" ":1:AKIA1234567890ABCDEF"
@@ -717,3 +717,31 @@ it "an unreadable deny-list is refused even with nothing committed"
 bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
          scan_secrets "$1" "$2"' _ "$EMH" "$EMH/broken.json" >/dev/null 2>&1 \
     && fail "called an unscanned empty repository clean" || ok
+
+# ── an object a ref names outright ──────────────────────────────────────────
+# `git bundle --all` packs every ref, and a ref is free to name a blob.
+# rev-list lists commits, git grep reads the trees of commits, and a blob
+# hanging off a tag belongs to neither -- so it shipped and it scanned clean.
+# Cloning the bundle handed the key straight back.
+BLBH="$(mktemp -d)"; BLBR="$BLBH/repo"; _sec_repo "$BLBR" "" ""
+BLOB="$(printf 'AKIA1234567890ABCDEF\n' | git -C "$BLBR" hash-object -w --stdin)"
+git -C "$BLBR" tag loose "$BLOB" 2>/dev/null
+PEELED="$(printf 'AKIA9999999999999999\n' | git -C "$BLBR" hash-object -w --stdin)"
+git -C "$BLBR" -c user.email=t@t -c user.name=t \
+    tag -a wrapped -m 'points at a blob' "$PEELED" 2>/dev/null
+BLBOUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                   scan_secrets "$1" "$2"' _ "$BLBR" "$PWD/secrets.deny.json" 2>&1)"
+
+it "the bundle really would carry a blob that only a ref names"
+git -C "$BLBR" bundle create "$BLBH/b.bundle" --all HEAD >/dev/null 2>&1
+git clone -q "$BLBH/b.bundle" "$BLBH/clone" 2>/dev/null
+assert_contains "$(git -C "$BLBH/clone" cat-file blob "$BLOB" 2>&1)" "AKIA1234567890ABCDEF"
+
+it "a key in a blob a tag names directly is found"
+assert_contains "$BLBOUT" "blob:refs/tags/loose"
+
+it "and one behind an annotated tag is found after peeling"
+assert_contains "$BLBOUT" "blob:refs/tags/wrapped"
+
+it "the finding names the object kind rather than calling everything a message"
+assert_contains "$BLBOUT" "AKIA9999999999999999"

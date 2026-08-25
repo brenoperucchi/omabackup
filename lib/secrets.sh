@@ -279,9 +279,9 @@ scan_secrets() {
     local _had_pipefail=0; [[ -o pipefail ]] && _had_pipefail=1
     set -o pipefail
     pairs="$(git -C "$repo" log --all -z --format='%H%B' 2>/dev/null \
-             | awk 'BEGIN{RS="\000"; last="?"} {
+             | awk 'BEGIN{RS="\000"; last="commit:?"} {
                    h = substr($0, 1, 40); b = substr($0, 41)
-                   if (h ~ /^[0-9a-f]{40}$/) last = substr(h, 1, 12); else b = $0
+                   if (h ~ /^[0-9a-f]{40}$/) last = "commit:" substr(h, 1, 12); else b = $0
                    n = split(b, L, "\n")
                    for (j = 1; j <= n; j++) if (L[j] != "") print last "\t" L[j]
                }')"; prc=$?
@@ -313,6 +313,34 @@ scan_secrets() {
             pairs+="tag:$tref"$'\t'"$tl"$'\n'
         done <<<"$tbody"
     done <<<"$trefs"
+
+    # Objects a ref names directly. `git bundle --all` packs every ref and a ref
+    # is free to name a blob: rev-list lists commits, git grep reads the trees
+    # of commits, and a blob hanging off a tag belongs to neither. It shipped,
+    # and it scanned clean -- cloning the bundle handed the key straight back.
+    # A tag object is peeled, so an annotated tag pointing at a blob is caught
+    # as well; a ref naming a tree is handed to git grep, which reads a tree-ish
+    # of any kind.
+    local reflist rtype robj rname bl bline
+    reflist="$(git -C "$repo" for-each-ref \
+        --format='%(objecttype) %(objectname) %(refname)%0a%(*objecttype) %(*objectname) %(refname)' \
+        2>/dev/null)" \
+        || { printf '%somabackup: cannot list the refs of %s -- refusing to call it clean%s\n' \
+                 "$RED" "$(_tilde "$repo")" "$NC" >&2; return 1; }
+    while read -r rtype robj rname; do
+        [[ -n "$rtype" && -n "$robj" && -n "$rname" ]] || continue
+        case "$rtype" in
+            tree) revs+=("$robj") ;;
+            blob)
+                bl="$(git -C "$repo" cat-file blob "$robj" 2>/dev/null)" \
+                    || { printf '%somabackup: cannot read the blob at %s -- refusing to call it clean%s\n' \
+                             "$RED" "$rname" "$NC" >&2; return 1; }
+                while IFS= read -r bline; do
+                    [[ -n "$bline" ]] || continue
+                    pairs+="blob:$rname"$'\t'"$bline"$'\n'
+                done <<<"$bl" ;;
+        esac
+    done <<<"$reflist"
 
     # Split in bash rather than through cut, whose status was thrown away: a cut
     # that failed emptied every message and the push carried on. What is left is
@@ -397,7 +425,7 @@ scan_secrets() {
             ln="${hit%%:*}"; body="${hit#*:}"
             _still_matches "$body" "$re" "$ci" || continue
             who="${MSGWHO[$((ln - 1))]:-?}"
-            printf '%s\tcommit-message: %s: %s\n' "$id" "$who" "$body"
+            printf '%s\t%s: %s\n' "$id" "$who" "$body"
         done <<<"$mout"
     done <<<"$patterns"
     return $rc
@@ -422,8 +450,9 @@ report_secrets() {  # report_secrets <repo> <deny-file>
         printf '  %s%s%s  %s\n' "$YELLOW" "$id" "$NC" "$(printf '%s' "$rest" | head -c 160)" >&2
     done <<<"$hits"
     printf '\n  A leak is irreversible, so this blocks rather than warns (docs/DESIGN.md §6).\n' >&2
-    printf '  This scans every reachable commit: deleting the file does not remove it\n' >&2
-    printf '  from history. Rewrite the history, or add a justified entry to %s.\n' \
+    printf '  This scans every reachable commit, every commit message and tag body,\n' >&2
+    printf '  and every object a ref names outright: deleting the file does not remove\n' >&2
+    printf '  it from history. Rewrite the history, or add a justified entry to %s.\n' \
         "$(_tilde "$SECRETS_DENY_FILE")" >&2
     return 1
 }
