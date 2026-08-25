@@ -333,14 +333,29 @@ scan_secrets() {
         case "$rtype" in
             tree) revs+=("$robj") ;;
             tag)
-                bl="$(git -C "$repo" for-each-ref \
-                        --format='%(taggername) %(taggeremail)%0a%(contents)' "$rname" 2>/dev/null)" \
-                    || { printf '%somabackup: cannot read tag %s -- refusing to call it clean%s\n' \
-                             "$RED" "$rname" "$NC" >&2; return 1; }
-                while IFS= read -r bline; do
-                    [[ -n "$bline" ]] || continue
-                    pairs+="tag:$rname"$'\t'"$bline"$'\n'
-                done <<<"$bl" ;;
+                # The whole object, not a handful of fields. A tag object
+                # carries its own name in a "tag <name>" header, which differs
+                # from the refname and ships with it -- that name was reaching
+                # the scanner only because rev-list --objects happens to print
+                # it in the path column, which is a side effect and not a
+                # reading. And a tag may name another tag: %(*objecttype) peels
+                # all the way to the final commit or blob, so every tag object
+                # in between had its message read by nobody.
+                local tobj="$robj" ttype tdepth=0
+                while [[ -n "$tobj" ]] && (( tdepth < 32 )); do
+                    bl="$(git -C "$repo" cat-file tag "$tobj" 2>/dev/null)" \
+                        || { printf '%somabackup: cannot read the tag object at %s -- refusing to call it clean%s\n' \
+                                 "$RED" "$rname" "$NC" >&2; return 1; }
+                    while IFS= read -r bline; do
+                        [[ -n "$bline" ]] || continue
+                        pairs+="tag:$rname"$'\t'"$bline"$'\n'
+                    done <<<"$bl"
+                    tobj="$(printf '%s' "$bl" | awk '/^object /{print $2; exit}')"
+                    [[ -n "$tobj" ]] || break
+                    ttype="$(git -C "$repo" cat-file -t "$tobj" 2>/dev/null)" || break
+                    [[ "$ttype" == tag ]] || break
+                    tdepth=$((tdepth + 1))
+                done ;;
             blob)
                 bl="$(git -C "$repo" cat-file blob "$robj" 2>/dev/null)" \
                     || { printf '%somabackup: cannot read the blob at %s -- refusing to call it clean%s\n' \

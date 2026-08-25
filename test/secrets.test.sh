@@ -784,3 +784,39 @@ assert_contains "$RESTOUT" "AKIA3333333333333333"
 
 it "an annotated tag outside refs/tags has its message read"
 assert_contains "$RESTOUT" "AKIA4444444444444444"
+
+# ── the tag object itself, and the tags behind it ───────────────────────────
+# A tag object carries its own name in a "tag <name>" header, which need not
+# match the refname and ships beside it. That name was reaching the scanner
+# only because rev-list --objects happens to print it in the path column: a
+# side effect, not a reading. And a tag may name another tag -- %(*objecttype)
+# peels straight through to the final commit, so every tag object in between
+# had its message read by nobody.
+TAGH="$(mktemp -d)"; TAGR="$TAGH/repo"; _sec_repo "$TAGR" "" ""
+TAGIN="$(git -C "$TAGR" mktag <<TAGOBJ 2>/dev/null
+object $(git -C "$TAGR" rev-parse HEAD)
+type commit
+tag inner
+tagger t <t@t> 0 +0000
+
+AKIA7777777777777777
+TAGOBJ
+)"
+TAGOUT="$(git -C "$TAGR" mktag <<TAGOBJ 2>/dev/null
+object $TAGIN
+type tag
+tag AKIA6666666666666666
+tagger t <t@t> 0 +0000
+
+a clean message
+TAGOBJ
+)"
+[[ -n "$TAGOUT" ]] && git -C "$TAGR" update-ref refs/tags/chain "$TAGOUT" 2>/dev/null
+TAGSCAN="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                    scan_secrets "$1" "$2"' _ "$TAGR" "$PWD/secrets.deny.json" 2>&1)"
+
+it "a key in a tag object's own name is read as a tag, not as a path"
+assert_contains "$TAGSCAN" "tag:refs/tags/chain: tag AKIA6666666666666666"
+
+it "and a tag behind a tag has its message read"
+assert_contains "$TAGSCAN" "AKIA7777777777777777"
