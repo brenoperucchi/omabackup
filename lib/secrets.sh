@@ -206,6 +206,17 @@ scan_secrets() {
     local repo="$1" file="$2" id re ci hit rc=0
     [[ -f "$file" ]] || return 1
 
+    # Replacements off, for every git command below. `git replace` rewrites what
+    # git SHOWS you: point refs/replace/<oid> at a clean commit and rev-list,
+    # log, grep and cat-file all hand you the clean one. `git bundle` is a pack
+    # transfer and hands over the original -- so the half that checks and the
+    # half that packs were reading two different repositories, and a key behind
+    # a replacement scanned clean and then came back out of a clone of the
+    # bundle in plain text. The refs under refs/replace are themselves reachable
+    # and get scanned like any others, so both objects are covered.
+    local GIT_NO_REPLACE_OBJECTS=1
+    export GIT_NO_REPLACE_OBJECTS
+
     # `local` here, not a bare global: bash scopes dynamically, so _still_matches
     # still sees it, and nothing survives the call to collide with a later one.
     local -a DENY_EXCEPTIONS=()

@@ -864,3 +864,29 @@ PATH="$DEEPH/stub:$PATH" bash -c '
     source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
     scan_secrets "$1" "$2"' _ "$TAGR" "$PWD/secrets.deny.json" >/dev/null 2>&1 \
     && fail "a cat-file it could not run read as the end of the chain" || ok
+
+# ── a replacement rewrites what git shows, not what the bundle packs ────────
+# Point refs/replace/<oid> at a clean commit and rev-list, log, grep and
+# cat-file all hand you the clean one. `git bundle` is a pack transfer and
+# hands over the original. The half that checks and the half that packs were
+# reading two different repositories: the key scanned clean and came back out
+# of a clone of the bundle in plain text.
+REPH="$(mktemp -d)"; REPR="$REPH/repo"; _sec_repo "$REPR" "" ""
+printf 'AKIA1234567890ABCDEF\n' >"$REPR/leak.txt"
+git -C "$REPR" add leak.txt 2>/dev/null
+git -C "$REPR" -c user.email=t@t -c user.name=t commit -q -m 'the original' 2>/dev/null
+REPORIG="$(git -C "$REPR" rev-parse HEAD)"
+printf 'nothing to see\n' >"$REPR/leak.txt"
+git -C "$REPR" add leak.txt 2>/dev/null
+git -C "$REPR" -c user.email=t@t -c user.name=t commit -q --amend -m 'the clean one' 2>/dev/null
+git -C "$REPR" replace "$REPORIG" "$(git -C "$REPR" rev-parse HEAD)" 2>/dev/null
+git -C "$REPR" update-ref refs/heads/master "$REPORIG" 2>/dev/null
+
+it "the bundle really would carry the original, replacement or not"
+git -C "$REPR" bundle create "$REPH/b.bundle" --all HEAD >/dev/null 2>&1
+git clone -q "$REPH/b.bundle" "$REPH/clone" 2>/dev/null
+assert_contains "$(git -C "$REPH/clone" cat-file -p "$REPORIG:leak.txt" 2>&1)" "AKIA1234567890ABCDEF"
+
+it "and the scan reads the original rather than what replace shows it"
+assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                            scan_secrets "$1" "$2"' _ "$REPR" "$PWD/secrets.deny.json" 2>&1)" "AKIA1234567890ABCDEF"
