@@ -276,33 +276,37 @@ scan_secrets() {
     [[ -n "$revlist" ]] && mapfile -t revs <<<"$revlist"
 
     local pairs prc trefs tref tbody tl pline msgs
-    # -z terminates each entry with NUL, the one byte a commit message cannot
-    # carry: \x01 could, and a message holding one split into a record with no
-    # sha in front of it, which the previous version dropped outright -- a key
-    # after that byte was never scanned. The sha is read by width rather than
-    # by a second delimiter for the same reason: an \x02 in a message would
-    # have hidden everything past it. A record that still arrives without a sha
-    # is attributed to the one before rather than discarded.
+    # The raw commit object, every line of it. Reading it through --format
+    # meant naming in advance each field worth scanning -- %B, then %an and %ae
+    # and %cn and %ce when those turned out to ship too -- and a commit header
+    # holds more than the placeholders expose: mergetag carries an entire tag
+    # object inside a merge commit, and it survives the tag being deleted.
+    # Enumerating what to read is how a gate acquires blind spots; this reads
+    # the object.
     #
-    # Author and committer ride in front of the body. They are packed with the
-    # commit and they are free text -- a token pasted into a name or an address
-    # by some piece of automation ships exactly like one pasted into a message.
+    # Framed by cat-file's own header line rather than by a separator chosen
+    # from the message's own alphabet. \x01 could appear in a message, and one
+    # that held it split into a record with no sha in front, which the previous
+    # version dropped outright -- a key after that byte was never scanned. A
+    # content line that happens to look like a header would misattribute, which
+    # is a wrong name on a finding rather than a finding that never appears.
+    #
+    # Not --pretty=raw, which indents the message by four spaces: that is the
+    # same decoration defect as git grep's, and an anchored pattern would miss
+    # a key sitting on its own line.
     # pipefail is asked for here rather than assumed. bin/omabackup sets it,
     # but this library is sourced directly by the specs and by anything else
     # that cares to, and without it the pipeline reported awk's status: a git
     # that could not read the log became "no messages", became clean.
     local _had_pipefail=0; [[ -o pipefail ]] && _had_pipefail=1
     set -o pipefail
-    pairs="$(git -C "$repo" log --all -z --format='%H%an <%ae>%n%cn <%ce>%n%B' 2>/dev/null \
-             | awk 'BEGIN{RS="\000"; last="commit:?"} {
-                   h = substr($0, 1, 40); b = substr($0, 41)
-                   if (h ~ /^[0-9a-f]{40}$/) last = "commit:" substr(h, 1, 12); else b = $0
-                   n = split(b, L, "\n")
-                   for (j = 1; j <= n; j++) if (L[j] != "") print last "\t" L[j]
-               }')"; prc=$?
+    pairs="$(git -C "$repo" rev-list --all 2>/dev/null \
+             | git -C "$repo" cat-file --batch 2>/dev/null \
+             | awk '/^[0-9a-f]{40} commit [0-9]+$/ { last = "commit:" substr($1, 1, 12); next }
+                    { if ($0 != "") print (last == "" ? "commit:?" : last) "\t" $0 }')"; prc=$?
     (( _had_pipefail )) || set +o pipefail
     if (( prc != 0 )); then
-        printf '%somabackup: cannot read the commit messages of %s -- refusing to call it clean%s\n' \
+        printf '%somabackup: cannot read the commit objects of %s -- refusing to call it clean%s\n' \
             "$RED" "$(_tilde "$repo")" "$NC" >&2
         return 1
     fi
@@ -397,14 +401,31 @@ scan_secrets() {
 
     # Path names, which git grep never sees: it searches what a file holds, not
     # what it is called. A key used as a filename is packed like any other.
-    # rev-list --objects names every reachable object and its path in one pass.
+    #
+    # Two sources, because rev-list --objects prints each OID once, with the
+    # first path it was found at: two files with identical content share a blob
+    # and only one of the names survives -- so a key used as a filename was
+    # hidden by any harmless file that happened to hold the same bytes. git log
+    # --name-only walks the diffs and names both.
     local objlist opath
-    objlist="$(git -C "$repo" rev-list --objects --all 2>/dev/null)" \
+    local -A seenpath=()
+    objlist="$(git -C "$repo" rev-list --objects --all 2>/dev/null
+               git -C "$repo" log --all -m --no-renames --name-only --format='' 2>/dev/null)" \
         || { printf '%somabackup: cannot list the objects of %s -- refusing to call it clean%s\n' \
                  "$RED" "$(_tilde "$repo")" "$NC" >&2; return 1; }
     while IFS= read -r bline; do
-        opath="${bline#* }"
-        [[ -n "$opath" && "$opath" != "$bline" ]] || continue
+        [[ -n "$bline" ]] || continue
+        # rev-list lines are "<oid> <path>"; log --name-only lines are the path
+        # alone. A bare 40-hex line is an object with no path and is skipped.
+        if [[ "$bline" =~ ^[0-9a-f]{40}( |$) ]]; then
+            opath="${bline#* }"
+            [[ -n "$opath" && "$opath" != "$bline" ]] || continue
+        else
+            opath="$bline"
+        fi
+        # The two sources overlap, and one finding per name is enough.
+        [[ -n "${seenpath[$opath]:-}" ]] && continue
+        seenpath[$opath]=1
         pairs+="path"$'\t'"$opath"$'\n'
     done <<<"$objlist"
 
@@ -499,6 +520,54 @@ scan_secrets() {
 
 # Prints the report and returns non-zero when anything was found OR when the
 # scan could not run. Both are reasons not to send.
+# scan_files <dir> <deny-file>
+# The same patterns, over a directory. The repository scan runs before the
+# artefact is assembled, and assembly then adds files the scan never saw: the
+# tool, the manifest it was built from, the restore notes. Those ride to the
+# same destinations as everything else -- and the manifest in particular is the
+# user's own file, free to name whatever it names.
+#
+# repo.bundle is skipped: it is a packfile, its contents were scanned as objects
+# a moment ago, and grepping compressed bytes finds nothing either way.
+scan_files() {
+    local dir="$1" file="$2" id re ci hit rc=0 patterns body
+    [[ -d "$dir" && -f "$file" ]] || return 1
+
+    local -a DENY_EXCEPTIONS=()
+    mapfile -t DENY_EXCEPTIONS < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
+
+    patterns="$(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' \
+                "$file" 2>/dev/null)" || return 1
+    if [[ -z "$patterns" ]]; then
+        printf '%somabackup: the deny-list yielded no patterns -- refusing to call this clean%s\n' \
+            "$RED" "$NC" >&2
+        return 1
+    fi
+
+    while IFS=$'\t' read -r id re ci; do
+        [[ -n "$id" && -n "$re" ]] || continue
+        local out grc
+        local -a gflags=(-r -a -n -H -E)
+        [[ "$ci" == true ]] && gflags+=(-i)
+        out="$(grep "${gflags[@]}" --exclude=repo.bundle -e "$re" "$dir" 2>&1)"; grc=$?
+        if (( grc > 1 )); then
+            printf '%somabackup: pattern %s could not be scanned over %s%s\n' \
+                "$RED" "$id" "$(_tilde "$dir")" "$NC" >&2
+            rc=1
+            continue
+        fi
+        while IFS= read -r hit; do
+            [[ -n "$hit" ]] || continue
+            # grep -H -n prints "<path>:<lineno>:<content>"; the pattern must
+            # meet the content, not the decoration in front of it.
+            body="${hit#*:}"; body="${body#*:}"
+            _still_matches "$body" "$re" "$ci" || continue
+            printf '%s\t%s\n' "$id" "${hit:0:200}"
+        done <<<"$out"
+    done <<<"$patterns"
+    return $rc
+}
+
 report_secrets() {  # report_secrets <repo> <deny-file>
     local hits id rest rc=0
     hits="$(scan_secrets "$1" "$2")" || rc=1

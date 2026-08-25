@@ -890,3 +890,56 @@ assert_contains "$(git -C "$REPH/clone" cat-file -p "$REPORIG:leak.txt" 2>&1)" "
 it "and the scan reads the original rather than what replace shows it"
 assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
                             scan_secrets "$1" "$2"' _ "$REPR" "$PWD/secrets.deny.json" 2>&1)" "AKIA1234567890ABCDEF"
+
+# ── two names, one blob ─────────────────────────────────────────────────────
+# rev-list --objects prints each OID once, with the first path it was found at.
+# Two files with identical content share a blob, so one of the two names never
+# appears -- and a key used as a filename was hidden by any harmless file that
+# happened to hold the same bytes.
+ALIH="$(mktemp -d)"; ALIR="$ALIH/repo"; _sec_repo "$ALIR" "" ""
+# The harmless name has to sort FIRST: rev-list keeps the path it reaches
+# first, so with the key sorting earlier the old code passed this by luck.
+printf 'identical bytes\n' >"$ALIR/aaa-harmless.txt"
+printf 'identical bytes\n' >"$ALIR/zzz-AKIA1234567890ABCDEF.txt"
+git -C "$ALIR" add . 2>/dev/null
+git -C "$ALIR" -c user.email=t@t -c user.name=t commit -q -m 'two names' 2>/dev/null
+ALIOUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                   scan_secrets "$1" "$2"' _ "$ALIR" "$PWD/secrets.deny.json" 2>&1)"
+
+it "a key used as a filename is found even when another file shares its blob"
+assert_contains "$ALIOUT" "zzz-AKIA1234567890ABCDEF.txt"
+
+it "and the name is reported once, not once per source"
+assert_eq "$(printf '%s\n' "$ALIOUT" | grep -c 'zzz-AKIA1234567890ABCDEF.txt')" "1"
+
+# ── the commit object, not a list of fields worth reading ───────────────────
+# Reading through --format meant naming in advance each field that ships: %B,
+# then the author and committer when those turned out to ship too. A commit
+# header holds more than the placeholders expose.
+RAWH="$(mktemp -d)"; RAWR="$RAWH/repo"; _sec_repo "$RAWR" "" ""
+GIT_AUTHOR_NAME='AKIA5555555555555555' GIT_AUTHOR_EMAIL=a@b \
+GIT_COMMITTER_NAME=c GIT_COMMITTER_EMAIL=c@d \
+    git -C "$RAWR" commit -q --allow-empty -m 'a clean message' 2>/dev/null
+RAWOUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                   scan_secrets "$1" "$2"' _ "$RAWR" "$PWD/secrets.deny.json" 2>&1)"
+
+it "the author line of the raw commit object is scanned"
+assert_contains "$RAWOUT" "author AKIA5555555555555555"
+
+# ── the files assembly adds after the gate has run ──────────────────────────
+# push gates the repository, then build_bundle copies in the tool, the manifest
+# and the restore notes. Those ride to the same destinations and the gate never
+# saw them -- and the manifest is the user's own file.
+STGH="$(mktemp -d)"; mkdir -p "$STGH/stage/tool"
+printf '{"paths":["~/AKIA6666666666666666"]}\n' >"$STGH/stage/tool/groups.default.json"
+printf 'nothing here\n' >"$STGH/stage/RESTORE.md"
+
+it "a key in a file assembly added is found by the directory scan"
+assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                            scan_files "$1" "$2"' _ "$STGH/stage" "$PWD/secrets.deny.json" 2>&1)" \
+    "AKIA6666666666666666"
+
+it "and a clean staging directory reports nothing"
+rm -f "$STGH/stage/tool/groups.default.json"
+assert_eq "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                      scan_files "$1" "$2"' _ "$STGH/stage" "$PWD/secrets.deny.json" 2>&1)" ""

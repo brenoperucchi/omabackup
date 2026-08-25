@@ -186,6 +186,23 @@ build_bundle() {
 
     _restore_readme >"$stage/RESTORE.md"
     _bundle_manifest "$repo" "$stage" >"$stage/manifest.json" || { rm -rf "$stage"; return 1; }
+    # Everything assembly added, before it is sealed. `push` gates the
+    # repository and then this function copies in the tool, the manifest and the
+    # restore notes -- files the gate never saw, riding to the same destinations
+    # as the rest. The manifest is the user's own and free to name anything.
+    local extra
+    extra="$(scan_files "$stage" "$SECRETS_DENY_FILE" 2>&1)" || {
+        printf '%somabackup: the secret scan could not run over the staged artefact%s\n' \
+            "${RED:-}" "${NC:-}" >&2
+        rm -rf "$stage"; return 1
+    }
+    if [[ -n "$extra" ]]; then
+        printf '%somabackup: refusing to build -- the deny-list matched a file assembly added%s\n' \
+            "${RED:-}" "${NC:-}" >&2
+        printf '%s\n' "$extra" >&2
+        rm -rf "$stage"; return 1
+    fi
+
     ( cd "$stage" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS ) \
         || { rm -rf "$stage"; return 1; }
 
