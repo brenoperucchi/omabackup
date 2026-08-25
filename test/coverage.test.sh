@@ -103,3 +103,33 @@ assert_eq "$GP" "3"
 
 it "while systemd counts its two"
 assert_eq "$GS" "2"
+
+# ── counts belong to the manifest that produced them ───────────────────────
+# coverage.json recorded numbers keyed by group id and nothing else, so a
+# manifest edit that kept an id but changed what it covers left the old numbers
+# on screen as if they described the new definition. Reproduced: a group
+# repointed from a five-file directory to a one-file one still reported five.
+MFH="$(mktemp -d)"
+mkdir -p "$MFH/.config/wide" "$MFH/.config/narrow"
+for i in 1 2 3 4 5; do printf 'x\n' >"$MFH/.config/wide/f$i"; done
+printf 'y\n' >"$MFH/.config/narrow/f1"
+cat >"$MFH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/wide"]}]}
+JSON
+_cov_env "$MFH" collect >/dev/null
+
+it "a fresh collect reports what it staged"
+assert_eq "$(_cov_env "$MFH" verify --json | jq -r '.groups[0].files')" "5"
+
+cat >"$MFH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/narrow"]}]}
+JSON
+
+it "after the manifest changes, the old counts are not presented as current"
+assert_eq "$(_cov_env "$MFH" verify --json | jq -r '.groups[0].files')" "null"
+
+it "and collecting again under the new manifest restores real numbers"
+_cov_env "$MFH" collect >/dev/null
+assert_eq "$(_cov_env "$MFH" verify --json | jq -r '.groups[0].files')" "1"

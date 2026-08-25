@@ -87,3 +87,25 @@ assert_eq "$(_stale_env "$CH" "$CH/repo" status --json | jq -r '.lastSync')" "nu
 
 it "verify names it as never having run"
 assert_contains "$(_stale_env "$CH" "$CH/repo" verify 2>&1)" "never"
+
+# ── a timestamp from the future is not freshness ───────────────────────────
+# A clock stepping backwards, or a marker restored from a machine ahead of this
+# one, produced a negative age -- and "less than a day" read as up to date. The
+# tool would then report a healthy backup indefinitely without one running.
+FH="$(_stale_home)"
+_stale_env "$FH" "$FH/repo" sync --commit >/dev/null
+printf '%s' "$(( $(date +%s) + 7200 ))" >"$FH/.state/last-sync"
+
+it "a last-sync stamp in the future is not treated as up to date"
+assert_eq "$(_stale_env "$FH" "$FH/repo" status --json | jq -r '.stale')" "true"
+
+it "and verify says the clock is the problem rather than blaming the backup"
+assert_contains "$(_stale_env "$FH" "$FH/repo" verify 2>&1)" "future"
+
+# ── an unreadable marker is not "never run" ────────────────────────────────
+GH="$(_stale_home)"
+_stale_env "$GH" "$GH/repo" sync --commit >/dev/null
+printf 'not a number\n' >"$GH/.state/last-sync"
+
+it "a corrupt marker is reported as unreadable, not as never having run"
+assert_contains "$(_stale_env "$GH" "$GH/repo" verify 2>&1)" "unreadable"

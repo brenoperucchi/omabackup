@@ -103,11 +103,14 @@ _hostname() { uname -n 2>/dev/null || printf 'unknown-host'; }
 # Recorded on any successful sync, not only on one that committed: a run that
 # found nothing to do still proves the backup is working, and counting only
 # commits would call a healthy idle machine stale.
+# Returns non-zero when the marker could not be written. It used to swallow
+# every failure and return success, so a backup announced itself as done while
+# the thing that records "it happened" never changed -- and the next run would
+# then call the machine stale for a backup that had actually run.
 record_sync_success() {
-    mkdir -p "$(dirname "$LAST_SYNC_FILE")" 2>/dev/null || return 0
-    printf '%s' "$(date +%s)" >"$LAST_SYNC_FILE.tmp" 2>/dev/null \
-        && mv "$LAST_SYNC_FILE.tmp" "$LAST_SYNC_FILE" 2>/dev/null
-    return 0
+    mkdir -p "$(dirname "$LAST_SYNC_FILE")" 2>/dev/null || return 1
+    printf '%s' "$(date +%s)" >"$LAST_SYNC_FILE.tmp" 2>/dev/null || return 1
+    mv "$LAST_SYNC_FILE.tmp" "$LAST_SYNC_FILE" 2>/dev/null || return 1
 }
 
 # Prints the age in seconds, or nothing when it has never run.
@@ -122,8 +125,11 @@ last_sync_age() {
 is_stale() {
     local age
     # Never having run is stale. Reporting it as fresh would make a machine that
-    # has never backed anything up look exactly like one that just did.
+    # has never backed anything up look exactly like one that just did. A stamp
+    # dated in the future is not freshness either -- a clock stepping backwards
+    # would otherwise report a healthy backup indefinitely without one running.
     age="$(last_sync_age)" || return 0
+    (( age < 0 )) && return 0
     (( age > STALE_AFTER_SEC ))
 }
 
@@ -327,9 +333,18 @@ cmd_verify() {
 # and on a recovery tty, where no user session exists to ask.
 probe_stale() {
     local age
-    if ! age="$(last_sync_age)"; then
+    # Three different unknowns, three different messages. Collapsing them into
+    # "never run" told someone whose marker was corrupt to start their first
+    # backup, on a machine that had been backing up all week.
+    if [[ ! -e "$LAST_SYNC_FILE" ]]; then
         finding warn schedule never-run \
             "never run: no backup has succeeded on this machine yet -- start one with: omabackup sync --commit" ""
+    elif ! age="$(last_sync_age)"; then
+        finding warn schedule unreadable \
+            "the last-backup marker is unreadable: $(_tilde "$LAST_SYNC_FILE")" "$LAST_SYNC_FILE"
+    elif (( age < 0 )); then
+        finding warn schedule clock-skew \
+            "the last backup is dated in the future by $(( -age / 60 ))m -- the clock moved, or this marker came from another machine" ""
     elif (( age > STALE_AFTER_SEC )); then
         finding warn schedule stale \
             "last successful backup was $(( age / 3600 ))h ago" ""
@@ -465,8 +480,11 @@ _generated_files() {
 # _staged_size <dir> -> "<files>\t<bytes>" for what is under it right now.
 _staged_size() {
     [[ -d "$1" || -f "$1" ]] || { printf '0\t0'; return 0; }
-    find "$1" \( -type f -o -type l \) -printf '%s\n' 2>/dev/null \
-        | awk '{n++; b+=$1} END{printf "%d\t%d", n+0, b+0}'
+    local out
+    # find's status is checked: a partial walk produced a partial count that was
+    # written as though it were the whole truth.
+    out="$(find "$1" \( -type f -o -type l \) -printf '%s\n' 2>/dev/null)" || return 1
+    printf '%s' "$out" | awk '{n++; b+=$1} END{printf "%d\t%d", n+0, b+0}'
 }
 
 cmd_collect() {
@@ -559,7 +577,9 @@ write_coverage() {
                         [[ -n "$p" ]] || continue
                         e="$(_expand "$p")"
                         dest="$STAGING/${e#$HOME/}"
-                        IFS=$'\t' read -r files bytes <<<"$(_staged_size "$dest")"
+                        local sz
+                        sz="$(_staged_size "$dest")" || return 1
+                        IFS=$'\t' read -r files bytes <<<"$sz"
                         gf=$((gf + files)); gb=$((gb + bytes))
                     done < <(group_paths "$id") ;;
         esac
@@ -567,8 +587,13 @@ write_coverage() {
     done < <(groups_ids)
 
     mkdir -p "$(dirname "$COVERAGE_FILE")" 2>/dev/null || return 0
+    # The manifest's content hash rides along. Counts keyed by group id alone
+    # survived a manifest edit that kept an id and changed what it covers, and
+    # the stale numbers were then shown as if they described the new definition
+    # -- five files reported for a group repointed at a directory holding one.
     printf '%s' "$rows" | jq -R -s --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-        '{schemaVersion:1, at:$at,
+        --arg manifest "$(sha256sum "$GROUPS_FILE" 2>/dev/null | cut -c1-16)" \
+        '{schemaVersion:1, at:$at, manifest:$manifest,
           groups: (split("\n") | map(select(length>0) | split("\t")
                    | {id:.[0], files:(.[1]|tonumber), bytes:(.[2]|tonumber)}))}' \
         >"$COVERAGE_FILE.tmp" 2>/dev/null \
@@ -582,8 +607,14 @@ write_coverage() {
 # count must not read as zero: zero means collect ran and found nothing, which
 # is the phantom coverage this project was built after.
 groups_json() {
-    local cov='{"groups":[]}'
-    [[ -s "$COVERAGE_FILE" ]] && cov="$(cat "$COVERAGE_FILE" 2>/dev/null)"
+    local cov='{"groups":[]}' recorded
+    if [[ -s "$COVERAGE_FILE" ]]; then
+        recorded="$(jq -r '.manifest // ""' "$COVERAGE_FILE" 2>/dev/null)"
+        # Counts from a different manifest describe a different question.
+        # Unknown is the honest answer until the next collect.
+        [[ "$recorded" == "$(sha256sum "$GROUPS_FILE" 2>/dev/null | cut -c1-16)" ]] \
+            && cov="$(cat "$COVERAGE_FILE" 2>/dev/null)"
+    fi
     jq -n --argjson m "$(jq '[.groups[] | select(.enabled != false)
                              | {id, label, mode, coupled:(.coupled // false),
                                 critical:(.critical // false),
@@ -756,7 +787,7 @@ cmd_sync() {
             || die "git status failed in $(_tilde "$repo")"
     fi
     if [[ -z "$dirty" ]]; then
-        record_sync_success
+        record_sync_success || printf '  %s!%s could not record this run; the next check may call it stale\n' "$YELLOW" "$NC"
         printf '\n  %sup to date%s -- nothing changed since the last sync\n' "$DIM" "$NC"
         return 0
     fi
@@ -764,7 +795,7 @@ cmd_sync() {
     printf '\n%s\n' "$dirty" | sed 's/^/  /'
 
     if (( ! commit )); then
-        record_sync_success
+        record_sync_success || printf '  %s!%s could not record this run; the next check may call it stale\n' "$YELLOW" "$NC"
         printf '\n  review with %sgit -C %s status%s / %sdiff%s, then rerun with --commit\n' \
             "$CYAN" "$(_tilde "$repo")" "$NC" "$CYAN" "$NC"
         return 0
@@ -782,7 +813,7 @@ cmd_sync() {
     git -C "$repo" add -- "${written[@]}" \
         || die "git add failed in $(_tilde "$repo")"
     if git -C "$repo" diff --cached --quiet -- "${written[@]}"; then
-        record_sync_success
+        record_sync_success || printf '  %s!%s could not record this run; the next check may call it stale\n' "$YELLOW" "$NC"
         printf '  %sup to date%s -- nothing of ours left to commit\n' "$DIM" "$NC"
         return 0
     fi
@@ -790,7 +821,7 @@ cmd_sync() {
         -m "omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)" \
         -- "${written[@]}" \
         || die "git commit failed in $(_tilde "$repo")"
-    record_sync_success
+    record_sync_success || printf '  %s!%s could not record this run; the next check may call it stale\n' "$YELLOW" "$NC"
     printf '  %scommitted%s\n' "$GREEN" "$NC"
 }
 
