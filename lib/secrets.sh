@@ -66,20 +66,38 @@ assert_deny_understood() {
 }
 
 # _still_matches <line> <regex> <ignore-case>
-# An exception explains one phrase; it does not clear the line it sits on. The
-# excepted substrings are cut out and the pattern is retried against what is
-# left, so `hide_token_restore` beside an AWS key no longer swallows the key.
+# True when the line carries a match no exception explains.
+#
+# An exception EXCUSES a match; it does not edit the line. The first version cut
+# excepted text out and retested what was left, and a four-character exception
+# then bypassed the scanner completely: "AKIA" does not itself match
+# `\bAKIA[0-9A-Z]{16}\b`, so validation accepted it, and removing "AKIA" from
+# the line destroyed the key. One innocuous line in a JSON file turned a
+# detector off. Two short exceptions could do it between them.
+#
+# So the test is containment: a match is excused only when some exception
+# CONTAINS that exact matched text -- when it genuinely is the thing the
+# exception was written to explain. A fragment cannot excuse the whole.
 _still_matches() {
-    local line="$1" re="$2" ci="$3" ex
-    for ex in "${DENY_EXCEPTIONS[@]:-}"; do
-        [[ -n "$ex" ]] || continue
-        line="${line//"$ex"/ }"
-    done
+    local line="$1" re="$2" ci="$3" m ex excused
+    local -a matches=()
     if [[ "$ci" == true ]]; then
-        printf '%s' "$line" | grep -qiE -e "$re"
+        mapfile -t matches < <(printf '%s' "$line" | grep -oiE -e "$re")
     else
-        printf '%s' "$line" | grep -qE -e "$re"
+        mapfile -t matches < <(printf '%s' "$line" | grep -oE -e "$re")
     fi
+    (( ${#matches[@]} )) || return 1
+
+    for m in "${matches[@]}"; do
+        [[ -n "$m" ]] || continue
+        excused=0
+        for ex in "${DENY_EXCEPTIONS[@]:-}"; do
+            [[ -n "$ex" ]] || continue
+            [[ "$ex" == *"$m"* ]] && { excused=1; break; }
+        done
+        (( excused )) || return 0
+    done
+    return 1
 }
 
 # scan_secrets <repo> <deny-file>

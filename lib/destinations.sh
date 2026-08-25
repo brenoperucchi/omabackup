@@ -174,9 +174,7 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
     dir="$(dest_field "$id" path)"
     [[ -n "$dir" ]] || { printf 'no path configured'; return 1; }
     mkdir -p "$dir" 2>/dev/null || { printf 'cannot create %s' "$dir"; return 1; }
-    # A .tmp from an interrupted push is ours and nobody else's; leaving it to
-    # accumulate is how a destination fills with half-written archives.
-    find "$dir" -maxdepth 1 -type f -name '*.tar.zst.tmp' -delete 2>/dev/null
+
     cp "$bundle" "$dir/$name.tmp" 2>/dev/null && mv "$dir/$name.tmp" "$dir/$name" 2>/dev/null \
         || { rm -f "$dir/$name.tmp" 2>/dev/null; printf 'cannot write into %s' "$dir"; return 1; }
     # The stamp is what lets retention delete here, so it can only be granted to
@@ -191,6 +189,15 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
     # Only now, with the new copy confirmed on disk. "Delete the old, upload the
     # new" is how you arrive at zero copies.
     [[ -f "$dir/$name" ]] || { printf 'copy vanished after write'; return 1; }
+    # Only now, and only our own: this used to run right after mkdir, before
+    # anything had established the directory was ours -- so pointing the config
+    # at somebody's folder deleted their half-written archives on the way in.
+    # That is the failure the stamp exists to prevent, one line above the stamp.
+    if [[ -f "$dir/$DEST_STAMP" ]]; then
+        find "$dir" -maxdepth 1 -type f -regextype posix-extended \
+            -regex ".*/omabackup-.+-${DEST_NAME_TAIL%\\.tar\\.zst}\.tar\.zst\.tmp" \
+            -delete 2>/dev/null
+    fi
     removed="$(prune_bundles "$dir" "$(_hostname)" "$(dest_field "$id" keep)" 2>/dev/null)" || removed=0
     printf '%s' "${removed:-0}"
 }

@@ -344,3 +344,55 @@ printf 'b\n' >>"$CMS/f"; git -C "$CMS" add -A
 git -C "$CMS" commit -q -m "N7EXAMPLE is the rest of it"
 [[ -z "$(scan_secrets "$CMS" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
     && ok || fail "a match spanned the seam between two messages"
+
+# ── an exception excuses a match, it does not edit the line ────────────────
+# The scanner cut excepted text out of the line and retested the pattern on
+# what was left. A four-character exception then bypassed it completely: "AKIA"
+# does not itself match `\bAKIA[0-9A-Z]{16}\b`, so validation accepted it, and
+# removing "AKIA" from the line destroyed the key. One innocuous-looking line
+# in a JSON file turned the whole detector off.
+#
+# So an exception no longer rewrites anything: a match is excused only when the
+# exception CONTAINS that exact matched text -- when it is genuinely the thing
+# the exception was written to explain.
+PXH="$(mktemp -d)"
+cat >"$PXH/partial.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"aws","regex":"\\bAKIA[0-9A-Z]{16}\\b","reason":"AWS key id"}],
+ "exceptions":[{"id":"innocent","match":"AKIA","reason":"a fragment, not a key"}]}
+JSON
+PXR="$(mktemp -d)/repo"; mkdir -p "$PXR"; git init -q "$PXR"
+git -C "$PXR" config user.email t@t; git -C "$PXR" config user.name t
+printf 'aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n' >"$PXR/f.conf"
+git -C "$PXR" add -A && git -C "$PXR" commit -qm x
+
+it "an exception that is a fragment of a secret does not excuse the secret"
+[[ -n "$(scan_secrets "$PXR" "$PXH/partial.json" 2>/dev/null)" ]] \
+    && ok || fail "a four-character exception switched the detector off"
+
+it "and two exceptions cannot be combined to erase one either"
+cat >"$PXH/two.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"aws","regex":"\\bAKIA[0-9A-Z]{16}\\b","reason":"AWS key id"}],
+ "exceptions":[{"id":"a","match":"AKIAIOSF","reason":"half"},
+               {"id":"b","match":"ODNN7EXAMPLE","reason":"other half"}]}
+JSON
+[[ -n "$(scan_secrets "$PXR" "$PXH/two.json" 2>/dev/null)" ]] \
+    && ok || fail "two fragments together erased the key"
+
+it "while a real exception still excuses what it was written for"
+# The shipped ones must keep working: this is the case the cutting existed for.
+CLR="$(mktemp -d)/repo"; mkdir -p "$CLR"; git init -q "$CLR"
+git -C "$CLR" config user.email t@t; git -C "$CLR" config user.name t
+printf -- '--password-store=gnome-libsecret\n' >"$CLR/f.conf"
+git -C "$CLR" add -A && git -C "$CLR" commit -qm x
+[[ -z "$(scan_secrets "$CLR" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "a legitimate exception stopped working"
+
+it "and a phrase beside a real credential still does not excuse it"
+BTH="$(mktemp -d)/repo"; mkdir -p "$BTH"; git init -q "$BTH"
+git -C "$BTH" config user.email t@t; git -C "$BTH" config user.name t
+printf 'set hide_token_restore on # aws_access_key_id = AKIAIOSFODNN7EXAMPLE\n' >"$BTH/f.conf"
+git -C "$BTH" add -A && git -C "$BTH" commit -qm x
+[[ -n "$(scan_secrets "$BTH" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "the exception swallowed the key beside it"

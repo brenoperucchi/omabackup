@@ -333,3 +333,37 @@ _dest_env "$VH" "$VR" push oops >/dev/null
 it "a directory holding someone's own folders is still refused"
 [[ ! -f "$VDOCS/.omabackup-destination" ]] \
     && ok || fail "stamped a directory full of somebody's work"
+
+# ── nothing is deleted before we know the directory is ours ────────────────
+# _push_dir cleared `*.tar.zst.tmp` right after mkdir -- before _dir_is_ours had
+# said anything. Point the config at somebody's folder and the tool deleted
+# their half-written archives on the way in, which is the exact failure the
+# stamp exists to prevent, happening one line above the stamp.
+WH="$(mktemp -d)"; WR="$WH/repo"; _dest_repo "$WR"
+WDOCS="$WH/somebodys-folder"; mkdir -p "$WDOCS"
+printf 'their work\n' >"$WDOCS/thesis.odt"
+printf 'their partial download\n' >"$WDOCS/something.tar.zst.tmp"
+cat >"$WH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"oops","type":"dir","path":"$WDOCS","keep":1}]}
+JSON
+_dest_env "$WH" "$WR" push oops >/dev/null
+
+it "a stranger's .tmp file is not deleted from an unowned directory"
+[[ -f "$WDOCS/something.tar.zst.tmp" ]] \
+    && ok || fail "deleted a half-written file belonging to somebody else"
+
+it "and their real file is untouched too"
+[[ -f "$WDOCS/thesis.odt" ]] && ok || fail "deleted their work"
+
+# ── but our own leftovers are still cleared where we do own the place ──────
+OH="$(mktemp -d)"; OR="$OH/repo"; _dest_repo "$OR"
+ONAS="$OH/nas"; mkdir -p "$ONAS"
+printf 'ours, interrupted\n' >"$ONAS/omabackup-$HOSTN-20200101-000000-abc123456789.tar.zst.tmp"
+cat >"$OH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$ONAS","keep":1}]}
+JSON
+_dest_env "$OH" "$OR" push nas >/dev/null
+
+it "our own interrupted write is still cleaned up in a directory we own"
+[[ -z "$(find "$ONAS" -maxdepth 1 -name '*.tar.zst.tmp' 2>/dev/null)" ]] \
+    && ok || fail "our leftover survived"
