@@ -8,8 +8,11 @@ import qs.Ui
 // OmaBackup's bar surface: an icon that stays quiet while coverage holds, and a
 // panel listing what the last check found.
 //
-// Everything this file does is read one JSON document produced by the
-// `omabackup` CLI. No file is written here, no git runs here, nothing blocks.
+// This file reads two JSON documents from the `omabackup` CLI and, from its
+// buttons, asks that same CLI to act -- exactly as the systemd timer does. It
+// never writes a file itself and never runs git itself (DESIGN.md §1); the
+// distinction is that the work happens in the CLI, where it is testable and
+// where a failure cannot take the desktop with it.
 // An error in this file would take down the bar, the dock and the menu at once
 // (docs/CONTEXT.md §2), so every boundary is guarded and the worst case is a
 // widget that hides itself.
@@ -33,10 +36,7 @@ Panel {
   // status always exits 0 and never probes the network, so polling it is free.
   property var statusDoc: null
 
-  readonly property var destinations: {
-    if (!statusDoc || !statusDoc.destinations) return []
-    return statusDoc.destinations
-  }
+  readonly property var destinations: cleanDestinations(statusDoc)
   // Absent scheduler key means an older CLI, not an unscheduled machine: do not
   // invent an alarm out of a missing field.
   // §4: the badge does not clear itself. "nothing is scheduled" was already
@@ -71,7 +71,7 @@ Panel {
 
   // "last backup 8m ago", the way the mockup's header reads it.
   function agoText(sec) {
-    if (typeof sec !== "number") return "never"
+    if (typeof sec !== "number" || !isFinite(sec) || sec < 0) return "never"
     if (sec < 90) return "just now"
     if (sec < 5400) return Math.round(sec / 60) + "m ago"
     if (sec < 172800) return Math.round(sec / 3600) + "h ago"
@@ -97,14 +97,14 @@ Panel {
   }
 
   function shortPath(p) {
-    if (!p) return "—"
+    if (typeof p !== "string" || p === "") return "—"
     var h = Quickshell.env("HOME")
     return (h && p.indexOf(h) === 0) ? "~" + p.substring(h.length) : p
   }
   // systemd's calendar syntax is precise and unreadable. The panel says what it
   // means; `systemctl --user list-timers` is there for the exact expression.
   function humanSchedule(c) {
-    if (!c) return "not scheduled"
+    if (typeof c !== "string" || c === "") return "not scheduled"
     var m = c.match(/\*:00\/(\d+):00/)
     if (m) return "every " + m[1] + " min"
     if (c.indexOf("*:00:00") >= 0) return "hourly"
@@ -122,7 +122,7 @@ Panel {
     for (var i = 0; i < destinations.length; i++) {
       var d = destinations[i]
       if (!d) continue
-      if (d.lastError || !d.lastSuccess) out.push(d)
+      if (d.failed || d.lastSuccess === "") out.push(d)
     }
     return out
   }
@@ -131,10 +131,7 @@ Panel {
   // From verify --json, counted by collect rather than recomputed here: collect
   // is what decides which files enter the backup, and a second implementation
   // of that decision would eventually disagree with the first.
-  readonly property var groups: {
-    if (!report || !report.groups) return []
-    return report.groups
-  }
+  readonly property var groups: cleanGroups(report)
   readonly property int coveredFiles: {
     var t = 0
     for (var i = 0; i < groups.length; i++) {
@@ -153,7 +150,7 @@ Panel {
   }
 
   function humanSize(b) {
-    if (typeof b !== "number") return "?"
+    if (typeof b !== "number" || !isFinite(b) || b < 0) return "?"
     if (b < 1024) return b + " B"
     if (b < 1048576) return Math.round(b / 1024) + " KB"
     return (Math.round(b / 104857.6) / 10) + " MB"
@@ -206,12 +203,60 @@ Panel {
   }
 
   function refresh() {
-    if (root.checking || root.cliMissing) return
+    // Reading while the CLI is mid-write reports a half-finished state as
+    // though it were the answer.
+    if (root.checking || root.cliMissing || root.cli === "" || root.busy) return
     root.checking = true
     root.lastError = ""
     verifyProc.buffer = ""
     verifyProc.running = true
     if (!statusProc.running) { statusProc.buffer = ""; statusProc.running = true }
+  }
+
+  // Whatever the CLI returned becomes a known shape HERE, once, instead of a
+  // guard at every binding. A newer CLI, a half-written document, a field that
+  // is a number where a string was expected: reproduced four binding TypeErrors
+  // that way -- a null entry in `groups`, a numeric `mode`, a null destination,
+  // a numeric `config.repo`. Guarding each site would have been the same fact
+  // written a dozen times.
+  function asText(v) { return (typeof v === "string") ? v : "" }
+  function asCount(v) {
+    return (typeof v === "number" && isFinite(v) && v >= 0) ? Math.floor(v) : null
+  }
+  function asList(v) { return (v && Array.isArray(v)) ? v : [] }
+
+  function cleanGroups(doc) {
+    var out = []
+    var raw = doc ? asList(doc.groups) : []
+    for (var i = 0; i < raw.length; i++) {
+      var g = raw[i]
+      if (!g || typeof g !== "object") continue
+      out.push({
+        id: asText(g.id), label: asText(g.label) || asText(g.id),
+        mode: asText(g.mode),
+        coupled: g.coupled === true, critical: g.critical === true,
+        enabled: g.enabled !== false,
+        files: asCount(g.files), bytes: asCount(g.bytes)
+      })
+    }
+    return out
+  }
+
+  function cleanDestinations(doc) {
+    var out = []
+    var raw = doc ? asList(doc.destinations) : []
+    for (var i = 0; i < raw.length; i++) {
+      var d = raw[i]
+      if (!d || typeof d !== "object") continue
+      var msg = (d.lastError && typeof d.lastError === "object")
+                ? asText(d.lastError.message) : ""
+      out.push({
+        id: asText(d.id), type: asText(d.type),
+        lastSuccess: asText(d.lastSuccess),
+        errorMessage: msg, failed: !!d.lastError
+      })
+    }
+    return out
   }
 
   function applyStatus(text) {
@@ -227,7 +272,7 @@ Panel {
   }
 
   function collect() {
-    if (root.cliMissing || collectProc.running) return
+    if (root.cli === "" || root.cliMissing || root.busy) return
     collectProc.running = true
   }
 
@@ -237,9 +282,17 @@ Panel {
   // The master switch. Unlike the group toggles, this one sets: `enable` and
   // `disable` start and stop the timers, which is what "is omabackup on" means
   // -- with them stopped nothing collects, commits or is sent.
+  // One notion of busy, not one guard per process. Each Process only checked
+  // whether IT was already running, so a sync, a collect, an enable and the
+  // refresh timer could all be in flight over the same repository at once --
+  // and the panel would then read state from the middle of its own write.
+  readonly property bool busy: syncing || switching || collectProc.running
   property bool switching: false
   function setEnabled(on) {
-    if (root.cliMissing || root.switching) return
+    // `cli === ""` is not the same as `cliMissing`: between startup and the
+    // resolver answering, neither is true, and the command would have gone out
+    // as ["", "enable"].
+    if (root.cli === "" || root.cliMissing || root.busy) return
     root.switching = true
     switchProc.command = [root.cli, on ? "enable" : "disable"]
     switchProc.running = true
@@ -247,7 +300,7 @@ Panel {
 
   property bool syncing: false
   function syncNow() {
-    if (root.cliMissing || root.syncing) return
+    if (root.cli === "" || root.cliMissing || root.busy) return
     root.syncing = true
     syncProc.running = true
   }
@@ -464,7 +517,7 @@ Panel {
               anchors.verticalCenter: headRow.verticalCenter
               checked: root.scheduled
               busy: root.switching
-              interactive: !root.cliMissing && !root.switching
+              interactive: root.cli !== "" && !root.cliMissing && !root.busy
               onToggled: root.setEnabled(!root.scheduled)
             }
           }
@@ -492,14 +545,14 @@ Panel {
               text: root.syncing ? "backing up…" : "Back up now"
               bordered: true
               focusable: true
-              enabled: !root.cliMissing && !root.syncing
+              enabled: root.cli !== "" && !root.cliMissing && !root.busy
               onClicked: root.syncNow()
             }
             Button {
               text: "Check again"
               bordered: true
               focusable: true
-              enabled: !root.cliMissing && !root.checking
+              enabled: root.cli !== "" && !root.cliMissing && !root.checking && !root.busy
               onClicked: root.refresh()
             }
           }
@@ -699,9 +752,9 @@ Panel {
                   // Not clickable: pushing to one destination on demand needs
                   // `push <id>`, and a chip that looks pressable but does
                   // nothing is worse than one that plainly reports.
-                  selected: destRow.modelData.lastSuccess && !destRow.modelData.lastError
-                  foreground: destRow.modelData.lastError ? Color.urgent
-                            : destRow.modelData.lastSuccess ? Color.foreground
+                  selected: destRow.modelData.lastSuccess !== "" && !destRow.modelData.failed
+                  foreground: destRow.modelData.failed ? Color.urgent
+                            : destRow.modelData.lastSuccess !== "" ? Color.foreground
                             : Color.accent
                 }
 
@@ -714,12 +767,12 @@ Panel {
                     var d = destRow.modelData
                     var bits = []
                     if (d.type && d.type !== d.id) bits.push(d.type)
-                    if (d.lastError && d.lastError.message) bits.push(d.lastError.message)
-                    else if (d.lastSuccess) bits.push("sent " + root.agoFromIso(d.lastSuccess))
+                    if (d.errorMessage !== "") bits.push(d.errorMessage)
+                    else if (d.lastSuccess !== "") bits.push("sent " + root.agoFromIso(d.lastSuccess))
                     else bits.push("never sent")
                     return bits.join("  ·  ")
                   }
-                  color: destRow.modelData.lastError ? Color.urgent : Color.muted
+                  color: destRow.modelData.failed ? Color.urgent : Color.muted
                   font.family: Style.font.family
                   font.pixelSize: Style.font.caption
                 }
