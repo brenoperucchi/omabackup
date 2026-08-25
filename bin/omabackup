@@ -1130,8 +1130,15 @@ cmd_reload() {
 
     # Poll rather than sleep a guessed interval: the restart is asynchronous,
     # and a fixed sleep is what made this unreliable by hand.
+    #
+    # Thirty seconds, not ten. omarchy-restart-shell returns in about half a
+    # second and the shell it starts usually appears within one -- but not
+    # always, and twice in one afternoon reload printed "the update did not
+    # land" for a restart that had landed, with the retry succeeding every
+    # time. A window that expires early turns a slow restart into a false
+    # report, which costs more than waiting does.
     local i after_at=0 after_id=none
-    for i in 1 2 3 4 5 6 7 8 9 10; do
+    for i in $(seq 1 30); do
         sleep 1
         after_at="$(_shell_started_at || echo 0)"
         after_id="$(_shell_identity || echo none)"
