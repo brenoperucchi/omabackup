@@ -234,6 +234,17 @@ Panel {
   // "Fazer backup agora" from the mockup. The plugin still writes nothing and
   // runs no git itself (DESIGN.md §1) -- it asks the CLI, exactly as the timer
   // does, and re-reads when the CLI is done.
+  // The master switch. Unlike the group toggles, this one sets: `enable` and
+  // `disable` start and stop the timers, which is what "is omabackup on" means
+  // -- with them stopped nothing collects, commits or is sent.
+  property bool switching: false
+  function setEnabled(on) {
+    if (root.cliMissing || root.switching) return
+    root.switching = true
+    switchProc.command = [root.cli, on ? "enable" : "disable"]
+    switchProc.running = true
+  }
+
   property bool syncing: false
   function syncNow() {
     if (root.cliMissing || root.syncing) return
@@ -300,6 +311,15 @@ Panel {
     stdout: StdioCollector { onStreamFinished: statusProc.buffer = text }
     onExited: function(code) {
       if (statusProc.buffer.trim() !== "") root.applyStatus(statusProc.buffer)
+    }
+  }
+
+  Process {
+    id: switchProc
+    command: ["true"]
+    onExited: function(code) {
+      root.switching = false
+      root.refresh()
     }
   }
 
@@ -438,23 +458,27 @@ Panel {
               }
             }
 
-            Text {
+            // The one control on this panel that actually sets something.
+            ToggleSwitch {
               anchors.right: parent.right
               anchors.verticalCenter: headRow.verticalCenter
-              text: root.headline
-              color: root.failCount > 0 ? Color.urgent
-                   : (!root.scheduled || root.stale || root.destAlerts.length > 0) ? Color.accent
-                   : Color.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
+              checked: root.scheduled
+              busy: root.switching
+              interactive: !root.cliMissing && !root.switching
+              onToggled: root.setEnabled(!root.scheduled)
             }
           }
 
           Text {
             visible: root.statusDoc !== null
             width: parent.width
-            text: root.summaryLine
-            color: Color.muted
+            // The status word moved here from the header, where the switch now
+            // sits. Color.muted was too dark to read at caption size against
+            // the panel ground -- this is the foreground, dimmed, which stays
+            // legible while still reading as secondary.
+            text: root.headline + "  ·  " + root.summaryLine
+            color: Color.foreground
+            opacity: 0.62
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
             elide: Text.ElideRight

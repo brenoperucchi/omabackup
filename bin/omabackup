@@ -870,6 +870,32 @@ cmd_install() {
     printf '  check with: %ssystemctl --user list-timers omabackup-\*%s\n' "$CYAN" "$NC"
 }
 
+# ── enable / disable ─────────────────────────────────────────────────────────
+# The master switch. "Is omabackup on" means "are its timers running": with them
+# stopped nothing collects, nothing commits and nothing is sent, and `verify`
+# already reports exactly that.
+#
+# It stops and starts units, never removes them. Turning it back on has to be a
+# switch, not a reinstall -- and the panel's toggle is the whole reason this
+# verb exists, so it must be reversible from there.
+cmd_enable() {
+    local want="$1"; shift
+    reject_flags "$want" "$@"
+    [[ -d "$UNIT_DIR" ]] \
+        || die "the timers are not installed yet -- run: omabackup install"
+
+    if [[ "$want" == enable ]]; then
+        "$SYSTEMCTL" --user enable --now "${TIMER_UNITS[@]}" >/dev/null 2>&1 \
+            || die "could not start the timers"
+        printf '  %s✓%s on %s(sync every 15m, push hourly)%s\n' "$GREEN" "$NC" "$DIM" "$NC"
+    else
+        "$SYSTEMCTL" --user disable --now "${TIMER_UNITS[@]}" >/dev/null 2>&1 \
+            || die "could not stop the timers"
+        printf '  %soff%s %s-- nothing will run until: omabackup enable%s\n' \
+            "$YELLOW" "$NC" "$DIM" "$NC"
+    fi
+}
+
 # ── reload ───────────────────────────────────────────────────────────────────
 # quickshell reads QML once, at startup, and watches nothing -- there is no
 # reload flag. So updating the installed plugin is two ordered steps: write the
@@ -1113,6 +1139,8 @@ case "$CMD" in
     sync)    cmd_sync "${ARGS[@]}" ;;
     install) cmd_install "${ARGS[@]}" ;;
     reload)  cmd_reload "${ARGS[@]}" ;;
+    enable)  cmd_enable enable "${ARGS[@]}" ;;
+    disable) cmd_enable disable "${ARGS[@]}" ;;
     bundle)  cmd_bundle "${ARGS[@]}" ;;
     push)    cmd_push "${ARGS[@]}" ;;
     status)  reject_flags status "${ARGS[@]}"; cmd_status ;;
@@ -1122,6 +1150,8 @@ omabackup <command> [--json] [--groups a,b]
 
   status    Omarchy identity, restore range and groups
   reload    update the installed plugin and restart the shell onto it
+  enable    start the timers -- the master switch
+  disable   stop them; nothing runs until enable
   collect   collect the groups into staging (does not touch the repo)
   verify    check that the backup covers what the system actually reads
 
