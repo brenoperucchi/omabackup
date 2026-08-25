@@ -651,3 +651,38 @@ printf '{"schemaVersion":1,"destinations":[]}\n' >"$ANH/destinations.json"
 # blocked downstream by the fail-closed lock, which is what happened while the
 # probe was "a" and could not see it.
 assert_contains "$(OMABACKUP_SECRETS_DENY="$ANH/sometimes.json" _sec_env "$ANH" "$ANR" push 2>&1)" "sometimes can match the empty string"
+
+# ── a message that carries the byte the reader was using as a separator ─────
+# Commit bodies were split on \x01 and the sha taken off with \x02. A message
+# holding either byte produced a record the awk could not parse, and the awk
+# dropped it -- so everything after that byte was never scanned at all. Entries
+# are NUL-terminated now (the one byte a commit message cannot carry) and the
+# sha is read by width, not by a second delimiter.
+SEPH="$(mktemp -d)"; SEPR="$SEPH/repo"; _sec_repo "$SEPR" "" ""
+git -C "$SEPR" -c user.email=t@t -c user.name=t \
+    commit -q --allow-empty -m "$(printf 'nota\x01\nAKIA1234567890ABCDEF')" 2>/dev/null
+git -C "$SEPR" -c user.email=t@t -c user.name=t \
+    tag -a v9 -m "$(printf 'AKIA1234567890ABCDEF\nsegunda linha')" 2>/dev/null
+cat >"$SEPH/anchored.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"anchored","regex":"^AKIA[0-9A-Z]{16}$","reason":"a key alone on its line"}],
+ "exceptions":[]}
+JSON
+SEPOUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                   scan_secrets "$1" "$2"' _ "$SEPR" "$SEPH/anchored.json" 2>&1)"
+
+it "a key after a separator byte in a commit message is still found"
+assert_contains "$SEPOUT" "$(git -C "$SEPR" rev-parse HEAD | cut -c1-12)"
+
+it "a key on the first line of a tag body is found by an anchored pattern"
+assert_contains "$SEPOUT" "tag:v9"
+
+# A cut whose status nobody read used to stand between the messages and the
+# patterns: when it failed, every message vanished and the push carried on.
+mkdir -p "$SEPH/stub"
+printf '#!/bin/bash\nexit 3\n' >"$SEPH/stub/cut"; chmod +x "$SEPH/stub/cut"
+
+it "and the scan does not lean on a cut whose status it never read"
+assert_contains "$(PATH="$SEPH/stub:$PATH" bash -c '
+    source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_secrets "$1" "$2"' _ "$SEPR" "$SEPH/anchored.json" 2>&1)" "tag:v9"

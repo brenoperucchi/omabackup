@@ -243,39 +243,67 @@ scan_secrets() {
     # (a hit named no commit, and the fix for a message is rewriting history --
     # you cannot rewrite what you cannot locate) and let a match span the seam
     # between one message and the next.
-    local msgraw msgrc tagraw tagrc msgs
-    msgraw="$(git -C "$repo" log --all --format=$'\x01%H\x02%B' 2>/dev/null)"; msgrc=$?
-    tagraw="$(git -C "$repo" for-each-ref --format='%(refname:short) %(contents)' \
-              refs/tags 2>/dev/null)"; tagrc=$?
-    if (( msgrc != 0 || tagrc != 0 )); then
-        printf '%somabackup: cannot read commit messages or tags in %s -- refusing to call it clean%s\n' \
+    local pairs prc trefs tref tbody tl pline msgs
+    # -z terminates each entry with NUL, the one byte a commit message cannot
+    # carry: \x01 could, and a message holding one split into a record with no
+    # sha in front of it, which the previous version dropped outright -- a key
+    # after that byte was never scanned. The sha is read by width rather than
+    # by a second delimiter for the same reason: an \x02 in a message would
+    # have hidden everything past it. A record that still arrives without a sha
+    # is attributed to the one before rather than discarded.
+    # pipefail is asked for here rather than assumed. bin/omabackup sets it,
+    # but this library is sourced directly by the specs and by anything else
+    # that cares to, and without it the pipeline reported awk's status: a git
+    # that could not read the log became "no messages", became clean.
+    local _had_pipefail=0; [[ -o pipefail ]] && _had_pipefail=1
+    set -o pipefail
+    pairs="$(git -C "$repo" log --all -z --format='%H%B' 2>/dev/null \
+             | awk 'BEGIN{RS="\000"; last="?"} {
+                   h = substr($0, 1, 40); b = substr($0, 41)
+                   if (h ~ /^[0-9a-f]{40}$/) last = substr(h, 1, 12); else b = $0
+                   n = split(b, L, "\n")
+                   for (j = 1; j <= n; j++) if (L[j] != "") print last "\t" L[j]
+               }')"; prc=$?
+    (( _had_pipefail )) || set +o pipefail
+    if (( prc != 0 )); then
+        printf '%somabackup: cannot read the commit messages of %s -- refusing to call it clean%s\n' \
             "$RED" "$(_tilde "$repo")" "$NC" >&2
         return 1
     fi
-    # The commit id travels beside each line, not in front of it. Prefixing it
-    # put "<sha>:" where an anchored pattern expects the start of the line, the
-    # same defect the git grep format carried.
-    local pairs
-    pairs="$(printf '%s' "$msgraw" | awk -v RS=$'\x01' 'NR>1 {
-                  i = index($0, "\002"); if (i == 0) next
-                  h = substr($0, 1, i - 1); b = substr($0, i + 1)
-                  n = split(b, L, "\n")
-                  for (j = 1; j <= n; j++) if (L[j] != "") print substr(h,1,12) "\t" L[j]
-              }')"
-    # The awk that splits them carries its own way of failing, and reading it
-    # through an unchecked assignment would restore the fail-open one layer down
-    # from where it was just closed.
-    if (( $? != 0 )); then
-        printf '%somabackup: could not split the commit messages of %s -- refusing to call it clean%s\n' \
-            "$RED" "$(_tilde "$repo")" "$NC" >&2
-        return 1
-    fi
-    # Tag bodies have no commit to name, so they are attributed to the tag line
-    # itself; both streams are searched as bare content and located by line.
+
+    # Command substitution strips the trailing newline, so appending the tags
+    # straight onto this glued the first of them to the last message line.
+    pairs="${pairs:+$pairs$'\n'}"
+
+    # One ref at a time, because "%(refname:short) %(contents)" put the tag name
+    # in front of the body's first line -- so an anchored pattern could not
+    # match a secret that occupied that line, the same defect as git grep's
+    # decoration. Refnames carry no whitespace, so one per line is exact.
+    trefs="$(git -C "$repo" for-each-ref --format='%(refname:short)' refs/tags 2>/dev/null)" \
+        || { printf '%somabackup: cannot list the tags of %s -- refusing to call it clean%s\n' \
+                 "$RED" "$(_tilde "$repo")" "$NC" >&2; return 1; }
+    while read -r tref; do
+        [[ -n "$tref" ]] || continue
+        tbody="$(git -C "$repo" for-each-ref --format='%(contents)' "refs/tags/$tref" 2>/dev/null)" \
+            || { printf '%somabackup: cannot read tag %s -- refusing to call it clean%s\n' \
+                     "$RED" "$tref" "$NC" >&2; return 1; }
+        while IFS= read -r tl; do
+            [[ -n "$tl" ]] || continue
+            pairs+="tag:$tref"$'\t'"$tl"$'\n'
+        done <<<"$tbody"
+    done <<<"$trefs"
+
+    # Split in bash rather than through cut, whose status was thrown away: a cut
+    # that failed emptied every message and the push carried on. What is left is
+    # two parallel streams -- who said it, and what was said -- so the pattern
+    # only ever meets the line itself.
     local -a MSGWHO=()
-    mapfile -t MSGWHO < <(printf '%s' "$pairs" | cut -f1
-                          printf '%s' "$tagraw" | sed 's/.*/tag/')
-    msgs="$(printf '%s' "$pairs" | cut -f2-)"$'\n'"$tagraw"
+    msgs=""
+    while IFS= read -r pline; do
+        [[ -n "$pline" ]] || continue
+        MSGWHO+=("${pline%%$'\t'*}")
+        msgs+="${pline#*$'\t'}"$'\n'
+    done <<<"$pairs"
 
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
@@ -311,7 +339,7 @@ scan_secrets() {
             rc=1
             continue
         fi
-        local head="" want_head=1 body
+        local head="" want_head=1 body line_out
         while IFS= read -r hit; do
             if [[ -z "$hit" ]]; then want_head=1; continue; fi
             if (( want_head )); then head="$hit"; want_head=0; continue; fi
@@ -319,8 +347,11 @@ scan_secrets() {
             _still_matches "$body" "$re" "$ci" || continue
             # A hit inside a binary would otherwise dump the blob into the
             # report. Keep it printable and bounded.
-            printf '%s\t%s\n' "$id" \
-                "$(printf '%s:%s' "$head" "$hit" | tr -c '[:print:]\t' '.' | cut -c1-200)"
+            # Bounded in bash. The truncation used to run through cut, whose
+            # failure would have emptied the one part of the finding that says
+            # where the secret is.
+            line_out="$(printf '%s:%s' "$head" "$hit" | tr -c '[:print:]\t' '.')"
+            printf '%s\t%s\n' "$id" "${line_out:0:200}"
         done <<<"$out"
 
         # Commit messages and tag bodies, collected once above. grep exits 1
@@ -343,7 +374,7 @@ scan_secrets() {
             ln="${hit%%:*}"; body="${hit#*:}"
             _still_matches "$body" "$re" "$ci" || continue
             who="${MSGWHO[$((ln - 1))]:-?}"
-            printf '%s\tcommit-message: %s:%s\n' "$id" "$who" "$body"
+            printf '%s\tcommit-message: %s: %s\n' "$id" "$who" "$body"
         done <<<"$mout"
     done <<<"$patterns"
     return $rc
