@@ -608,3 +608,46 @@ cat >"$ZWH/broken.json" <<'JSON'
  "exceptions":[]}
 JSON
 assert_contains "$(OMABACKUP_SECRETS_DENY="$ZWH/broken.json" _sec_env "$ZWH" "$ZWR" push 2>&1)" "malformed"
+
+# ── an anchored pattern, and the decoration git grep puts in front of a hit ──
+# git grep prefixes each hit with "<rev>:<path>:<lineno>:" and _still_matches
+# was re-applying the pattern to that. ^AKIA[0-9A-Z]{16}$ matched inside git
+# grep and failed here, because ^ no longer sat where the key begins -- the two
+# halves disagreed and the disagreement resolved to "clean". The push went out
+# with the key in it.
+ANH="$(mktemp -d)"; ANR="$ANH/repo"; _sec_repo "$ANR" "" ""
+printf 'AKIA1234567890ABCDEF\n' >"$ANR/key.txt"
+git -C "$ANR" add key.txt 2>/dev/null
+git -C "$ANR" -c user.email=t@t -c user.name=t \
+    commit -q -m 'AKIA1234567890ABCDEF' 2>/dev/null
+cat >"$ANH/anchored.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"anchored","regex":"^AKIA[0-9A-Z]{16}$","reason":"a key alone on its line"}],
+ "exceptions":[]}
+JSON
+ANOUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                  scan_secrets "$1" "$2"' _ "$ANR" "$ANH/anchored.json" 2>&1)"
+
+it "a key alone on its line is found by an anchored pattern"
+assert_contains "$ANOUT" "key.txt"
+
+it "and the same pattern still finds it in a commit message"
+assert_contains "$ANOUT" "commit-message:"
+
+it "the report still names the file and line, not just the pattern"
+assert_contains "$ANOUT" ":1:AKIA1234567890ABCDEF"
+
+it "and still names the commit a message hit came from"
+assert_contains "$ANOUT" "$(git -C "$ANR" rev-parse HEAD | cut -c1-12)"
+
+it "a pattern that only matches empty on SOME lines is refused as such"
+cat >"$ANH/sometimes.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"sometimes","regex":"a?","reason":"zero-width wherever there is no a"}],
+ "exceptions":[]}
+JSON
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$ANH/destinations.json"
+# Refused at validation, by name and for the right reason -- not merely
+# blocked downstream by the fail-closed lock, which is what happened while the
+# probe was "a" and could not see it.
+assert_contains "$(OMABACKUP_SECRETS_DENY="$ANH/sometimes.json" _sec_env "$ANH" "$ANR" push 2>&1)" "sometimes can match the empty string"

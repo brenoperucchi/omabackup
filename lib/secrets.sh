@@ -72,14 +72,19 @@ assert_deny_understood() {
     # ERE rather than of grep -o, whose handling of a zero-width match turned
     # out to vary between invocations on this machine; a detector must not rest
     # on that. An expression bash cannot compile is refused in the same breath.
+    #
+    # The probe is the empty string, which is the question being asked. Probing
+    # with "a" answered a narrower one: "a?" matches "a" with content and so
+    # looked healthy, while on any line without an "a" it matches nothing at
+    # all -- zero-width for most of the repository.
     local pid3 pre3 zwrc
     while IFS=$'\t' read -r pid3 pre3; do
         [[ -n "$pid3" && -n "$pre3" ]] || continue
-        ( [[ "a" =~ $pre3 ]] ) 2>/dev/null; zwrc=$?
+        ( [[ "" =~ $pre3 ]] ) 2>/dev/null; zwrc=$?
         if (( zwrc == 2 )); then
             bad="${bad:+$bad$'\n'}pattern $pid3 is not a regular expression this scanner can compile"
         elif (( zwrc == 0 )) \
-          && [[ -z "$( [[ "a" =~ $pre3 ]] 2>/dev/null; printf '%s' "${BASH_REMATCH[0]}" )" ]]; then
+          && [[ -z "$( [[ "" =~ $pre3 ]] 2>/dev/null; printf '%s' "${BASH_REMATCH[0]}" )" ]]; then
             bad="${bad:+$bad$'\n'}pattern $pid3 can match the empty string: it would match every line and report none"
         fi
     done < <(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)"' "$file" 2>/dev/null)
@@ -247,12 +252,16 @@ scan_secrets() {
             "$RED" "$(_tilde "$repo")" "$NC" >&2
         return 1
     fi
-    msgs="$(printf '%s' "$msgraw" | awk -v RS=$'\x01' 'NR>1 {
+    # The commit id travels beside each line, not in front of it. Prefixing it
+    # put "<sha>:" where an anchored pattern expects the start of the line, the
+    # same defect the git grep format carried.
+    local pairs
+    pairs="$(printf '%s' "$msgraw" | awk -v RS=$'\x01' 'NR>1 {
                   i = index($0, "\002"); if (i == 0) next
                   h = substr($0, 1, i - 1); b = substr($0, i + 1)
                   n = split(b, L, "\n")
-                  for (j = 1; j <= n; j++) if (L[j] != "") print substr(h,1,12) ":" L[j]
-              }')"$'\n'"$tagraw"
+                  for (j = 1; j <= n; j++) if (L[j] != "") print substr(h,1,12) "\t" L[j]
+              }')"
     # The awk that splits them carries its own way of failing, and reading it
     # through an unchecked assignment would restore the fail-open one layer down
     # from where it was just closed.
@@ -261,6 +270,12 @@ scan_secrets() {
             "$RED" "$(_tilde "$repo")" "$NC" >&2
         return 1
     fi
+    # Tag bodies have no commit to name, so they are attributed to the tag line
+    # itself; both streams are searched as bare content and located by line.
+    local -a MSGWHO=()
+    mapfile -t MSGWHO < <(printf '%s' "$pairs" | cut -f1
+                          printf '%s' "$tagraw" | sed 's/.*/tag/')
+    msgs="$(printf '%s' "$pairs" | cut -f2-)"$'\n'"$tagraw"
 
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
@@ -271,7 +286,20 @@ scan_secrets() {
         # patterns are high-signal ASCII shapes -- random bytes matching
         # `AKIA[0-9A-Z]{16}` is not a realistic false positive -- so reading
         # binary as text closes the hole at no practical cost.
-        local -a gflags=(-a -n -E)
+        # --break --heading, so the decoration never reaches the regex. The
+        # default format prefixes each hit with "<rev>:<path>:<lineno>:", and
+        # _still_matches was then re-applying the pattern to THAT: an anchored
+        # pattern -- ^AKIA[0-9A-Z]{16}$ on a key that occupies its own line --
+        # matched inside git grep and failed here, and the disagreement between
+        # the two resolved to "clean". The push went out with the key in it.
+        #
+        # In this format a heading is "<rev>:<path>" on its own line and every
+        # following line is "<lineno>:<content>" until a blank line announces
+        # the next heading. A blank matching line prints as "<lineno>:", never
+        # as an empty line, so the two can never be confused -- which the plain
+        # format could not promise, a path being free to contain colons and a
+        # line free to begin with something shaped like a sha.
+        local -a gflags=(-a -n --break --heading -E)
         [[ "$ci" == true ]] && gflags+=(-i)
         local out grc
         out="$(git -C "$repo" grep "${gflags[@]}" -e "$re" "${revs[@]}" 2>&1)"; grc=$?
@@ -283,12 +311,16 @@ scan_secrets() {
             rc=1
             continue
         fi
+        local head="" want_head=1 body
         while IFS= read -r hit; do
-            [[ -n "$hit" ]] || continue
-            _still_matches "$hit" "$re" "$ci" || continue
+            if [[ -z "$hit" ]]; then want_head=1; continue; fi
+            if (( want_head )); then head="$hit"; want_head=0; continue; fi
+            body="${hit#*:}"          # drop the line number; what is left is the line
+            _still_matches "$body" "$re" "$ci" || continue
             # A hit inside a binary would otherwise dump the blob into the
             # report. Keep it printable and bounded.
-            printf '%s\t%s\n' "$id" "$(printf '%s' "$hit" | tr -c '[:print:]\t' '.' | cut -c1-200)"
+            printf '%s\t%s\n' "$id" \
+                "$(printf '%s:%s' "$head" "$hit" | tr -c '[:print:]\t' '.' | cut -c1-200)"
         done <<<"$out"
 
         # Commit messages and tag bodies, collected once above. grep exits 1
@@ -296,8 +328,8 @@ scan_secrets() {
         # a process substitution those were the same answer, and the second one
         # meant a pattern silently stopped being applied to the history.
         local mout mrc
-        if [[ "$ci" == true ]]; then mout="$(printf '%s' "$msgs" | grep -iE -e "$re")"
-        else mout="$(printf '%s' "$msgs" | grep -E -e "$re")"; fi
+        if [[ "$ci" == true ]]; then mout="$(printf '%s' "$msgs" | grep -niE -e "$re")"
+        else mout="$(printf '%s' "$msgs" | grep -nE -e "$re")"; fi
         mrc=$?
         if (( mrc > 1 )); then
             printf '%somabackup: pattern %s could not be applied to the commit messages%s\n' \
@@ -305,10 +337,13 @@ scan_secrets() {
             rc=1
             continue
         fi
+        local ln who
         while IFS= read -r hit; do
             [[ -n "$hit" ]] || continue
-            _still_matches "$hit" "$re" "$ci" || continue
-            printf '%s\tcommit-message: %s\n' "$id" "$hit"
+            ln="${hit%%:*}"; body="${hit#*:}"
+            _still_matches "$body" "$re" "$ci" || continue
+            who="${MSGWHO[$((ln - 1))]:-?}"
+            printf '%s\tcommit-message: %s:%s\n' "$id" "$who" "$body"
         done <<<"$mout"
     done <<<"$patterns"
     return $rc
