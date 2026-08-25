@@ -33,8 +33,31 @@ bundle_name() {
     printf 'omabackup-%s-%s-%s.tar.zst' "$(_hostname)" "${ts:-00000000-000000}" "${sha:-unknown}"
 }
 
+# What the tool is, recorded in the manifest: its commit when there is one.
 _tool_commit() {
     printf '%s' "${OMABACKUP_TOOL_ID:-$(git -C "$OMABACKUP_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')}"
+}
+
+# What the tool's CODE is, which is a different question and the one the cache
+# key needs. A commit does not move when the working tree is edited, and it
+# collapses to "unknown" wherever the tool is installed without its history --
+# so an artefact built by different code was served from the cache under both
+# conditions. Hashing the files answers it directly.
+_tool_fingerprint() {
+    # The override still wins: a caller that names the tool version is naming
+    # the thing the key is meant to distinguish.
+    if [[ -n "${OMABACKUP_TOOL_ID:-}" ]]; then printf '%s' "$OMABACKUP_TOOL_ID"; return; fi
+    # cat's status, read. Piped straight into sha256sum, a cat that could not
+    # open a single file still produced the hash of empty input -- a stable,
+    # confident-looking fingerprint meaning "I read nothing", which every
+    # unreadable installation would have shared.
+    local blob h
+    [[ -r "$OMABACKUP_ROOT/bin/omabackup" ]] || return 1
+    blob="$(cat "$OMABACKUP_ROOT/bin/omabackup" "$OMABACKUP_ROOT"/lib/*.sh 2>/dev/null)" || return 1
+    [[ -n "$blob" ]] || return 1
+    h="$(printf '%s' "$blob" | sha256sum 2>/dev/null | cut -c1-16)" || return 1
+    [[ -n "$h" ]] || return 1
+    printf '%s' "$h"
 }
 
 # _bundle_manifest <repo> <staging> — everything a restore needs, in one file.
@@ -148,8 +171,10 @@ bundle_cache_path() {
     local repo="$1" cache="$2" head key
     head="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || return 1
     [[ -n "$head" ]] || return 1
-    key="$(printf '%s\n%s\n%s\n' "$head" "$(_tool_commit)" \
-            "$(git -C "$repo" show-ref 2>/dev/null | sha256sum)" | sha256sum | cut -c1-16)"
+    local fp refs
+    fp="$(_tool_fingerprint)" || return 1
+    refs="$(git -C "$repo" show-ref 2>/dev/null | sha256sum)" || return 1
+    key="$(printf '%s\n%s\n%s\n' "$head" "$fp" "$refs" | sha256sum | cut -c1-16)"
     printf '%s/%s.tar.zst' "$cache" "$key"
 }
 

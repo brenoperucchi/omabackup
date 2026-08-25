@@ -135,7 +135,6 @@ prune_bundles() {  # prune_bundles <dir> <host> <keep> -> prints how many it rem
     # within the same second, so `sort -r` kept the older format and pruned the
     # newer. The key is <timestamp> <1 if sha'd> <name>, so a tie is decided by
     # format age rather than by punctuation.
-    local -a found=()
     # The timestamp is read at a known offset, not searched for. awk's match()
     # finds the FIRST -YYYYMMDD-HHMMSS in the name, and a hostname that looks
     # like a timestamp ("box-20200101-000000") owns it: every bundle then sorted
@@ -143,13 +142,22 @@ prune_bundles() {  # prune_bundles <dir> <host> <keep> -> prints how many it rem
     # newer by a day was pruned in favour of a sha'd one older by a day. The
     # prefix is exactly "omabackup-<host>-", so the 15 characters after it are
     # the timestamp, whatever the host is called. Its LENGTH is what crosses
-    # into awk: a number needs no quoting and no escape handling, and a
-    # temporary assignment on `mapfile` never reached the process substitution's
-    # environment at all.
+    # into awk: a number needs no quoting and no escape handling.
     local off=$(( ${#host} + 11 ))
-    mapfile -t found < <(find "$dir" -maxdepth 1 -type f -regextype posix-extended \
+    # The walk's status is read. mapfile through a process substitution threw it
+    # away, so a find that stopped partway -- an unreadable subdirectory, a
+    # vanishing mount -- produced a partial list, and retention then decided
+    # which files were "oldest" from a fraction of what was there. Deleting on a
+    # partial reading of a backup directory is the one thing this function must
+    # never do.
+    local listing
+    listing="$(find "$dir" -maxdepth 1 -type f -regextype posix-extended \
         -regex ".*/omabackup-${hre}-${DEST_NAME_TAIL}" \
-        -printf '%f\n' 2>/dev/null \
+        -printf '%f\n' 2>/dev/null)" \
+        || { printf 'omabackup: could not list %s -- refusing to prune it\n' "$dir" >&2
+             printf '%s' 0; return 1; }
+    local -a found=()
+    [[ -n "$listing" ]] && mapfile -t found < <(printf '%s' "$listing" \
         | awk -v off="$off" '{ stamp = substr($0, off + 1, 15)
                  sha = ($0 ~ /-[0-9a-f]{12}\.tar\.zst$/) ? 1 : 0
                  print stamp "\t" sha "\t" $0 }' \

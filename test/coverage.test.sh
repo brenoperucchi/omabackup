@@ -198,3 +198,30 @@ it "and the collect still succeeds -- what it staged is on disk"
 
 it "while last run's numbers are retired rather than left standing"
 assert_eq "$(_cov_env "$SZH" verify --json | jq -r '.groups[0].files')" "null"
+
+# ── a hash that could not be computed is not a hash ─────────────────────────
+# The manifest hash tells a later read whether these counts still describe the
+# same question. Computed inline, a sha256sum that failed wrote an empty one --
+# and the reader, computing it the same way and failing the same way, compared
+# "" against "" and accepted stale counts as current. Two failures agreeing is
+# not agreement.
+MHH="$(mktemp -d)"; mkdir -p "$MHH/.config/solo" "$MHH/stub"
+printf 'c\n' >"$MHH/.config/solo/one.conf"
+cat >"$MHH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"solo","label":"Solo","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/solo"]}]}
+JSON
+_cov_env "$MHH" collect >/dev/null
+
+it "a first collect records a real count"
+assert_eq "$(_cov_env "$MHH" verify --json | jq -r '.groups[0].files')" "1"
+
+printf '#!/bin/bash\nexit 1\n' >"$MHH/stub/sha256sum"; chmod +x "$MHH/stub/sha256sum"
+printf 'extra\n' >"$MHH/.config/solo/two.conf"
+MHOUT="$(PATH="$MHH/stub:$PATH" _cov_env "$MHH" collect 2>&1)"
+
+it "a manifest that cannot be hashed is said out loud"
+assert_contains "$MHOUT" "could not hash"
+
+it "and the counts are retired rather than left to match an empty hash"
+assert_eq "$(_cov_env "$MHH" verify --json | jq -r '.groups[0].files')" "null"

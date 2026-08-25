@@ -223,3 +223,32 @@ GIT_COMMITTER_DATE="$(git -C "$BNR" show -s --format=%cI HEAD)" \
   git -C "$BNR" -c user.email=t@t -c user.name=t commit -q -am two --date="$(git -C "$BNR" show -s --format=%cI HEAD)"
 N2="$(OMABACKUP_ROOT="$PWD" bash -c 'source lib/bundle.sh; bundle_name "$1"' _ "$BNR")"
 [[ "$N1" != "$N2" ]] && ok || fail "both commits produce the same filename: $N1"
+
+# ── the cache key tracks the code, not the commit ───────────────────────────
+# It was built from the tool's git HEAD, which does not move when the working
+# tree is edited and collapses to "unknown" wherever the tool is installed
+# without its history. Under either condition an artefact built by different
+# code was served from the cache -- including one built before a gate existed.
+FPH="$(mktemp -d)"; FPR="$FPH/repo"; FPC="$FPH/cache"
+git init -q "$FPR" 2>/dev/null; printf 'x\n' >"$FPR/a"
+git -C "$FPR" add a 2>/dev/null
+git -C "$FPR" -c user.email=t@t -c user.name=t commit -q -m ok 2>/dev/null
+_fpkey() { OMABACKUP_ROOT="$PWD" bash -c 'source lib/bundle.sh
+                    bundle_cache_path "$1" "$2"' _ "$FPR" "$FPC" 2>/dev/null; }
+FPBEFORE="$(_fpkey)"
+printf '\n# an edit that changes what the tool does\n' >>lib/publish.sh
+FPDIRTY="$(_fpkey)"
+git checkout -q lib/publish.sh 2>/dev/null
+FPBACK="$(_fpkey)"
+
+it "editing the tool changes the cache key, with no commit involved"
+[[ -n "$FPBEFORE" && "$FPBEFORE" != "$FPDIRTY" ]] \
+    && ok || fail "same key for different code: $FPBEFORE"
+
+it "and undoing the edit brings the old key back"
+assert_eq "$FPBACK" "$FPBEFORE"
+
+it "a key cannot be built when the tool cannot be read"
+OMABACKUP_ROOT=/nonexistent bash -c 'source '"$PWD"'/lib/bundle.sh
+    bundle_cache_path "$1" "$2"' _ "$FPR" "$FPC" >/dev/null 2>&1 \
+    && fail "built a cache key from a tool it could not read" || ok

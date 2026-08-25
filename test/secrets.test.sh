@@ -943,3 +943,71 @@ it "and a clean staging directory reports nothing"
 rm -f "$STGH/stage/tool/groups.default.json"
 assert_eq "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
                       scan_files "$1" "$2"' _ "$STGH/stage" "$PWD/secrets.deny.json" 2>&1)" ""
+
+# ── a path is free to contain a colon ───────────────────────────────────────
+# `grep -r -H -n` prints "<path>:<lineno>:<content>", so stripping two
+# colon-delimited fields off "a:b.txt:1:KEY" leaves "b.txt:1:KEY" and an
+# anchored pattern misses the key. git grep's decoration defect, reached from
+# the other direction.
+COLH="$(mktemp -d)"; mkdir -p "$COLH/stage"
+printf 'AKIA1234567890ABCDEF\n' >"$COLH/stage/a:b.txt"
+cat >"$COLH/anchored.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"anchored","regex":"^AKIA[0-9A-Z]{16}$","reason":"a key alone on its line"}],
+ "exceptions":[]}
+JSON
+
+it "an anchored pattern still matches in a file whose name holds a colon"
+assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                            scan_files "$1" "$2"' _ "$COLH/stage" "$COLH/anchored.json" 2>&1)" \
+    "a:b.txt"
+
+# ── the two object listings, each with its own status ───────────────────────
+# Both inside one substitution reported only the last one's, so a rev-list that
+# failed left the paths half-collected and the scan returned clean.
+RLH="$(mktemp -d)"; RLR="$RLH/repo"; _sec_repo "$RLR" "" ""
+printf 'AKIA1234567890ABCDEF\n' >"$RLR/leak.txt"
+git -C "$RLR" add leak.txt 2>/dev/null
+git -C "$RLR" -c user.email=t@t -c user.name=t commit -q -m 'a leak' 2>/dev/null
+mkdir -p "$RLH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'prev=""; for a in "$@"; do [[ "$prev" == rev-list && "$a" == --objects ]] && exit 128; prev="$a"; done\n'
+  printf 'exec %s "$@"\n' "$(command -v git)"
+} >"$RLH/stub/git"; chmod +x "$RLH/stub/git"
+
+it "a rev-list --objects that fails refuses instead of reporting clean"
+PATH="$RLH/stub:$PATH" bash -c '
+    source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_secrets "$1" "$2"' _ "$RLR" "$PWD/secrets.deny.json" >/dev/null 2>&1 \
+    && fail "a half-collected object listing read as a clean repository" || ok
+
+# ── a header no --format placeholder exposes ────────────────────────────────
+# mergetag carries an entire tag object inside a merge commit and survives the
+# tag being deleted, so nothing else in this scan would ever see it. Built with
+# hash-object because git will not produce one on demand.
+MTH="$(mktemp -d)"; MTR="$MTH/repo"; _sec_repo "$MTR" "" ""
+MTTREE="$(git -C "$MTR" rev-parse HEAD^{tree})"; MTPARENT="$(git -C "$MTR" rev-parse HEAD)"
+MTTAG="$(git -C "$MTR" mktag <<TAGOBJ 2>/dev/null
+object $MTPARENT
+type commit
+tag deleted-later
+tagger t <t@t> 0 +0000
+
+AKIA8888888888888888
+TAGOBJ
+)"
+MTC="$(git -C "$MTR" cat-file tag "$MTTAG" 2>/dev/null | sed 's/^/ /' | {
+    printf 'tree %s\nparent %s\nauthor t <t@t> 0 +0000\ncommitter t <t@t> 0 +0000\nmergetag' \
+        "$MTTREE" "$MTPARENT"
+    cat
+    printf '\na merge with nothing in its message\n'
+  } | git -C "$MTR" hash-object -t commit -w --stdin 2>/dev/null)"
+[[ -n "$MTC" ]] && git -C "$MTR" update-ref refs/heads/master "$MTC" 2>/dev/null
+
+it "the tag has no ref of its own -- only the header carries it"
+assert_eq "$(git -C "$MTR" for-each-ref refs/tags | wc -l)" "0"
+
+it "a key living only in a mergetag header is found"
+assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                            scan_secrets "$1" "$2"' _ "$MTR" "$PWD/secrets.deny.json" 2>&1)" \
+    "AKIA8888888888888888"

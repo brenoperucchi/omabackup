@@ -409,10 +409,17 @@ scan_secrets() {
     # --name-only walks the diffs and names both.
     local objlist opath
     local -A seenpath=()
-    objlist="$(git -C "$repo" rev-list --objects --all 2>/dev/null
-               git -C "$repo" log --all -m --no-renames --name-only --format='' 2>/dev/null)" \
+    # Each with its own status. Both inside one substitution reported only the
+    # last one's, so a rev-list that failed left the paths half-collected and
+    # the scan returned clean.
+    local objrev objlog
+    objrev="$(git -C "$repo" rev-list --objects --all 2>/dev/null)" \
         || { printf '%somabackup: cannot list the objects of %s -- refusing to call it clean%s\n' \
                  "$RED" "$(_tilde "$repo")" "$NC" >&2; return 1; }
+    objlog="$(git -C "$repo" log --all -m --no-renames --name-only --format='' 2>/dev/null)" \
+        || { printf '%somabackup: cannot list the paths of %s -- refusing to call it clean%s\n' \
+                 "$RED" "$(_tilde "$repo")" "$NC" >&2; return 1; }
+    objlist="$objrev"$'\n'"$objlog"
     while IFS= read -r bline; do
         [[ -n "$bline" ]] || continue
         # rev-list lines are "<oid> <path>"; log --name-only lines are the path
@@ -546,24 +553,31 @@ scan_files() {
 
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
-        local out grc
-        local -a gflags=(-r -a -n -H -E)
+        # One file at a time, and without -H. `grep -r -H -n` prints
+        # "<path>:<lineno>:<content>", and a path is free to contain a colon:
+        # stripping two colon-delimited fields off "a:b.txt:1:KEY" leaves
+        # "b.txt:1:KEY" and an anchored pattern misses the key entirely. That is
+        # git grep's decoration defect, arrived at from the other direction.
+        # Walked here, the path is known and only "<lineno>:" is in front.
+        local f out grc
+        local -a gflags=(-a -n -E)
         [[ "$ci" == true ]] && gflags+=(-i)
-        out="$(grep "${gflags[@]}" --exclude=repo.bundle -e "$re" "$dir" 2>&1)"; grc=$?
-        if (( grc > 1 )); then
-            printf '%somabackup: pattern %s could not be scanned over %s%s\n' \
-                "$RED" "$id" "$(_tilde "$dir")" "$NC" >&2
-            rc=1
-            continue
-        fi
-        while IFS= read -r hit; do
-            [[ -n "$hit" ]] || continue
-            # grep -H -n prints "<path>:<lineno>:<content>"; the pattern must
-            # meet the content, not the decoration in front of it.
-            body="${hit#*:}"; body="${body#*:}"
-            _still_matches "$body" "$re" "$ci" || continue
-            printf '%s\t%s\n' "$id" "${hit:0:200}"
-        done <<<"$out"
+        while IFS= read -r -d '' f; do
+            [[ "$(basename "$f")" == repo.bundle ]] && continue
+            out="$(grep "${gflags[@]}" -e "$re" -- "$f" 2>&1)"; grc=$?
+            if (( grc > 1 )); then
+                printf '%somabackup: pattern %s could not be scanned over %s%s\n' \
+                    "$RED" "$id" "$(_tilde "$f")" "$NC" >&2
+                rc=1
+                continue
+            fi
+            while IFS= read -r hit; do
+                [[ -n "$hit" ]] || continue
+                body="${hit#*:}"
+                _still_matches "$body" "$re" "$ci" || continue
+                printf '%s\t%s\n' "$id" "${f#$dir/}:${hit:0:200}"
+            done <<<"$out"
+        done < <(find "$dir" -type f -print0 2>/dev/null)
     done <<<"$patterns"
     return $rc
 }

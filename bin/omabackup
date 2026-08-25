@@ -652,9 +652,18 @@ write_coverage() {
     # current one. Unknown counts print as "--"; stale counts print as fact.
     # This tool exists because coverage that reads as fact and is not is the
     # failure worth catching.
+    # The manifest hash is what tells a later read whether these counts still
+    # describe the same question. Computed inline, a sha256sum that failed wrote
+    # an empty one -- and the reader, computing it the same way and failing the
+    # same way, compared "" against "" and accepted stale counts as current.
+    local mhash
+    mhash="$(_manifest_hash)" || {
+        _retire_coverage "could not hash $(_tilde "$GROUPS_FILE")"
+        return 1
+    }
     if ! mkdir -p "$(dirname "$COVERAGE_FILE")" 2>/dev/null \
     || ! printf '%s' "$rows" | jq -R -s --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-           --arg manifest "$(sha256sum "$GROUPS_FILE" 2>/dev/null | cut -c1-16)" \
+           --arg manifest "$mhash" \
            '{schemaVersion:1, at:$at, manifest:$manifest,
              groups: (split("\n") | map(select(length>0) | split("\t")
                       | {id:.[0], files:(.[1]|tonumber), bytes:(.[2]|tonumber)}))}' \
@@ -664,6 +673,15 @@ write_coverage() {
         return 1
     fi
     return 0
+}
+
+# The manifest's content hash, or nothing. Never an empty string passed off as
+# one: two failures comparing equal is how stale counts were accepted as fresh.
+_manifest_hash() {
+    local h
+    h="$(sha256sum "$GROUPS_FILE" 2>/dev/null | cut -c1-16)" || return 1
+    [[ -n "$h" ]] || return 1
+    printf '%s' "$h"
 }
 
 # The manifest's description of each group, joined to what collect measured.
@@ -677,8 +695,11 @@ groups_json() {
         recorded="$(jq -r '.manifest // ""' "$COVERAGE_FILE" 2>/dev/null)"
         # Counts from a different manifest describe a different question.
         # Unknown is the honest answer until the next collect.
-        [[ "$recorded" == "$(sha256sum "$GROUPS_FILE" 2>/dev/null | cut -c1-16)" ]] \
-            && cov="$(cat "$COVERAGE_FILE" 2>/dev/null)"
+        local live
+        if live="$(_manifest_hash)"; then
+            [[ -n "$recorded" && "$recorded" == "$live" ]] \
+                && cov="$(cat "$COVERAGE_FILE" 2>/dev/null)"
+        fi
     fi
     jq -n --argjson m "$(jq '[.groups[] | select(.enabled != false)
                              | {id, label, mode, coupled:(.coupled // false),

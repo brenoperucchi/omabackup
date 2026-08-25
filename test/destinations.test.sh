@@ -414,3 +414,25 @@ it "a host whose name contains a timestamp still prunes by the real one"
 it "and the older one is what went"
 [[ ! -e "$HNH/omabackup-$HN-20260101-120000-aaaaaaaaaaaa.tar.zst" ]] \
     && ok || fail "removed the wrong file, or neither"
+
+# ── a walk that stopped partway is not a listing ────────────────────────────
+# mapfile through a process substitution threw find's status away, so a walk
+# that stopped -- an unreadable subdirectory, a mount going away -- produced a
+# partial list, and retention then decided which files were "oldest" from a
+# fraction of what was there. Deleting on a partial reading of a backup
+# directory is the one thing this function must never do.
+PWH="$(mktemp -d)/dest"; mkdir -p "$PWH"
+printf 'stamped\n' >"$PWH/.omabackup-destination"
+printf 'older\n' >"$PWH/omabackup-h-20260101-120000.tar.zst"
+printf 'newer\n' >"$PWH/omabackup-h-20260102-120000.tar.zst"
+mkdir -p "$PWH/../stub"; PWSTUB="$(cd "$PWH/.." && pwd)/stub"
+printf '#!/bin/bash\nexit 1\n' >"$PWSTUB/find"; chmod +x "$PWSTUB/find"
+PWRC=0
+PATH="$PWSTUB:$PATH" bash -c 'source lib/bundle.sh; source lib/destinations.sh
+    prune_bundles "$1" h 1' _ "$PWH" >/dev/null 2>&1 || PWRC=$?
+
+it "a find that fails makes prune refuse rather than report nothing removed"
+[[ $PWRC -ne 0 ]] && ok || fail "reported success on a directory it could not list"
+
+it "and nothing was deleted on the strength of a listing it never got"
+assert_eq "$(ls "$PWH" | grep -c 'tar.zst')" "2"
