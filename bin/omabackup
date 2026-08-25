@@ -191,10 +191,17 @@ finding() {
 
 # ── group manifest ───────────────────────────────────────────────────────────
 groups_ids() {
+    # Split on comma and matched exactly, not `inside`. `.id | inside($only)`
+    # asks whether the id is a SUBSTRING of the raw --groups value, which let
+    # `--groups shellrc` also select `shell` (id "shell" is a substring of
+    # "shellrc") -- restore inherited this the moment it started filtering by
+    # $ONLY like every other command, and a filter meant to narrow one group
+    # silently pulled in another.
     jq -r --arg only "$ONLY" '
-        .groups
+        ($only | if . == "" then [] else split(",") end) as $ids
+        | .groups
         | map(select(.enabled != false))
-        | map(select($only == "" or (.id | inside($only))))
+        | map(select(($ids | length) == 0 or (.id as $i | $ids | index($i) != null)))
         | .[].id' "$GROUPS_FILE"
 }
 group_field() { jq -r --arg id "$1" --arg f "$2" '.groups[] | select(.id==$id) | .[$f] // empty' "$GROUPS_FILE"; }
@@ -1292,13 +1299,16 @@ cmd_push() {
 
 # ── restore ──────────────────────────────────────────────────────────────────
 cmd_restore() {
-    local artifact="" apply=0 into="" filter=""
+    local artifact="" apply=0 into=""
     while (( $# )); do
         case "$1" in
             --apply)  apply=1; shift ;;
             --into)   [[ -n "${2:-}" ]] || die "--into needs a directory"; into="$2"; shift 2 ;;
-            --groups) [[ -n "${2:-}" ]] || die "--groups needs a value"; filter="$2"; shift 2 ;;
-            --json)   shift ;;
+            # --groups and --json are real flags for this command, but the
+            # global parser above already consumed them into $ONLY/$JSON
+            # before this loop ever runs -- they cannot appear here. Naming
+            # them in this case would be dead code pretending to handle
+            # something it structurally cannot see.
             -*)       die "unknown flag for restore: $1" ;;
             *)        [[ -z "$artifact" ]] || die "restore takes one artifact, not two"
                       artifact="$1"; shift ;;
@@ -1308,17 +1318,17 @@ cmd_restore() {
     [[ -f "$artifact" ]] || die "no such artifact: $(_tilde "$artifact")"
     require_tools jq git tar zstd
 
-    # Proved before it is read. An artefact whose checksums do not match, or
-    # whose bundle will not clone, is not a thing to be copying over a live
-    # home directory -- and verify_bundle is the same proof build_bundle makes,
-    # so restore trusts exactly what creation promised.
-    printf '  %schecking the artifact%s\n' "$DIM" "$NC" >&2
-    verify_bundle "$artifact" >/dev/null 2>&1 \
-        || die "this artifact does not verify -- refusing to restore from it"
-
+    # Extracted once. The first version verified through verify_bundle, which
+    # extracts into its OWN temp directory and discards it, then extracted the
+    # SAME artifact file again here -- two reads of one file with a window
+    # between them in which it could change. What is checked now is what is
+    # used: extract, verify that exact directory, and only then read it.
     local x; x="$(mktemp -d)" || die "could not make a working directory"
+    printf '  %schecking the artifact%s\n' "$DIM" "$NC" >&2
     tar -C "$x" -xf <(zstd -dc "$artifact" 2>/dev/null) 2>/dev/null \
         || { rm -rf "$x"; die "could not extract $(_tilde "$artifact")"; }
+    _verify_extracted "$x" >/dev/null 2>&1 \
+        || { rm -rf "$x"; die "this artifact does not verify -- refusing to restore from it"; }
     [[ -f "$x/manifest.json" ]] || { rm -rf "$x"; die "no manifest in $(_tilde "$artifact")"; }
 
     # The verdict is about THIS machine, so it is taken before --into moves the
@@ -1335,46 +1345,54 @@ cmd_restore() {
     local HOME="${into:-$HOME}"
     [[ -z "$into" ]] || mkdir -p "$into" || { rm -rf "$x"; die "could not make $(_tilde "$into")"; }
 
-    local rows; rows="$(restore_rows "$x" "$verdict" "$filter")" \
-        || { rm -rf "$x"; die "could not read the artifact's contents"; }
+    local rows; rows="$(restore_rows "$x" "$verdict")" \
+        || { rm -rf "$x"; die "could not plan against the artifact's own manifest"; }
 
     local bv bm
     bv="$(jq -r '.omarchy.version // "unknown"' "$x/manifest.json")"
     bm="$(jq -r '.omarchy.migrationWatermark // "0"' "$x/manifest.json")"
-    printf '\n  %sfrom%s Omarchy %s, migrated through %s\n' "$DIM" "$NC" "$bv" \
-        "$(date -d "@$bm" '+%Y-%m-%d' 2>/dev/null || printf '%s' "$bm")"
-    case "$verdict" in
-        quarantine) printf '  %s!%s %s\n' "$YELLOW" "$NC" "$why" ;;
-        *)          printf '  %s·%s %s\n' "$DIM" "$NC" "$why" ;;
-    esac
 
-    local a g rel dest nr=0 nq=0 nrep=0 na=0
-    # Unique even against itself. Named by the second alone, two restores in
-    # the same second shared a directory -- and a file replaced by both would
-    # have had its original backup overwritten by the intermediate version, in
-    # the one place that exists to keep originals.
-    local base
-    mkdir -p "$OMABACKUP_STATE/restore" 2>/dev/null \
-        || { rm -rf "$x"; die "could not make $(_tilde "$OMABACKUP_STATE/restore")"; }
-    base="$(mktemp -d "$OMABACKUP_STATE/restore/$(date -u '+%Y%m%d-%H%M%S')-XXXX")" \
-        || { rm -rf "$x"; die "could not make a directory to keep replaced files in"; }
-    local backup="$base/replaced" quar="$base/quarantine"
-
+    local a g rel dest nr=0 nq=0 nrep=0 na=0 nheld=0 nesc=0
     while IFS=$'\t' read -r a g rel dest; do
         [[ -n "$a" ]] || continue
         case "$a" in
-            restore)   nr=$((nr + 1)) ;;
+            restore)    nr=$((nr + 1)) ;;
             quarantine) nq=$((nq + 1)) ;;
-            report)    nrep=$((nrep + 1)) ;;
-            ambiguous) na=$((na + 1)) ;;
+            report)     nrep=$((nrep + 1)) ;;
+            ambiguous)  na=$((na + 1)) ;;
+            held)       nheld=$((nheld + 1)) ;;
+            escape)     nesc=$((nesc + 1)) ;;
         esac
     done <<<"$rows"
 
-    printf '\n'
     if (( ! apply )); then
+        if (( JSON )); then
+            jq -n --arg verdict "$verdict" --arg why "$why" --arg version "$bv" \
+                --argjson watermark "$bm" \
+                --argjson counts "$(jq -n --argjson r "$nr" --argjson q "$nq" \
+                    --argjson h "$nheld" --argjson a "$na" --argjson g "$nrep" --argjson e "$nesc" \
+                    '{restore:$r, quarantine:$q, held:$h, ambiguous:$a, report:$g, escape:$e}')" \
+                --argjson rows "$(printf '%s' "$rows" | jq -R -s '
+                    split("\n") | map(select(length > 0) | split("\t")
+                    | {action:.[0], group:.[1], repo:.[2], dest:.[3]})')" \
+                '{schemaVersion:1, verdict:$verdict, why:$why,
+                  from:{version:$version, migrationWatermark:$watermark},
+                  counts:$counts, rows:$rows}'
+            rm -rf "$x"
+            return 0
+        fi
+        printf '\n  %sfrom%s Omarchy %s, migrated through %s\n' "$DIM" "$NC" "$bv" \
+            "$(date -d "@$bm" '+%Y-%m-%d' 2>/dev/null || printf '%s' "$bm")"
+        case "$verdict" in
+            quarantine) printf '  %s!%s %s\n' "$YELLOW" "$NC" "$why" ;;
+            *)          printf '  %s·%s %s\n' "$DIM" "$NC" "$why" ;;
+        esac
+        printf '\n'
         printf '  %s%s files would be restored%s' "$GREEN" "$nr" "$NC"
         (( nq )) && printf ', %s%s quarantined%s' "$YELLOW" "$nq" "$NC"
+        (( nheld )) && printf ', %s%s held (migration markers)%s' "$DIM" "$nheld" "$NC"
         (( na )) && printf ', %s%s ambiguous%s' "$YELLOW" "$na" "$NC"
+        (( nesc )) && printf ', %s%s refused (outside the target)%s' "$RED" "$nesc" "$NC"
         (( nrep )) && printf ', %s%s to read yourself%s' "$DIM" "$nrep" "$NC"
         printf '\n'
         while IFS=$'\t' read -r a g rel dest; do
@@ -1383,8 +1401,12 @@ cmd_restore() {
                 restore)    printf '    %s→%s %-11s %s\n' "$GREEN" "$NC" "$g" "$(_tilde "$dest")" ;;
                 quarantine) printf '    %s⊘%s %-11s %s %s(coupled, not applied)%s\n' \
                                 "$YELLOW" "$NC" "$g" "$(_tilde "$dest")" "$DIM" "$NC" ;;
+                held)       printf '    %s·%s %-11s %s %s(migration marker, not restored on a forward move)%s\n' \
+                                "$DIM" "$NC" "$g" "$(_tilde "$dest")" "$DIM" "$NC" ;;
                 ambiguous)  printf '    %s?%s %-11s %s %s(the repo flattens several directories into one)%s\n' \
                                 "$YELLOW" "$NC" "$g" "$(_tilde "$dest")" "$DIM" "$NC" ;;
+                escape)     printf '    %s✗%s %-11s %s %s(resolves outside the target home -- refused)%s\n' \
+                                "$RED" "$NC" "$g" "$dest" "$DIM" "$NC" ;;
                 report)     printf '    %s·%s %-11s %s %s(a list to act on, not a file to place)%s\n' \
                                 "$DIM" "$NC" "$g" "$rel" "$DIM" "$NC" ;;
             esac
@@ -1395,8 +1417,22 @@ cmd_restore() {
         return 0
     fi
 
+    # Unique even against itself. Named by mktemp rather than by the second,
+    # since two restores in the same second used to share this directory -- and
+    # a file replaced by both would have had its original backup overwritten by
+    # the intermediate version, in the one place that exists to keep originals.
+    # Created only here, in the apply branch: a plan run used to make this
+    # directory too, so "nothing was written" was said after something already
+    # had been.
+    local base
+    mkdir -p "$OMABACKUP_STATE/restore" 2>/dev/null \
+        || { rm -rf "$x"; die "could not make $(_tilde "$OMABACKUP_STATE/restore")"; }
+    base="$(mktemp -d "$OMABACKUP_STATE/restore/$(date -u '+%Y%m%d-%H%M%S')-XXXX")" \
+        || { rm -rf "$x"; die "could not make a directory to keep replaced files in"; }
+    local backup="$base/replaced" quar="$base/quarantine"
     mkdir -p "$backup" || { rm -rf "$x"; die "could not make $(_tilde "$backup")"; }
-    local ok=0 bad=0 qok=0
+
+    local ok=0 bad=0 qok=0 qbad=0
     while IFS=$'\t' read -r a g rel dest; do
         [[ -n "$a" ]] || continue
         case "$a" in
@@ -1405,19 +1441,30 @@ cmd_restore() {
                 else bad=$((bad + 1))
                      printf '  %s✗%s %s\n' "$RED" "$NC" "$(_tilde "$dest")" >&2; fi ;;
             quarantine)
-                mkdir -p "$quar/$g/$(dirname "$rel")" 2>/dev/null \
-                    && cp -Pp "$x/worktree/$rel" "$quar/$g/$rel" 2>/dev/null \
-                    && qok=$((qok + 1)) ;;
+                if mkdir -p "$quar/$g/$(dirname "$rel")" 2>/dev/null \
+                    && cp -Pp "$x/worktree/$rel" "$quar/$g/$rel" 2>/dev/null
+                then qok=$((qok + 1))
+                else qbad=$((qbad + 1))
+                     printf '  %s✗%s could not quarantine %s/%s\n' "$RED" "$NC" "$g" "$rel" >&2; fi ;;
         esac
     done <<<"$rows"
 
-    printf '  %s✓%s restored %s files\n' "$GREEN" "$NC" "$ok"
-    (( bad )) && printf '  %s✗%s %s could not be written\n' "$RED" "$NC" "$bad" >&2
-    (( qok )) && printf '  %s⊘%s %s coupled files held at %s\n' \
-        "$YELLOW" "$NC" "$qok" "$(_tilde "$quar")"
-    printf '  %swhat was replaced is at %s%s\n' "$DIM" "$(_tilde "$backup")" "$NC"
+    if (( JSON )); then
+        jq -n --argjson ok "$ok" --argjson bad "$bad" --argjson qok "$qok" --argjson qbad "$qbad" \
+            --arg backup "$backup" --arg quar "$quar" \
+            '{schemaVersion:1, restored:$ok, failed:$bad, quarantined:$qok, quarantineFailed:$qbad,
+              replacedAt:$backup, quarantineAt:$quar}'
+    else
+        printf '  %s✓%s restored %s files\n' "$GREEN" "$NC" "$ok"
+        (( bad )) && printf '  %s✗%s %s could not be written\n' "$RED" "$NC" "$bad" >&2
+        (( qok )) && printf '  %s⊘%s %s coupled files held at %s\n' \
+            "$YELLOW" "$NC" "$qok" "$(_tilde "$quar")"
+        (( qbad )) && printf '  %s✗%s %s coupled files could not be quarantined -- they are neither restored nor held anywhere%s\n' \
+            "$RED" "$NC" "$qbad" "" >&2
+        printf '  %swhat was replaced is at %s%s\n' "$DIM" "$(_tilde "$backup")" "$NC"
+    fi
     rm -rf "$x"
-    (( bad == 0 ))
+    (( bad == 0 && qbad == 0 ))
 }
 
 cmd_status() {

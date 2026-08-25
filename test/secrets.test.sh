@@ -1011,3 +1011,30 @@ it "a key living only in a mergetag header is found"
 assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
                             scan_secrets "$1" "$2"' _ "$MTR" "$PWD/secrets.deny.json" 2>&1)" \
     "AKIA8888888888888888"
+
+# ── find's status did not survive the fix that removed the manual walk ──────
+# The colon-in-filename fix walked file by file, discarding find's status
+# through a process substitution -- the same fail-open this file exists to
+# refuse, reintroduced. Rewritten on grep -r -Z, which does its own walk and
+# whose own status already covers this; the regression was in the version that
+# walked manually, not in the current one, but the spec pins the property.
+SFFH="$(mktemp -d)"; mkdir -p "$SFFH/stage/open" "$SFFH/stage/locked"
+printf 'AKIA1234567890ABCDEF\n' >"$SFFH/stage/open/a.txt"
+printf 'x\n' >"$SFFH/stage/locked/b.txt"
+chmod 000 "$SFFH/stage/locked"
+cat >"$SFFH/anchored.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"anchored","regex":"^AKIA[0-9A-Z]{16}$","reason":"a key alone on its line"}],
+ "exceptions":[]}
+JSON
+
+it "a subdirectory the scan cannot enter is a refusal, not a clean report"
+bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+         scan_files "$1" "$2"' _ "$SFFH/stage" "$SFFH/anchored.json" >/dev/null 2>&1 \
+    && fail "an unreadable subdirectory read as nothing to find" || ok
+chmod 755 "$SFFH/stage/locked"
+
+it "and a readable staging directory still finds a key when everything is fine"
+assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                            scan_files "$1" "$2"' _ "$SFFH/stage" "$SFFH/anchored.json" 2>&1)" \
+    "AKIA1234567890ABCDEF"

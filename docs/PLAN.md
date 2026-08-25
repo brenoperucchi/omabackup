@@ -384,24 +384,37 @@ Three things shape it, and all three came out of §12:
   the machine happens to carry would look for groups the artifact never had and
   place files by rules written after it.
 - **The verdict is taken before anything is read.** `same` (identical
-  watermark: coupled groups and migration markers both apply), `forward`
-  (inside the declared range, further along: coupled groups apply, markers do
-  not -- `omarchy-migrate` exists to walk that distance), `quarantine` (outside
-  the range, or BEHIND the backup: coupled groups are held, never placed).
+  watermark: coupled groups and migration markers both apply), `behind`
+  (inside the range, this machine has fewer migrations than the backup --
+  typically a fresh install with no migrations directory yet: coupled groups
+  and markers both apply, matching the schema the config is written for),
+  `forward` (inside the range, further along: coupled groups apply, markers do
+  not -- `omarchy-migrate` exists to walk that distance), `quarantine`
+  (outside the declared range: nothing from the coupled block applies).
   August's failure is refused by construction rather than discovered hours
-  later.
+  later. `behind` is not in DESIGN.md §12.3, which only names `==`, `>`, and
+  "outside the range" -- the first version of this file treated `<` as a kind
+  of downgrade and quarantined it, which quarantined the PRIMARY recovery
+  scenario (new machine, valid backup, same version) with the markers that
+  would fix the watermark held inside the very block that got quarantined. A
+  second run gave the same verdict forever.
 - **Nothing is written unless asked, and what is replaced is kept.** A backup
-  that cannot be taken cancels the write. Two restores in the same second get
-  separate directories -- named by the second alone, the second would have
-  overwritten the first's originals in the one place that exists to keep them.
+  that cannot be taken cancels the write. Two restores get separate
+  directories -- named by `mktemp` now rather than by the second, since two in
+  the same second used to share one and the second would overwrite the
+  first's originals in the one place that exists to keep them. A destination
+  that resolves outside the target home, once every symlink and `..` in it is
+  followed, is refused outright as `escape` -- never written, regardless of
+  verdict or group.
 
-The one honest gap: `map_to_repo` flattens `trackedRepoPath` groups, so if two
-declared directories ever shared a destination, a file there could not be
-traced home. Restore detects that and says `ambiguous` instead of guessing. No
-group in the shipped manifest does it -- `scripts` declares `~/.local/bin` and
-`~/bin` with distinct destinations -- but the first version of the check
-counted a group's paths rather than the paths sharing a destination, and called
-`scripts` ambiguous for having two of anything.
+`map_to_repo` flattens `trackedRepoPath` groups, so if two declared
+directories ever shared a destination, a file there could not be traced home.
+Restore detects that and says `ambiguous` instead of guessing -- across every
+group now, not only within one: the first version of the check rebuilt its
+collision map per group, so two DIFFERENT groups naming the same
+`trackedRepoPath` were never caught, only two paths inside the same group
+were. No group in the shipped manifest does either -- `scripts` declares
+`~/.local/bin` and `~/bin` with distinct destinations.
 
 ## Immediate next actions
 

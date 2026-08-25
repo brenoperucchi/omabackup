@@ -251,10 +251,17 @@ build_bundle() {
 # §11.4 as a check rather than a claim: extract, clone, compare both halves,
 # confirm the checksums and run the embedded tool. Offline throughout, because
 # cloning from a .bundle file is offline by definition.
-verify_bundle() {
-    local path="$1" x clone rc=0
-    x="$(mktemp -d)" || return 1
-    tar -C "$x" -xf <(zstd -dc "$path" 2>/dev/null) 2>/dev/null || { rm -rf "$x"; return 1; }
+# _verify_extracted <already-extracted-dir>
+# The checks alone, over a directory the caller extracted and owns. Split out
+# of verify_bundle so a caller that needs the content afterward -- restore is
+# the one that does -- extracts once and verifies THAT directory, rather than
+# trusting a verify done on a separate extraction of the same artifact file a
+# moment earlier. Between two extractions the file on disk can change; a
+# restore acting on the second one would then be acting on something the first
+# one never actually checked.
+_verify_extracted() {
+    local x="$1" clone rc=0
+    [[ -d "$x" ]] || return 1
 
     ( cd "$x" && sha256sum -c --quiet SHA256SUMS >/dev/null 2>&1 ) || rc=1
 
@@ -274,6 +281,15 @@ verify_bundle() {
         OMABACKUP_STATE="$x/.state" XDG_RUNTIME_DIR=/nonexistent \
         bash "$x/tool/bin/omabackup" status --json >/dev/null 2>&1 || rc=1
 
+    rm -rf "$clone"
+    return $rc
+}
+
+verify_bundle() {
+    local path="$1" x rc
+    x="$(mktemp -d)" || return 1
+    tar -C "$x" -xf <(zstd -dc "$path" 2>/dev/null) 2>/dev/null || { rm -rf "$x"; return 1; }
+    _verify_extracted "$x"; rc=$?
     rm -rf "$x"
     return $rc
 }

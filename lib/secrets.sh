@@ -553,31 +553,46 @@ scan_files() {
 
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
-        # One file at a time, and without -H. `grep -r -H -n` prints
-        # "<path>:<lineno>:<content>", and a path is free to contain a colon:
-        # stripping two colon-delimited fields off "a:b.txt:1:KEY" leaves
-        # "b.txt:1:KEY" and an anchored pattern misses the key entirely. That is
-        # git grep's decoration defect, arrived at from the other direction.
-        # Walked here, the path is known and only "<lineno>:" is in front.
-        local f out grc
-        local -a gflags=(-a -n -E)
+        # -Z, not a manual walk. The first version walked file by file to keep
+        # the path unambiguous -- `grep -r -H -n` prints "<path>:<lineno>:", and
+        # a path free to contain a colon strips wrong. That walk re-ran per
+        # pattern (9 patterns, 9 full walks) and shelled out to grep once per
+        # file per pattern: 200 files became ~2.9s, a 144x cost over the bulk
+        # form, in a project that rejected rsync over 44ms of process spawn.
+        # And a find whose status was thrown away by a process substitution was
+        # the very fail-open this file exists to refuse, back in its own scan.
+        #
+        # -Z ends the filename with a NUL instead of whatever character would
+        # otherwise follow it, so the path/content boundary is unambiguous no
+        # matter what either one holds -- no walk, no per-file spawn, and
+        # grep's own exit status covers what find's used to.
+        local out grc
+        local -a gflags=(-r -a -n -Z -E --exclude=repo.bundle)
         [[ "$ci" == true ]] && gflags+=(-i)
-        while IFS= read -r -d '' f; do
-            [[ "$(basename "$f")" == repo.bundle ]] && continue
-            out="$(grep "${gflags[@]}" -e "$re" -- "$f" 2>&1)"; grc=$?
-            if (( grc > 1 )); then
-                printf '%somabackup: pattern %s could not be scanned over %s%s\n' \
-                    "$RED" "$id" "$(_tilde "$f")" "$NC" >&2
-                rc=1
-                continue
-            fi
-            while IFS= read -r hit; do
-                [[ -n "$hit" ]] || continue
-                body="${hit#*:}"
-                _still_matches "$body" "$re" "$ci" || continue
-                printf '%s\t%s\n' "$id" "${f#$dir/}:${hit:0:200}"
-            done <<<"$out"
-        done < <(find "$dir" -type f -print0 2>/dev/null)
+        # pipefail asked for explicitly, and restored after. The pipe runs
+        # inside the command substitution's own subshell; PIPESTATUS there
+        # never crosses back out to this shell, so checking it here reads tr's
+        # exit status, always 0, not grep's. That was the first version of this
+        # fix, and it looked closed until the fail-closed spec was run: a grep
+        # denied a subdirectory reported success.
+        local _had_pf=0; [[ -o pipefail ]] && _had_pf=1
+        set -o pipefail
+        out="$(grep "${gflags[@]}" -e "$re" -- "$dir" 2>&1 | tr '\0' '\001')"; grc=$?
+        (( _had_pf )) || set +o pipefail
+        if (( grc > 1 )); then
+            printf '%somabackup: pattern %s could not be scanned over %s%s\n' \
+                "$RED" "$id" "$(_tilde "$dir")" "$NC" >&2
+            rc=1
+            continue
+        fi
+        local f rest
+        while IFS= read -r hit; do
+            [[ -n "$hit" ]] || continue
+            f="${hit%%$'\001'*}"; rest="${hit#*$'\001'}"
+            body="${rest#*:}"
+            _still_matches "$body" "$re" "$ci" || continue
+            printf '%s\t%s\n' "$id" "${f#$dir/}:${rest:0:200}"
+        done <<<"$out"
     done <<<"$patterns"
     return $rc
 }
