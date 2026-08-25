@@ -112,8 +112,17 @@ _restore_contained() {
 # so rather than guessing -- see restore_rows.
 _restore_repo_prefix() {
     local id="$1" p="$2" sub e rel
+    # trackedRepoPath is looked up by exact match against the manifest's own
+    # .live string -- if a manifest declares that WITH a trailing slash, the
+    # lookup needs the same unstripped form group_paths handed back. The
+    # trailing slash is only stripped below, for the tree computation, where
+    # it survives into `rel` and the later ${f#"$wt/$prefix"/} strip then looks
+    # for a "//" that is never there -- not a loss (the file this happens to is
+    # caught by its own missing-source check first), but a stray line naming a
+    # temp directory that was never meant to be user-visible.
     sub="$(group_tracked_repo_path "$id" "$p")"
     if [[ -n "$sub" ]]; then printf '%s\tflat' "$sub"; return 0; fi
+    p="${p%/}"
     e="$(_expand "$p")"; rel="${e#"$HOME"/}"
     # The exact forms matter here in a way they never did in map_to_repo, which
     # only ever sees a file inside one of these. A group declares the DIRECTORY
@@ -142,9 +151,10 @@ _restore_repo_prefix() {
 #              somewhere safe, never placed
 #   held       a migration marker on a `forward` restore: DESIGN.md §12.3 says
 #              the coupled groups apply but the markers do not, so this file
-#              is set aside like a quarantined one, for the same reason it is
-#              not `restore` -- but it is not a symptom of anything being
-#              wrong, so it is not counted or labelled the way quarantine is.
+#              is simply never written -- nothing to preserve, since the live
+#              marker (if any) was never going to be touched in the first
+#              place. Not a symptom of anything being wrong, unlike quarantine,
+#              which extracts what it holds somewhere a human can find it.
 #   report     a generated list, or something restoring means installing
 #              rather than copying -- packages, systemd units, the enabled-
 #              plugins list, a patch against an upstream plugin. The file is
@@ -231,22 +241,42 @@ restore_rows() {
                         printf '%s\t%s\t%s/%s\t%s\n' "$action" "$id" "$prefix" "$sub" "$dest"
                     fi
                 done < <(find "$wt/$prefix" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
+                # find's own status, checked -- the same fail-open scan_files
+                # and prune_bundles were already closed, still open here: a
+                # walk that stopped partway produced fewer rows, and "N files
+                # would be restored" was printed as a fact about a directory
+                # this never finished reading.
+                wait "$!" || return 1
             elif [[ -d "$wt/$prefix" ]]; then
                 while IFS= read -r -d '' f; do
                     rel="${f#"$wt/$prefix"/}"
                     dest="$e/$rel"
                     if ! _restore_contained "$dest"; then
                         printf 'escape\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
+                    # The collision map was checked for `flat` only. Two groups
+                    # are free to declare the same live directory -- nothing
+                    # stops two ids both naming ~/.config/hypr -- and for
+                    # `tree` that means both enumerate the SAME $wt/$prefix and
+                    # each emit a `restore` row for every file in it. The
+                    # second one to run in _restore_one backs up what the
+                    # FIRST one just wrote, not the real original, and the real
+                    # original is gone from both the destination and the one
+                    # place kept to protect it.
+                    elif (( ${prefixcount[$prefix]:-1} > 1 )); then
+                        printf 'ambiguous\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
                     elif [[ "$verdict" == forward && ( "$dest" == "$migdir" || "$dest" == "$migdir"/* ) ]]; then
                         printf 'held\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
                     else
                         printf '%s\t%s\t%s/%s\t%s\n' "$action" "$id" "$prefix" "$rel" "$dest"
                     fi
                 done < <(find "$wt/$prefix" \( -type f -o -type l \) -print0 2>/dev/null)
+                wait "$!" || return 1
             else
                 dest="$e"
                 if ! _restore_contained "$dest"; then
                     printf 'escape\t%s\t%s\t%s\n' "$id" "$prefix" "$dest"
+                elif (( ${prefixcount[$prefix]:-1} > 1 )); then
+                    printf 'ambiguous\t%s\t%s\t%s\n' "$id" "$prefix" "$dest"
                 else
                     printf '%s\t%s\t%s\t%s\n' "$action" "$id" "$prefix" "$dest"
                 fi
@@ -266,6 +296,7 @@ restore_rows() {
                 rel="${f#"$wt"/}"
                 printf 'report\t%s\t%s\t-\n' "$id" "$rel"
             done < <(find "$wt/patches/omarchy-plugins" -maxdepth 1 -type f -name '*.patch' -print0 2>/dev/null)
+            wait "$!" || return 1
         fi
     done < <(groups_ids)
 }

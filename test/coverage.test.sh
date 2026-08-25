@@ -225,3 +225,27 @@ assert_contains "$MHOUT" "could not hash"
 
 it "and the counts are retired rather than left to match an empty hash"
 assert_eq "$(_cov_env "$MHH" verify --json | jq -r '.groups[0].files')" "null"
+
+# ── groups_json's own read-time hash comparison, not just write_coverage's ──
+# A valid coverage record already on disk, read back while sha256sum is broken
+# -- not a write failing (that path retires the record and is covered above),
+# but the SEPARATE comparison groups_json makes every time status/verify --json
+# runs. Before _manifest_hash existed, both sides of "recorded == live" were
+# computed inline with sha256sum's own status unchecked: a broken sha256sum
+# made BOTH sides equally empty, "" == "" passed, and a stale record read as
+# current -- files=2 for a manifest that no longer described two files.
+GJH="$(mktemp -d)"; mkdir -p "$GJH/.config/solo" "$GJH/stub"
+printf 'c\n' >"$GJH/.config/solo/one.conf"
+cat >"$GJH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"solo","label":"Solo","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/solo"]}]}
+JSON
+_cov_env "$GJH" collect >/dev/null
+
+it "the record is readable right after a normal collect"
+assert_eq "$(_cov_env "$GJH" verify --json | jq -r '.groups[0].files')" "1"
+
+printf '#!/bin/bash\nexit 1\n' >"$GJH/stub/sha256sum"; chmod +x "$GJH/stub/sha256sum"
+
+it "and reads as unknown, not as a match, once sha256sum breaks at read time"
+assert_eq "$(PATH="$GJH/stub:$PATH" _cov_env "$GJH" verify --json | jq -r '.groups[0].files')" "null"

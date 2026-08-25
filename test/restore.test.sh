@@ -384,6 +384,28 @@ assert_contains "$PLPLAN" "omarchy-plugins.txt"
 it "and the patch against it is named too"
 assert_contains "$PLPLAN" "plugin-a.patch"
 
+# ── restore_rows' own walks discard find's status, same class as scan_files ──
+# find's status is checked in scan_files and prune_bundles; the walks inside
+# restore_rows (flat, tree, and the plugin-patches listing) still ran through a
+# process substitution with nothing reading what find returned. A walk that
+# stops partway produces fewer rows, and "N files would be restored" is
+# printed as fact about a directory this never finished reading. A real
+# permission failure here is caught one gate earlier by _verify_extracted's own
+# checksum and diff, which is exactly the shape 4g/4j/4k/5's group_field defect
+# took -- so this is reproduced the same way, with a stub that fails on one
+# specific call and leaves everything verify touches alone.
+mkdir -p "$PLH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *patches/omarchy-plugins* ]] && exit 1; done\n'
+  printf 'exec %s "$@"\n' "$(command -v find)"
+} >"$PLH/stub/find"; chmod +x "$PLH/stub/find"
+
+it "a find that fails inside restore_rows refuses to plan, rather than under-reporting"
+PLTGT2="$(mktemp -d)"
+PATH="$PLH/stub:$PATH" HOME="$PLTGT2" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$PLH/rstate2" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$PLART" >/dev/null 2>&1 \
+    && fail "planned successfully despite a walk that could not finish" || ok
+
 # ── a plan does not create the state it later writes into ───────────────────
 DRH="$(mktemp -d)"; DRART="$(_res_build "$DRH" '["4.*"]')"
 DRTGT="$(mktemp -d)"
@@ -415,3 +437,161 @@ printf '%s' "$JSOUT" | jq -e . >/dev/null 2>&1 && ok || fail "not valid JSON: $J
 
 it "and it carries the verdict"
 assert_eq "$(printf '%s' "$JSOUT" | jq -r '.verdict')" "same"
+
+# ── two groups sharing a TREE destination lose the real original ────────────
+# The collision map was built once, across every group -- the right fix for
+# flat. But only the flat branch consulted it. Two groups are free to declare
+# the same live directory (nothing stops two ids both naming ~/.config/hypr),
+# and for `tree` that means both enumerate the exact same $wt/$prefix and each
+# emit a `restore` row for every file in it. The second _restore_one to run
+# backs up what the FIRST one just wrote -- not the real original -- and the
+# real original is gone from both the destination and the one place kept to
+# protect it. Reported by omabackup-rev-2 against a build that had already
+# fixed the flat case, which is exactly why this needed its own repro rather
+# than reusing the flat one.
+TRH="$(mktemp -d)"; TRR="$TRH/repo"
+mkdir -p "$TRR/configs/hypr"
+git init -q "$TRR"; git -C "$TRR" config user.email t@t; git -C "$TRR" config user.name t
+printf 'from the artifact\n' >"$TRR/configs/hypr/bindings.conf"
+git -C "$TRR" add -A && git -C "$TRR" commit -qm one
+cat >"$TRH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"compositor","label":"Compositor","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/hypr"]},
+ {"id":"wm","label":"WM","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/hypr"]}]}
+JSON
+mkdir -p "$TRH/home"
+HOME="$TRH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$TRH/g.json" \
+    OMABACKUP_STATE="$TRH/home/.state" OMABACKUP_REPO="$TRR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+TRART="$(ls -t "$TRH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+TRTGT="$(mktemp -d)"
+mkdir -p "$TRTGT/.config/hypr"
+printf 'my own irreplaceable original\n' >"$TRTGT/.config/hypr/bindings.conf"
+TRPLAN="$(_res_run "$TRTGT" "$TRH/rstate" "$TRART")"
+
+it "two groups naming the same tree destination are flagged ambiguous"
+assert_contains "$TRPLAN" "ambiguous"
+
+it "and NOT counted as something that would be restored"
+assert_contains "$TRPLAN" "0 files would be restored"
+
+_res_run "$TRTGT" "$TRH/rstate" "$TRART" --apply >/dev/null 2>&1
+
+it "the live file is left exactly as it was"
+assert_eq "$(cat "$TRTGT/.config/hypr/bindings.conf" 2>/dev/null)" "my own irreplaceable original"
+
+it "and the original is not lost to a backup-of-a-backup"
+TRKEPT="$(find "$TRH/rstate/restore" -path '*replaced*' -name 'bindings.conf' 2>/dev/null | head -1)"
+[[ -z "$TRKEPT" ]] || assert_eq "$(cat "$TRKEPT" 2>/dev/null)" "my own irreplaceable original"
+
+# ── the verdict is printed on --apply too, not only on the plan ─────────────
+# It used to live inside the plan-only branch, so the run that actually
+# changes the machine reported how many files it touched and never why.
+R2H="$(mktemp -d)"; R2ART="$(_res_build "$R2H" '["3.*"]')"
+R2TGT="$(mktemp -d)"
+R2OUT="$(_res_run "$R2TGT" "$R2H/rstate" "$R2ART" --apply)"
+
+it "an --apply run still explains the verdict it acted on"
+assert_contains "$R2OUT" "3.*"
+
+# ── escape and ambiguous are visible on --apply, not swallowed ──────────────
+# Built as a real repo through `bundle`, not by hand-editing an already-built
+# artifact's worktree afterward -- files added post-hoc exist in the worktree
+# half but never in the git history half, and _verify_extracted's own diff
+# between the two catches exactly that mismatch before restore ever runs.
+R3H="$(mktemp -d)"; R3R="$R3H/repo"
+R3MARK="restore-escape-apply-$(basename "$R3H")"
+mkdir -p "$R3R/dotfiles" "$R3R/$R3MARK"
+git init -q "$R3R"; git -C "$R3R" config user.email t@t; git -C "$R3R" config user.name t
+printf 'anchor\n' >"$R3R/dotfiles/.anchor"
+printf 'x\n' >"$R3R/$R3MARK/f.txt"
+git -C "$R3R" add -A && git -C "$R3R" commit -qm one
+cat >"$R3H/g.json" <<JSON
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"esc2","label":"Esc2","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/../$R3MARK"]}]}
+JSON
+mkdir -p "$R3H/home"
+HOME="$R3H/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$R3H/g.json" \
+    OMABACKUP_STATE="$R3H/home/.state" OMABACKUP_REPO="$R3R" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+R3ART="$(ls -t "$R3H/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+R3TGT="$(mktemp -d)"
+R3OUT="$(_res_run "$R3TGT" "$R3H/rstate" "$R3ART" --apply)"
+
+it "--apply reports how many rows were refused as escapes"
+assert_contains "$R3OUT" "refused"
+rm -rf "/tmp/$R3MARK" "$(dirname "$R3TGT")/$R3MARK" 2>/dev/null
+
+# ── realpath is required up front, not discovered as a silent no-op ─────────
+R4H="$(mktemp -d)"; R4ART="$(_res_build "$R4H" '["4.*"]')"
+R4TGT="$(mktemp -d)"
+mkdir -p "$R4H/norealpath"
+for t in bash jq git tar zstd sh cat mkdir rm cp find date sed grep basename dirname \
+         mv chmod ls sort head tail wc cut tr; do
+    ln -sf "$(command -v "$t" 2>/dev/null)" "$R4H/norealpath/$t" 2>/dev/null
+done
+
+it "restore refuses up front when realpath is not available"
+PATH="$R4H/norealpath" HOME="$R4TGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$R4H/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$R4ART" >/dev/null 2>&1 \
+    && fail "proceeded without realpath, indistinguishable from an empty backup" || ok
+
+# ── a watermark that is not a bare integer does not crash --json ────────────
+R5H="$(mktemp -d)"; R5RAW="$(_res_build "$R5H" '["4.*"]')"
+R5X="$(mktemp -d)"; tar -C "$R5X" -xf <(zstd -dc "$R5RAW")
+jq '.omarchy.migrationWatermark = "2026-08-13"' "$R5X/manifest.json" >"$R5X/manifest.json.new"
+mv "$R5X/manifest.json.new" "$R5X/manifest.json"
+( cd "$R5X" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+R5ART="$R5H/badwatermark.tar.zst"
+tar -C "$R5X" -cf - . | zstd -q -19 -T0 -o "$R5ART"
+R5TGT="$(mktemp -d)"
+R5OUT="$(HOME="$R5TGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$R5H/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --json "$R5ART" 2>/dev/null)"
+
+it "--json still emits valid JSON when the watermark is not a bare integer"
+printf '%s' "$R5OUT" | jq -e . >/dev/null 2>&1 && ok || fail "not valid JSON: $R5OUT"
+
+# ── a trailing slash on a declared path does not leak a temp dir into the report ─
+R9H="$(mktemp -d)"; R9RAW="$(_res_build "$R9H" '["4.*"]')"
+R9X="$(mktemp -d)"; tar -C "$R9X" -xf <(zstd -dc "$R9RAW")
+R9G="$(jq '(.groups[] | select(.id=="terminal") | .paths) = ["~/.config/alacritty/"]' "$R9X/tool/groups.default.json")"
+printf '%s' "$R9G" >"$R9X/tool/groups.default.json"
+( cd "$R9X" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+R9ART="$R9H/trailingslash.tar.zst"
+tar -C "$R9X" -cf - . | zstd -q -19 -T0 -o "$R9ART"
+R9TGT="$(mktemp -d)"
+R9PLAN="$(_res_run "$R9TGT" "$R9H/rstate" "$R9ART")"
+
+it "a trailing slash on a declared path still restores the file"
+assert_contains "$R9PLAN" "alacritty.toml"
+
+it "and no row names a bare temp directory as the destination"
+[[ "$R9PLAN" != *"//tmp/"* ]] && ok || fail "leaked a temp path: $R9PLAN"
+
+# ── --groups on restore refuses a typo against the ARTIFACT's manifest ──────
+R7H="$(mktemp -d)"; R7ART="$(_res_build "$R7H" '["4.*"]')"
+R7TGT="$(mktemp -d)"
+
+it "a typo'd --groups on restore is refused, not silently selecting nothing"
+assert_contains "$(_res_run "$R7TGT" "$R7H/rstate" "$R7ART" --groups termnal)" \
+    "this artifact's manifest does not have"
+
+it "and the correctly spelled id still works"
+assert_contains "$(_res_run "$R7TGT" "$R7H/rstate" "$R7ART" --groups terminal)" \
+    "alacritty.toml"
+
+R7ONLY="$(mktemp -d)"
+cat >"$R7ONLY/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"only-on-this-machine","label":"X","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/nothere"]}]}
+JSON
+R7ONLYOUT="$(HOME="$(mktemp -d)" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$R7ONLY/g.json" \
+    OMABACKUP_STATE="$(mktemp -d)" XDG_RUNTIME_DIR=/nonexistent \
+    "$OB" restore --groups terminal "$R7ART" 2>&1)"
+
+it "restore --groups is validated against the ARTIFACT's manifest, not this machine's"
+assert_contains "$R7ONLYOUT" "alacritty.toml"

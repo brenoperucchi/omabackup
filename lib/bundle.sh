@@ -171,10 +171,20 @@ bundle_cache_path() {
     local repo="$1" cache="$2" head key
     head="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || return 1
     [[ -n "$head" ]] || return 1
-    local fp refs
+    local fp refs gh
     fp="$(_tool_fingerprint)" || return 1
     refs="$(git -C "$repo" show-ref 2>/dev/null | sha256sum)" || return 1
-    key="$(printf '%s\n%s\n%s\n' "$head" "$fp" "$refs" | sha256sum | cut -c1-16)"
+    # The manifest, hashed by content. It ships inside the artifact as
+    # tool/groups.default.json -- which cmd_restore reads to decide what the
+    # artifact even contains -- but the fingerprint above only covers the
+    # tool's own code. _tool_commit used to cover this by accident: committing
+    # a manifest edit moved HEAD, which changed the key too. Editing the
+    # manifest, committing, and building again returned the OLD artifact, with
+    # the old manifest inside it and a tool.commit field that no longer
+    # described what actually shipped.
+    gh="$(sha256sum "$GROUPS_FILE" 2>/dev/null)" || return 1
+    [[ -n "$gh" ]] || return 1
+    key="$(printf '%s\n%s\n%s\n%s\n' "$head" "$fp" "$refs" "$gh" | sha256sum | cut -c1-16)"
     printf '%s/%s.tar.zst' "$cache" "$key"
 }
 
@@ -188,7 +198,18 @@ build_bundle() {
 
     mkdir -p "$cache" || return 1
     out="$(bundle_cache_path "$repo" "$cache")" || return 1
-    if [[ -f "$out" ]]; then printf '%s' "$out"; return 0; fi
+    # A cache hit is trusted only after it re-proves itself. The freshly-built
+    # path at the end of this function calls verify_bundle before ever handing
+    # the path back -- a cache hit returned here without it, so a bundle
+    # written by a process that crashed or hit a full disk mid-write, and left
+    # a truncated file at the exact cache key a later run would compute, was
+    # served as though it were whole every time after, never re-checked again.
+    if [[ -f "$out" ]]; then
+        verify_bundle "$out" && { printf '%s' "$out"; return 0; }
+        printf 'omabackup: the cached bundle at %s failed its own restore check -- rebuilding\n' \
+            "$(_tilde "$out")" >&2
+        rm -f "$out"
+    fi
 
     # A shallow repo or one leaning on alternates produces a bundle that cannot
     # clone on its own -- exactly the promise being made here.
@@ -231,8 +252,19 @@ build_bundle() {
     ( cd "$stage" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS ) \
         || { rm -rf "$stage"; return 1; }
 
-    tar -C "$stage" -cf - . 2>/dev/null | zstd -q -19 -T0 -o "$out.tmp" 2>/dev/null \
-        || { rm -rf "$stage" "$out.tmp"; return 1; }
+    # pipefail asked for explicitly. Without it, $? after this pipe is zstd's
+    # status alone: a tar that dies partway (a file vanishing between staging
+    # and archiving) still hands zstd whatever bytes it managed to emit, zstd
+    # compresses that incomplete stream and exits 0, and the `||` guard never
+    # fires. The self-verify a few lines down would likely still catch this --
+    # SHA256SUMS lists what tar failed to include -- but a status this cheap to
+    # check should not be left to a downstream safety net to notice instead.
+    local _had_pf=0; [[ -o pipefail ]] && _had_pf=1
+    set -o pipefail
+    tar -C "$stage" -cf - . 2>/dev/null | zstd -q -19 -T0 -o "$out.tmp" 2>/dev/null
+    local comprc=$?
+    (( _had_pf )) || set +o pipefail
+    (( comprc == 0 )) || { rm -rf "$stage" "$out.tmp"; return 1; }
     mv "$out.tmp" "$out" || { rm -rf "$stage" "$out.tmp"; return 1; }
     rm -rf "$stage"
     # Proved here, not in whichever command happened to ask. verify_bundle used

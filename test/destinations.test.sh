@@ -436,3 +436,25 @@ it "a find that fails makes prune refuse rather than report nothing removed"
 
 it "and nothing was deleted on the strength of a listing it never got"
 assert_eq "$(ls "$PWH" | grep -c 'tar.zst')" "2"
+
+# ── a prune failure during push is not swallowed to /dev/null ───────────────
+# `removed="$(prune_bundles ... 2>/dev/null)" || removed=0` treated a real
+# retention failure exactly like "nothing needed pruning" -- the new copy
+# still lands (correctly: a retention hiccup should not turn into a backup
+# outage), but the failure itself vanished with no diagnostic anywhere.
+PFH="$(mktemp -d)"; PFR="$PFH/repo"; _dest_repo "$PFR"
+PFNAS="$PFH/nas"; mkdir -p "$PFNAS"
+printf 'stamped\n' >"$PFNAS/.omabackup-destination"
+printf 'old\n' >"$PFNAS/omabackup-$(hostname 2>/dev/null || echo host)-20260101-120000.tar.zst"
+cat >"$PFH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$PFNAS","keep":1}]}
+JSON
+mkdir -p "$PFH/stub"
+printf '#!/bin/bash\nexit 2\n' >"$PFH/stub/sort"; chmod +x "$PFH/stub/sort"
+PFOUT="$(PATH="$PFH/stub:$PATH" _dest_env "$PFH" "$PFR" push nas)"
+
+it "the push itself still succeeds -- a retention hiccup is not a backup outage"
+assert_contains "$PFOUT" "✓"
+
+it "and the prune failure is visible, not silently discarded"
+assert_contains "$PFOUT" "could not order"

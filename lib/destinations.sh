@@ -157,11 +157,27 @@ prune_bundles() {  # prune_bundles <dir> <host> <keep> -> prints how many it rem
         || { printf 'omabackup: could not list %s -- refusing to prune it\n' "$dir" >&2
              printf '%s' 0; return 1; }
     local -a found=()
-    [[ -n "$listing" ]] && mapfile -t found < <(printf '%s' "$listing" \
-        | awk -v off="$off" '{ stamp = substr($0, off + 1, 15)
-                 sha = ($0 ~ /-[0-9a-f]{12}\.tar\.zst$/) ? 1 : 0
-                 print stamp "\t" sha "\t" $0 }' \
-        | sort -r | cut -f3)
+    if [[ -n "$listing" ]]; then
+        # find's status is checked above; the pipe that turns its output into a
+        # sort key was not -- awk, sort or cut failing partway left `found`
+        # with whatever had made it through by then, and retention deleted on
+        # that partial ordering same as it would have on a partial listing.
+        local sorted _had_pf=0
+        [[ -o pipefail ]] && _had_pf=1
+        set -o pipefail
+        sorted="$(printf '%s' "$listing" \
+            | awk -v off="$off" '{ stamp = substr($0, off + 1, 15)
+                     sha = ($0 ~ /-[0-9a-f]{12}\.tar\.zst$/) ? 1 : 0
+                     print stamp "\t" sha "\t" $0 }' \
+            | sort -r | cut -f3)"
+        local sortrc=$?
+        (( _had_pf )) || set +o pipefail
+        if (( sortrc != 0 )); then
+            printf 'omabackup: could not order the bundles in %s -- refusing to prune it\n' "$dir" >&2
+            printf '%s' 0; return 1
+        fi
+        mapfile -t found <<<"$sorted"
+    fi
     for f in "${found[@]:-}"; do
         [[ -n "$f" ]] || continue
         n=$((n + 1))
@@ -226,7 +242,13 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
             -regex ".*/omabackup-.+-${DEST_NAME_TAIL%\\.tar\\.zst}\.tar\.zst\.tmp" \
             -delete 2>/dev/null
     fi
-    removed="$(prune_bundles "$dir" "$(_hostname)" "$(dest_field "$id" keep)" 2>/dev/null)" || removed=0
+    # A prune failure does not fail the push -- the new copy already landed,
+    # and refusing to report that over a retention hiccup would turn a cleanup
+    # problem into a backup outage. But it must not vanish either: `|| removed=0`
+    # swallowed it into the same shape as "nothing needed pruning," through a
+    # stderr this line threw away with 2>/dev/null. Left to reach the real
+    # stderr now, so a full destination that cannot prune says so.
+    removed="$(prune_bundles "$dir" "$(_hostname)" "$(dest_field "$id" keep)")" || removed=0
     printf '%s' "${removed:-0}"
 }
 

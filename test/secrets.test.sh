@@ -1038,3 +1038,29 @@ it "and a readable staging directory still finds a key when everything is fine"
 assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
                             scan_files "$1" "$2"' _ "$SFFH/stage" "$SFFH/anchored.json" 2>&1)" \
     "AKIA1234567890ABCDEF"
+
+# ── the path/content boundary needs no substitute byte at all ───────────────
+# The first version of the colon-safe rewrite piped grep's -Z output through
+# `tr '\0' '\001'` to make it hold in a bash variable, trading the colon
+# ambiguity for a rarer one: 0x01 is legal in a filename, and a record ending
+# in a literal newline (also legal in a filename) split into two lines, the
+# first of which was discarded and the second reported the finding under a
+# truncated path. Two sequential reads against the raw stream -- one stopping
+# at the real NUL, one at the real newline -- need no substitute and have no
+# such byte to collide with.
+NLH="$(mktemp -d)"; mkdir -p "$NLH/stage"
+NLNAME="$(printf 'a\nb.txt')"
+printf 'AKIA1234567890ABCDEF\n' >"$NLH/stage/$NLNAME"
+cat >"$NLH/anchored.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"anchored","regex":"^AKIA[0-9A-Z]{16}$","reason":"a key alone on its line"}],
+ "exceptions":[]}
+JSON
+NLOUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+                  scan_files "$1" "$2"' _ "$NLH/stage" "$NLH/anchored.json" 2>&1)"
+
+it "a filename holding a literal newline is still matched"
+assert_contains "$NLOUT" "AKIA1234567890ABCDEF"
+
+it "and the full name is in the report, not truncated at the embedded newline"
+assert_contains "$NLOUT" "$NLNAME"

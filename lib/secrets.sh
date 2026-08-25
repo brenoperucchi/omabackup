@@ -566,33 +566,38 @@ scan_files() {
         # otherwise follow it, so the path/content boundary is unambiguous no
         # matter what either one holds -- no walk, no per-file spawn, and
         # grep's own exit status covers what find's used to.
-        local out grc
+        #
+        # Read directly off the NUL, not through a variable. A command
+        # substitution cannot hold a NUL byte any better than `read` can --
+        # bash silently drops it either way -- so the first version of this fix
+        # ran the NUL through `tr` into 0x01 first, a byte legal in a filename,
+        # and claimed the boundary was unambiguous "no matter what either one
+        # holds" when it had just traded one collision for a rarer one. Two
+        # sequential reads against the SAME stream split it correctly instead:
+        # -d '' stops at the real NUL for the path, and the plain read after it
+        # stops at the newline that already ends every hit.
+        #
+        # grep's status does not cross the process-substitution boundary any
+        # more directly than PIPESTATUS crossed the pipe in the version before
+        # this one, so it is captured with `wait` on the substitution's own
+        # PID instead of guessed at.
+        local grc
         local -a gflags=(-r -a -n -Z -E --exclude=repo.bundle)
         [[ "$ci" == true ]] && gflags+=(-i)
-        # pipefail asked for explicitly, and restored after. The pipe runs
-        # inside the command substitution's own subshell; PIPESTATUS there
-        # never crosses back out to this shell, so checking it here reads tr's
-        # exit status, always 0, not grep's. That was the first version of this
-        # fix, and it looked closed until the fail-closed spec was run: a grep
-        # denied a subdirectory reported success.
-        local _had_pf=0; [[ -o pipefail ]] && _had_pf=1
-        set -o pipefail
-        out="$(grep "${gflags[@]}" -e "$re" -- "$dir" 2>&1 | tr '\0' '\001')"; grc=$?
-        (( _had_pf )) || set +o pipefail
+        local f rest
+        while IFS= read -r -d '' f && IFS= read -r rest; do
+            [[ -n "$f" ]] || continue
+            body="${rest#*:}"
+            _still_matches "$body" "$re" "$ci" || continue
+            printf '%s\t%s\n' "$id" "${f#$dir/}:${rest:0:200}"
+        done < <(grep "${gflags[@]}" -e "$re" -- "$dir")
+        wait "$!"; grc=$?
         if (( grc > 1 )); then
             printf '%somabackup: pattern %s could not be scanned over %s%s\n' \
                 "$RED" "$id" "$(_tilde "$dir")" "$NC" >&2
             rc=1
             continue
         fi
-        local f rest
-        while IFS= read -r hit; do
-            [[ -n "$hit" ]] || continue
-            f="${hit%%$'\001'*}"; rest="${hit#*$'\001'}"
-            body="${rest#*:}"
-            _still_matches "$body" "$re" "$ci" || continue
-            printf '%s\t%s\n' "$id" "${f#$dir/}:${rest:0:200}"
-        done <<<"$out"
     done <<<"$patterns"
     return $rc
 }

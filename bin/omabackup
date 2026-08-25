@@ -190,6 +190,29 @@ finding() {
 }
 
 # ── group manifest ───────────────────────────────────────────────────────────
+# _assert_groups_filter_understood
+# --groups is a typo away from silently meaning "all groups excluded" once
+# groups_ids matches by exact id: the old substring match let a near-miss like
+# "compositr" still catch "compositor" by accident, which hid this. An id
+# named in --groups that the manifest does not have is refused rather than
+# quietly selecting nothing.
+# Prints nothing and returns 0 when every requested id exists; on a miss,
+# prints the offending id and returns 1 -- the caller decides how to die,
+# since one call site needs to clean up an extraction first and the other does
+# not.
+_assert_groups_filter_understood() {
+    [[ -n "$ONLY" ]] || return 0
+    local want
+    local -a known=() wanted=()
+    mapfile -t known < <(jq -r '.groups[]?.id // empty' "$GROUPS_FILE" 2>/dev/null)
+    IFS=',' read -r -a wanted <<<"$ONLY"
+    for want in "${wanted[@]}"; do
+        [[ -n "$want" ]] || continue
+        printf '%s\n' "${known[@]}" | grep -qxF "$want" || { printf '%s' "$want"; return 1; }
+    done
+    return 0
+}
+
 groups_ids() {
     # Split on comma and matched exactly, not `inside`. `.id | inside($only)`
     # asks whether the id is a SUBSTRING of the raw --groups value, which let
@@ -1316,7 +1339,13 @@ cmd_restore() {
     done
     [[ -n "$artifact" ]] || die "restore needs an artifact: omabackup restore <file.tar.zst>"
     [[ -f "$artifact" ]] || die "no such artifact: $(_tilde "$artifact")"
-    require_tools jq git tar zstd
+    # realpath is what _restore_contained refuses on when it is missing --
+    # correctly, since a containment check it cannot run is not a check. But
+    # that failure is silent per file: every row would then be refused as
+    # though it escaped, and "0 files would be restored" reads exactly like a
+    # clean artifact with nothing to do. Checked up front, named, so a
+    # recovery tty's incomplete coreutils is not mistaken for an empty backup.
+    require_tools jq git tar zstd realpath
 
     # Extracted once. The first version verified through verify_bundle, which
     # extracts into its OWN temp directory and discards it, then extracted the
@@ -1341,6 +1370,12 @@ cmd_restore() {
     # had, and would place files by rules written after it.
     local GROUPS_FILE="$x/tool/groups.default.json"
     [[ -f "$GROUPS_FILE" ]] || { rm -rf "$x"; die "the artifact carries no manifest of its own"; }
+    # Deferred from the top-level check, which runs against this machine's own
+    # manifest -- wrong file for restore. Checked here, now that $GROUPS_FILE
+    # is the artifact's.
+    local badg; badg="$(_assert_groups_filter_understood)" || {
+        rm -rf "$x"; die "--groups names a group this artifact's manifest does not have: $badg"
+    }
 
     local HOME="${into:-$HOME}"
     [[ -z "$into" ]] || mkdir -p "$into" || { rm -rf "$x"; die "could not make $(_tilde "$into")"; }
@@ -1351,6 +1386,29 @@ cmd_restore() {
     local bv bm
     bv="$(jq -r '.omarchy.version // "unknown"' "$x/manifest.json")"
     bm="$(jq -r '.omarchy.migrationWatermark // "0"' "$x/manifest.json")"
+    # Guarded the same way _restore_verdict guards its own copy. Unguarded, a
+    # watermark that is not a bare integer -- read straight from a manifest
+    # field nothing here controls -- reached --argjson as a literal and jq
+    # refused it, with the refusal landing on stderr and the command exiting 0:
+    # the JSON surface this feeds (the panel, eventually) got nothing and a
+    # success code in the same breath.
+    [[ "$bm" =~ ^[0-9]+$ ]] || bm=0
+
+    # Printed once, before the plan/apply branches split -- not only on a plan,
+    # and not at all in JSON mode (where verdict/why ride inside the object
+    # each branch prints below). It used to live inside the plan-only, non-JSON
+    # branch, so the run that actually changes the machine reported how many
+    # files it touched and never why: the verdict and its explanation are the
+    # report DESIGN.md §12.1/§12.2 asks for, and they are least dispensable on
+    # the run that writes.
+    if (( ! JSON )); then
+        printf '\n  %sfrom%s Omarchy %s, migrated through %s\n' "$DIM" "$NC" "$bv" \
+            "$(date -d "@$bm" '+%Y-%m-%d' 2>/dev/null || printf '%s' "$bm")"
+        case "$verdict" in
+            quarantine) printf '  %s!%s %s\n' "$YELLOW" "$NC" "$why" ;;
+            *)          printf '  %s·%s %s\n' "$DIM" "$NC" "$why" ;;
+        esac
+    fi
 
     local a g rel dest nr=0 nq=0 nrep=0 na=0 nheld=0 nesc=0
     while IFS=$'\t' read -r a g rel dest; do
@@ -1381,12 +1439,6 @@ cmd_restore() {
             rm -rf "$x"
             return 0
         fi
-        printf '\n  %sfrom%s Omarchy %s, migrated through %s\n' "$DIM" "$NC" "$bv" \
-            "$(date -d "@$bm" '+%Y-%m-%d' 2>/dev/null || printf '%s' "$bm")"
-        case "$verdict" in
-            quarantine) printf '  %s!%s %s\n' "$YELLOW" "$NC" "$why" ;;
-            *)          printf '  %s·%s %s\n' "$DIM" "$NC" "$why" ;;
-        esac
         printf '\n'
         printf '  %s%s files would be restored%s' "$GREEN" "$nr" "$NC"
         (( nq )) && printf ', %s%s quarantined%s' "$YELLOW" "$nq" "$NC"
@@ -1450,9 +1502,13 @@ cmd_restore() {
     done <<<"$rows"
 
     if (( JSON )); then
-        jq -n --argjson ok "$ok" --argjson bad "$bad" --argjson qok "$qok" --argjson qbad "$qbad" \
+        jq -n --arg verdict "$verdict" --arg why "$why" \
+            --argjson ok "$ok" --argjson bad "$bad" --argjson qok "$qok" --argjson qbad "$qbad" \
+            --argjson held "$nheld" --argjson ambiguous "$na" --argjson escaped "$nesc" \
             --arg backup "$backup" --arg quar "$quar" \
-            '{schemaVersion:1, restored:$ok, failed:$bad, quarantined:$qok, quarantineFailed:$qbad,
+            '{schemaVersion:1, verdict:$verdict, why:$why,
+              restored:$ok, failed:$bad, quarantined:$qok, quarantineFailed:$qbad,
+              held:$held, ambiguous:$ambiguous, escaped:$escaped,
               replacedAt:$backup, quarantineAt:$quar}'
     else
         printf '  %s✓%s restored %s files\n' "$GREEN" "$NC" "$ok"
@@ -1461,6 +1517,15 @@ cmd_restore() {
             "$YELLOW" "$NC" "$qok" "$(_tilde "$quar")"
         (( qbad )) && printf '  %s✗%s %s coupled files could not be quarantined -- they are neither restored nor held anywhere%s\n' \
             "$RED" "$NC" "$qbad" "" >&2
+        # escape, ambiguous and held were counted before the plan/apply split
+        # but only ever shown in the plan's own printout -- an apply run that
+        # hit any of them said nothing, and rc stayed 0: the plan's warning and
+        # the apply's silence about the very same rows disagreed.
+        (( nesc )) && printf '  %s✗%s %s refused (outside the target home)\n' "$RED" "$NC" "$nesc" >&2
+        (( na )) && printf '  %s?%s %s ambiguous (the repo flattens several directories into one)\n' \
+            "$YELLOW" "$NC" "$na" >&2
+        (( nheld )) && printf '  %s·%s %s migration marker(s) not restored, this being a forward move\n' \
+            "$DIM" "$NC" "$nheld"
         printf '  %swhat was replaced is at %s%s\n' "$DIM" "$(_tilde "$backup")" "$NC"
     fi
     rm -rf "$x"
@@ -1539,6 +1604,14 @@ done
 reject_flags() { local c="$1"; shift; (($# == 0)) || die "unknown flag for $c: $1"; }
 
 [[ -f "$GROUPS_FILE" ]] || die "group manifest not found: $GROUPS_FILE"
+# restore validates --groups against the ARTIFACT's manifest, not this
+# machine's -- a group name valid for one is not necessarily valid for the
+# other, and checking here against the wrong file would refuse a legitimate
+# artifact-only group or accept a machine-only one that means nothing to it.
+if [[ "$CMD" != restore ]]; then
+    bad="$(_assert_groups_filter_understood)" \
+        || die "--groups names a group this manifest does not have: $bad"
+fi
 
 case "$CMD" in
     verify)  reject_flags verify "${ARGS[@]}"; cmd_verify ;;

@@ -233,12 +233,22 @@ FPH="$(mktemp -d)"; FPR="$FPH/repo"; FPC="$FPH/cache"
 git init -q "$FPR" 2>/dev/null; printf 'x\n' >"$FPR/a"
 git -C "$FPR" add a 2>/dev/null
 git -C "$FPR" -c user.email=t@t -c user.name=t commit -q -m ok 2>/dev/null
-_fpkey() { OMABACKUP_ROOT="$PWD" bash -c 'source lib/bundle.sh
+# A disposable copy of the tool, not the real tracked bin/ and lib/: editing
+# and `git checkout`ing the actual source tree mid-suite is exactly the kind
+# of thing that discards a real uncommitted edit, or leaves it half-reverted
+# if the suite is interrupted between the append and the checkout.
+FPTOOL="$FPH/tool"; mkdir -p "$FPTOOL"
+cp -r "$PWD/bin" "$PWD/lib" "$PWD/groups.default.json" "$FPTOOL/"
+_fpkey() { OMABACKUP_ROOT="$FPTOOL" GROUPS_FILE="$FPTOOL/groups.default.json" bash -c '
+                    source lib/bundle.sh
                     bundle_cache_path "$1" "$2"' _ "$FPR" "$FPC" 2>/dev/null; }
 FPBEFORE="$(_fpkey)"
-printf '\n# an edit that changes what the tool does\n' >>lib/publish.sh
+printf '\n# an edit that changes what the tool does\n' >>"$FPTOOL/lib/publish.sh"
 FPDIRTY="$(_fpkey)"
-git checkout -q lib/publish.sh 2>/dev/null
+# Restored by copying the real, untouched file over the disposable one -- not
+# `git checkout`, which has no business running against anything but this
+# scratch copy in the first place.
+cp "$PWD/lib/publish.sh" "$FPTOOL/lib/publish.sh"
 FPBACK="$(_fpkey)"
 
 it "editing the tool changes the cache key, with no commit involved"
@@ -252,3 +262,89 @@ it "a key cannot be built when the tool cannot be read"
 OMABACKUP_ROOT=/nonexistent bash -c 'source '"$PWD"'/lib/bundle.sh
     bundle_cache_path "$1" "$2"' _ "$FPR" "$FPC" >/dev/null 2>&1 \
     && fail "built a cache key from a tool it could not read" || ok
+
+# ── the manifest is part of the code the cache key describes ────────────────
+# _tool_commit used to cover this by accident: committing a manifest edit
+# moved the tool's own HEAD, which changed the key too. _tool_fingerprint
+# replaced that with a hash of bin/omabackup + lib/*.sh alone -- the manifest
+# itself, which ships inside the artifact as tool/groups.default.json and is
+# what cmd_restore reads to decide what the artifact contains, was left out.
+GMH="$(mktemp -d)"; GMC="$GMH/cache"; GMR="$GMH/repo"
+git init -q "$GMR" 2>/dev/null; printf 'x\n' >"$GMR/a"
+git -C "$GMR" add a 2>/dev/null
+git -C "$GMR" -c user.email=t@t -c user.name=t commit -q -m ok 2>/dev/null
+GMG1="$GMH/g1.json"; GMG2="$GMH/g2.json"
+printf '{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[]}\n' >"$GMG1"
+printf '{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[{"id":"x"}]}\n' >"$GMG2"
+_gmkey() { OMABACKUP_ROOT="$PWD" GROUPS_FILE="$1" bash -c '
+    source lib/bundle.sh; bundle_cache_path "$1" "$2"' _ "$GMR" "$GMC" 2>/dev/null; }
+GMK1="$(GROUPS_FILE="$GMG1" _gmkey "$GMG1")"
+GMK2="$(GROUPS_FILE="$GMG2" _gmkey "$GMG2")"
+
+it "a different manifest changes the cache key, with no commit involved"
+[[ -n "$GMK1" && "$GMK1" != "$GMK2" ]] \
+    && ok || fail "same key for two different manifests: $GMK1"
+
+it "and a key cannot be built when the manifest cannot be read"
+GROUPS_FILE="$GMH/missing.json" OMABACKUP_ROOT="$PWD" bash -c '
+    source lib/bundle.sh; bundle_cache_path "$1" "$2"' _ "$GMR" "$GMC" >/dev/null 2>&1 \
+    && fail "built a cache key from a manifest it could not read" || ok
+
+# ── a cache hit is re-proved, not merely trusted for existing ───────────────
+# The freshly-built path calls verify_bundle before ever handing a path back;
+# a cache hit returned early, skipping it. A bundle a prior crash or full disk
+# left truncated at the exact cache key a later run computes was served as
+# whole, every time after, forever.
+# Driven through the real CLI, like every other bundle spec in this file --
+# build_bundle needs the full set of helpers bin/omabackup defines (_tilde,
+# omarchy_identity, _hostname...), not just what lib/bundle.sh brings in on
+# its own.
+CVH="$(mktemp -d)"; CVR="$CVH/repo"; CVC="$CVH/home/.state/bundles"
+git init -q "$CVR" 2>/dev/null; printf 'x\n' >"$CVR/a"
+git -C "$CVR" add a 2>/dev/null
+git -C "$CVR" -c user.email=t@t -c user.name=t commit -q -m ok 2>/dev/null
+CVKEY="$(OMABACKUP_ROOT="$PWD" GROUPS_FILE="$PWD/groups.default.json" bash -c '
+    source lib/bundle.sh; bundle_cache_path "$1" "$2"' _ "$CVR" "$CVC" 2>/dev/null)"
+mkdir -p "$CVC"; printf 'not a real bundle, just garbage\n' >"$CVKEY"
+# Not _bundle_env: it merges stderr into stdout, and rebuilding past a
+# corrupted cache entry prints a diagnostic on stderr by design -- mixed into
+# stdout, that diagnostic breaks the JSON this needs to parse cleanly.
+CVOUT="$(HOME="$CVH/home" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$CVH/home/.state" OMABACKUP_REPO="$CVR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle --json 2>/dev/null)"
+CVPATH="$(printf '%s' "$CVOUT" | jq -r '.path // empty' 2>/dev/null)"
+
+it "a corrupted file already sitting at the cache key is not served as-is"
+[[ -n "$CVPATH" && -f "$CVPATH" ]] && ok || fail "did not rebuild past the corrupted cache entry: $CVOUT"
+
+it "and what came back verifies for real"
+bash -c 'source lib/bundle.sh; verify_bundle "$1"' _ "$CVPATH" >/dev/null 2>&1 \
+    && ok || fail "returned a path that still does not verify"
+
+it "and it landed at the SAME cache key, not a new one"
+assert_eq "$CVPATH" "$CVKEY"
+
+# ── tar failing mid-archive is not masked by zstd's own success ─────────────
+# $? after `tar | zstd -o out` with no pipefail is zstd's status alone: a tar
+# that dies partway still hands zstd whatever it emitted, zstd compresses that
+# incomplete stream and exits 0, and the build's own || guard never fires.
+TZH="$(mktemp -d)"; mkdir -p "$TZH/stage"
+printf 'a\n' >"$TZH/stage/f1"
+TZOUT="$TZH/out.tar.zst"
+_tz_pipe() {
+    local _had_pf=0; [[ -o pipefail ]] && _had_pf=1
+    set -o pipefail
+    { tar -cf - -C "$TZH/stage" f1 f2-does-not-exist 2>/dev/null; } | zstd -q -19 -T0 -o "$TZOUT" 2>/dev/null
+    local rc=$?
+    (( _had_pf )) || set +o pipefail
+    return $rc
+}
+
+it "a tar that fails partway is not reported as a successful pipe"
+_tz_pipe; [[ $? -ne 0 ]] && ok || fail "pipefail did not surface tar's own failure"
+
+# A prune failure inside _push_dir not being silently swallowed to /dev/null
+# is exercised in test/destinations.test.sh, through a real `dir` destination
+# and the actual `push` command -- _push_dir depends on too much of
+# bin/omabackup's own helpers (dest_field, _hostname, the destinations state
+# machinery) to stub correctly in isolation here.
