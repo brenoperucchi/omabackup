@@ -309,3 +309,38 @@ it "scanning does not leak its exception list into the caller"
 unset DENY_EXCEPTIONS 2>/dev/null || true
 scan_secrets "$AR" "$PWD/secrets.deny.json" >/dev/null 2>&1
 [[ -z "${DENY_EXCEPTIONS+set}" ]] && ok || fail "DENY_EXCEPTIONS survived the call"
+
+# ── a hit in a message has to say which commit ─────────────────────────────
+# The tree scan reports `<sha>:<file>:<line>`. The message scan reported the
+# offending line and nothing else, because it grepped one concatenated blob of
+# every message at once. For a secret in a commit message the remedy is
+# rewriting history, and you cannot rewrite what you cannot locate.
+CMH="$(mktemp -d)/repo"; mkdir -p "$CMH"; git init -q "$CMH"
+git -C "$CMH" config user.email t@t; git -C "$CMH" config user.name t
+printf 'a\n' >"$CMH/f"; git -C "$CMH" add -A; git -C "$CMH" commit -qm "clean one"
+printf 'b\n' >>"$CMH/f"; git -C "$CMH" add -A
+git -C "$CMH" commit -q -m "first line
+aws_access_key_id = AKIAIOSFODNN7EXAMPLE"
+CMGUILTY="$(git -C "$CMH" rev-parse HEAD)"
+CMHIT="$(scan_secrets "$CMH" "$PWD/secrets.deny.json" 2>/dev/null)"
+
+it "a secret in a commit message names the commit that carries it"
+assert_contains "$CMHIT" "${CMGUILTY:0:12}"
+
+it "and not the innocent commit beside it"
+CMCLEAN="$(git -C "$CMH" rev-parse HEAD~1)"
+assert_not_contains "$CMHIT" "${CMCLEAN:0:12}"
+
+it "a multi-line message does not let a match span two commits"
+# %H%n%B concatenated every message into one blob, so a pattern could match
+# across the seam between one commit's body and the next one's hash.
+CMS="$(mktemp -d)/repo"; mkdir -p "$CMS"; git init -q "$CMS"
+git -C "$CMS" config user.email t@t; git -C "$CMS" config user.name t
+printf 'a\n' >"$CMS/f"; git -C "$CMS" add -A
+# Two halves that only form a key when joined -- neither matches alone, so a
+# hit here could only come from the seam.
+git -C "$CMS" commit -q -m "key prefix AKIAIOSFODN"
+printf 'b\n' >>"$CMS/f"; git -C "$CMS" add -A
+git -C "$CMS" commit -q -m "N7EXAMPLE is the rest of it"
+[[ -z "$(scan_secrets "$CMS" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "a match spanned the seam between two messages"

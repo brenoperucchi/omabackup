@@ -153,11 +153,22 @@ scan_secrets() {
         # `git grep <rev>` reads the tree at that commit and nothing else, but
         # `git bundle --all` packs the commit objects and the annotated tag
         # objects too -- so a token pasted into a commit message shipped and
-        # scanned clean. Messages and tag bodies are text that leaves the
-        # machine; they get the same patterns.
+        # scanned clean.
+        #
+        # Each line carries its own commit. The first version concatenated every
+        # message into one blob with %H%n%B, which lost the attribution entirely
+        # (a hit named no commit, and the fix for a message is rewriting
+        # history -- you cannot rewrite what you cannot locate) and let a match
+        # span the seam between one message and the next.
         local msgs
-        msgs="$(git -C "$repo" log --format='%H%n%B' --all 2>/dev/null
-                git -C "$repo" for-each-ref --format='%(refname) %(contents)' refs/tags 2>/dev/null)"
+        msgs="$(git -C "$repo" log --all --format=$'\x01%H\x02%B' 2>/dev/null \
+                | awk -v RS=$'\x01' 'NR>1 {
+                      i = index($0, "\002"); if (i == 0) next
+                      h = substr($0, 1, i - 1); b = substr($0, i + 1)
+                      n = split(b, L, "\n")
+                      for (j = 1; j <= n; j++) if (L[j] != "") print substr(h,1,12) ":" L[j]
+                  }'
+                git -C "$repo" for-each-ref --format='%(refname:short) %(contents)' refs/tags 2>/dev/null)"
         while IFS= read -r hit; do
             [[ -n "$hit" ]] || continue
             _still_matches "$hit" "$re" "$ci" || continue
