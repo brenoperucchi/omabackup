@@ -86,6 +86,16 @@ Panel {
     return bits.join("  ·  ")
   }
 
+  // "2m ago" from the ISO stamp the CLI writes. A wall-clock UTC string is
+  // precise and useless at a glance -- "2026-08-25 01:03:51 UTC" makes you do
+  // subtraction to answer "is this current?".
+  function agoFromIso(iso) {
+    if (!iso) return ""
+    var t = Date.parse(String(iso))
+    if (isNaN(t)) return ""
+    return agoText(Math.max(0, (Date.now() - t) / 1000))
+  }
+
   function shortPath(p) {
     if (!p) return "—"
     var h = Quickshell.env("HOME")
@@ -645,34 +655,50 @@ Panel {
             PanelSeparator { anchors.bottom: parent.bottom; width: parent.width }
           }
 
-          Repeater {
-            model: root.destinations
-            Column {
-              required property var modelData
-              width: column.width
-              spacing: Style.space(1)
+          // Each destination is a chip -- omarchy's Button carries `selected`,
+          // which is exactly "this one is live". A row of them reads at a
+          // glance: what exists, and which are working.
+          Flow {
+            width: column.width
+            spacing: Style.space(6)
 
-              Text {
-                width: parent.width
-                text: (modelData.lastError ? "✗  " : modelData.lastSuccess ? "·  " : "!  ")
-                      + (modelData.id || "") + "  " + (modelData.type || "")
-                color: modelData.lastError ? Color.urgent
-                     : modelData.lastSuccess ? Color.foreground : Color.accent
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-                elide: Text.ElideRight
-              }
-              Text {
-                width: parent.width
-                text: modelData.lastError && modelData.lastError.message
-                        ? modelData.lastError.message
-                        : modelData.lastSuccess
-                          ? "last sent " + String(modelData.lastSuccess).replace("T", " ").replace("Z", " UTC")
-                          : "never sent -- this copy does not exist yet"
-                color: Color.muted
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
+            Repeater {
+              model: root.destinations
+              Row {
+                id: destRow
+                required property var modelData
+                spacing: Style.space(6)
+
+                Button {
+                  text: destRow.modelData.id || ""
+                  bordered: true
+                  // Not clickable: pushing to one destination on demand needs
+                  // `push <id>`, and a chip that looks pressable but does
+                  // nothing is worse than one that plainly reports.
+                  selected: destRow.modelData.lastSuccess && !destRow.modelData.lastError
+                  foreground: destRow.modelData.lastError ? Color.urgent
+                            : destRow.modelData.lastSuccess ? Color.foreground
+                            : Color.accent
+                }
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  // The type only earns space when it says something the id
+                  // does not -- for github the two are the same word, which is
+                  // how the panel came to read "github  github".
+                  text: {
+                    var d = destRow.modelData
+                    var bits = []
+                    if (d.type && d.type !== d.id) bits.push(d.type)
+                    if (d.lastError && d.lastError.message) bits.push(d.lastError.message)
+                    else if (d.lastSuccess) bits.push("sent " + root.agoFromIso(d.lastSuccess))
+                    else bits.push("never sent")
+                    return bits.join("  ·  ")
+                  }
+                  color: destRow.modelData.lastError ? Color.urgent : Color.muted
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.caption
+                }
               }
             }
           }
