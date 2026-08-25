@@ -533,14 +533,12 @@ Panel {
           // ── what is saved ─────────────────────────────────────────────────
           // The question the interface could not answer: you had to open
           // groups.default.json to find out what this tool actually keeps.
-          PanelSeparator { width: parent.width; visible: root.groups.length > 0 }
-
-          // Header and total on one line, the way the mockup reads: the section
-          // says what it is on the left and how much of it there is on the right.
+          // The section rule sits UNDER the header, not above it: it belongs to
+          // the header as an underline rather than floating between sections.
           Item {
             visible: root.groups.length > 0
             width: parent.width
-            implicitHeight: gHdr.implicitHeight
+            implicitHeight: gHdr.implicitHeight + Style.space(5)
             PanelSectionHeader { id: gHdr; anchors.left: parent.left; text: "Groups" }
             Text {
               anchors.right: parent.right
@@ -551,6 +549,7 @@ Panel {
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
             }
+            PanelSeparator { anchors.bottom: parent.bottom; width: parent.width }
           }
 
           // Two columns: eleven groups in one made the panel a scroll with
@@ -560,53 +559,74 @@ Panel {
             id: groupGrid
             width: column.width
             columns: 2
-            columnSpacing: Style.space(8)
-            rowSpacing: Style.space(2)
+            columnSpacing: Style.space(14)
+            rowSpacing: Style.space(3)
             readonly property real cellWidth: (width - columnSpacing) / 2
 
             Repeater {
               model: root.groups
-              // Toggle is omarchy's own row for "a named thing, described,
-              // that is on or off" -- which is exactly a backup group. The
-              // checkbox reflects `enabled` from the manifest; making it
-              // clickable needs a CLI verb that does not exist yet, so it
-              // reports rather than sets.
-              Item {
+              Row {
+                id: groupRow
                 required property var modelData
                 width: groupGrid.cellWidth
-                implicitHeight: tog.implicitHeight
+                spacing: Style.space(7)
 
-                Toggle {
-                  id: tog
-                  width: parent.width - modePill.width - Style.space(4)
-                  label: parent.modelData.label || parent.modelData.id || ""
-                  description: root.groupDetail(parent.modelData)
-                               + (parent.modelData.coupled ? "  ·  tied to this version" : "")
-                  checked: parent.modelData.enabled !== false
-                  accent: (typeof parent.modelData.files === "number"
-                           && parent.modelData.files === 0) ? Color.urgent : Color.accent
+                // A 3px rail, not a toggle. This reports state; it does not set
+                // it, and a switch that cannot be switched invites the click it
+                // then ignores. Red when the group covers nothing -- zero
+                // coverage is the failure this project was built after.
+                Rectangle {
+                  width: Style.space(3)
+                  height: cellCol.implicitHeight
+                  color: (typeof groupRow.modelData.files === "number"
+                          && groupRow.modelData.files === 0) ? Color.urgent
+                       : groupRow.modelData.enabled === false ? Color.muted
+                       : Color.foreground
+                  opacity: groupRow.modelData.enabled === false ? 0.35 : 0.55
                 }
 
-                // The mode badge, uppercase and boxed like the mockup's pills.
-                Rectangle {
-                  id: modePill
-                  anchors.right: parent.right
-                  anchors.top: parent.top
-                  anchors.topMargin: Style.space(6)
-                  width: pillText.implicitWidth + Style.space(6)
-                  height: pillText.implicitHeight + Style.space(2)
-                  radius: Style.space(3)
-                  color: "transparent"
-                  border.width: 1
-                  border.color: Color.muted
-                  opacity: 0.7
+                Column {
+                  id: cellCol
+                  width: parent.width - Style.space(10)
+                  spacing: Style.space(1)
+
+                  // Name and mode share one line, so the badge cannot float
+                  // loose in a corner of the cell.
+                  Item {
+                    width: parent.width
+                    implicitHeight: nameText.implicitHeight
+                    Text {
+                      id: nameText
+                      anchors.left: parent.left
+                      anchors.right: modeText.left
+                      anchors.rightMargin: Style.space(5)
+                      text: groupRow.modelData.label || groupRow.modelData.id || ""
+                      color: groupRow.modelData.enabled === false
+                             ? Color.muted : Color.foreground
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.bodySmall
+                      elide: Text.ElideRight
+                    }
+                    Text {
+                      id: modeText
+                      anchors.right: parent.right
+                      anchors.baseline: nameText.baseline
+                      text: (groupRow.modelData.mode || "").toUpperCase()
+                      color: Color.muted
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                      opacity: 0.75
+                    }
+                  }
+
                   Text {
-                    id: pillText
-                    anchors.centerIn: parent
-                    text: (parent.parent.modelData.mode || "").toUpperCase()
+                    width: parent.width
+                    text: root.groupDetail(groupRow.modelData)
+                          + (groupRow.modelData.coupled ? "  ·  tied" : "")
                     color: Color.muted
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
                   }
                 }
               }
@@ -617,11 +637,12 @@ Panel {
           // Coverage says the backup holds the right files. This says whether
           // any of it ever left the machine -- the question nothing answered
           // before, and the one a dead disk asks.
-          PanelSeparator { width: parent.width }
-
-          PanelSectionHeader {
+          Item {
             visible: root.destinations.length > 0
-            text: "Destinations"
+            width: parent.width
+            implicitHeight: dHdr.implicitHeight + Style.space(5)
+            PanelSectionHeader { id: dHdr; anchors.left: parent.left; text: "Destinations" }
+            PanelSeparator { anchors.bottom: parent.bottom; width: parent.width }
           }
 
           Repeater {
@@ -697,9 +718,12 @@ Panel {
           }
 
           // ── config ────────────────────────────────────────────────────────
-          PanelSeparator { width: parent.width }
-
-          PanelSectionHeader { text: "Config" }
+          Item {
+            width: parent.width
+            implicitHeight: cHdr.implicitHeight + Style.space(5)
+            PanelSectionHeader { id: cHdr; anchors.left: parent.left; text: "Config" }
+            PanelSeparator { anchors.bottom: parent.bottom; width: parent.width }
+          }
 
           Grid {
             id: cfgGrid
