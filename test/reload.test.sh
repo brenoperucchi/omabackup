@@ -74,3 +74,30 @@ it "reload never reaches for omarchy-refresh-shell"
 # wipe the user's bar configuration -- including this very widget. The names
 # are one word apart.
 assert_not_contains "$(sed -n '/^cmd_reload/,/^}/p' "$OB")" "refresh-shell"
+
+# ── the same second is not a failure ───────────────────────────────────────
+# mtimes and process start times have one-second granularity, and the pull
+# always happens before the restart -- so landing in the same second means it
+# worked. Comparing with a strict `>` called that a failure, and did so on the
+# very first real use of this verb.
+DH="$(_rl_home)"
+DNOW="$(date +%s)"
+touch -d "@$DNOW" "$DH/plugin/Panel.qml"
+DOUT="$(_rl_run "$DH" "$DNOW")"
+DRC=$?
+
+it "a shell starting in the same second as the write counts as reloaded"
+assert_contains "$DOUT" "reloaded"
+
+it "and exits clean"
+[[ $DRC -eq 0 ]] && ok || fail "same-second reload reported failure"
+
+# ── but a shell that never restarted is still caught ───────────────────────
+# Loosening the comparison must not lose the check: if the restart command does
+# nothing at all, the verb has to say so.
+EH="$(_rl_home)"
+printf '#!/bin/bash\nexit 0\n' >"$EH/stub/restart"; chmod +x "$EH/stub/restart"
+EOUT="$(_rl_run "$EH" "$(( $(date +%s) - 600 ))")"
+
+it "a shell that predates the files is still caught"
+assert_contains "$EOUT" "still running"

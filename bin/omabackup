@@ -921,11 +921,14 @@ cmd_reload() {
     for i in 1 2 3 4 5 6 7 8 9 10; do
         sleep 1
         after_at="$(_shell_started_at || echo 0)"
-        (( after_at > files )) && break
+        # >=, not >: mtimes and process start times are second-granular, and
+        # the pull always precedes the restart -- so the same second means it
+        # worked. A strict > failed the verb's own first real use.
+        (( after_at >= files )) && break
     done
 
     local head; head="$(git -C "$PLUGIN_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-    if (( after_at > files )); then
+    if (( after_at >= files )); then
         printf '  %s✓%s reloaded %s(%s is live)%s\n' "$GREEN" "$NC" "$DIM" "$head" "$NC"
         return 0
     fi
