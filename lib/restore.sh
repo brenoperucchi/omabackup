@@ -84,23 +84,31 @@ _restore_verdict() {
     fi
 }
 
-# _restore_contained <destination-path>
-# Whether a destination, once every symlink and `..` in it is resolved, is
-# still inside $HOME. realpath -m resolves the parts of the path that exist
-# (following any symlink along the way) and normalizes the parts that do not
-# lexically, in one pass -- which is exactly the two ways a destination
-# escaped: a declared path holding `..` normalizes past $HOME, and a directory
-# under $HOME that is itself a symlink to somewhere else resolves through it.
-# --into does not change what this checks: HOME is reassigned to the target
-# before this ever runs, so containment is always relative to wherever the
-# restore is actually landing.
-_restore_contained() {
-    local dest="$1" rp home_rp
-    rp="$(realpath -m -- "$dest" 2>/dev/null)" || return 1
-    home_rp="$(realpath -e -- "$HOME" 2>/dev/null)" || return 1
-    [[ -n "$rp" && -n "$home_rp" ]] || return 1
-    [[ "$rp" == "$home_rp" || "$rp" == "$home_rp"/* ]]
+# _path_contained <path> <base>
+# Whether a path, once every symlink and `..` in it is resolved, is still
+# inside <base>. realpath -m resolves the parts that exist (following any
+# symlink along the way) and normalizes the parts that do not, lexically, in
+# one pass -- which is exactly the two ways a path escapes: something holding
+# `..` normalizes past its base, and a directory under the base that is itself
+# a symlink elsewhere resolves through it. General over $HOME specifically,
+# because it turned out $HOME was not the only base a path built from artifact
+# content needed checking against -- see _restore_contained below, and the
+# quarantine write in cmd_restore, which builds a path from a group id the
+# manifest names and never validated that name at all.
+_path_contained() {
+    local p="$1" base="$2" rp base_rp
+    rp="$(realpath -m -- "$p" 2>/dev/null)" || return 1
+    base_rp="$(realpath -e -- "$base" 2>/dev/null)" || return 1
+    [[ -n "$rp" && -n "$base_rp" ]] || return 1
+    [[ "$rp" == "$base_rp" || "$rp" == "$base_rp"/* ]]
 }
+
+# _restore_contained <destination-path>
+# Whether a destination is still inside $HOME once resolved -- see
+# _path_contained. --into does not change what this checks: HOME is
+# reassigned to the target before this ever runs, so containment is always
+# relative to wherever the restore is actually landing.
+_restore_contained() { _path_contained "$1" "$HOME"; }
 
 # _restore_repo_prefix <group-id> <declared-path>
 # "<repo-relative-prefix>\t<kind>", where kind is `tree` (the repo mirrors the

@@ -635,3 +635,37 @@ it "and does not die claiming the manifest is unreadable"
 
 it "the local plugin tree itself is still offered"
 assert_contains "$PLNPLAN" "init.lua"
+
+# ── the quarantine path is built from a group id, and it was never checked ──
+# $g came straight from the artifact's manifest and was concatenated into
+# $quar/$g/... with no validation at all -- unlike a live destination, which
+# _restore_contained checks before it is ever written to. An artifact naming
+# a group "../../../../../<mark>" wrote there directly, outside $quar
+# entirely, with rc=0 and no escape row anywhere to have caught it: escape
+# only ever guarded the live-write path a `restore` row computes.
+TVMARK="restore-traversal-$(basename "$(mktemp -u)")"
+TVH="$(mktemp -d)"; TVR="$TVH/repo"
+mkdir -p "$TVR/configs/hypr"
+git init -q "$TVR"; git -C "$TVR" config user.email t@t; git -C "$TVR" config user.name t
+printf 'x\n' >"$TVR/configs/hypr/bindings.conf"
+git -C "$TVR" add -A && git -C "$TVR" commit -qm one
+cat >"$TVH/g.json" <<JSON
+{"schemaVersion":1,"supportedTargets":["3.*"],"groups":[
+ {"id":"../../../../../../tmp/$TVMARK","label":"Evil","mode":"copy","coupled":true,"critical":true,
+  "paths":["~/.config/hypr"]}]}
+JSON
+mkdir -p "$TVH/home"
+HOME="$TVH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$TVH/g.json" \
+    OMABACKUP_STATE="$TVH/home/.state" OMABACKUP_REPO="$TVR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+TVART="$(ls -t "$TVH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+TVTGT="$(mktemp -d)"
+_res_run "$TVTGT" "$TVH/rstate" "$TVART" --apply >/dev/null 2>&1
+
+it "a group id crafted to traverse out of the quarantine directory is refused"
+[[ ! -e "/tmp/$TVMARK" ]] && ok || fail "wrote outside the quarantine directory"
+rm -rf "/tmp/$TVMARK" 2>/dev/null
+
+it "and the target home has nothing from that group either"
+[[ ! -e "$TVTGT/.config/hypr/bindings.conf" ]] \
+    && ok || fail "a coupled file from a hostile group id was still applied"

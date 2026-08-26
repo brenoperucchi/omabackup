@@ -1496,6 +1496,11 @@ cmd_restore() {
         || { rm -rf "$x"; die "could not make a directory to keep replaced files in"; }
     local backup="$base/replaced" quar="$base/quarantine"
     mkdir -p "$backup" || { rm -rf "$x"; die "could not make $(_tilde "$backup")"; }
+    # $quar has to exist before the quarantine branch can check containment
+    # against it -- realpath -e, deliberately, needs a real directory to
+    # resolve, and one made lazily by mkdir -p alongside the write it was
+    # meant to guard would have to exist already to pass that very check.
+    mkdir -p "$quar" || { rm -rf "$x"; die "could not make $(_tilde "$quar")"; }
 
     local ok=0 bad=0 qok=0 qbad=0
     while IFS=$'\t' read -r a g rel dest; do
@@ -1506,7 +1511,14 @@ cmd_restore() {
                 else bad=$((bad + 1))
                      printf '  %s✗%s %s\n' "$RED" "$NC" "$(_tilde "$dest")" >&2; fi ;;
             quarantine)
-                if mkdir -p "$quar/$g/$(dirname "$rel")" 2>/dev/null \
+                # $g is a group id straight from the artifact's manifest, and
+                # nothing about a group id was ever validated -- an artifact
+                # naming one "../../../../../tmp/x" wrote there directly,
+                # outside $quar entirely, with rc=0 and no escape row to catch
+                # it: escape only ever guarded the live destination a `restore`
+                # row computes, never this one.
+                if _path_contained "$quar/$g/$rel" "$quar" \
+                    && mkdir -p "$quar/$g/$(dirname "$rel")" 2>/dev/null \
                     && cp -Pp "$x/worktree/$rel" "$quar/$g/$rel" 2>/dev/null
                 then qok=$((qok + 1))
                 else qbad=$((qbad + 1))
