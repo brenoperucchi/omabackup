@@ -67,6 +67,12 @@ _restore_verdict() {
             "$tv" "$(printf '%s' "$targets" | jq -r 'join(", ")' 2>/dev/null)"
         return 0
     fi
+    # "unreadable" (from omarchy_identity) means the migrations directory
+    # exists but could not be scanned -- a real machine problem, not "no
+    # migrations yet." Defaulting that to 0 the same way an absent directory
+    # legitimately does would have read as a fresh install and applied coupled
+    # config against a watermark this machine could not actually confirm.
+    [[ "$tm" == unreadable ]] && return 1
     [[ "$bm" =~ ^[0-9]+$ ]] || bm=0
     [[ "$tm" =~ ^[0-9]+$ ]] || tm=0
     if (( tm == bm )); then
@@ -128,7 +134,20 @@ _restore_repo_prefix() {
     # for a "//" that is never there -- not a loss (the file this happens to is
     # caught by its own missing-source check first), but a stray line naming a
     # temp directory that was never meant to be user-visible.
-    sub="$(group_tracked_repo_path "$id" "$p")"
+    # A query this cannot answer is not the same as one that answered "no
+    # override" -- jq's own status is checked. Read through command
+    # substitution alone, a failed lookup and an absent trackedRepoPath were
+    # the same empty string, and this fell through to the generic .config/*
+    # mapping either way: for a group whose override existed precisely
+    # because its content does NOT belong wherever that generic mapping would
+    # look, that is not a missed override, it is the wrong file's content
+    # restored under the right group's name.
+    #
+    # Returns 2 here, not 1: 1 is the ordinary "nothing maps this path, skip
+    # it" a caller continues past (.local/bin and friends use it on purpose);
+    # this is "the question itself could not be answered," which a caller
+    # must not treat the same way.
+    sub="$(group_tracked_repo_path "$id" "$p")" || return 2
     if [[ -n "$sub" ]]; then printf '%s\tflat' "$sub"; return 0; fi
     p="${p%/}"
     e="$(_expand "$p")"; rel="${e#"$HOME"/}"
@@ -185,22 +204,39 @@ restore_rows() {
 
     local migdir; migdir="$(_expand '~/.local/state/omarchy/migrations')"
 
-    # The collision map is built once, over every group, before any row is
-    # emitted. The first version built it per group and reset it between them,
-    # so it never saw two DIFFERENT groups sharing one destination -- `scripts`
-    # declaring ~/.local/bin and ~/bin is fine (distinct destinations), but
-    # nothing stopped two groups from both naming trackedRepoPath
-    # "scripts/shared", which this now catches the same way.
-    local -A prefixcount=()
+    # Two collision maps, not one -- they catch two different things that both
+    # end in the same loss. prefixcount, keyed by repo-side prefix, is what
+    # restore_rows' doc comment describes: two declared directories flattened
+    # into the SAME repo location, so a file there cannot be traced back to
+    # which live destination it belongs to (`shared` claimed by both
+    # ~/.config/one and ~/.config/two -- the repo cannot tell which is which).
+    # destcount, keyed by the expanded LIVE path, catches the mirror case: two
+    # DIFFERENT repo prefixes ("prefix-one", "prefix-two") that both declared
+    # the SAME `live` directory, printed as an ordinary `restore` row for the
+    # same file from two sources -- the second _restore_one to run would have
+    # backed up what the first had just written. Neither map subsumes the
+    # other: swapping one for the other during development silently traded
+    # one class of loss for the other, which the original flat-collision spec
+    # (same prefix, different live paths) caught immediately.
+    local -A prefixcount=() destcount=()
     while read -r id; do
         [[ -n "$id" ]] || continue
         gm="$(group_field "$id" mode)" || return 1
         [[ "$gm" == gen ]] && continue
         while read -r p; do
             [[ -n "$p" ]] || continue
-            IFS=$'\t' read -r prefix kind <<<"$(_restore_repo_prefix "$id" "$p")" || continue
+            # <<<"$(...)" loses the inner command's exit status -- read's own
+            # status is what `<<<` reports, and read succeeds on an empty
+            # string same as a real answer. Captured first so the status that
+            # matters is the one actually checked.
+            local rp; rp="$(_restore_repo_prefix "$id" "$p")"; local rprc=$?
+            (( rprc == 2 )) && return 1
+            (( rprc == 0 )) || continue
+            IFS=$'\t' read -r prefix kind <<<"$rp"
             [[ -n "$prefix" ]] || continue
+            e="$(_expand "$p")"
             prefixcount[$prefix]=$(( ${prefixcount[$prefix]:-0} + 1 ))
+            destcount[$e]=$(( ${destcount[$e]:-0} + 1 ))
         done < <(group_paths "$id")
     done < <(groups_ids)
 
@@ -232,7 +268,10 @@ restore_rows() {
 
         while read -r p; do
             [[ -n "$p" ]] || continue
-            IFS=$'\t' read -r prefix kind <<<"$(_restore_repo_prefix "$id" "$p")" || continue
+            local rp; rp="$(_restore_repo_prefix "$id" "$p")"; local rprc=$?
+            (( rprc == 2 )) && return 1
+            (( rprc == 0 )) || continue
+            IFS=$'\t' read -r prefix kind <<<"$rp"
             [[ -n "$prefix" ]] || continue
             e="$(_expand "$p")"
             [[ -e "$wt/$prefix" ]] || continue
@@ -243,8 +282,18 @@ restore_rows() {
                     dest="$e/$sub"
                     if ! _restore_contained "$dest"; then
                         printf 'escape\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
-                    elif (( ${prefixcount[$prefix]:-1} > 1 )); then
+                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )); then
                         printf 'ambiguous\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
+                    # held was checked in the tree branch only. A manifest is
+                    # free to declare a trackedRepoPath override for the
+                    # migrations directory itself, which routes it through
+                    # `flat` instead -- the shipped manifest never does this,
+                    # but nothing stops one from declaring it, and a forward
+                    # verdict restoring an old marker through that path would
+                    # be exactly the contradiction the tree branch's held check
+                    # exists to prevent.
+                    elif [[ "$verdict" == forward && ( "$dest" == "$migdir" || "$dest" == "$migdir"/* ) ]]; then
+                        printf 'held\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
                     else
                         printf '%s\t%s\t%s/%s\t%s\n' "$action" "$id" "$prefix" "$sub" "$dest"
                     fi
@@ -270,7 +319,7 @@ restore_rows() {
                     # FIRST one just wrote, not the real original, and the real
                     # original is gone from both the destination and the one
                     # place kept to protect it.
-                    elif (( ${prefixcount[$prefix]:-1} > 1 )); then
+                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )); then
                         printf 'ambiguous\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
                     elif [[ "$verdict" == forward && ( "$dest" == "$migdir" || "$dest" == "$migdir"/* ) ]]; then
                         printf 'held\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
@@ -283,7 +332,7 @@ restore_rows() {
                 dest="$e"
                 if ! _restore_contained "$dest"; then
                     printf 'escape\t%s\t%s\t%s\n' "$id" "$prefix" "$dest"
-                elif (( ${prefixcount[$prefix]:-1} > 1 )); then
+                elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )); then
                     printf 'ambiguous\t%s\t%s\t%s\n' "$id" "$prefix" "$dest"
                 else
                     printf '%s\t%s\t%s\t%s\n' "$action" "$id" "$prefix" "$dest"
@@ -344,6 +393,14 @@ _restore_one() {
         mkdir -p "$(dirname "$keep")" 2>/dev/null || return 1
         cp -Pp "$dest" "$keep" 2>/dev/null || return 1
     fi
+    # Re-checked immediately before the write that actually matters, not only
+    # once at the top -- a parent directory swapped for a symlink in the
+    # window between the first check and this line would otherwise be
+    # followed by the mkdir -p and the cp right after it. This narrows the
+    # window to what is unavoidable with these tools; it does not close it --
+    # a symlink swapped between THIS check and the write below still wins,
+    # which would need an O_NOFOLLOW-style primitive bash does not have.
+    _restore_contained "$dest" || return 1
     mkdir -p "$(dirname "$dest")" 2>/dev/null || return 1
     # -P: a symlink is restored as a symlink. Following it would write through
     # to whatever it points at, which is somebody else's file.

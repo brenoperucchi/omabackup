@@ -383,7 +383,10 @@ Three things shape it, and all three came out of §12:
   inside every bundle for exactly this. A restore driven by whatever manifest
   the machine happens to carry would look for groups the artifact never had and
   place files by rules written after it.
-- **The verdict is taken before anything is read.** `same` (identical
+- **The verdict is taken before anything is WRITTEN, and against wherever
+  `--into` says the restore is landing.** (The artifact is extracted and
+  verified first, which is reading -- the promise is about deciding, not
+  about touching disk.) `same` (identical
   watermark: coupled groups and migration markers both apply), `behind`
   (inside the range, this machine has fewer migrations than the backup --
   typically a fresh install with no migrations directory yet: coupled groups
@@ -409,11 +412,14 @@ Three things shape it, and all three came out of §12:
 
 `map_to_repo` flattens `trackedRepoPath` groups, so if two declared
 directories ever shared a destination, a file there could not be traced home.
-Restore detects that and says `ambiguous` instead of guessing -- across every
-group now, not only within one: the first version of the check rebuilt its
-collision map per group, so two DIFFERENT groups naming the same
-`trackedRepoPath` were never caught, only two paths inside the same group
-were. No group in the shipped manifest does either -- `scripts` declares
+Restore detects that and says `ambiguous` instead of guessing, via two
+collision maps kept together -- one keyed by repo-side prefix (two groups
+naming the same `trackedRepoPath`), one by the expanded live destination (two
+DIFFERENT prefixes that both declared the same `live` directory). Neither
+subsumes the other: an earlier version had only the first, and lost the
+second case -- two distinct repo locations agreeing on one live path printed
+as an ordinary `restore` row for the same file, with nothing to catch it. No
+group in the shipped manifest triggers either -- `scripts` declares
 `~/.local/bin` and `~/bin` with distinct destinations.
 
 ## Immediate next actions

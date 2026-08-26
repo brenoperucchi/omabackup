@@ -198,9 +198,13 @@ it "and it is not counted as something that would be restored"
 assert_contains "$ESCPLAN" "0 files would be restored"
 
 _res_run "$ESCTGT" "$ESCH/rstate" "$ESCART" --apply >/dev/null 2>&1
+ESCAPPLYRC=$?
 
 it "and --apply writes nothing for it, inside the target"
 [[ ! -e "$ESCTGT/../$ESCMARK/evil.conf" ]] && ok || fail "wrote past the target home"
+
+it "and --apply's own exit status says so -- an all-escape restore is not success"
+[[ $ESCAPPLYRC -ne 0 ]] && ok || fail "exited 0 on a restore where everything was refused"
 
 it "nor anywhere else on the machine"
 [[ ! -f "/tmp/$ESCMARK/evil.conf" && ! -f "$(dirname "$ESCTGT")/$ESCMARK/evil.conf" ]] \
@@ -669,3 +673,187 @@ rm -rf "/tmp/$TVMARK" 2>/dev/null
 it "and the target home has nothing from that group either"
 [[ ! -e "$TVTGT/.config/hypr/bindings.conf" ]] \
     && ok || fail "a coupled file from a hostile group id was still applied"
+
+# ── a trackedRepoPath lookup that fails must not fall back to the wrong file ─
+# group_tracked_repo_path's jq call had its status discarded, so a failed
+# lookup and "no override declared" were the same empty string -- and this
+# fell through to the generic .config/* mapping either way. For a group whose
+# override exists precisely because its content does NOT belong wherever that
+# generic mapping would look, that is not a missed override: it is a
+# DIFFERENT group's content restored under this group's name, silently.
+TRPH="$(mktemp -d)"; TRPR="$TRPH/repo"
+mkdir -p "$TRPR/special" "$TRPR/configs/a"
+git init -q "$TRPR"; git -C "$TRPR" config user.email t@t; git -C "$TRPR" config user.name t
+printf 'correct content\n' >"$TRPR/special/thing.conf"
+printf 'WRONG content, from an unrelated group\n' >"$TRPR/configs/a/thing.conf"
+git -C "$TRPR" add -A && git -C "$TRPR" commit -qm one
+cat >"$TRPH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"special","label":"Special","mode":"copy","coupled":false,"critical":false,
+  "paths":[{"live":"~/.config/a","trackedRepoPath":"special"}]},
+ {"id":"a","label":"A","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/a"]}]}
+JSON
+mkdir -p "$TRPH/home"
+HOME="$TRPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$TRPH/g.json" \
+    OMABACKUP_STATE="$TRPH/home/.state" OMABACKUP_REPO="$TRPR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+TRPART="$(ls -t "$TRPH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+mkdir -p "$TRPH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *trackedRepoPath* ]] && exit 3; done\n'
+  printf 'exec %s "$@"\n' "$(command -v jq)"
+} >"$TRPH/stub/jq"; chmod +x "$TRPH/stub/jq"
+TRPTGT="$(mktemp -d)"
+
+it "a trackedRepoPath query that fails refuses to plan, not falls back wrong"
+PATH="$TRPH/stub:$PATH" HOME="$TRPTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$TRPH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$TRPART" --apply >/dev/null 2>&1 \
+    && fail "restored something despite a trackedRepoPath lookup it could not answer" || ok
+
+it "and specifically: the wrong file's content never lands"
+[[ ! -e "$TRPTGT/.config/a/thing.conf" ]] && ok || fail "the wrong group's content was restored"
+
+# ── two DIFFERENT repo prefixes agreeing on the same live destination ───────
+# The collision map was keyed by repo-side prefix alone, which catches two
+# groups naming the SAME trackedRepoPath -- but not two DIFFERENT prefixes
+# that both declared the same `live` directory. Two distinct repo locations
+# ("prefix-one", "prefix-two"), same $HOME/.config/shared destination, both
+# printed as an ordinary `restore` row for the same file: the second
+# _restore_one to run would have backed up what the first had just written.
+DCH="$(mktemp -d)"; DCR="$DCH/repo"
+mkdir -p "$DCR/prefix-one" "$DCR/prefix-two"
+git init -q "$DCR"; git -C "$DCR" config user.email t@t; git -C "$DCR" config user.name t
+printf 'from prefix one\n' >"$DCR/prefix-one/shared.conf"
+printf 'from prefix two\n' >"$DCR/prefix-two/shared.conf"
+git -C "$DCR" add -A && git -C "$DCR" commit -qm one
+cat >"$DCH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"g1","label":"G1","mode":"copy","coupled":false,"critical":false,
+  "paths":[{"live":"~/.config/shared","trackedRepoPath":"prefix-one"}]},
+ {"id":"g2","label":"G2","mode":"copy","coupled":false,"critical":false,
+  "paths":[{"live":"~/.config/shared","trackedRepoPath":"prefix-two"}]}]}
+JSON
+mkdir -p "$DCH/home"
+HOME="$DCH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$DCH/g.json" \
+    OMABACKUP_STATE="$DCH/home/.state" OMABACKUP_REPO="$DCR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+DCART="$(ls -t "$DCH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+DCTGT="$(mktemp -d)"
+mkdir -p "$DCTGT/.config/shared"
+printf 'my irreplaceable original\n' >"$DCTGT/.config/shared/shared.conf"
+DCPLAN="$(_res_run "$DCTGT" "$DCH/rstate" "$DCART")"
+
+it "two different prefixes agreeing on one live destination are flagged ambiguous"
+assert_contains "$DCPLAN" "ambiguous"
+
+it "and NOT counted as something that would be restored"
+assert_contains "$DCPLAN" "0 files would be restored"
+
+_res_run "$DCTGT" "$DCH/rstate" "$DCART" --apply >/dev/null 2>&1
+
+it "the live file is left exactly as it was"
+assert_eq "$(cat "$DCTGT/.config/shared/shared.conf" 2>/dev/null)" "my irreplaceable original"
+
+# ── the verdict is evaluated against --into's target, not the operator's home ─
+# omarchy_identity reads $HOME/.local/state/omarchy/migrations, and the verdict
+# was computed BEFORE --into moved $HOME -- so a --into restore was judged
+# against the OPERATOR's own migration state while the files landed somewhere
+# else entirely. A same/behind/forward call rested on state the target never
+# had anything to do with.
+IVH="$(mktemp -d)"; IVR="$IVH/repo"
+mkdir -p "$IVR/state/omarchy/migrations"
+git init -q "$IVR"; git -C "$IVR" config user.email t@t; git -C "$IVR" config user.name t
+printf 'old\n' >"$IVR/state/omarchy/migrations/1700000000.sh"
+printf 'x\n' >"$IVR/state/omarchy/theme"
+git -C "$IVR" add -A && git -C "$IVR" commit -qm one
+cat >"$IVH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"state","label":"State","mode":"copy","coupled":true,"critical":false,
+  "paths":["~/.local/state/omarchy"]}]}
+JSON
+mkdir -p "$IVH/home"
+HOME="$IVH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$IVH/g.json" \
+    OMABACKUP_STATE="$IVH/home/.state" OMABACKUP_REPO="$IVR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+IVART="$(ls -t "$IVH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+
+# The --into target has a LATER watermark than the backup; the CALLER's own
+# $HOME (this test process, no migrations dir at all) has none.
+IVINTO="$(mktemp -d)"
+mkdir -p "$IVINTO/.local/state/omarchy/migrations"
+touch "$IVINTO/.local/state/omarchy/migrations/1800000000.sh"
+IVOUT="$(OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$IVH/rstate" XDG_RUNTIME_DIR=/nonexistent \
+    "$OB" restore "$IVART" --into "$IVINTO" 2>&1)"
+
+it "the verdict reflects --into's target watermark, not the caller's own"
+assert_contains "$IVOUT" "2027-01-15"
+
+it "and the migration markers are held, matching that target's own state"
+assert_contains "$IVOUT" "held"
+
+# ── a find that fails reading migrations is not a fresh install ─────────────
+# `| tail -1` on that pipe, without pipefail, exits 0 whether find succeeded
+# or not -- tail on empty input is still success. A migrations directory that
+# EXISTS but could not be read defaulted to watermark 0, same as one that
+# never existed, and restore's compatibility gate read that as "fresh
+# install" and proceeded to apply coupled config against a state it could not
+# actually confirm.
+MRH="$(mktemp -d)"; MRRAW="$(_res_build "$MRH" '["4.*"]')"
+mkdir -p "$MRH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *migrations* ]] && exit 1; done\n'
+  printf 'exec %s "$@"\n' "$(command -v find)"
+} >"$MRH/stub/find"; chmod +x "$MRH/stub/find"
+MRTGT="$(mktemp -d)"; mkdir -p "$MRTGT/.local/state/omarchy/migrations"
+touch "$MRTGT/.local/state/omarchy/migrations/1900000000.sh"
+
+it "restore refuses rather than guess when it cannot read its own migrations"
+PATH="$MRH/stub:$PATH" HOME="$MRTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$MRH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$MRRAW" >/dev/null 2>&1 \
+    && fail "proceeded with a compatibility verdict it could not actually confirm" || ok
+
+# The absent-directory case -- a genuinely fresh install -- must still work.
+MRTGT2="$(mktemp -d)"
+
+it "a directory that legitimately does not exist yet still reads as watermark 0"
+PATH="$MRH/stub:$PATH" HOME="$MRTGT2" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$MRH/rstate2" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$MRRAW" >/dev/null 2>&1 \
+    && ok || fail "refused a restore onto a machine that has simply never migrated"
+
+# ── the forward-verdict marker exclusion applies to flat too, not tree alone ─
+# A manifest is free to declare a trackedRepoPath override for the migrations
+# directory itself, routing it through `flat` instead of `tree`. The shipped
+# manifest never does this, but nothing stops one from declaring it, and the
+# forward verdict's own promise -- "the markers do not apply" -- held for tree
+# and did not for flat.
+HFH="$(mktemp -d)"; HFR="$HFH/repo"
+mkdir -p "$HFR/mig-flat"
+git init -q "$HFR"; git -C "$HFR" config user.email t@t; git -C "$HFR" config user.name t
+printf 'old marker\n' >"$HFR/mig-flat/1700000000.sh"
+git -C "$HFR" add -A && git -C "$HFR" commit -qm one
+cat >"$HFH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"state","label":"State","mode":"copy","coupled":true,"critical":false,
+  "paths":[{"live":"~/.local/state/omarchy/migrations","trackedRepoPath":"mig-flat"}]}]}
+JSON
+mkdir -p "$HFH/home"
+HOME="$HFH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$HFH/g.json" \
+    OMABACKUP_STATE="$HFH/home/.state" OMABACKUP_REPO="$HFR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+HFART="$(ls -t "$HFH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+HFTGT="$(mktemp -d)"; mkdir -p "$HFTGT/.local/state/omarchy/migrations"
+touch "$HFTGT/.local/state/omarchy/migrations/1900000000.sh"
+HFPLAN="$(_res_run "$HFTGT" "$HFH/rstate" "$HFART")"
+
+it "a migrations marker routed through a flat mapping is held too, on forward"
+assert_contains "$HFPLAN" "held"
+
+it "and not counted as something that would be restored"
+assert_contains "$HFPLAN" "0 files would be restored"
+
+_res_run "$HFTGT" "$HFH/rstate" "$HFART" --apply >/dev/null 2>&1
+
+it "and --apply really does not write the old marker back, through flat either"
+[[ ! -e "$HFTGT/.local/state/omarchy/migrations/1700000000.sh" ]] \
+    && ok || fail "restored an old migration marker through a flat mapping on a forward move"

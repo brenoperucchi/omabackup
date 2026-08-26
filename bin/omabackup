@@ -338,11 +338,32 @@ probe_link_integrity() {
 }
 
 omarchy_identity() {
-    local v c m
+    local v c m mdir
     v="$(omarchy-version 2>/dev/null || echo unknown)"
     c="$(omarchy-channel-current 2>/dev/null || echo unknown)"
-    m="$(find "$HOME/.local/state/omarchy/migrations" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null \
-         | sed 's/\.sh$//' | sort -n | tail -1)"
+    mdir="$HOME/.local/state/omarchy/migrations"
+    if [[ ! -d "$mdir" ]]; then
+        # Legitimately nothing: a fresh install has not migrated at all yet,
+        # and the directory does not exist until the first migration runs.
+        # This is the "behind" case restore's verdict is built to handle.
+        m=0
+    else
+        # The directory exists, so a find failure here means something else
+        # went wrong reading it -- and `| tail -1` on a pipe with no pipefail
+        # would have swallowed that: tail on empty input exits 0 same as it
+        # would on a real answer, and the caller could not tell "no
+        # migrations" from "could not check." Distinguished with a sentinel
+        # no valid migration timestamp can equal, rather than defaulting to
+        # 0 -- which restore's compatibility gate would have read as a fresh
+        # install and applied coupled config against.
+        local _had_pf=0; [[ -o pipefail ]] && _had_pf=1
+        set -o pipefail
+        m="$(find "$mdir" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null \
+             | sed 's/\.sh$//' | sort -n | tail -1)"
+        local mrc=$?
+        (( _had_pf )) || set +o pipefail
+        (( mrc == 0 )) || m=unreadable
+    fi
     printf '%s\t%s\t%s' "$v" "$c" "${m:-0}"
 }
 
@@ -1373,10 +1394,29 @@ cmd_restore() {
         || { rm -rf "$x"; die "this artifact does not verify -- refusing to restore from it"; }
     [[ -f "$x/manifest.json" ]] || { rm -rf "$x"; die "no manifest in $(_tilde "$artifact")"; }
 
-    # The verdict is about THIS machine, so it is taken before --into moves the
-    # destination anywhere.
+    # --into first, THEN the verdict. omarchy_identity reads
+    # $HOME/.local/state/omarchy/migrations, and the compatibility question the
+    # verdict answers is about wherever the restore actually lands -- not
+    # about whichever machine happens to be running this command. Computing it
+    # before --into moved $HOME evaluated a --into restore against the
+    # OPERATOR's own migration state while writing the files somewhere else
+    # entirely, so a same/behind/forward call rested on state the target
+    # never had anything to do with. version and channel remain the real
+    # machine's -- omarchy-version/omarchy-channel-current are system
+    # commands, not $HOME-relative, so --into cannot simulate a different
+    # Omarchy install, only a different destination for one.
+    local HOME="${into:-$HOME}"
+    [[ -z "$into" ]] || mkdir -p "$into" || { rm -rf "$x"; die "could not make $(_tilde "$into")"; }
+
     local verdict why
-    IFS=$'\t' read -r verdict why <<<"$(_restore_verdict "$x/manifest.json")"
+    # Captured before parsing, not <<<"$(...)" directly -- that loses
+    # _restore_verdict's own exit status, and it now has one worth keeping:
+    # it refuses outright when this machine's migration state could not be
+    # read at all, rather than silently treating "could not check" the same
+    # as "fresh install."
+    local vout; vout="$(_restore_verdict "$x/manifest.json")" \
+        || { rm -rf "$x"; die "could not determine this machine's own migration state -- refusing to judge compatibility blind"; }
+    IFS=$'\t' read -r verdict why <<<"$vout"
 
     # Described by the manifest that made it. A restore driven by whatever
     # manifest this machine carries would look for groups the artefact never
@@ -1389,9 +1429,6 @@ cmd_restore() {
     local badg; badg="$(_assert_groups_filter_understood)" || {
         rm -rf "$x"; die "--groups names a group this artifact's manifest does not have: $badg"
     }
-
-    local HOME="${into:-$HOME}"
-    [[ -z "$into" ]] || mkdir -p "$into" || { rm -rf "$x"; die "could not make $(_tilde "$into")"; }
 
     local rows; rows="$(restore_rows "$x" "$verdict")" \
         || { rm -rf "$x"; die "could not plan against the artifact's own manifest"; }
@@ -1554,7 +1591,13 @@ cmd_restore() {
         printf '  %swhat was replaced is at %s%s\n' "$DIM" "$(_tilde "$backup")" "$NC"
     fi
     rm -rf "$x"
-    (( bad == 0 && qbad == 0 ))
+    # escape and ambiguous were counted before the split and shown in both the
+    # plan and (since the round that added this) the apply summary, but never
+    # factored into the exit status -- a restore where every single row was
+    # refused as escape or ambiguous still exited 0, "restored 0 files," which
+    # to anything scripted against this command reads identically to an
+    # artifact that genuinely had nothing to restore.
+    (( bad == 0 && qbad == 0 && nesc == 0 && na == 0 ))
 }
 
 cmd_status() {

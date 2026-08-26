@@ -189,11 +189,12 @@ bundle_cache_path() {
 }
 
 # build_bundle <repo> <cache_dir>
-# Content-addressed by HEAD: the same commit yields the same artifact, so a
-# timer that fires with nothing new to say does no NEW work -- a cache hit
-# still re-runs verify_bundle on what is already there (0.165s measured, on a
-# 336K bundle with 31 commits) rather than trusting that its mere presence at
-# the key means it is whole. Prints "<path>\t<reused|built>".
+# Content-addressed, via bundle_cache_path -- HEAD, the tool's own fingerprint,
+# every ref, and the manifest's hash, not HEAD alone -- so a timer that fires
+# with nothing new to say does no NEW work. A cache hit still re-runs
+# verify_bundle on what is already there (0.165s measured, on a 336K bundle
+# with 31 commits) rather than trusting that its mere presence at the key
+# means it is whole. Prints "<path>\t<reused|built>".
 build_bundle() {
     local repo="$1" cache="$2" head stage out
     head="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || return 1
