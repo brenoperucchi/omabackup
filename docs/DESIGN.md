@@ -701,3 +701,54 @@ disposable test process instead of the desktop.
 
 Practical fallout: do not set `XDG_RUNTIME_DIR` to a nonexistent path when
 driving quickshell for testing, isolated harness or not.
+
+## 15. What `restore` trusts, and what it explicitly does not (2026-08-26)
+
+A PoC found that `restore`'s own verification step executed the artifact's
+embedded copy of the tool (`tool/bin/omabackup status --json`, run as part of
+proving the artifact restorable per §11.4) — with the operator's full
+privileges, in plan mode, before `--apply` and before any consent. An
+artifact under attacker control also computes its own `SHA256SUMS`, so it is
+self-consistent by construction; the checksum check earlier in the same
+function proved nothing about what that binary does when actually run.
+
+The fix (`_verify_extracted`, `lib/bundle.sh`) stops running the embedded
+binary on the `restore` path unconditionally, while keeping it on
+`build_bundle`'s own self-check — the one case where the content being
+proven "actually runs" is this machine's own just-built output, not
+something a `restore` was handed from elsewhere (another person's machine, a
+shared destination, a stranger's public dotfiles). Two independent design
+consultants converged on this as the right cut, over two alternatives:
+
+- **Real sandboxing** (`bwrap`) for the self-check itself was rejected as
+  the fix for this — it adds a system dependency not installed by default on
+  Omarchy, and an inherent tension (isolate it enough to be safe and you may
+  no longer be testing whether the tool works in a *real* restore). Tied
+  conceptually to §5.3's T3 stage instead, if a sandboxed execution check is
+  ever wanted.
+- **Signed artifacts** (`ssh-keygen -Y sign/verify`) were considered as a way
+  to re-enable running the embedded tool for artifacts whose provenance
+  checks out, and explicitly rejected for that purpose: a valid signature
+  authenticates *bytes*, not what those bytes do once executed, and cannot
+  detect a compromised or careless *build* machine that signed something
+  genuinely bad. It also does not solve trivially — the natural instinct to
+  commit the public key/`allowed-signers` file into the same dotfiles repo
+  the artifact backs up is circular: an attacker who controls that repo
+  copy can swap in their own key and self-sign, and the artifact's own
+  `repo.bundle`/`worktree` come from that same artifact. A trust anchor has
+  to live outside anything the artifact or its source repo can supply.
+  Opt-in provenance verification remains a plausible **separate** future
+  project, scoped with an anchor kept off the backed-up path (e.g.
+  machine-local config, confirmed by the user through an independent
+  channel), never a path back to running artifact-supplied code.
+
+**What this does not close.** `restore --apply` still writes dotfile content
+that is itself executable — `.bashrc`, Hyprland `.lua` configs, scripts
+under `~/.local/bin` — because writing those files back is the entire point
+of a restore. No provenance or verification scheme changes that: an
+artifact whose *files* are malicious, as opposed to whose embedded *tool
+binary* is malicious, is restored faithfully, exactly as asked. This is not
+an oversight; it is what `--apply` means. The boundary this section's fix
+draws is narrower and specific: `omabackup` itself, checking whether an
+artifact is restorable, never hands the artifact's own code the operator's
+privileges to find out.
