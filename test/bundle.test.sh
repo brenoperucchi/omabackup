@@ -348,3 +348,30 @@ _tz_pipe; [[ $? -ne 0 ]] && ok || fail "pipefail did not surface tar's own failu
 # and the actual `push` command -- _push_dir depends on too much of
 # bin/omabackup's own helpers (dest_field, _hostname, the destinations state
 # machinery) to stub correctly in isolation here.
+
+# ── "reused" means genuinely reused, not "a file existed at the key" ────────
+# reused was decided from the cache path's existence BEFORE build_bundle ran;
+# the corruption check happens INSIDE it. A cache entry a prior crash left
+# truncated was detected, deleted and rebuilt from scratch by build_bundle,
+# and the outer check -- which only knows a file was there when it looked --
+# still reported reused:true and printed "reused ... (verified restorable)",
+# exactly when a human most wants to be told it had to rebuild.
+RUH="$(mktemp -d)"; RUR="$RUH/repo"; RUC="$RUH/home/.state/bundles"
+git init -q "$RUR" 2>/dev/null; printf 'x\n' >"$RUR/a"
+git -C "$RUR" add a 2>/dev/null
+git -C "$RUR" -c user.email=t@t -c user.name=t commit -q -m ok 2>/dev/null
+RUKEY="$(OMABACKUP_ROOT="$PWD" GROUPS_FILE="$PWD/groups.default.json" bash -c '
+    source lib/bundle.sh; bundle_cache_path "$1" "$2"' _ "$RUR" "$RUC" 2>/dev/null)"
+mkdir -p "$RUC"; printf 'garbage, not a real bundle\n' >"$RUKEY"
+RUOUT="$(HOME="$RUH/home" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$RUH/home/.state" OMABACKUP_REPO="$RUR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle --json 2>/dev/null)"
+
+it "rebuilding past a corrupted cache entry is reported as built, not reused"
+assert_eq "$(printf '%s' "$RUOUT" | jq -r '.reused')" "false"
+
+it "and a genuine cache hit the second time really is reused"
+RUOUT2="$(HOME="$RUH/home" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$RUH/home/.state" OMABACKUP_REPO="$RUR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle --json 2>/dev/null)"
+assert_eq "$(printf '%s' "$RUOUT2" | jq -r '.reused')" "true"

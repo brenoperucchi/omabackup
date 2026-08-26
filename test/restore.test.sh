@@ -595,3 +595,43 @@ R7ONLYOUT="$(HOME="$(mktemp -d)" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$R7ONLY
 
 it "restore --groups is validated against the ARTIFACT's manifest, not this machine's"
 assert_contains "$R7ONLYOUT" "alacritty.toml"
+
+# ── the common case: a plugins group with no dirty plugin, ever ─────────────
+# patches/omarchy-plugins only exists once some plugin has been patched --
+# most repos never have one. Without a directory-existence guard matching the
+# other two find call sites, find on a directory that legitimately does not
+# exist exits 1 exactly like one it could not read, and the fix above for a
+# real find failure could not tell the two apart: it killed restore's plan for
+# every artifact that never had a dirty plugin, blaming the manifest for a
+# directory that was never supposed to exist. This is what the fail-closed
+# spec above could not catch on its own -- a missing directory is the SAME
+# input as the stub that simulates a broken one, so a spec proving the refusal
+# without also proving the ordinary case passes cannot tell which one it
+# actually pinned.
+PLNH="$(mktemp -d)"; PLNR="$PLNH/repo"
+mkdir -p "$PLNR/configs/omarchy/plugins/some-plugin"
+git init -q "$PLNR"; git -C "$PLNR" config user.email t@t; git -C "$PLNR" config user.name t
+printf 'x\n' >"$PLNR/configs/omarchy/plugins/some-plugin/init.lua"
+git -C "$PLNR" add -A && git -C "$PLNR" commit -qm one
+cat >"$PLNH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"plugins","label":"Plugins","mode":"triple","coupled":true,"critical":true,
+  "paths":["~/.config/omarchy/plugins"]}]}
+JSON
+mkdir -p "$PLNH/home"
+HOME="$PLNH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$PLNH/g.json" \
+    OMABACKUP_STATE="$PLNH/home/.state" OMABACKUP_REPO="$PLNR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+PLNART="$(ls -t "$PLNH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+PLNTGT="$(mktemp -d)"
+PLNPLAN="$(_res_run "$PLNTGT" "$PLNH/rstate" "$PLNART")"
+
+it "a plugins group with no patches directory at all still plans normally"
+assert_contains "$PLNPLAN" "would be restored"
+
+it "and does not die claiming the manifest is unreadable"
+[[ "$PLNPLAN" != *"could not plan"* ]] \
+    && ok || fail "refused to plan over a directory that was never supposed to exist: $PLNPLAN"
+
+it "the local plugin tree itself is still offered"
+assert_contains "$PLNPLAN" "init.lua"

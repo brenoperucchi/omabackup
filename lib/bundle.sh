@@ -190,7 +190,10 @@ bundle_cache_path() {
 
 # build_bundle <repo> <cache_dir>
 # Content-addressed by HEAD: the same commit yields the same artifact, so a
-# timer that fires with nothing new to say does no work. Prints the path.
+# timer that fires with nothing new to say does no NEW work -- a cache hit
+# still re-runs verify_bundle on what is already there (0.165s measured, on a
+# 336K bundle with 31 commits) rather than trusting that its mere presence at
+# the key means it is whole. Prints "<path>\t<reused|built>".
 build_bundle() {
     local repo="$1" cache="$2" head stage out
     head="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || return 1
@@ -205,7 +208,7 @@ build_bundle() {
     # a truncated file at the exact cache key a later run would compute, was
     # served as though it were whole every time after, never re-checked again.
     if [[ -f "$out" ]]; then
-        verify_bundle "$out" && { printf '%s' "$out"; return 0; }
+        verify_bundle "$out" && { printf '%s\treused' "$out"; return 0; }
         printf 'omabackup: the cached bundle at %s failed its own restore check -- rebuilding\n' \
             "$(_tilde "$out")" >&2
         rm -f "$out"
@@ -276,7 +279,7 @@ build_bundle() {
         printf 'omabackup: the bundle did not survive its own restore check\n' >&2
         return 1
     fi
-    printf '%s' "$out"
+    printf '%s\tbuilt' "$out"
 }
 
 # verify_bundle <path>

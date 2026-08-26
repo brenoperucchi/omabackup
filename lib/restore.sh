@@ -292,11 +292,22 @@ restore_rows() {
         if [[ "$gm" == triple ]]; then
             [[ -f "$wt/lists/omarchy-plugins.txt" ]] \
                 && printf 'report\t%s\tlists/omarchy-plugins.txt\t-\n' "$id"
-            while IFS= read -r -d '' f; do
-                rel="${f#"$wt"/}"
-                printf 'report\t%s\t%s\t-\n' "$id" "$rel"
-            done < <(find "$wt/patches/omarchy-plugins" -maxdepth 1 -type f -name '*.patch' -print0 2>/dev/null)
-            wait "$!" || return 1
+            # Guarded like the other two find call sites -- patches/omarchy-
+            # plugins only exists at all once some plugin has been patched,
+            # which is not the common case. Without the guard, find on a
+            # directory that legitimately does not exist exits 1 same as it
+            # would on one it could not read, and wait "$!" || return 1 could
+            # not tell "nothing here" from "something went wrong": it killed
+            # restore's own plan for every artifact that never had a dirty
+            # plugin, blaming the manifest for a directory that was never
+            # supposed to exist in the first place.
+            if [[ -d "$wt/patches/omarchy-plugins" ]]; then
+                while IFS= read -r -d '' f; do
+                    rel="${f#"$wt"/}"
+                    printf 'report\t%s\t%s\t-\n' "$id" "$rel"
+                done < <(find "$wt/patches/omarchy-plugins" -maxdepth 1 -type f -name '*.patch' -print0 2>/dev/null)
+                wait "$!" || return 1
+            fi
         fi
     done < <(groups_ids)
 }

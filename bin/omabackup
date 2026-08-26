@@ -1243,9 +1243,19 @@ cmd_bundle() {
     local cache="$OMABACKUP_STATE/bundles"
     # §11.4 is checked inside build_bundle now, so `push` gets the same proof
     # rather than only whoever typed `bundle`.
-    [[ -f "$(bundle_cache_path "$repo" "$cache" 2>/dev/null)" ]] && reused=1
-    path="$(build_bundle "$repo" "$cache")" \
+    #
+    # Whether it was reused comes back FROM build_bundle now, not from
+    # checking the cache path's existence before the call. A file already
+    # sitting there is not the same as one build_bundle actually trusted: a
+    # corrupted cache entry is detected, deleted and rebuilt from inside that
+    # same call, and the existence check alone could not tell the two apart --
+    # "reused" and "verified restorable" were both printed for a run that had
+    # in fact just rebuilt the thing from scratch, in exactly the case where a
+    # human most wants to know that it did.
+    local outcome
+    outcome="$(build_bundle "$repo" "$cache")" \
         || die "could not build a verifiable bundle from $(_tilde "$repo")"
+    path="${outcome%$'\t'*}"; [[ "${outcome##*$'\t'}" == reused ]] && reused=1
 
     if (( JSON )); then
         jq -n --arg p "$path" --arg n "$(bundle_name "$repo")" \
@@ -1295,9 +1305,12 @@ cmd_push() {
     (( ${#targets[@]} )) || { printf '  %sno destinations configured%s\n' "$DIM" "$NC"; return 0; }
 
     # Built once and shared: content-addressed, so a tick with no new commit
-    # reuses it and every destination receives the identical artifact.
+    # reuses it and every destination receives the identical artifact. push
+    # only needs the path; the reused/built flag build_bundle now also
+    # returns is cmd_bundle's to report.
     bundle="$(build_bundle "$repo" "$OMABACKUP_STATE/bundles")" \
         || die "could not build a bundle from $(_tilde "$repo")"
+    bundle="${bundle%$'\t'*}"
     name="$(bundle_name "$repo")"
 
     for id in "${targets[@]}"; do
