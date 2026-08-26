@@ -26,5 +26,7 @@ alive in sibling panes of the same workspace right now — not hypothetical,
 nothing to set up. When you finish a reviewable unit of work, use the
 `herdr-review` skill to dispatch a blind, parallel review round to both and
 resolve their findings (CONFIRMED/UNIQUE/CONFLICT) before considering the
-work done. Requires `HERDR_ENV=1`; if that's unset, you're not in a
-Herdr-managed pane and none of this applies.
+work done. The same pair can also weigh in on an open design question
+*before* you build something — see the `herdr-ask` skill for that case.
+Requires `HERDR_ENV=1`; if that's unset, you're not in a Herdr-managed pane
+and none of this applies.
