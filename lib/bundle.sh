@@ -299,16 +299,36 @@ build_bundle() {
 # §11.4 as a check rather than a claim: extract, clone, compare both halves,
 # confirm the checksums and run the embedded tool. Offline throughout, because
 # cloning from a .bundle file is offline by definition.
-# _verify_extracted <already-extracted-dir>
-# The checks alone, over a directory the caller extracted and owns. Split out
-# of verify_bundle so a caller that needs the content afterward -- restore is
-# the one that does -- extracts once and verifies THAT directory, rather than
+# _verify_extracted <already-extracted-dir> <run-embedded:0|1>
+# The checks over a directory the caller extracted and owns. Split out of
+# verify_bundle so a caller that needs the content afterward -- restore is the
+# one that does -- extracts once and verifies THAT directory, rather than
 # trusting a verify done on a separate extraction of the same artifact file a
 # moment earlier. Between two extractions the file on disk can change; a
 # restore acting on the second one would then be acting on something the first
 # one never actually checked.
+#
+# <run-embedded> is required, not optional with a default -- a PoC confirmed
+# that running the artifact's own tool/bin/omabackup as a "does it work"
+# self-check executes arbitrary code with the caller's full privileges, since
+# an artifact under attacker control also controls its own SHA256SUMS: it is
+# self-consistent by construction, so the checksum check earlier in this same
+# function proves nothing about what that binary will do when run. That is
+# safe for build_bundle, which verifies output it JUST built on this machine
+# from its own repo. It is not safe for restore, which may be handed an
+# artifact from anywhere -- another person's machine, a shared destination, a
+# stranger's public dotfiles someone is trying to bootstrap from. The PoC's
+# script ran in PLAN mode, before --apply, before any consent, contradicting
+# the "nothing was written" this command prints in that mode.
+#
+# A parameter with a default value would have made the SAFE choice the one a
+# careless third caller gets by omission -- exactly the shape of bug this
+# project keeps finding in itself ("the half that checks and the half that
+# packs were reading two repositories," review 4k). ${2?...} makes bash itself
+# refuse to run this function at all without an explicit answer.
 _verify_extracted() {
-    local x="$1" clone rc=0
+    local x="$1" run_embedded="${2?_verify_extracted requires an explicit run-embedded argument (0 or 1)}"
+    local clone rc=0
     [[ -d "$x" ]] || return 1
 
     ( cd "$x" && sha256sum -c --quiet SHA256SUMS >/dev/null 2>&1 ) || rc=1
@@ -325,19 +345,24 @@ _verify_extracted() {
         diff -r --no-dereference --exclude=.git "$clone" "$x/worktree" >/dev/null 2>&1 || rc=1
     fi
 
-    OMABACKUP_ROOT="$x/tool" OMABACKUP_GROUPS="$x/tool/groups.default.json" \
-        OMABACKUP_STATE="$x/.state" XDG_RUNTIME_DIR=/nonexistent \
-        bash "$x/tool/bin/omabackup" status --json >/dev/null 2>&1 || rc=1
+    if (( run_embedded )); then
+        OMABACKUP_ROOT="$x/tool" OMABACKUP_GROUPS="$x/tool/groups.default.json" \
+            OMABACKUP_STATE="$x/.state" XDG_RUNTIME_DIR=/nonexistent \
+            bash "$x/tool/bin/omabackup" status --json >/dev/null 2>&1 || rc=1
+    fi
 
     rm -rf "$clone"
     return $rc
 }
 
+# Called only from build_bundle's own self-check, right after creating an
+# artifact on THIS machine from THIS repo -- trusted by construction, and the
+# one case where "does the embedded tool actually run" is worth proving.
 verify_bundle() {
     local path="$1" x rc
     x="$(mktemp -d)" || return 1
     tar -C "$x" -xf <(zstd -dc "$path" 2>/dev/null) 2>/dev/null || { rm -rf "$x"; return 1; }
-    _verify_extracted "$x"; rc=$?
+    _verify_extracted "$x" 1; rc=$?
     rm -rf "$x"
     return $rc
 }

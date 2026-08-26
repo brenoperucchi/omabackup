@@ -923,3 +923,66 @@ PATH="$BUH/stub:$PATH" HOME="$BUH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="
     OMABACKUP_STATE="$BUH/home/.state" OMABACKUP_REPO="$BUR" XDG_RUNTIME_DIR=/nonexistent \
     "$OB" bundle >/dev/null 2>&1 \
     && fail "built a bundle nobody could ever restore with confidence" || ok
+
+# ── restore never executes the artifact's own embedded tool ─────────────────
+# _verify_extracted used to run tool/bin/omabackup status --json as part of
+# proving an artifact restorable -- including on restore, where the artifact
+# is not necessarily this machine's own trusted output. A PoC confirmed that
+# an artifact whose SHA256SUMS is self-consistent (trivial: the attacker who
+# builds the artifact also computes its checksums) can replace that binary
+# with anything and have it run with the operator's full privileges, even in
+# plan mode, before --apply and before any consent. This proves the specific
+# fix: restore no longer runs that binary at all, signed or not, apply or
+# plan -- it only checks data (SHA256SUMS, the git-bundle-vs-worktree diff).
+MXH="$(mktemp -d)"; MXRAW="$(_res_build "$MXH" '["4.*"]')"
+MXX="$(mktemp -d)"; tar -C "$MXX" -xf <(zstd -dc "$MXRAW")
+MXMARK="$MXH/pwned"
+cat >"$MXX/tool/bin/omabackup" <<EOF
+#!/bin/bash
+echo pwned >"$MXMARK"
+echo '{}'
+EOF
+chmod +x "$MXX/tool/bin/omabackup"
+( cd "$MXX" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+MXART="$MXH/malicious.tar.zst"
+tar -C "$MXX" -cf - . | zstd -q -19 -T0 -o "$MXART"
+
+it "a malicious embedded tool does not run during a restore plan"
+MXTGT="$(mktemp -d)"
+_res_run "$MXTGT" "$MXH/rstate" "$MXART" >/dev/null 2>&1
+[[ ! -e "$MXMARK" ]] && ok || fail "the artifact's own binary ran during plan mode"
+
+it "and does not run during --apply either"
+_res_run "$MXTGT" "$MXH/rstate2" "$MXART" --apply >/dev/null 2>&1
+[[ ! -e "$MXMARK" ]] && ok || fail "the artifact's own binary ran during --apply"
+
+# ── build_bundle still self-checks its own freshly-built output ─────────────
+# The embedded-tool self-check stays for build_bundle: it verifies output it
+# JUST built, on this machine, from this machine's own repo -- there is no
+# untrusted party in that path, and it is the one place actually proving the
+# embedded copy runs. A tool broken in a way SHA256SUMS cannot see (it is
+# computed from the very files being checked, so a break introduced before
+# publish is self-consistent too) must still fail the build.
+BEH="$(mktemp -d)"; BER="$BEH/repo"
+mkdir -p "$BER/configs/app"
+git init -q "$BER"; git -C "$BER" config user.email t@t; git -C "$BER" config user.name t
+printf 'x\n' >"$BER/configs/app/f.txt"
+git -C "$BER" add -A && git -C "$BER" commit -qm one
+mkdir -p "$BEH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == status ]] && exit 1; done\n'
+  printf 'exec %s "$@"\n' "$OB"
+} >"$BEH/stub/omabackup"; chmod +x "$BEH/stub/omabackup"
+BESTAGE="$(mktemp -d)"
+mkdir -p "$BESTAGE/bin" "$BESTAGE/lib"
+cp -r "$PWD/lib/." "$BESTAGE/lib/"
+cp "$PWD/groups.default.json" "$PWD/secrets.deny.json" "$BESTAGE/" 2>/dev/null
+cp "$BEH/stub/omabackup" "$BESTAGE/bin/omabackup"
+chmod +x "$BESTAGE/bin/omabackup"
+
+it "build_bundle still fails when its own embedded tool is broken"
+mkdir -p "$BEH/home"
+HOME="$BEH/home" OMABACKUP_ROOT="$BESTAGE" OMABACKUP_GROUPS="$BESTAGE/groups.default.json" \
+    OMABACKUP_STATE="$BEH/home/.state" OMABACKUP_REPO="$BER" XDG_RUNTIME_DIR=/nonexistent \
+    "$BESTAGE/bin/omabackup" bundle >/dev/null 2>&1 \
+    && fail "built and accepted a bundle whose own embedded tool cannot run" || ok

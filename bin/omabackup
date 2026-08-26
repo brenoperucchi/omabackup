@@ -1390,7 +1390,13 @@ cmd_restore() {
     printf '  %schecking the artifact%s\n' "$DIM" "$NC" >&2
     tar -C "$x" -xf <(zstd -dc "$artifact" 2>/dev/null) 2>/dev/null \
         || { rm -rf "$x"; die "could not extract $(_tilde "$artifact")"; }
-    _verify_extracted "$x" >/dev/null 2>&1 \
+    # 0: never run the artifact's own tool/bin/omabackup here. A PoC confirmed
+    # that a crafted artifact can replace that binary and have it execute --
+    # with the operator's full privileges, in plan mode, before any --apply --
+    # since the artifact also controls its own SHA256SUMS and is therefore
+    # self-consistent by construction. Data checks (checksums, git-bundle vs
+    # worktree diff) still run; only the embedded-tool self-check is skipped.
+    _verify_extracted "$x" 0 >/dev/null 2>&1 \
         || { rm -rf "$x"; die "this artifact does not verify -- refusing to restore from it"; }
     [[ -f "$x/manifest.json" ]] || { rm -rf "$x"; die "no manifest in $(_tilde "$artifact")"; }
 
