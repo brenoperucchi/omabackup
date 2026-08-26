@@ -1,5 +1,7 @@
 /staging/
 *.tmp
 
-# herdr review-cycle: estado efemero de rodada, reviewer.md fica versionado
-.herdr/review/
+# herdr review-cycle: estado efemero (rodadas de review/ask, handoffs) -
+# reviewer.md fica versionado
+.herdr/*
+!.herdr/reviewer.md
