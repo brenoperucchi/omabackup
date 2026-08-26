@@ -897,6 +897,14 @@ it "a backup whose own watermark was unreadable at build time is refused"
 _res_run "$UBTGT" "$UBH/rstate" "$UBART" >/dev/null 2>&1 \
     && fail "proceeded with a compatibility verdict the backup itself never had" || ok
 
+# _restore_verdict returns 1 for THIS machine's state, 2 for the ARTIFACT's --
+# the same distinction _restore_repo_prefix already draws for a different
+# question. One shared message named only the machine, so a perfectly healthy
+# machine restoring an old, tainted artifact was told to go investigate
+# itself.
+it "and the refusal names the artifact, not a healthy machine"
+assert_contains "$(_res_run "$UBTGT" "$UBH/rstate" "$UBART")" "artifact's own migration state"
+
 # ── and build_bundle refuses to produce one in the first place ──────────────
 BUH="$(mktemp -d)"; BUR="$BUH/repo"
 mkdir -p "$BUR/configs/app"

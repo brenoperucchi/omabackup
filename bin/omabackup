@@ -1417,11 +1417,20 @@ cmd_restore() {
     local verdict why
     # Captured before parsing, not <<<"$(...)" directly -- that loses
     # _restore_verdict's own exit status, and it now has one worth keeping:
-    # it refuses outright when this machine's migration state could not be
+    # it refuses outright when either side's migration state could not be
     # read at all, rather than silently treating "could not check" the same
-    # as "fresh install."
-    local vout; vout="$(_restore_verdict "$x/manifest.json")" \
-        || { rm -rf "$x"; die "could not determine this machine's own migration state -- refusing to judge compatibility blind"; }
+    # as "fresh install." Two distinct statuses, not one message for both:
+    # this machine's own state (1) and the artifact's, read from its manifest
+    # (2), are different things to go fix -- a single "could not determine
+    # this machine's" message sent someone to investigate a perfectly healthy
+    # machine when an old artifact, built before this check existed, was what
+    # actually needed rebuilding.
+    local vout vrc; vout="$(_restore_verdict "$x/manifest.json")"; vrc=$?
+    if (( vrc == 1 )); then
+        rm -rf "$x"; die "could not determine this machine's own migration state -- refusing to judge compatibility blind"
+    elif (( vrc == 2 )); then
+        rm -rf "$x"; die "this artifact's own migration state could not be confirmed when it was built -- rebuild it on a healthy machine"
+    fi
     IFS=$'\t' read -r verdict why <<<"$vout"
 
     local HOME="${into:-$HOME}"

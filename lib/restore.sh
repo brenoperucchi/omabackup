@@ -78,8 +78,13 @@ _restore_verdict() {
     # migration state was never actually known to anyone. build_bundle
     # refuses on this now too (lib/bundle.sh), so a NEW bundle cannot carry
     # it -- this guards artifacts already built before that existed.
+    # Two distinct returns, matching the pattern this file already uses in
+    # _restore_repo_prefix for the same reason: 1 for "this machine's own
+    # state," 2 for "the artifact's" -- the caller could not tell them apart
+    # otherwise, and told the user to go investigate their own perfectly
+    # healthy machine when an old artifact was what actually needed rebuilding.
     [[ "$tm" == unreadable ]] && return 1
-    [[ "$bm" == unreadable ]] && return 1
+    [[ "$bm" == unreadable ]] && return 2
     [[ "$bm" =~ ^[0-9]+$ ]] || bm=0
     [[ "$tm" =~ ^[0-9]+$ ]] || tm=0
     if (( tm == bm )); then

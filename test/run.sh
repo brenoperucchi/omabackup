@@ -3,6 +3,18 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# Specs never clean up their own `mktemp -d` fixtures -- 216 calls across the
+# suite, zero of them removed. Scoped to a throwaway TMPDIR and torn down on
+# exit instead of leaking into the shared /tmp forever: a full run left ~20k
+# orphaned directories behind, enough to exhaust /tmp's INODE table on a
+# tmpfs long before its byte capacity, which stopped the harness itself from
+# writing anywhere. A spec that names /tmp directly still escapes this -- a
+# handful do -- but the overwhelming majority are ordinary `mktemp -d` calls
+# with no opinion about where, and this is where.
+TMPDIR="$(mktemp -d)"
+export TMPDIR
+trap 'rm -rf "$TMPDIR"' EXIT
+
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; DIM=$'\033[2m'; NC=$'\033[0m'
 PASS=0; FAIL=0; CURRENT=""
 
