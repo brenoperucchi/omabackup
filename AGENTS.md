@@ -17,3 +17,14 @@ them, not by default.
 - `~/Devs/omarchy-personal` is the user's actual dotfiles — private, and is
   `OMABACKUP_REPO`. OmaBackup's own code never belongs there.
 - Update `docs/PLAN.md` before ending a session — see its own header.
+
+## Reviewer colleagues
+
+If you're running as `omabackup-exec` inside a Herdr workspace, `omabackup-rev`
+(Codex) and `omabackup-rev-2` (Claude Opus) are two independent reviewers
+alive in sibling panes of the same workspace right now — not hypothetical,
+nothing to set up. When you finish a reviewable unit of work, use the
+`herdr-review` skill to dispatch a blind, parallel review round to both and
+resolve their findings (CONFIRMED/UNIQUE/CONFLICT) before considering the
+work done. Requires `HERDR_ENV=1`; if that's unset, you're not in a
+Herdr-managed pane and none of this applies.
