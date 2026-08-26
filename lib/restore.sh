@@ -69,10 +69,17 @@ _restore_verdict() {
     fi
     # "unreadable" (from omarchy_identity) means the migrations directory
     # exists but could not be scanned -- a real machine problem, not "no
-    # migrations yet." Defaulting that to 0 the same way an absent directory
-    # legitimately does would have read as a fresh install and applied coupled
-    # config against a watermark this machine could not actually confirm.
+    # migrations yet." Checked on tm AND bm: bm carries the same sentinel
+    # when the backup was built by a machine that hit it, and checking only
+    # the live side left that half open -- a bundle built while unreadable
+    # shipped with migrationWatermark: "unreadable" baked into its manifest,
+    # and this same regex-fallback defaulted it exactly like an old bundle
+    # predating the field, applying coupled config against a backup whose
+    # migration state was never actually known to anyone. build_bundle
+    # refuses on this now too (lib/bundle.sh), so a NEW bundle cannot carry
+    # it -- this guards artifacts already built before that existed.
     [[ "$tm" == unreadable ]] && return 1
+    [[ "$bm" == unreadable ]] && return 1
     [[ "$bm" =~ ^[0-9]+$ ]] || bm=0
     [[ "$tm" =~ ^[0-9]+$ ]] || tm=0
     if (( tm == bm )); then

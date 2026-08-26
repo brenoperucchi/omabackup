@@ -64,6 +64,18 @@ _tool_fingerprint() {
 _bundle_manifest() {
     local repo="$1" stage="$2" dirty ov oc om
     IFS=$'\t' read -r ov oc om <<<"$(omarchy_identity)"
+    # Refused here, not merely defaulted at restore time. A bundle built while
+    # this machine could not confirm its own migration state would otherwise
+    # ship with migrationWatermark: "unreadable" baked in, silently -- and
+    # every future restore from it would inherit a compatibility question
+    # nobody could ever actually answer. Build time is the moment this is
+    # fixable (check the migrations directory); a restore months later, on a
+    # different machine, is not.
+    if [[ "$om" == unreadable ]]; then
+        printf 'omabackup: this machine'"'"'s own migration state could not be confirmed -- refusing to build a bundle nobody could ever restore with confidence\n' \
+            >&2
+        return 1
+    fi
     dirty="$(git -C "$repo" status --porcelain 2>/dev/null)"
 
     # verify's whole document, verbatim. A boolean does not serve: whoever

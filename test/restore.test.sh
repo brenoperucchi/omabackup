@@ -755,12 +755,18 @@ _res_run "$DCTGT" "$DCH/rstate" "$DCART" --apply >/dev/null 2>&1
 it "the live file is left exactly as it was"
 assert_eq "$(cat "$DCTGT/.config/shared/shared.conf" 2>/dev/null)" "my irreplaceable original"
 
-# ── the verdict is evaluated against --into's target, not the operator's home ─
-# omarchy_identity reads $HOME/.local/state/omarchy/migrations, and the verdict
-# was computed BEFORE --into moved $HOME -- so a --into restore was judged
-# against the OPERATOR's own migration state while the files landed somewhere
-# else entirely. A same/behind/forward call rested on state the target never
-# had anything to do with.
+# ── the verdict stays with the operator's real machine, --into or not ───────
+# version and channel are unavoidably the real machine's -- system commands,
+# not $HOME-relative -- so an earlier version computed the watermark from
+# --into's target to match them, reasoning the verdict is "about wherever the
+# restore lands." That broke the far more common use of --into worse than the
+# bug it fixed: --into pointed at an empty sandbox (no Omarchy footprint at
+# all, hence no migrations directory) read as watermark 0, the PERMISSIVE
+# "behind" case -- so previewing --apply against a scratch directory applied
+# MORE than a real restore onto the operator's own machine would have.
+# Reverted: all three -- version, channel, watermark -- come from the same
+# real machine regardless of --into, which is at least one consistent
+# identity instead of two machines' worth spliced together.
 IVH="$(mktemp -d)"; IVR="$IVH/repo"
 mkdir -p "$IVR/state/omarchy/migrations"
 git init -q "$IVR"; git -C "$IVR" config user.email t@t; git -C "$IVR" config user.name t
@@ -778,19 +784,30 @@ HOME="$IVH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$IVH/g.json" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
 IVART="$(ls -t "$IVH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
 
-# The --into target has a LATER watermark than the backup; the CALLER's own
-# $HOME (this test process, no migrations dir at all) has none.
+# The OPERATOR's own $HOME has a LATER watermark than the backup (forward,
+# markers held). --into's target has a watermark that would read "same" if it
+# were consulted instead -- if the verdict or the write followed --into's
+# state, this would diverge from the operator-only expectation below.
+IVOP="$(mktemp -d)"
+mkdir -p "$IVOP/.local/state/omarchy/migrations"
+touch "$IVOP/.local/state/omarchy/migrations/1800000000.sh"
 IVINTO="$(mktemp -d)"
 mkdir -p "$IVINTO/.local/state/omarchy/migrations"
-touch "$IVINTO/.local/state/omarchy/migrations/1800000000.sh"
-IVOUT="$(OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$IVH/rstate" XDG_RUNTIME_DIR=/nonexistent \
+touch "$IVINTO/.local/state/omarchy/migrations/1700000000.sh"
+IVOUT="$(HOME="$IVOP" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$IVH/rstate" XDG_RUNTIME_DIR=/nonexistent \
     "$OB" restore "$IVART" --into "$IVINTO" 2>&1)"
 
-it "the verdict reflects --into's target watermark, not the caller's own"
+it "the verdict reflects the operator's own watermark, not --into's target"
 assert_contains "$IVOUT" "2027-01-15"
 
-it "and the migration markers are held, matching that target's own state"
+it "and the migration markers are held, matching the OPERATOR's forward state"
 assert_contains "$IVOUT" "held"
+
+it "the file still lands inside --into's target, not the operator's real home"
+HOME="$IVOP" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$IVH/rstate2" XDG_RUNTIME_DIR=/nonexistent \
+    "$OB" restore "$IVART" --into "$IVINTO" --apply >/dev/null 2>&1
+[[ -f "$IVINTO/.local/state/omarchy/theme" && ! -f "$IVOP/.local/state/omarchy/theme" ]] \
+    && ok || fail "the write followed the wrong home"
 
 # ── a find that fails reading migrations is not a fresh install ─────────────
 # `| tail -1` on that pipe, without pipefail, exits 0 whether find succeeded
@@ -857,3 +874,44 @@ _res_run "$HFTGT" "$HFH/rstate" "$HFART" --apply >/dev/null 2>&1
 it "and --apply really does not write the old marker back, through flat either"
 [[ ! -e "$HFTGT/.local/state/omarchy/migrations/1700000000.sh" ]] \
     && ok || fail "restored an old migration marker through a flat mapping on a forward move"
+
+# ── a bundle built while unreadable ships with the sentinel baked in ────────
+# _restore_verdict checked the sentinel on tm (this machine, live) but not on
+# bm (the backup's recorded value, static) -- so a bundle built by a machine
+# that could not confirm its own migration state shipped with
+# migrationWatermark: "unreadable," and a later restore's [[ "$bm" =~
+# ^[0-9]+$ ]] || bm=0 defaulted it exactly like an old bundle predating the
+# field, applying coupled config against a backup whose migration state was
+# never known to anyone. build_bundle now refuses to build one in the first
+# place; this proves the read-time half for an artifact that predates that.
+UBH="$(mktemp -d)"; UBRAW="$(_res_build "$UBH" '["4.*"]')"
+UBX="$(mktemp -d)"; tar -C "$UBX" -xf <(zstd -dc "$UBRAW")
+jq '.omarchy.migrationWatermark = "unreadable"' "$UBX/manifest.json" >"$UBX/manifest.json.new"
+mv "$UBX/manifest.json.new" "$UBX/manifest.json"
+( cd "$UBX" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+UBART="$UBH/unreadable-watermark.tar.zst"
+tar -C "$UBX" -cf - . | zstd -q -19 -T0 -o "$UBART"
+UBTGT="$(mktemp -d)"
+
+it "a backup whose own watermark was unreadable at build time is refused"
+_res_run "$UBTGT" "$UBH/rstate" "$UBART" >/dev/null 2>&1 \
+    && fail "proceeded with a compatibility verdict the backup itself never had" || ok
+
+# ── and build_bundle refuses to produce one in the first place ──────────────
+BUH="$(mktemp -d)"; BUR="$BUH/repo"
+mkdir -p "$BUR/configs/app"
+git init -q "$BUR"; git -C "$BUR" config user.email t@t; git -C "$BUR" config user.name t
+printf 'x\n' >"$BUR/configs/app/f.txt"
+git -C "$BUR" add -A && git -C "$BUR" commit -qm one
+mkdir -p "$BUH/home/.local/state/omarchy/migrations"
+mkdir -p "$BUH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *migrations* ]] && exit 1; done\n'
+  printf 'exec %s "$@"\n' "$(command -v find)"
+} >"$BUH/stub/find"; chmod +x "$BUH/stub/find"
+
+it "build_bundle refuses to build while this machine's watermark is unreadable"
+PATH="$BUH/stub:$PATH" HOME="$BUH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$BUH/home/.state" OMABACKUP_REPO="$BUR" XDG_RUNTIME_DIR=/nonexistent \
+    "$OB" bundle >/dev/null 2>&1 \
+    && fail "built a bundle nobody could ever restore with confidence" || ok

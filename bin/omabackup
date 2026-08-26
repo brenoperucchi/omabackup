@@ -1394,20 +1394,26 @@ cmd_restore() {
         || { rm -rf "$x"; die "this artifact does not verify -- refusing to restore from it"; }
     [[ -f "$x/manifest.json" ]] || { rm -rf "$x"; die "no manifest in $(_tilde "$artifact")"; }
 
-    # --into first, THEN the verdict. omarchy_identity reads
-    # $HOME/.local/state/omarchy/migrations, and the compatibility question the
-    # verdict answers is about wherever the restore actually lands -- not
-    # about whichever machine happens to be running this command. Computing it
-    # before --into moved $HOME evaluated a --into restore against the
-    # OPERATOR's own migration state while writing the files somewhere else
-    # entirely, so a same/behind/forward call rested on state the target
-    # never had anything to do with. version and channel remain the real
-    # machine's -- omarchy-version/omarchy-channel-current are system
-    # commands, not $HOME-relative, so --into cannot simulate a different
-    # Omarchy install, only a different destination for one.
-    local HOME="${into:-$HOME}"
-    [[ -z "$into" ]] || mkdir -p "$into" || { rm -rf "$x"; die "could not make $(_tilde "$into")"; }
-
+    # The verdict, computed against the REAL machine running this command --
+    # not --into's target. This went back and forth. version and channel are
+    # unavoidably the real machine's: omarchy-version and
+    # omarchy-channel-current are system commands, not $HOME-relative, and
+    # --into cannot redirect them. An earlier version of this file computed
+    # the watermark from --into's target to match it to those, on the
+    # reasoning that a --into restore is "about wherever the restore actually
+    # lands." That broke the more common use of --into worse than the bug it
+    # fixed: --into pointed at an empty sandbox directory (no migrations
+    # directory, because it is not an Omarchy home at all) read as watermark
+    # 0, which is the PERMISSIVE "behind" case -- so previewing what --apply
+    # would do against a scratch directory applied MORE than a real restore
+    # onto the operator's own machine would have. version from one machine
+    # and watermark from another is not any machine's real identity either
+    # way; keeping all three on the operator's own machine is at least
+    # internally consistent, and errs toward the safer verdict on the
+    # far more common case (a disposable preview target) rather than the
+    # rarer one (restoring onto another machine's mounted, already-populated
+    # home, where booting into that machine to run the restore natively
+    # answers the compatibility question correctly and this cannot).
     local verdict why
     # Captured before parsing, not <<<"$(...)" directly -- that loses
     # _restore_verdict's own exit status, and it now has one worth keeping:
@@ -1417,6 +1423,9 @@ cmd_restore() {
     local vout; vout="$(_restore_verdict "$x/manifest.json")" \
         || { rm -rf "$x"; die "could not determine this machine's own migration state -- refusing to judge compatibility blind"; }
     IFS=$'\t' read -r verdict why <<<"$vout"
+
+    local HOME="${into:-$HOME}"
+    [[ -z "$into" ]] || mkdir -p "$into" || { rm -rf "$x"; die "could not make $(_tilde "$into")"; }
 
     # Described by the manifest that made it. A restore driven by whatever
     # manifest this machine carries would look for groups the artefact never
