@@ -505,6 +505,22 @@ _verify_cache_entry() {
         live_fp="$(_tool_fingerprint)" || rc=1
         [[ -n "$cached_fp" && "$cached_fp" == "$live_fp" ]] || rc=1
     fi
+    # The tool fingerprint above proves the cached CODE matches what
+    # $OMABACKUP_ROOT would produce; it says nothing about the cached POLICY
+    # -- tool/groups.default.json, which is what decides which groups are
+    # coupled. A PoC confirmed the gap: a cache entry with only that one file
+    # swapped (coupled:true -> false, SHA256SUMS recomputed, the tool binary
+    # itself untouched) still reused:true'd. bundle_cache_path's own key
+    # already commits to sha256sum "$GROUPS_FILE" as one of its inputs (the
+    # same reasoning as the tool fingerprint above, same fix): checked here
+    # against the actual bytes now sitting in the cached file, not merely
+    # trusted because the path happened to match.
+    if (( rc == 0 )); then
+        local cached_gh live_gh
+        cached_gh="$(sha256sum "$cx/tool/groups.default.json" 2>/dev/null | cut -d' ' -f1)"
+        live_gh="$(sha256sum "$GROUPS_FILE" 2>/dev/null | cut -d' ' -f1)"
+        [[ -n "$cached_gh" && "$cached_gh" == "$live_gh" ]] || rc=1
+    fi
     rm -rf "$cx"
     return $rc
 }

@@ -476,3 +476,33 @@ assert_eq "$(printf '%s' "$WMOUT2" | jq -r '.reused')" "false"
 it "and the reported watermark is the current one, not the stale cached one"
 WMX2="$(_unpack "$WMPATH2")"
 assert_eq "$(jq -r '.omarchy.migrationWatermark' "$WMX2/manifest.json")" "1800000000"
+
+# ── a cache hit must not serve tampered POLICY, only the tool was checked ───
+# _verify_cache_entry's fingerprint check covers tool/bin/omabackup + lib/*.sh
+# -- the CODE. It said nothing about tool/groups.default.json -- the POLICY
+# that decides which groups are coupled. A PoC confirmed the gap: a cache
+# entry with ONLY that one file swapped (coupled:true -> false, SHA256SUMS
+# recomputed, the tool binary itself untouched) still came back reused:true.
+PCH="$(mktemp -d)"; PCR="$PCH/repo"
+_bundle_repo "$PCR"
+_bundle_env "$PCH" "$PCR" bundle >/dev/null 2>&1
+PCPATH="$(ls -t "$PCH/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+PCX="$(_unpack "$PCPATH")"
+PCG="$(jq '(.groups[0].coupled) = (.groups[0].coupled | not)' "$PCX/tool/groups.default.json")"
+printf '%s' "$PCG" >"$PCX/tool/groups.default.json"
+( cd "$PCX" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+tar -C "$PCX" -cf - . | zstd -q -19 -T0 -f -o "$PCPATH"
+
+it "a cache entry with only its policy tampered is not reused"
+# Not _bundle_env: it merges stderr into stdout, and rebuilding past a
+# tampered cache entry prints a diagnostic on stderr by design -- mixed into
+# stdout, that diagnostic breaks the JSON this needs to parse cleanly.
+PCOUT="$(HOME="$PCH" OMABACKUP_GROUPS="$PWD/groups.default.json" OMABACKUP_STATE="$PCH/.state" \
+    OMABACKUP_REPO="$PCR" XDG_RUNTIME_DIR=/nonexistent "$OB" bundle --json 2>/dev/null)"
+assert_eq "$(printf '%s' "$PCOUT" | jq -r '.reused')" "false"
+
+it "and the rebuilt policy matches the real groups.default.json again"
+PCPATH2="$(printf '%s' "$PCOUT" | jq -r '.path')"
+PCX2="$(_unpack "$PCPATH2")"
+diff -q "$PCX2/tool/groups.default.json" "$PWD/groups.default.json" >/dev/null 2>&1 \
+    && ok || fail "the rebuilt cache still does not match the real groups.default.json"

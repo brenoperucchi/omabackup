@@ -324,16 +324,43 @@ restore_rows() {
         fi
 
         coupled="$(group_field "$id" coupled)" || return 1
+        # A second floor, entirely inside the artifact: manifest.json records
+        # its OWN copy of coupled per group (_bundle_manifest, built from the
+        # SAME groups.default.json at build time), and this used to be the
+        # only one ever read for the decision above. Nothing kept the two
+        # documents honest against each other for an artifact an attacker
+        # assembled by hand -- a PoC confirmed a manifest.json claiming
+        # coupled:true for a group while tool/groups.default.json quietly
+        # said false restored that group anyway; neither document is a
+        # trusted second opinion on its own, but the query above only ever
+        # consulted one of the two places this artifact makes the same claim,
+        # and disagreeing with itself is not a reason to pick the answer that
+        # applies more.
+        local manifest_coupled
+        manifest_coupled="$(jq -r --arg id "$id" \
+            '.groups[]? | select(.id==$id) | .coupled // empty' "$x/manifest.json")" || return 1
+        [[ "$manifest_coupled" == true ]] && coupled=true
         # The floor described above the function's own comment: the artifact
         # cannot talk this id's coupling down below what the operator's own
         # installed schema, if it recognizes the id at all, already says.
-        # Read failures on the operator's own file are not this artifact's
-        # fault -- if it cannot be read or the query cannot run, this simply
-        # has nothing to add, and the artifact's own answer above stands.
+        #
+        # jq's own status is checked -- not discarded into 2>/dev/null the
+        # way the first version of this floor did. A genuinely absent id
+        # (jq succeeds, produces nothing) legitimately has nothing to add,
+        # and the artifact's own answer stands. But a file that EXISTS and
+        # is READABLE yet fails to PARSE -- corrupted, truncated, edited by
+        # hand into invalid JSON -- used to look exactly the same as
+        # "absent": empty output either way, `2>/dev/null` erasing the
+        # difference. A PoC confirmed the result: an unreadable-to-jq local
+        # manifest let the artifact's own (less restrictive) answer win,
+        # which is precisely what this floor exists to prevent. The
+        # question this floor asks was not answered "no" -- it could not be
+        # asked at all, and a floor that cannot be checked must not be
+        # skipped.
         if [[ -n "$opgroups" && -r "$opgroups" ]]; then
             local local_coupled
             local_coupled="$(jq -r --arg id "$id" \
-                '.groups[]? | select(.id==$id) | .coupled // empty' "$opgroups" 2>/dev/null)"
+                '.groups[]? | select(.id==$id) | .coupled // empty' "$opgroups")" || return 1
             [[ "$local_coupled" == true ]] && coupled=true
         fi
         action=restore
@@ -517,7 +544,19 @@ _restore_one() {
     # defects in this project.
     _restore_contained "$dest" || return 1
     if [[ -e "$dest" || -L "$dest" ]]; then
-        local keep="$backup/${dest#"$HOME"/}"
+        # ${dest#"$HOME"/} is a lexical strip, not the normalized path
+        # _restore_contained just confirmed containment against -- a $dest
+        # containing a literal ".." that still resolves back inside $HOME
+        # (a declared path like "~/../$(basename "$HOME")/target": legal
+        # containment, illegal-looking string) strips to a suffix that STILL
+        # carries the "..", and mkdir -p "$(dirname "$keep")" then creates a
+        # directory outside $backup entirely, a sibling of replaced/. The
+        # original ends up backed up outside the one place kept to protect
+        # it, while the report goes on naming $backup as where it landed.
+        # realpath -m first, so the suffix stripped is the path containment
+        # was actually checked against, not its unresolved spelling.
+        local dest_rp; dest_rp="$(realpath -m -- "$dest" 2>/dev/null)" || return 1
+        local keep="$backup/${dest_rp#"$HOME"/}"
         mkdir -p "$(dirname "$keep")" 2>/dev/null || return 1
         cp -Pp "$dest" "$keep" 2>/dev/null || return 1
     fi

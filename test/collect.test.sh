@@ -245,3 +245,67 @@ it "a declared path that is itself excluded is not collected"
 
 it "and its declared sibling still is"
 assert_contains "$(cat "$ST/.config/keep/f.txt" 2>/dev/null)" "yes"
+
+# ── a trackedRepoPath query that fails refuses to collect, not falls back ───
+# `[[ -n "$(group_tracked_repo_path "$id" "$p")" ]]` could not tell "no
+# override" from "the query itself failed" -- both are an empty string. A
+# stub jq that fails only on the trackedRepoPath query, with a genuinely
+# tracked-only path declared, confirmed the result: collect fell through to
+# the generic rsync branch, which copies both tracked and untracked names
+# into the same directory instead of refusing to guess.
+TRPH="$(mktemp -d)"; TRPR="$TRPH/repo"
+mkdir -p "$TRPR/scripts/local-bin"
+git init -q "$TRPR"; git -C "$TRPR" config user.email t@t; git -C "$TRPR" config user.name t
+printf '#!/bin/bash\necho hi\n' >"$TRPR/scripts/local-bin/tracked.sh"
+git -C "$TRPR" add -A && git -C "$TRPR" commit -qm one
+cat >"$TRPH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"scripts","label":"Scripts","mode":"copy","coupled":false,"critical":false,
+  "paths":[{"live":"~/.local/bin","trackedRepoPath":"scripts/local-bin"}]}]}
+JSON
+mkdir -p "$TRPH/home/.local/bin"
+printf '#!/bin/bash\necho hi\n' >"$TRPH/home/.local/bin/tracked.sh"
+mkdir -p "$TRPH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *trackedRepoPath* ]] && exit 9; done\n'
+  printf 'exec %s "$@"\n' "$(command -v jq)"
+} >"$TRPH/stub/jq"; chmod +x "$TRPH/stub/jq"
+
+it "collect refuses when a trackedRepoPath query fails, rather than guessing"
+HOME="$TRPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$TRPH/g.json" \
+    OMABACKUP_STATE="$TRPH/home/.state" OMABACKUP_REPO="$TRPR" \
+    PATH="$TRPH/stub:$PATH" XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
+    && fail "collected via a generic rsync fallback instead of refusing" || ok
+
+# ── a group_paths query that fails during collect_triple refuses, not "0" ───
+# `dir="$(_expand "$(group_paths "$id" | head -1)")"` lost group_paths' own
+# status twice over: head exits 0 regardless of whether its upstream
+# producer failed, and even a correct pipefail status on the INNER
+# substitution is not what the OUTER one (_expand's own, which never fails)
+# reports. A stub jq that fails only on group_paths' own query, with a real
+# local plugin present, confirmed the result: dir came back empty,
+# [[ -d "$dir" ]] read that as "nothing to collect," and collect reported
+# success having never looked up the plugin directory at all.
+CTH="$(mktemp -d)"; CTR="$CTH/repo"
+git init -q "$CTR"; git -C "$CTR" config user.email t@t; git -C "$CTR" config user.name t
+mkdir -p "$CTR/x"; printf 'x\n' >"$CTR/x/f"
+git -C "$CTR" add -A && git -C "$CTR" commit -qm one
+cat >"$CTH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"plugins","label":"Plugins","mode":"triple","coupled":false,"critical":false,
+  "paths":["~/.config/omarchy/plugins"]}]}
+JSON
+mkdir -p "$CTH/home/.config/omarchy/plugins/myplugin"
+git init -q "$CTH/home/.config/omarchy/plugins/myplugin" >/dev/null 2>&1
+printf 'x\n' >"$CTH/home/.config/omarchy/plugins/myplugin/f.txt"
+mkdir -p "$CTH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *"(.paths // [])"* ]] && exit 9; done\n'
+  printf 'exec %s "$@"\n' "$(command -v jq)"
+} >"$CTH/stub/jq"; chmod +x "$CTH/stub/jq"
+
+it "collect refuses when a triple group's paths query fails"
+HOME="$CTH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$CTH/g.json" \
+    OMABACKUP_STATE="$CTH/home/.state" OMABACKUP_REPO="$CTR" \
+    PATH="$CTH/stub:$PATH" XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
+    && fail "reported success without ever finding the plugin directory" || ok

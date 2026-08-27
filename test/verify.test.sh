@@ -105,3 +105,33 @@ assert_contains "$(jq -r .omarchy.version <<<"$OUT")" "."
 
 it "the report carries the migration watermark"
 [[ "$(jq -r .omarchy.migrationWatermark <<<"$OUT")" =~ ^[0-9]+$ ]] && ok || fail "watermark is not numeric"
+
+# ── a group whose probe cannot even be looked up must fail, not run nothing ─
+# `probe="$(group_field "$id" probe)" || continue` silently skipped this
+# group's dispatch on a query failure -- no finding, no trace in the exit
+# status: verify reported ok:true having never actually run whatever probe
+# this group declares. A stub jq that fails only on that specific query
+# confirmed the result before the fix, and confirms the fix now: a `fail`
+# finding, and ok:false.
+VPH="$(mktemp -d)"
+mkdir -p "$VPH/home/.config/omarchy"
+printf '{}' >"$VPH/home/.config/omarchy/shell.json"
+cat >"$VPH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"shell","label":"Shell","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/omarchy/shell.json"],"probe":"shell-json"}]}
+JSON
+mkdir -p "$VPH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *"select(.id==\$id) | .[\$f]"* ]] && exit 9; done\n'
+  printf 'exec %s "$@"\n' "$(command -v jq)"
+} >"$VPH/stub/jq"; chmod +x "$VPH/stub/jq"
+
+it "verify fails when a group's own probe field cannot be queried"
+VPOUT="$(HOME="$VPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$VPH/g.json" \
+    OMABACKUP_STATE="$VPH/home/.state" PATH="$VPH/stub:$PATH" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" verify --json 2>/dev/null)"
+assert_eq "$(jq -r '.ok' <<<"$VPOUT")" "false"
+
+it "and names it as a manifest problem, not silence"
+assert_contains "$VPOUT" "probe could not be read"

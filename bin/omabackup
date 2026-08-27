@@ -401,7 +401,12 @@ cmd_verify() {
     local ids_out; ids_out="$(groups_ids)" || true
     while read -r id; do
         [[ -n "$id" ]] || continue
-        probe="$(group_field "$id" probe)" || continue
+        # `|| continue` alone silently skipped this group's probe dispatch
+        # on a query failure -- no finding, no trace in the exit status:
+        # verify reported ok:true having never actually run whatever probe
+        # this group declares. A finding, so the fact this group went
+        # unchecked is itself something `report` counts.
+        probe="$(group_field "$id" probe)" || { finding fail "$id" manifest-unreadable "this group's probe could not be read from the manifest" ""; continue; }
         case "$probe" in
             hypr-lua)   probe_hypr ;;
             shell-json) probe_shell_json ;;
@@ -636,7 +641,18 @@ cmd_collect() {
             # group can mix a directory that should only pull already-tracked
             # names (desktop entries) with a plain file that should always
             # copy (mimeapps.list).
-            if [[ -n "$(group_tracked_repo_path "$id" "$p")" ]]; then
+            #
+            # Status captured explicitly -- `[[ -n "$(...)" ]]` alone cannot
+            # tell "no trackedRepoPath override" from "the query itself
+            # failed": both are an empty string. A PoC confirmed the result:
+            # a query that failed for a genuinely trackedRepoPath-declared
+            # path fell through to the generic rsync branch below, which
+            # copies both tracked AND untracked names into the same
+            # directory -- exactly what collect_tracked_only exists to keep
+            # separate for a group like `scripts`, whose whole point is that
+            # ~/.local/bin is not entirely the repo's to own.
+            local trp; trp="$(group_tracked_repo_path "$id" "$p")" || die "could not read group $id's trackedRepoPath override from the manifest"
+            if [[ -n "$trp" ]]; then
                 collect_tracked_only "$e" "$dest" "$id" "$p" || continue
             elif [[ -d "$e" && ! -L "$e" ]]; then
                 rsync -a --exclude '.git/' "${ex[@]}" "$e/" "$dest/"
@@ -808,7 +824,17 @@ groups_json() {
 # slotSize) is lost.
 collect_triple() {
     local id="$1" dir p pid n=0
-    dir="$(_expand "$(group_paths "$id" | head -1)")"
+    # group_paths' own status, checked directly -- nesting it inside
+    # $(_expand "$(group_paths "$id" | head -1)") discarded it twice over:
+    # once because `head -1` (its downstream reader) exits 0 regardless of
+    # whether the pipe's own producer failed, and again because the inner
+    # substitution's status, even correct, is not what the OUTER one
+    # reports -- that one is _expand's own, which never fails. A query that
+    # failed produced an empty $dir, [[ -d "$dir" ]] read that as "nothing
+    # to collect" and returned 0 -- collect reported success for a plugin
+    # group it never actually looked up.
+    local gp; gp="$(group_paths "$id")" || die "could not read group $id's paths from the manifest"
+    dir="$(_expand "$(head -1 <<<"$gp")")"
     [[ -d "$dir" ]] || return 0
     mkdir -p "$STAGING/.plugins/patches" "$STAGING/.plugins/local"
     : >"$STAGING/.plugins/manifest.txt"
@@ -1486,7 +1512,20 @@ cmd_restore() {
     IFS=$'\t' read -r verdict why <<<"$vout"
 
     local HOME="${into:-$HOME}"
-    [[ -z "$into" ]] || mkdir -p "$into" || { rm -rf "$x"; die "could not make $(_tilde "$into")"; }
+    # Made regardless of plan or apply: _restore_contained needs $HOME to
+    # already exist (realpath -e) to resolve containment for EITHER one, and
+    # the plan has to be able to say what would happen the same way apply
+    # would act on it. into_created remembers whether this call is the one
+    # that made it, though -- a plan run naming a --into target that did not
+    # exist yet used to create it regardless, an observable write in the
+    # one command that promises "nothing was written." Removed again, best-
+    # effort, at the end of the plan branch below, if it is still exactly
+    # what this call made: empty, and ours.
+    local into_created=0
+    if [[ -n "$into" ]]; then
+        [[ -d "$into" ]] || into_created=1
+        mkdir -p "$into" || { rm -rf "$x"; die "could not make $(_tilde "$into")"; }
+    fi
 
     # Captured before the override two lines down replaces it -- this
     # machine's OWN, locally-installed groups.default.json, not the
@@ -1594,6 +1633,13 @@ cmd_restore() {
         printf '\n  nothing was written. %somabackup restore %s --apply%s to do it\n' \
             "$CYAN" "$(_tilde "$artifact")" "$NC"
         rm -rf "$x"
+        # rmdir, not rm -rf: only removes it if it is still exactly empty,
+        # i.e. nothing else raced to use it since this call created it a few
+        # lines up. Best-effort -- a failure here (already gone, no longer
+        # empty, a permissions oddity) is not this command's problem to
+        # report, and the promise this keeps is "created nothing," not
+        # "guaranteed to remove everything ever placed at this path."
+        (( into_created )) && rmdir "$into" 2>/dev/null
         return 0
     fi
 

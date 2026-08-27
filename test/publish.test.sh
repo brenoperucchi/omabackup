@@ -198,3 +198,27 @@ publish_staging "$STG7" "$REPO7" "" "$LIST7" >/dev/null
 
 it "a symlink inside a local plugin is recorded for commit, not just copied"
 assert_contains "$(tr '\0' '\n' <"$LIST7")" "alias.qml"
+
+# ── a find that stops partway is a publish failure, not a silent undercount ─
+# `done < <(find "$staging" ... -print0 2>/dev/null)` had no `wait "$!"`
+# afterward -- find's own exit status was discarded the same way restore_rows
+# and scan_files were already closed against. A stub find that prints one
+# file then exits nonzero, simulating a walk that stopped partway, confirmed
+# the result: publish_staging returned 0 having published fewer files than
+# staging actually held.
+PFH="$(mktemp -d)"; PFSTG="$PFH/staging"; PFREPO="$PFH/repo"
+mkdir -p "$PFSTG/configs/app"
+printf 'x\n' >"$PFSTG/configs/app/f1.txt"
+printf 'y\n' >"$PFSTG/configs/app/f2.txt"
+git init -q "$PFREPO"; git -C "$PFREPO" config user.email t@t; git -C "$PFREPO" config user.name t
+mkdir -p "$PFH/stub"
+cat >"$PFH/stub/find" <<STUB
+#!/bin/bash
+printf '%s\0' "$PFSTG/configs/app/f1.txt"
+exit 9
+STUB
+chmod +x "$PFH/stub/find"
+
+it "publish_staging fails when its own walk stops partway"
+PATH="$PFH/stub:$PATH" publish_staging "$PFSTG" "$PFREPO" >/dev/null 2>&1 \
+    && fail "reported success despite the walk stopping partway" || ok

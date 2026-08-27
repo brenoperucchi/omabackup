@@ -1251,3 +1251,136 @@ HOME="$TSTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$TSH/rstate2" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$TSART" >/dev/null 2>&1
 [[ ! -e "$TSTGT/.local/state/omarchy/migrations/1700000000.sh" ]] \
     && ok || fail "the old marker was written despite the forward verdict"
+
+# ── the coupled floor itself must not be fail-open ───────────────────────────
+# The floor's own jq query against the operator's local schema was consumed
+# via 2>/dev/null, so "the operator's file genuinely doesn't mention this
+# group" and "the operator's file exists but cannot be PARSED" looked
+# identical: empty output either way, and the artifact's own (less
+# restrictive) coupled:false answer stood unchallenged. A PoC confirmed the
+# result: an artifact declaring compositor coupled:true in manifest.json but
+# omitting coupled in its own bundled groups.default.json, restored against
+# an operator whose LOCAL groups.default.json was simply invalid JSON,
+# restored the compositor config anyway -- exactly the case the floor exists
+# to hold back, defeated by making the floor itself unable to answer.
+CFLH="$(mktemp -d)"; CFLR="$CFLH/repo"
+mkdir -p "$CFLR/configs/hypr"
+git init -q "$CFLR"; git -C "$CFLR" config user.email t@t; git -C "$CFLR" config user.name t
+printf 'bind = SUPER, Q\n' >"$CFLR/configs/hypr/bindings.conf"
+git -C "$CFLR" add -A && git -C "$CFLR" commit -qm one
+cat >"$CFLH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["3.*"],"groups":[
+ {"id":"compositor","label":"Compositor","mode":"copy","coupled":true,"critical":true,
+  "paths":["~/.config/hypr"]}]}
+JSON
+mkdir -p "$CFLH/home"
+HOME="$CFLH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$CFLH/g.json" \
+    OMABACKUP_STATE="$CFLH/home/.state" OMABACKUP_REPO="$CFLR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+CFLX="$(mktemp -d)"; CFLRAW="$(ls -t "$CFLH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+tar -C "$CFLX" -xf <(zstd -dc "$CFLRAW")
+CFLG="$(jq '(.groups[] | select(.id=="compositor")) |= del(.coupled)' "$CFLX/tool/groups.default.json")"
+printf '%s' "$CFLG" >"$CFLX/tool/groups.default.json"
+( cd "$CFLX" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+CFLART="$CFLH/lied.tar.zst"
+tar -C "$CFLX" -cf - . | zstd -q -19 -T0 -o "$CFLART"
+CFLTGT="$(mktemp -d)"
+printf 'not valid json' >"$CFLH/local-broken.json"
+
+it "restore refuses when the floor's own local manifest cannot be parsed"
+HOME="$CFLTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$CFLH/local-broken.json" \
+    OMABACKUP_STATE="$CFLH/rstate" XDG_RUNTIME_DIR=/nonexistent \
+    "$OB" restore --apply "$CFLART" >/dev/null 2>&1 \
+    && fail "restored using the artifact's own answer while the local floor could not be checked" || ok
+
+it "and nothing from the coupled group was written"
+[[ ! -e "$CFLTGT/.config/hypr/bindings.conf" ]] \
+    && ok || fail "compositor config was restored despite the floor being unreadable"
+
+# ── manifest.json and the artifact's own groups.default.json can disagree --
+# ── the less restrictive one must not win ────────────────────────────────
+# The decision above only ever queried tool/groups.default.json; manifest.json
+# records its OWN copy of coupled per group (computed from the SAME file at
+# build time), and nothing cross-checked the two for an artifact assembled by
+# hand rather than built honestly. A PoC confirmed the result: manifest.json
+# claiming coupled:true for compositor while tool/groups.default.json quietly
+# says false restored the group anyway, on an operator machine whose own
+# local schema does not recognize this artifact's group id at all (so the
+# floor above has nothing to add either).
+MDH="$(mktemp -d)"; MDR="$MDH/repo"
+mkdir -p "$MDR/configs/hypr"
+git init -q "$MDR"; git -C "$MDR" config user.email t@t; git -C "$MDR" config user.name t
+printf 'bind = SUPER, Q\n' >"$MDR/configs/hypr/bindings.conf"
+git -C "$MDR" add -A && git -C "$MDR" commit -qm one
+cat >"$MDH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["3.*"],"groups":[
+ {"id":"compositor","label":"Compositor","mode":"copy","coupled":true,"critical":true,
+  "paths":["~/.config/hypr"]}]}
+JSON
+mkdir -p "$MDH/home"
+HOME="$MDH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$MDH/g.json" \
+    OMABACKUP_STATE="$MDH/home/.state" OMABACKUP_REPO="$MDR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+MDX="$(mktemp -d)"; MDRAW="$(ls -t "$MDH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+tar -C "$MDX" -xf <(zstd -dc "$MDRAW")
+MDG="$(jq '(.groups[] | select(.id=="compositor") | .coupled) = false' "$MDX/tool/groups.default.json")"
+printf '%s' "$MDG" >"$MDX/tool/groups.default.json"
+( cd "$MDX" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+MDART="$MDH/mismatched.tar.zst"
+tar -C "$MDX" -cf - . | zstd -q -19 -T0 -o "$MDART"
+MDTGT="$(mktemp -d)"
+
+it "manifest.json's coupled:true is not overridden by a lower groups.default.json value"
+HOME="$MDTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$MDH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$MDART" >/dev/null 2>&1
+[[ ! -e "$MDTGT/.config/hypr/bindings.conf" ]] \
+    && ok || fail "compositor config restored despite manifest.json saying it is coupled"
+
+# ── a plan run does not create --into's target directory either ─────────────
+# mkdir -p "$into" ran before the plan/apply split, unconditionally --
+# needed either way, since _restore_contained resolves $HOME with realpath -e
+# and a plan has to answer containment the same way apply would. But a plan
+# naming a --into target that did not exist yet still created it: an
+# observable write from the one command that promises "nothing was written."
+IOH="$(mktemp -d)"; IOART="$(_res_build "$IOH" '["3.*","4.*"]')"
+IOINTO="$IOH/does-not-exist-yet"
+
+it "a plan run with --into does not create the target directory"
+HOME="$IOH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$IOH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --into "$IOINTO" "$IOART" >/dev/null 2>&1
+[[ ! -e "$IOINTO" ]] && ok || fail "the plan created $(_tilde "$IOINTO" 2>/dev/null || echo "$IOINTO") despite writing nothing else"
+
+it "and --apply with --into does create it, same as before"
+HOME="$IOH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$IOH/rstate2" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --into "$IOINTO" --apply "$IOART" >/dev/null 2>&1
+[[ -d "$IOINTO" ]] && ok || fail "--apply did not create the --into target"
+
+# ── the backup of a replaced file must land inside replaced/, not beside it ─
+# `local keep="$backup/${dest#"$HOME"/}"` stripped $HOME's literal string
+# from $dest -- not the normalized path _restore_contained had just checked
+# containment against. A $dest holding a literal ".." that still resolves
+# back inside $HOME (legal containment, unusual spelling -- e.g. a declared
+# path routing through "$HOME/../$(basename $HOME)/...") strips to a suffix
+# that still carries the "..", and mkdir -p "$(dirname "$keep")" then creates
+# a directory OUTSIDE $backup entirely, a sibling of replaced/. Confirmed
+# directly against _restore_one, since routing this exact shape through the
+# full restore_rows path-mapping case statement is not the point being
+# tested here -- what matters is what THIS function does with a $dest that
+# already passed containment.
+RUH="$(mktemp -d)"; RUHOME="$RUH/home"
+mkdir -p "$RUHOME"
+RUBASENAME="$(basename "$RUHOME")"
+RUDEST="$RUHOME/../$RUBASENAME/victim.txt"
+printf 'original\n' >"$RUHOME/victim.txt"
+RUX="$RUH/extracted"; mkdir -p "$RUX/worktree"
+printf 'new-content\n' >"$RUX/worktree/rel.txt"
+RUBACKUP="$RUH/base/replaced"; mkdir -p "$RUBACKUP"
+
+it "a dest reaching back through .. and into HOME backs up inside replaced/"
+HOME="$RUHOME" bash -c 'source lib/restore.sh; _restore_one "$1" "$2" "$3" "$4"' \
+    _ "$RUX" "rel.txt" "$RUDEST" "$RUBACKUP" >/dev/null 2>&1
+[[ -f "$RUBACKUP/victim.txt" ]] && ok || fail "the backup did not land inside replaced/"
+
+it "and nothing was backed up outside it"
+[[ -z "$(find "$RUH/base" -type f ! -path "$RUBACKUP/*" 2>/dev/null)" ]] \
+    && ok || fail "a backup file escaped replaced/: $(find "$RUH/base" -type f ! -path "$RUBACKUP/*")"

@@ -120,6 +120,13 @@ publish_staging() {
         dst="$(map_to_repo "$rel" "$table")" || continue
         if _publish_file "$f" "$repo/$dst"; then written+=("$dst"); else failed=$((failed + 1)); fi
     done < <(find "$staging" \( -type f -o -type l \) -print0 2>/dev/null)
+    # find's own status, checked -- the same fail-open scan_files and
+    # restore_rows already closed, still open here: a walk that stopped
+    # partway published fewer files than staging actually held, and this
+    # function's own return status said nothing was wrong. A PoC (a stub
+    # find that prints one file then exits nonzero) confirmed rc=0 with an
+    # incomplete publish -- sync could proceed to commit over it.
+    wait "$!" || failed=$((failed + 1))
 
     if [[ -d "$staging/.generated" ]]; then
         for f in "$staging"/.generated/*; do
@@ -153,6 +160,7 @@ publish_staging() {
                     [[ -n "$pf" ]] || continue
                     written+=("configs/omarchy/plugins/$pid/${pf#"$f"}")
                 done < <(find "$f" \( -type f -o -type l \) -not -path "*/.git/*" -print0 2>/dev/null)
+                wait "$!" || failed=$((failed + 1))
             done
         fi
     fi
