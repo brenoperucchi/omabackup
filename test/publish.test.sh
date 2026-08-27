@@ -222,3 +222,39 @@ chmod +x "$PFH/stub/find"
 it "publish_staging fails when its own walk stops partway"
 PATH="$PFH/stub:$PATH" publish_staging "$PFSTG" "$PFREPO" >/dev/null 2>&1 \
     && fail "reported success despite the walk stopping partway" || ok
+
+# ── two staged files mapping to the same destination refuse, not overwrite ──
+# map_to_repo maps FLAT for a trackedRepoPath entry -- the repo keeps one
+# directory of names, not a mirror -- and nothing stopped two DIFFERENT
+# staged files from landing on the SAME repo destination: two groups whose
+# trackedRepoPath both name the same repo directory, each holding a file
+# with the same basename. A PoC confirmed the result: both wrote, the
+# second silently overwrote the first, "2 files" published, one gone,
+# exit 0.
+DDH="$(mktemp -d)"
+mkdir -p "$DDH/staging/a" "$DDH/staging/b" "$DDH/repo"
+printf 'content-A\n' >"$DDH/staging/a/same.txt"
+printf 'content-B\n' >"$DDH/staging/b/same.txt"
+git init -q "$DDH/repo"; git -C "$DDH/repo" config user.email t@t; git -C "$DDH/repo" config user.name t
+DDTABLE="$(printf 'a\tshared\nb\tshared\n')"
+
+it "publish_staging refuses two staged files that collide on one destination"
+publish_staging "$DDH/staging" "$DDH/repo" "$DDTABLE" >/dev/null 2>&1 \
+    && fail "reported success despite a destination collision" || ok
+
+it "and neither file's content silently overwrote the other"
+[[ ! -e "$DDH/repo/shared/same.txt" ]] \
+    && ok || fail "one file's content landed anyway, indistinguishable from a clean publish: $(cat "$DDH/repo/shared/same.txt" 2>/dev/null)"
+
+# ── the most specific trackedRepoPath wins, not the one earlier in the table ─
+# The first matching prefix used to win outright -- if the table declares
+# BOTH "root" and "root/nested" (an override for a directory nested inside
+# another trackedRepoPath), a file under root/nested/ matched both, and
+# which one answered depended on table ORDER, not on which mapping was
+# actually meant for it. A PoC confirmed the result changed with the two
+# entries simply swapped.
+it "root/nested wins over root, regardless of which comes first in the table"
+T1="$(printf 'root\tshared\nroot/nested\tshared/nested\n')"
+T2="$(printf 'root/nested\tshared/nested\nroot\tshared\n')"
+assert_eq "$(map_to_repo 'root/nested/file.txt' "$T1")" "shared/nested/file.txt"
+assert_eq "$(map_to_repo 'root/nested/file.txt' "$T2")" "shared/nested/file.txt"

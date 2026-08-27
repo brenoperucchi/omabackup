@@ -23,12 +23,24 @@
 # way to the repo. The manifest declares the destination; this only honors it.
 map_to_repo() {
     local rel="$1" table="${2:-}" prefix dest
+    # The FIRST matching prefix used to win, not the most specific one -- if
+    # the table declares BOTH "root" and "root/nested" (an override for a
+    # directory nested inside another trackedRepoPath), a file under
+    # root/nested/ matches both, and which one answered depended on table
+    # ORDER, not on which mapping was actually meant for it. A PoC confirmed
+    # the result changed with the two entries simply swapped. Every match is
+    # considered now; the LONGEST prefix -- the most specific one -- wins,
+    # regardless of where in the table it happens to sit.
+    local best_prefix="" best_dest=""
     while IFS=$'\t' read -r prefix dest; do
         [[ -n "$prefix" && -n "$dest" ]] || continue
         [[ "$rel" == "$prefix"/* ]] || continue
-        printf '%s/%s' "$dest" "${rel##*/}"
-        return 0
+        (( ${#prefix} > ${#best_prefix} )) && { best_prefix="$prefix"; best_dest="$dest"; }
     done <<<"$table"
+    if [[ -n "$best_prefix" ]]; then
+        printf '%s/%s' "$best_dest" "${rel##*/}"
+        return 0
+    fi
 
     case "$rel" in
         .config/omarchy/plugins/*) return 1 ;;  # triple strategy, not a plain copy
@@ -109,6 +121,24 @@ publish_staging() {
     local staging="$1" repo="$2" table="${3:-}" list="${4:-}" f pf pid rel dst failed=0
     local -a written=()
 
+    # map_to_repo maps FLAT for a trackedRepoPath entry -- the repo keeps one
+    # directory of names, not a mirror -- and nothing stopped two DIFFERENT
+    # staged files from mapping to the SAME repo destination: two groups
+    # whose trackedRepoPath both name the same repo directory, each holding
+    # a file with the same basename. A PoC confirmed the result: both wrote,
+    # the second silently overwrote the first, "2 files" published, one
+    # gone, exit 0. A first pass counts every destination this walk would
+    # produce, so a collision is caught before either file is written --
+    # not discovered after the second write already destroyed the first.
+    local -A destcount=()
+    while IFS= read -r -d '' f; do
+        rel="${f#"$staging"/}"
+        [[ "$rel" == .generated/* || "$rel" == .plugins/* ]] && continue
+        dst="$(map_to_repo "$rel" "$table")" || continue
+        destcount[$dst]=$(( ${destcount[$dst]:-0} + 1 ))
+    done < <(find "$staging" \( -type f -o -type l \) -print0 2>/dev/null)
+    wait "$!" || failed=$((failed + 1))
+
     # `-type f -o -type l`: a plain `-type f` excludes symlinks, and every staged
     # link was therefore dropped without a word. This machine stages
     # ~/.config/nvim/lua/plugins/theme.lua and .../current/background as links,
@@ -118,6 +148,12 @@ publish_staging() {
         rel="${f#"$staging"/}"
         [[ "$rel" == .generated/* || "$rel" == .plugins/* ]] && continue
         dst="$(map_to_repo "$rel" "$table")" || continue
+        if (( ${destcount[$dst]:-1} > 1 )); then
+            printf 'omabackup: %s maps to %s, which %s different staged files map to -- refusing to publish any of them, one would silently overwrite another\n' \
+                "$rel" "$dst" "${destcount[$dst]}" >&2
+            failed=$((failed + 1))
+            continue
+        fi
         if _publish_file "$f" "$repo/$dst"; then written+=("$dst"); else failed=$((failed + 1)); fi
     done < <(find "$staging" \( -type f -o -type l \) -print0 2>/dev/null)
     # find's own status, checked -- the same fail-open scan_files and

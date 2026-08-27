@@ -1384,3 +1384,47 @@ HOME="$RUHOME" bash -c 'source lib/restore.sh; _restore_one "$1" "$2" "$3" "$4"'
 it "and nothing was backed up outside it"
 [[ -z "$(find "$RUH/base" -type f ! -path "$RUBACKUP/*" 2>/dev/null)" ]] \
     && ok || fail "a backup file escaped replaced/: $(find "$RUH/base" -type f ! -path "$RUBACKUP/*")"
+
+# ── an ancestor declared path and a descendant one collide, and must be ─────
+# ── flagged ambiguous, not silently written twice ───────────────────────────
+# destcount/prefixcount key by exact string equality -- ~/.config/foo and
+# ~/.config/foo/bar never collide as strings, but the FIRST group's tree walk
+# already recurses into bar/ on its own, and the SECOND group's separate walk
+# over the same files produces a second row for the same destination. A PoC
+# confirmed the result: two rows, one destination, neither flagged ambiguous;
+# --apply wrote the file twice, and the SECOND write's backup overwrote the
+# first's in replaced/ -- the operator's real original was gone from both the
+# live destination and the one place kept to protect it.
+ADH="$(mktemp -d)"; ADR="$ADH/repo"
+mkdir -p "$ADR/configs/foo/bar"
+git init -q "$ADR"; git -C "$ADR" config user.email t@t; git -C "$ADR" config user.name t
+printf 'from-the-backup\n' >"$ADR/configs/foo/bar/f.txt"
+git -C "$ADR" add -A && git -C "$ADR" commit -qm one
+cat >"$ADH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"outer","label":"Outer","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/foo"]},
+ {"id":"inner","label":"Inner","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/foo/bar"]}]}
+JSON
+mkdir -p "$ADH/home"
+HOME="$ADH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$ADH/g.json" \
+    OMABACKUP_STATE="$ADH/home/.state" OMABACKUP_REPO="$ADR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+ADART="$(ls -t "$ADH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+ADTGT="$(mktemp -d)"
+mkdir -p "$ADTGT/.config/foo/bar"
+printf 'operators-original\n' >"$ADTGT/.config/foo/bar/f.txt"
+
+it "an ancestor and a descendant declared path collide, flagged ambiguous"
+ADPLAN="$(HOME="$ADTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$ADH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$ADART" 2>&1)"
+assert_contains "$ADPLAN" "ambiguous"
+
+it "and 0 files would be restored, not 1"
+assert_contains "$ADPLAN" "0 files would be restored"
+
+it "and --apply does not touch the operator's original at all"
+HOME="$ADTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$ADH/rstate2" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$ADART" >/dev/null 2>&1
+assert_eq "$(cat "$ADTGT/.config/foo/bar/f.txt")" "operators-original"

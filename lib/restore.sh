@@ -278,7 +278,23 @@ restore_rows() {
     # other: swapping one for the other during development silently traded
     # one class of loss for the other, which the original flat-collision spec
     # (same prefix, different live paths) caught immediately.
-    local -A prefixcount=() destcount=()
+    #
+    # Neither map catches a THIRD shape, though: two declared live paths
+    # where one is an ANCESTOR of the other -- ~/.config/foo (tree, mirrors
+    # everything under it) and ~/.config/foo/bar (also declared, its own
+    # entry). destcount's exact-string keying treats those as two unrelated
+    # paths -- they never collide as strings -- but the FIRST group's walk
+    # already recurses into bar/ on its own, and the second group's separate
+    # walk over the same files produces a second row for the same
+    # destination. A PoC confirmed the result: two rows, one destination,
+    # neither flagged ambiguous; --apply wrote the file twice, and the
+    # SECOND write's backup overwrote the first's in replaced/ -- the
+    # operator's real original was gone from both the live destination and
+    # the one place kept to protect it. seen_e/poisoned_e catch this by
+    # checking every new live path against every one already seen for a
+    # strict ancestor/descendant relationship, not just equality.
+    local -A prefixcount=() destcount=() poisoned_e=()
+    local -a seen_e=()
     while read -r id; do
         [[ -n "$id" ]] || continue
         gm="$(group_field "$id" mode)" || return 1
@@ -298,6 +314,15 @@ restore_rows() {
             e="$(_expand "$p")"
             prefixcount[$prefix]=$(( ${prefixcount[$prefix]:-0} + 1 ))
             destcount[$e]=$(( ${destcount[$e]:-0} + 1 ))
+            local existing_e
+            for existing_e in "${seen_e[@]}"; do
+                [[ "$existing_e" == "$e" ]] && continue
+                if [[ "$e" == "$existing_e"/* || "$existing_e" == "$e"/* ]]; then
+                    poisoned_e[$e]=1
+                    poisoned_e[$existing_e]=1
+                fi
+            done
+            seen_e+=("$e")
         done <<<"$paths_out"
     done <<<"$ids_out"
 
@@ -422,7 +447,7 @@ restore_rows() {
                         printf 'escape\t%s\t%s/<name with embedded tab or newline>\t%s\n' "$id" "$prefix" "$sdest"
                     elif ! _restore_contained "$dest"; then
                         printf 'escape\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
-                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )); then
+                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )) || [[ -n "${poisoned_e[$e]:-}" ]]; then
                         printf 'ambiguous\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
                     # held was checked in the tree branch only. A manifest is
                     # free to declare a trackedRepoPath override for the
@@ -466,7 +491,7 @@ restore_rows() {
                     # FIRST one just wrote, not the real original, and the real
                     # original is gone from both the destination and the one
                     # place kept to protect it.
-                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )); then
+                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )) || [[ -n "${poisoned_e[$e]:-}" ]]; then
                         printf 'ambiguous\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
                     elif [[ "$verdict" == forward ]] && _path_contained "$dest" "$migdir"; then
                         printf 'held\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
@@ -479,7 +504,7 @@ restore_rows() {
                 dest="$e"
                 if ! _restore_contained "$dest"; then
                     printf 'escape\t%s\t%s\t%s\n' "$id" "$prefix" "$dest"
-                elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )); then
+                elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )) || [[ -n "${poisoned_e[$e]:-}" ]]; then
                     printf 'ambiguous\t%s\t%s\t%s\n' "$id" "$prefix" "$dest"
                 else
                     printf '%s\t%s\t%s\t%s\n' "$action" "$id" "$prefix" "$dest"
