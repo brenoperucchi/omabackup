@@ -8,7 +8,7 @@ Codex, a fresh terminal, another machine) — it is what lets a cold session,
 regardless of which coding agent is reading it, pick up where the last one
 left off. Read this file first, in full, before touching any code.
 
-Last updated: 2026-08-24.
+Last updated: 2026-08-27.
 
 ---
 
@@ -83,8 +83,12 @@ Two things that deliberately did *not* go in, both correct:
 `ab5d352` built `omabackup bundle`: `git bundle --all HEAD` + `git archive
 HEAD` (never the working tree — measured 1.0MB against 66MB, the difference
 being untracked caches) + the tool itself + a self-sufficient `manifest.json`,
-content-addressed by HEAD, self-verified by extracting and cloning offline on
-every build. 416KB on this machine. `acc9c17` built `push`: destinations
+self-verified by extracting and cloning offline on every build. 416KB on this
+machine. Content-addressed at first by HEAD alone; a later round widened the
+cache key to HEAD + the tool's own fingerprint + every ref + the manifest's
+hash, so a timer firing with nothing new to say — same code, same repo state
+— still does no new work, and a tool upgrade with the repo unchanged still
+does. `acc9c17` built `push`: destinations
 config outside the repo (`~/.config/omabackup/destinations.json`, machine
 identity, not project data), per-destination state with epoch-based backoff,
 five-rule retention (the sharpest one: refuses to prune any directory missing
@@ -379,14 +383,31 @@ is not a file copy and is not something this tool does on anyone's behalf.
 
 Three things shape it, and all three came out of §12:
 
-- **The artifact's own manifest drives it.** `tool/groups.default.json` ships
-  inside every bundle for exactly this. A restore driven by whatever manifest
-  the machine happens to carry would look for groups the artifact never had and
-  place files by rules written after it.
-- **The verdict is taken before anything is WRITTEN, and against wherever
-  `--into` says the restore is landing.** (The artifact is extracted and
-  verified first, which is reading -- the promise is about deciding, not
-  about touching disk.) `same` (identical
+- **The artifact's own manifest drives it — with one floor.**
+  `tool/groups.default.json` ships inside every bundle for exactly this. A
+  restore driven by whatever manifest the machine happens to carry would look
+  for groups the artifact never had and place files by rules written after
+  it. But an artifact's own `coupled` flag is not trusted DOWNWARD: a later
+  review found that an artifact could simply omit `coupled` for a group its
+  own `manifest.json` calls coupled — the two are not independent, both
+  written by the same build — and restore past quarantine that way. This
+  machine's own locally-installed schema, captured before the artifact's copy
+  shadows it, is used as a floor: it can push a recognized group's `coupled`
+  up to true, never down.
+- **The verdict is taken before anything is WRITTEN, and always against THIS
+  machine, never `--into`'s target.** This went back and forth: an earlier
+  version computed it against `--into`'s target on the reasoning that a
+  `--into` restore is "about wherever the restore actually lands," which
+  broke the more common use of `--into` worse than the bug it fixed —
+  pointing it at an empty scratch directory read as watermark 0, the
+  PERMISSIVE case, so previewing what `--apply` would do applied MORE than a
+  real restore onto the operator's own machine would have. `version` and
+  `channel` are unavoidably the real machine's regardless (`omarchy-version`/
+  `omarchy-channel-current` are system commands, not `$HOME`-relative), so
+  `--into` was never going to simulate a different Omarchy install, only a
+  different destination for one. (The artifact is extracted and verified
+  first, which is reading -- the promise is about deciding, not about
+  touching disk.) `same` (identical
   watermark: coupled groups and migration markers both apply), `behind`
   (inside the range, this machine has fewer migrations than the backup --
   typically a fresh install with no migrations directory yet: coupled groups
@@ -421,6 +442,63 @@ second case -- two distinct repo locations agreeing on one live path printed
 as an ordinary `restore` row for the same file, with nothing to catch it. No
 group in the shipped manifest triggers either -- `scripts` declares
 `~/.local/bin` and `~/bin` with distinct destinations.
+
+### Restore's trust boundary, hardened (2026-08-26/27)
+
+A PoC found `restore` executing an artifact's own embedded `tool/bin/omabackup`
+as part of proving it "verifies" -- with the operator's full privileges, in
+plan mode, before `--apply`. Full reasoning, the alternatives considered
+(sandboxing, signing) and why they were set aside, in DESIGN.md §15. In brief:
+restore no longer runs an artifact's embedded binary at all, checked with a
+mandatory (no default) `run-embedded` argument threaded through
+`_verify_extracted`/`verify_bundle` so a future caller must decide explicitly
+rather than inherit a default.
+
+Two independent adversarial review passes on that fix (and each other) then
+found, and this session closed, six more:
+
+- A cache-hit reused an artifact from disk without re-proving it, which
+  reopened the SAME execution hole through `~/.local/state/omabackup/bundles/`
+  instead of a handed-over artifact -- closed with the same `run-embedded`
+  parameter, `0` for cache-hit, `1` only for output this exact call just built.
+- A tampered CACHED bundle, no longer executed, was still SERVED --
+  `verify_bundle`'s data-only checks cannot see a swapped tool with
+  recomputed `SHA256SUMS`. Closed with a fifth check specific to cache-hit:
+  the cached tool's own fingerprint must match what `$OMABACKUP_ROOT` would
+  produce right now.
+- `tar -xf <(zstd -dc ...)` discarded zstd's own exit status; a valid frame
+  followed by trailing garbage extracted clean. Fixed with a real pipe under
+  `pipefail`.
+- `groups_ids`/`group_paths` fed a process substitution directly, whose exit
+  status is not observable at the `done` that closes it; an unparseable
+  manifest read as "nothing to restore" instead of a refusal.
+- A missing `coupled` field in the artifact's own bundled schema walked past
+  quarantine -- the artifact's `manifest.json` and its `groups.default.json`
+  are not independent for an attacker who built both. Fixed with a floor:
+  this machine's own installed schema can push a recognized group's `coupled`
+  up, never down.
+- A non-integer watermark (a stray `junk.sh`, or a manifest field written
+  wrong) fell back to `0`, the most PERMISSIVE reading there is. Now refused,
+  joining the existing `unreadable` sentinel check, on both the build side and
+  the restore side.
+- A filename with an embedded tab or newline could inject a second, forged
+  TSV row into the plan -- a quarantined file's row split at the newline, and
+  the remainder read back as its own `restore` row for the same destination.
+  Refused as `escape` at every row-emission site that builds a name from
+  `find` output.
+
+Also solved a standing mystery: a commit named just "base" (`142ffb1`) had
+appeared on `main`, authored under this repo's own git identity, that nobody
+could explain. It was this test suite: dozens of fixtures build a throwaway
+repo via `mktemp -d` and then `git -C "$r" commit -qm base` against it, and
+`git -C ""` — confirmed directly — does not refuse an empty path, it silently
+operates on the CURRENT directory instead. When `mktemp -d` genuinely failed
+(the same `/tmp` inode exhaustion already on record above), whatever was
+sitting uncommitted in this repo's own working tree got committed for real.
+Reproduced a second time, live, while fixing it -- caught before it was ever
+pushed. `mktemp` is now overridden as a shell function in `test/run.sh`,
+before any spec is sourced, that kills the whole test run (not just its own
+subshell -- `exit` alone does not reach past `$(...)`) the moment it fails.
 
 ## Immediate next actions
 
