@@ -1208,3 +1208,46 @@ HOME="$TPTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$TPH/rstate2" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$TPART" >/dev/null 2>&1
 [[ -z "$(find "$TPTGT" -type f 2>/dev/null)" ]] \
     && ok || fail "files from outside the artifact's own worktree were written"
+
+# ── a trailing slash in a declared path does not defeat the held check ──────
+# migdir vs $dest used to be a raw string compare -- _expand does nothing but
+# substitute a leading ~, so a group declaring its live path WITH a trailing
+# slash ("~/.local/state/omarchy/" instead of without) made $dest carry a
+# double slash the comparison no longer matched. A PoC confirmed the result:
+# on a genuine `forward` verdict, an old migration marker that should have
+# been held was offered as an ordinary restore instead. Nothing malicious --
+# just an accidental trailing slash, in either this machine's own manifest or
+# an artifact's.
+TSH="$(mktemp -d)"; TSR="$TSH/repo"
+mkdir -p "$TSR/state/omarchy/migrations"
+git init -q "$TSR"; git -C "$TSR" config user.email t@t; git -C "$TSR" config user.name t
+printf 'old\n' >"$TSR/state/omarchy/migrations/1700000000.sh"
+git -C "$TSR" add -A && git -C "$TSR" commit -qm one
+cat >"$TSH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"state","label":"State","mode":"copy","coupled":true,"critical":false,
+  "paths":["~/.local/state/omarchy/"]}]}
+JSON
+mkdir -p "$TSH/home/.local/state/omarchy/migrations"
+printf 'artifact-own\n' >"$TSH/home/.local/state/omarchy/migrations/1700000000.sh"
+HOME="$TSH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$TSH/g.json" \
+    OMABACKUP_STATE="$TSH/home/.state" OMABACKUP_REPO="$TSR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+TSART="$(ls -t "$TSH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+TSTGT="$(mktemp -d)"
+mkdir -p "$TSTGT/.local/state/omarchy/migrations"
+printf 'newer\n' >"$TSTGT/.local/state/omarchy/migrations/1900000000.sh"
+
+it "an old marker is held on forward, even through a trailing-slash declared path"
+TSPLAN="$(HOME="$TSTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$TSH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$TSART" 2>&1)"
+assert_contains "$TSPLAN" "held"
+
+it "and 0 files would be restored, not 1"
+assert_contains "$TSPLAN" "0 files would be restored"
+
+it "and --apply really does not write the old marker back"
+HOME="$TSTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$TSH/rstate2" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$TSART" >/dev/null 2>&1
+[[ ! -e "$TSTGT/.local/state/omarchy/migrations/1700000000.sh" ]] \
+    && ok || fail "the old marker was written despite the forward verdict"

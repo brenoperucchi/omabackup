@@ -240,6 +240,17 @@ restore_rows() {
     [[ -d "$wt" ]] || return 1
 
     local migdir; migdir="$(_expand '~/.local/state/omarchy/migrations')"
+    # Compared below via _path_contained, not a raw string match against
+    # $migdir -- _expand does nothing but substitute a leading ~, and $dest is
+    # built the same uncanonicalized way. A PoC confirmed the gap: a group
+    # declaring its live path with a trailing slash ("~/.local/state/omarchy/"
+    # instead of without) made $dest carry a double slash
+    # (".../omarchy//migrations/...") that no longer string-equalled $migdir
+    # or matched its "/*" prefix, so an old migration marker on a `forward`
+    # verdict -- exactly the case this check exists to hold back -- was
+    # offered as an ordinary restore instead. Nothing malicious was needed,
+    # just an accidental trailing slash in either this machine's own manifest
+    # or an artifact's.
 
     # Captured once, checked, reused for both loops below -- not fed straight
     # into `done < <(groups_ids)`. A process substitution's own exit status is
@@ -394,7 +405,7 @@ restore_rows() {
                     # verdict restoring an old marker through that path would
                     # be exactly the contradiction the tree branch's held check
                     # exists to prevent.
-                    elif [[ "$verdict" == forward && ( "$dest" == "$migdir" || "$dest" == "$migdir"/* ) ]]; then
+                    elif [[ "$verdict" == forward ]] && _path_contained "$dest" "$migdir"; then
                         printf 'held\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
                     else
                         printf '%s\t%s\t%s/%s\t%s\n' "$action" "$id" "$prefix" "$sub" "$dest"
@@ -430,7 +441,7 @@ restore_rows() {
                     # place kept to protect it.
                     elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )); then
                         printf 'ambiguous\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
-                    elif [[ "$verdict" == forward && ( "$dest" == "$migdir" || "$dest" == "$migdir"/* ) ]]; then
+                    elif [[ "$verdict" == forward ]] && _path_contained "$dest" "$migdir"; then
                         printf 'held\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
                     else
                         printf '%s\t%s\t%s/%s\t%s\n' "$action" "$id" "$prefix" "$rel" "$dest"
