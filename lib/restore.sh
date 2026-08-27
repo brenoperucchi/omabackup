@@ -293,6 +293,18 @@ restore_rows() {
     # the one place kept to protect it. seen_e/poisoned_e catch this by
     # checking every new live path against every one already seen for a
     # strict ancestor/descendant relationship, not just equality.
+    #
+    # Both destcount and poisoned_e are keyed on $ec (canonical), not $e.
+    # A first version compared $e's raw spelling, and two PoCs went straight
+    # through it: a trailing slash on one of two otherwise-identical live
+    # paths (".../foo/" vs ".../foo"), and two declared paths that are not
+    # textually related AT ALL but are the SAME real location because one is
+    # a symlink to the other (~/.config/alias -> ~/.config/foo, both
+    # declared). Either one reproduced the exact replaced/-overwritten loss
+    # this map exists to prevent, just through a spelling the string
+    # comparison never saw as related. realpath -m resolves both: the
+    # trailing slash lexically, the symlink by actually following it on
+    # THIS machine's real filesystem, where the alias genuinely is one.
     local -A prefixcount=() destcount=() poisoned_e=()
     local -a seen_e=()
     while read -r id; do
@@ -312,17 +324,18 @@ restore_rows() {
             IFS=$'\t' read -r prefix kind <<<"$rp"
             [[ -n "$prefix" ]] || continue
             e="$(_expand "$p")"
+            local ec; ec="$(realpath -m -- "$e" 2>/dev/null)"; [[ -n "$ec" ]] || ec="$e"
             prefixcount[$prefix]=$(( ${prefixcount[$prefix]:-0} + 1 ))
-            destcount[$e]=$(( ${destcount[$e]:-0} + 1 ))
+            destcount[$ec]=$(( ${destcount[$ec]:-0} + 1 ))
             local existing_e
             for existing_e in "${seen_e[@]}"; do
-                [[ "$existing_e" == "$e" ]] && continue
-                if [[ "$e" == "$existing_e"/* || "$existing_e" == "$e"/* ]]; then
-                    poisoned_e[$e]=1
+                [[ "$existing_e" == "$ec" ]] && continue
+                if [[ "$ec" == "$existing_e"/* || "$existing_e" == "$ec"/* ]]; then
+                    poisoned_e[$ec]=1
                     poisoned_e[$existing_e]=1
                 fi
             done
-            seen_e+=("$e")
+            seen_e+=("$ec")
         done <<<"$paths_out"
     done <<<"$ids_out"
 
@@ -400,6 +413,11 @@ restore_rows() {
             IFS=$'\t' read -r prefix kind <<<"$rp"
             [[ -n "$prefix" ]] || continue
             e="$(_expand "$p")"
+            # Canonicalized the same way the counting pass above keys
+            # destcount/poisoned_e -- a lookup against the raw $e here would
+            # miss both maps for the exact spellings (trailing slash, a
+            # symlink alias) they exist to catch.
+            local ec; ec="$(realpath -m -- "$e" 2>/dev/null)"; [[ -n "$ec" ]] || ec="$e"
             # $prefix, for a `flat` kind, is trackedRepoPath -- verbatim from
             # the ARTIFACT's own bundled groups.default.json, never validated
             # against the worktree it is about to be read from. A PoC
@@ -447,7 +465,7 @@ restore_rows() {
                         printf 'escape\t%s\t%s/<name with embedded tab or newline>\t%s\n' "$id" "$prefix" "$sdest"
                     elif ! _restore_contained "$dest"; then
                         printf 'escape\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
-                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )) || [[ -n "${poisoned_e[$e]:-}" ]]; then
+                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$ec]:-1} > 1 )) || [[ -n "${poisoned_e[$ec]:-}" ]]; then
                         printf 'ambiguous\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
                     # held was checked in the tree branch only. A manifest is
                     # free to declare a trackedRepoPath override for the
@@ -491,7 +509,7 @@ restore_rows() {
                     # FIRST one just wrote, not the real original, and the real
                     # original is gone from both the destination and the one
                     # place kept to protect it.
-                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )) || [[ -n "${poisoned_e[$e]:-}" ]]; then
+                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$ec]:-1} > 1 )) || [[ -n "${poisoned_e[$ec]:-}" ]]; then
                         printf 'ambiguous\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
                     elif [[ "$verdict" == forward ]] && _path_contained "$dest" "$migdir"; then
                         printf 'held\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
@@ -504,7 +522,7 @@ restore_rows() {
                 dest="$e"
                 if ! _restore_contained "$dest"; then
                     printf 'escape\t%s\t%s\t%s\n' "$id" "$prefix" "$dest"
-                elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )) || [[ -n "${poisoned_e[$e]:-}" ]]; then
+                elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$ec]:-1} > 1 )) || [[ -n "${poisoned_e[$ec]:-}" ]]; then
                     printf 'ambiguous\t%s\t%s\t%s\n' "$id" "$prefix" "$dest"
                 else
                     printf '%s\t%s\t%s\t%s\n' "$action" "$id" "$prefix" "$dest"

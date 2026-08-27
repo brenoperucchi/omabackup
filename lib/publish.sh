@@ -59,8 +59,31 @@ map_to_repo() {
 # omarchy-shell-config serialize shell.json differently (insertion order vs.
 # `jq -S`), and without normalizing, moving one bar widget rewrites the whole
 # file in the diff. See docs/DESIGN.md §11.1.
-_publish_file() {
-    local src="$1" dst="$2"
+# _publish_contained <path> <base>
+# Self-contained rather than reusing lib/restore.sh's _path_contained --
+# publish.sh is sourced standalone in its own tests, and a cross-file
+# function dependency would break there. Same logic: realpath -m resolves
+# the parts of <path> that exist (following any symlink along the way) and
+# normalizes the rest lexically, in one pass -- the two ways a path escapes
+# its base, whether or not <path> itself exists yet.
+_publish_contained() {
+    local p="$1" base="$2" rp base_rp
+    rp="$(realpath -m -- "$p" 2>/dev/null)" || return 1
+    base_rp="$(realpath -e -- "$base" 2>/dev/null)" || return 1
+    [[ -n "$rp" && -n "$base_rp" ]] || return 1
+    [[ "$rp" == "$base_rp" || "$rp" == "$base_rp"/* ]]
+}
+
+_publish_file() {  # _publish_file <src> <dst> <repo-root>
+    local src="$1" dst="$2" base="$3"
+    # --remove-destination two lines down protects the FINAL component --
+    # confirmed separately that it does nothing for a symlink higher up the
+    # path. A PoC: repo/configs -> /tmp/outside (an existing symlinked
+    # ANCESTOR directory, not the file itself). mkdir -p follows it same as
+    # any real directory would, and the write landed in /tmp/outside instead
+    # of inside the repo, rc=0. Checked before mkdir -p ever runs, since by
+    # the time it has run the escape has already happened.
+    _publish_contained "$(dirname "$dst")" "$base" || return 1
     mkdir -p "$(dirname "$dst")" || return 1
     # A symlink is content: copied as a link, never followed. Publishing what it
     # points at would silently turn a link into a fat copy of somebody else's
@@ -121,74 +144,108 @@ publish_staging() {
     local staging="$1" repo="$2" table="${3:-}" list="${4:-}" f pf pid rel dst failed=0
     local -a written=()
 
+    # A snapshot, not two independent `find` calls. The first version ran
+    # find TWICE -- once to count destinations, once to write -- and a PoC
+    # confirmed that is not the same thing as one: forcing the two walks to
+    # see different sets (a file added between them) let a collision slip
+    # past the count and overwrite silently anyway. Captured once, into
+    # parallel arrays rather than a single delimited string, since a staged
+    # file's name is free to hold the tab or newline a text encoding would
+    # need as its own separator -- the same reasoning restore_rows' TSV rows
+    # were fixed against.
+    #
     # map_to_repo maps FLAT for a trackedRepoPath entry -- the repo keeps one
     # directory of names, not a mirror -- and nothing stopped two DIFFERENT
     # staged files from mapping to the SAME repo destination: two groups
     # whose trackedRepoPath both name the same repo directory, each holding
     # a file with the same basename. A PoC confirmed the result: both wrote,
     # the second silently overwrote the first, "2 files" published, one
-    # gone, exit 0. A first pass counts every destination this walk would
-    # produce, so a collision is caught before either file is written --
-    # not discovered after the second write already destroyed the first.
+    # gone, exit 0.
+    #
+    # destcount is also poisoned for ancestor/descendant destinations, the
+    # same technique restore_rows uses for declared live paths: "shared" and
+    # "shared/child" never collide as exact strings, but a PoC forcing the
+    # more specific one to enumerate first turned the less specific one's
+    # own file into a DIRECTORY component of the other's path -- shared/
+    # child/child instead of two files -- rc=0, no warning.
+    #
+    # .generated and .plugins/manifest.txt and .plugins/patches/*.patch are
+    # folded into this SAME map before anything is written, not skipped and
+    # written separately after: a PoC showed a plain staged file mapping to
+    # the identical repo path as a generated list (lists/pkgs-explicit.txt,
+    # reachable through a manifest that also declares that path) silently
+    # overwrote whichever one wrote last, uncaught, because the old code
+    # never compared the two namespaces against each other at all.
+    local -a rels=() dsts=()
     local -A destcount=()
     while IFS= read -r -d '' f; do
         rel="${f#"$staging"/}"
         [[ "$rel" == .generated/* || "$rel" == .plugins/* ]] && continue
         dst="$(map_to_repo "$rel" "$table")" || continue
-        destcount[$dst]=$(( ${destcount[$dst]:-0} + 1 ))
+        rels+=("$rel"); dsts+=("$dst")
     done < <(find "$staging" \( -type f -o -type l \) -print0 2>/dev/null)
-    wait "$!" || failed=$((failed + 1))
-
-    # `-type f -o -type l`: a plain `-type f` excludes symlinks, and every staged
-    # link was therefore dropped without a word. This machine stages
-    # ~/.config/nvim/lua/plugins/theme.lua and .../current/background as links,
-    # and the destination repo tracks four -- all frozen at whatever the previous
-    # tool left behind.
-    while IFS= read -r -d '' f; do
-        rel="${f#"$staging"/}"
-        [[ "$rel" == .generated/* || "$rel" == .plugins/* ]] && continue
-        dst="$(map_to_repo "$rel" "$table")" || continue
-        if (( ${destcount[$dst]:-1} > 1 )); then
-            printf 'omabackup: %s maps to %s, which %s different staged files map to -- refusing to publish any of them, one would silently overwrite another\n' \
-                "$rel" "$dst" "${destcount[$dst]}" >&2
-            failed=$((failed + 1))
-            continue
-        fi
-        if _publish_file "$f" "$repo/$dst"; then written+=("$dst"); else failed=$((failed + 1)); fi
-    done < <(find "$staging" \( -type f -o -type l \) -print0 2>/dev/null)
-    # find's own status, checked -- the same fail-open scan_files and
-    # restore_rows already closed, still open here: a walk that stopped
-    # partway published fewer files than staging actually held, and this
-    # function's own return status said nothing was wrong. A PoC (a stub
-    # find that prints one file then exits nonzero) confirmed rc=0 with an
-    # incomplete publish -- sync could proceed to commit over it.
-    wait "$!" || failed=$((failed + 1))
+    # find's own status, checked BEFORE anything below ever runs -- the
+    # earlier version incremented `failed` here but fell through to the
+    # write pass regardless. A PoC (a stub find that prints one file then
+    # exits nonzero) confirmed the result: rc=1 reported at the very end,
+    # but the file had already been written by then.
+    wait "$!" || return 1
 
     if [[ -d "$staging/.generated" ]]; then
         for f in "$staging"/.generated/*; do
             [[ -f "$f" ]] || continue
             dst="$(_generated_repo_name "$f")" || continue
-            if _publish_file "$f" "$repo/$dst"; then written+=("$dst"); else failed=$((failed + 1)); fi
+            rels+=(".generated/${f##*/}"); dsts+=("$dst")
+        done
+    fi
+    if [[ -f "$staging/.plugins/manifest.txt" ]]; then
+        rels+=(".plugins/manifest.txt"); dsts+=("lists/omarchy-plugins.txt")
+    fi
+    if [[ -d "$staging/.plugins/patches" ]]; then
+        for f in "$staging"/.plugins/patches/*.patch; do
+            [[ -f "$f" ]] || continue
+            rels+=(".plugins/patches/${f##*/}"); dsts+=("patches/omarchy-plugins/${f##*/}")
         done
     fi
 
+    local i n_pairs="${#rels[@]}" existing_dst
+    local -a seen_dst=()
+    for (( i = 0; i < n_pairs; i++ )); do
+        dst="${dsts[$i]}"
+        destcount[$dst]=$(( ${destcount[$dst]:-0} + 1 ))
+        for existing_dst in "${seen_dst[@]}"; do
+            [[ "$existing_dst" == "$dst" ]] && continue
+            if [[ "$dst" == "$existing_dst"/* || "$existing_dst" == "$dst"/* ]]; then
+                destcount[$dst]=$(( ${destcount[$dst]} + 1 ))
+                destcount[$existing_dst]=$(( ${destcount[$existing_dst]:-1} + 1 ))
+            fi
+        done
+        seen_dst+=("$dst")
+    done
+
+    for (( i = 0; i < n_pairs; i++ )); do
+        rel="${rels[$i]}"; dst="${dsts[$i]}"
+        f="$staging/$rel"
+        if (( ${destcount[$dst]:-1} > 1 )); then
+            printf 'omabackup: %s maps to %s, which more than one staged source maps to -- refusing to publish any of them, one would silently overwrite another\n' \
+                "$rel" "$dst" >&2
+            failed=$((failed + 1))
+            continue
+        fi
+        if _publish_file "$f" "$repo/$dst" "$repo"; then written+=("$dst"); else failed=$((failed + 1)); fi
+    done
+
     if [[ -d "$staging/.plugins" ]]; then
-        if [[ -f "$staging/.plugins/manifest.txt" ]]; then
-            if _publish_file "$staging/.plugins/manifest.txt" "$repo/lists/omarchy-plugins.txt"
-            then written+=("lists/omarchy-plugins.txt"); else failed=$((failed + 1)); fi
-        fi
-        if [[ -d "$staging/.plugins/patches" ]]; then
-            mkdir -p "$repo/patches/omarchy-plugins" || failed=$((failed + 1))
-            for f in "$staging"/.plugins/patches/*.patch; do
-                [[ -f "$f" ]] || continue
-                if cp "$f" "$repo/patches/omarchy-plugins/${f##*/}"
-                then written+=("patches/omarchy-plugins/${f##*/}"); else failed=$((failed + 1)); fi
-            done
-        fi
         if [[ -d "$staging/.plugins/local" ]]; then
             for f in "$staging"/.plugins/local/*/; do
                 [[ -d "$f" ]] || continue
                 pid="${f%/}"; pid="${pid##*/}"
+                # Same containment _publish_file's own writes get -- a repo
+                # whose configs/omarchy/plugins directory is itself a
+                # symlink (or has one somewhere in its ancestry) would
+                # otherwise have this rsync follow it same as mkdir -p does.
+                _publish_contained "$repo/configs/omarchy/plugins/$pid" "$repo" \
+                    || { failed=$((failed + 1)); continue; }
                 mkdir -p "$repo/configs/omarchy/plugins/$pid" || { failed=$((failed + 1)); continue; }
                 rsync -a --exclude '.git/' "$f" "$repo/configs/omarchy/plugins/$pid/" \
                     || { failed=$((failed + 1)); continue; }

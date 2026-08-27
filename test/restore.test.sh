@@ -1428,3 +1428,58 @@ it "and --apply does not touch the operator's original at all"
 HOME="$ADTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$ADH/rstate2" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$ADART" >/dev/null 2>&1
 assert_eq "$(cat "$ADTGT/.config/foo/bar/f.txt")" "operators-original"
+
+# ── the ancestor/descendant collision is caught through a trailing slash ────
+# ── and through a symlink alias, not just an identical literal spelling ─────
+# poisoned_e/destcount used to key on $e's raw spelling. Two independent PoCs
+# went straight through that: a trailing slash on one of two otherwise-
+# identical declared paths, and two declared paths that are not textually
+# related at all but are the SAME real location because one is a symlink to
+# the other. Both reproduced the exact replaced/-overwritten data loss the
+# collision map exists to prevent. Fixed by keying on realpath -m instead --
+# it resolves the trailing slash lexically and the symlink by actually
+# following it.
+TS1H="$(mktemp -d)"; TS1R="$TS1H/repo"
+mkdir -p "$TS1R/configs/foo"
+git init -q "$TS1R"; git -C "$TS1R" config user.email t@t; git -C "$TS1R" config user.name t
+printf 'from-backup\n' >"$TS1R/configs/foo/f.txt"
+git -C "$TS1R" add -A && git -C "$TS1R" commit -qm one
+cat >"$TS1H/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"a","label":"A","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/foo/"]},
+ {"id":"b","label":"B","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/foo"]}]}
+JSON
+mkdir -p "$TS1H/home/.config/foo"
+printf 'operator-original\n' >"$TS1H/home/.config/foo/f.txt"
+HOME="$TS1H/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$TS1H/g.json" \
+    OMABACKUP_STATE="$TS1H/home/.state" OMABACKUP_REPO="$TS1R" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+TS1ART="$(ls -t "$TS1H/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+
+it "a trailing slash on one of two identical declared paths is still caught"
+TS1PLAN="$(HOME="$TS1H/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$TS1H/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$TS1ART" 2>&1)"
+assert_contains "$TS1PLAN" "0 files would be restored"
+
+SAH="$(mktemp -d)"; SAR="$SAH/repo"
+mkdir -p "$SAR/configs/foo"
+git init -q "$SAR"; git -C "$SAR" config user.email t@t; git -C "$SAR" config user.name t
+printf 'from-backup\n' >"$SAR/configs/foo/f.txt"
+git -C "$SAR" add -A && git -C "$SAR" commit -qm one
+cat >"$SAH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"a","label":"A","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/alias"]},
+ {"id":"b","label":"B","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/foo"]}]}
+JSON
+mkdir -p "$SAH/home/.config/foo"
+printf 'operator-original\n' >"$SAH/home/.config/foo/f.txt"
+ln -s "$SAH/home/.config/foo" "$SAH/home/.config/alias"
+HOME="$SAH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$SAH/g.json" \
+    OMABACKUP_STATE="$SAH/home/.state" OMABACKUP_REPO="$SAR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+SAART="$(ls -t "$SAH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+
+it "two declared paths aliased by a real symlink are caught, apply writes nothing"
+HOME="$SAH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$SAH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$SAART" >/dev/null 2>&1
+assert_eq "$(cat "$SAH/home/.config/foo/f.txt")" "operator-original"

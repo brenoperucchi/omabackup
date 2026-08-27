@@ -301,3 +301,28 @@ OUTE="$(timeout 5 env HOME="$SHC" OMABACKUP_GROUPS="$SGC" OMABACKUP_STATE="$SHC/
 
 it "a flag is never swallowed as another flag's value"
 assert_contains "$OUTE" "--groups"
+
+# ── a trailing slash on a declared live path no longer drops the whole group ─
+# _expand did nothing but substitute a leading ~. A declared live path with a
+# trailing slash ("~/.local/bin/" instead of "~/.local/bin") built a
+# trackedRepoPath prefix ending in "/", and map_to_repo's own prefix match
+# (rel == "$prefix/"*) became "rel == .local/bin//"* -- two slashes, which no
+# real file's single-slash path ever satisfies. A PoC confirmed the result:
+# sync --commit returned success, published 0 files for that group, and the
+# repo stayed at whatever it held before -- silently, no warning, no error.
+TSH="$(mktemp -d)"; TSR="$TSH/repo"; _dest_repo "$TSR"
+mkdir -p "$TSR/scripts/local-bin"
+printf 'old\n' >"$TSR/scripts/local-bin/tool"
+git -C "$TSR" add -A && git -C "$TSR" -c user.email=t@t -c user.name=t commit -qm base
+TSG="$TSH/g.json"
+cat >"$TSG" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"scripts","label":"Scripts","mode":"copy","coupled":false,"critical":false,
+  "paths":[{"live":"~/.local/bin/","trackedRepoPath":"scripts/local-bin"}]}]}
+JSON
+mkdir -p "$TSH/.local/bin"
+printf 'new\n' >"$TSH/.local/bin/tool"
+
+it "sync --commit publishes through a trailing-slash declared live path"
+_sync_env "$TSH" "$TSR" "$TSG" sync --commit >/dev/null
+assert_eq "$(cat "$TSR/scripts/local-bin/tool" 2>/dev/null)" "new"

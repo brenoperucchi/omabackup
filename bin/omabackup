@@ -93,7 +93,18 @@ FINDINGS=()   # level\tgroup\tcode\tmessage\tpath
 die() { printf '%somabackup: %s%s\n' "$RED" "$*" "$NC" >&2; exit 1; }
 
 _tilde() { printf '%s' "${1/#$HOME/\~}"; }
-_expand() { printf '%s' "${1/#\~/$HOME}"; }
+# A trailing slash on a declared path (an easy typo: "~/.local/bin/" instead
+# of "~/.local/bin") used to ride straight through every consumer of this
+# function's output. It broke restore's forward-move held check
+# (".../omarchy//migrations", fixed in 23c300a) and, confirmed separately,
+# silently dropped an entire trackedRepoPath group from publish: the prefix
+# built from it became ".local/bin/" and every real file's rel path
+# ("`.local/bin/foo`", one slash) failed to match ".local/bin//"* (two).
+# publish_staging returned 0, published 0 files, and the repo stayed stale
+# with no error. Stripped once, here, rather than at each of the many places
+# that read this function's output -- the same reasoning DESIGN.md already
+# gives for _path_contained being general instead of copied per caller.
+_expand() { local e="${1/#\~/$HOME}"; printf '%s' "${e%/}"; }
 
 # `uname -n`, never `hostname`: the latter ships in `inetutils`, which nothing
 # on a stock Omarchy requires -- on this machine it is "Explicitly installed /

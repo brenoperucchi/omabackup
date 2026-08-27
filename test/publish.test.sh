@@ -258,3 +258,105 @@ T1="$(printf 'root\tshared\nroot/nested\tshared/nested\n')"
 T2="$(printf 'root/nested\tshared/nested\nroot\tshared\n')"
 assert_eq "$(map_to_repo 'root/nested/file.txt' "$T1")" "shared/nested/file.txt"
 assert_eq "$(map_to_repo 'root/nested/file.txt' "$T2")" "shared/nested/file.txt"
+
+# ── a preflight failure aborts before any write, not just at the end ────────
+# The first fix (find's status checked, `failed` incremented) still fell
+# through to the write pass regardless -- a PoC confirmed rc=1 reported, but
+# only after the file the preflight DID manage to see had already been
+# written. Now the whole function returns as soon as the preflight's own
+# walk fails, before either pass over the captured list ever runs.
+PA1H="$(mktemp -d)"
+mkdir -p "$PA1H/staging/configs/app" "$PA1H/repo"
+printf 'x\n' >"$PA1H/staging/configs/app/f1.txt"
+git init -q "$PA1H/repo"; git -C "$PA1H/repo" config user.email t@t; git -C "$PA1H/repo" config user.name t
+mkdir -p "$PA1H/stub"
+cat >"$PA1H/stub/find" <<STUB
+#!/bin/bash
+printf '%s\0' "$PA1H/staging/configs/app/f1.txt"
+exit 9
+STUB
+chmod +x "$PA1H/stub/find"
+
+it "publish_staging aborts on a preflight failure before writing anything"
+PATH="$PA1H/stub:$PATH" publish_staging "$PA1H/staging" "$PA1H/repo" >/dev/null 2>&1
+[[ -z "$(find "$PA1H/repo" -type f ! -path '*/.git/*' 2>/dev/null)" ]] \
+    && ok || fail "a file was written despite the preflight walk failing"
+
+# ── a normal staged file colliding with a generated destination is caught ───
+# .generated and .plugins/manifest.txt/patches were skipped by the collision
+# count and written separately after -- a regular staged file whose
+# trackedRepoPath happens to name the identical destination as a generated
+# list (lists/pkgs-explicit.txt is real, reachable through a manifest that
+# declares it) silently overwrote whichever one wrote last. Both namespaces
+# are folded into the same collision map now.
+PA3H="$(mktemp -d)"
+mkdir -p "$PA3H/staging/.generated" "$PA3H/staging/tracked" "$PA3H/repo"
+printf 'generated-content\n' >"$PA3H/staging/.generated/pkgs-explicit.txt"
+printf 'staged-content\n' >"$PA3H/staging/tracked/pkgs-explicit.txt"
+git init -q "$PA3H/repo"; git -C "$PA3H/repo" config user.email t@t; git -C "$PA3H/repo" config user.name t
+PA3TABLE="$(printf 'tracked\tlists\n')"
+
+it "a staged file colliding with a generated list's destination is refused"
+publish_staging "$PA3H/staging" "$PA3H/repo" "$PA3TABLE" >/dev/null 2>&1 \
+    && fail "published despite the generated/staged collision" || ok
+
+it "and neither one silently landed there"
+[[ ! -e "$PA3H/repo/lists/pkgs-explicit.txt" ]] \
+    && ok || fail "one of the two colliding sources landed anyway"
+
+# ── ancestor/descendant collision in the PUBLISH destination is caught ──────
+# destcount keyed by exact equality only -- "shared" and "shared/child" never
+# collide as strings, but a PoC forcing the more specific one to enumerate
+# first turned the less specific one's own file into a directory COMPONENT
+# of the other's path (shared/child/child instead of two real files), rc=0.
+PA4H="$(mktemp -d)"
+mkdir -p "$PA4H/staging/a" "$PA4H/staging/b" "$PA4H/repo"
+printf 'a-content\n' >"$PA4H/staging/a/child"
+printf 'b-content\n' >"$PA4H/staging/b/x"
+git init -q "$PA4H/repo"; git -C "$PA4H/repo" config user.email t@t; git -C "$PA4H/repo" config user.name t
+PA4TABLE="$(printf 'a\tshared\nb\tshared/child\n')"
+
+it "an ancestor and descendant publish destination collide, refused"
+publish_staging "$PA4H/staging" "$PA4H/repo" "$PA4TABLE" >/dev/null 2>&1 \
+    && fail "published despite the ancestor/descendant destination collision" || ok
+
+it "and nothing landed under shared/ at all"
+[[ -z "$(find "$PA4H/repo/shared" -type f 2>/dev/null)" ]] \
+    && ok || fail "something was written despite the collision"
+
+# ── a symlinked ancestor directory in the repo is not written through ───────
+# --remove-destination protects the final path component; nothing protected
+# an ANCESTOR directory that is itself a symlink. A PoC (repo/configs ->
+# /tmp/outside) had mkdir -p follow it same as any real directory, writing
+# outside the repo entirely, rc=0.
+PA7H="$(mktemp -d)"
+mkdir -p "$PA7H/staging/.config/app" "$PA7H/outside" "$PA7H/repo"
+printf 'staged\n' >"$PA7H/staging/.config/app/f.txt"
+git init -q "$PA7H/repo"; git -C "$PA7H/repo" config user.email t@t; git -C "$PA7H/repo" config user.name t
+ln -s "$PA7H/outside" "$PA7H/repo/configs"
+
+it "publish_staging refuses to write through a symlinked ancestor directory"
+publish_staging "$PA7H/staging" "$PA7H/repo" >/dev/null 2>&1 \
+    && fail "wrote through the symlinked configs/ directory" || ok
+
+it "and nothing landed outside the repo"
+[[ -z "$(find "$PA7H/outside" -type f 2>/dev/null)" ]] \
+    && ok || fail "a file was written outside the repo through the symlink"
+
+# ── a plugin patch symlink is not followed either ────────────────────────────
+# The patches loop used a bare `cp`, bypassing _publish_file's own
+# --remove-destination protection entirely. A pre-planted symlink at the
+# exact destination path had its target silently overwritten instead.
+PA8H="$(mktemp -d)"
+mkdir -p "$PA8H/staging/.plugins/patches" "$PA8H/outside" "$PA8H/repo/patches/omarchy-plugins"
+printf 'sensitive\n' >"$PA8H/outside/victim.patch"
+printf 'patch-content\n' >"$PA8H/staging/.plugins/patches/a.patch"
+git init -q "$PA8H/repo"; git -C "$PA8H/repo" config user.email t@t; git -C "$PA8H/repo" config user.name t
+ln -s "$PA8H/outside/victim.patch" "$PA8H/repo/patches/omarchy-plugins/a.patch"
+
+it "a plugin patch does not write through a pre-planted symlink"
+publish_staging "$PA8H/staging" "$PA8H/repo" >/dev/null 2>&1
+assert_eq "$(cat "$PA8H/outside/victim.patch")" "sensitive"
+
+it "and the real patch content landed in the repo instead"
+assert_eq "$(cat "$PA8H/repo/patches/omarchy-plugins/a.patch" 2>/dev/null)" "patch-content"
