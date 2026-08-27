@@ -307,34 +307,61 @@ tracked_path_map() {
 
 # Every path declared by any group, expanded. Probes use this to answer
 # "is this file covered by anyone?".
+#
+# jq piped straight into `while read`, previously -- the pipeline's own exit
+# status is the LAST command's (the while loop, which happily reads zero
+# lines and exits 0), not jq's. A manifest jq could not read at all produced
+# the same empty output as one that genuinely declares nothing, and every
+# caller below read that silence as "nothing declared" rather than "this
+# could not be answered". Captured first, checked, THEN looped.
 all_declared_paths() {
+    local out; out="$(jq -r '(.groups[] | (.paths // [])[])' "$GROUPS_FILE")" || return 1
     local p
-    jq -r '(.groups[] | (.paths // [])[])' "$GROUPS_FILE" | while read -r p; do _expand "$p"; echo; done
+    [[ -n "$out" ]] && while read -r p; do _expand "$p"; echo; done <<<"$out"
+    return 0
 }
 
 # Deliberate exclusions: known dead weight, each with a versioned reason.
 # Without this the checker starts out with a dozen warnings and teaches you to
 # ignore it.
 all_excluded_paths() {
+    local out; out="$(jq -r '(.excluded // [])[].path' "$GROUPS_FILE")" || return 1
     local p
-    jq -r '(.excluded // [])[].path' "$GROUPS_FILE" | while read -r p; do _expand "$p"; echo; done
+    [[ -n "$out" ]] && while read -r p; do _expand "$p"; echo; done <<<"$out"
+    return 0
 }
 
+# Returns 2 for "the exclusion list itself could not be queried" -- distinct
+# from 1, "queried fine, this path is not on it" -- the same distinction
+# _restore_repo_prefix already draws for the same reason: a caller must not
+# treat the two the same way. `< <(all_excluded_paths)` alone, previously,
+# fed the loop from a process substitution whose own exit status has no `$?`
+# slot to check at all; a query failure there was silence, indistinguishable
+# from a manifest with no exclusions. A PoC confirmed the result: a manifest
+# excluding ~/.config/secret, with the .excluded query itself failing,
+# reported "not excluded" for that path -- collect_tree below used to take
+# that at face value and staged the file.
 is_excluded() {
-    local target="$1" ex
+    local target="$1" ex out
+    out="$(all_excluded_paths)" || return 2
+    [[ -n "$out" ]] || return 1
     while read -r ex; do
         [[ -n "$ex" ]] || continue
         [[ "$target" == "$ex" || "$target" == "$ex"/* ]] && return 0
-    done < <(all_excluded_paths)
+    done <<<"$out"
     return 1
 }
 
+# Same distinction, same reason: 2 for "could not be queried", 1 for
+# "queried fine, not covered".
 is_covered() {
-    local target="$1" decl
+    local target="$1" decl out
+    out="$(all_declared_paths)" || return 2
+    [[ -n "$out" ]] || return 1
     while read -r decl; do
         [[ -n "$decl" ]] || continue
         [[ "$target" == "$decl" || "$target" == "$decl"/* ]] && return 0
-    done < <(all_declared_paths)
+    done <<<"$out"
     return 1
 }
 
@@ -588,11 +615,19 @@ _emit_exclude() {
 # match under a root of `~/.config/nvim`. The file the manifest called
 # "constant diff noise" was therefore backed up on every single run.
 _rsync_excludes() {
-    local id="$1" root="${2:-}" pat ex
-    while read -r pat; do _emit_exclude "$pat"; done \
-        < <(jq -r --arg id "$id" '.groups[]|select(.id==$id)|(.exclude // [])[]' "$GROUPS_FILE")
+    local id="$1" root="${2:-}" pat ex out
+    # Both jq queries below, captured and checked before anything reads
+    # them -- a `while read < <(jq ...)` process substitution has no `$?`
+    # slot a caller can check at all, so a failing query here used to be
+    # silent: the pattern list for this transfer came back empty exactly as
+    # it would for a group with genuinely nothing to exclude, and rsync
+    # copied whatever those patterns existed to keep out.
+    out="$(jq -r --arg id "$id" '.groups[]|select(.id==$id)|(.exclude // [])[]' "$GROUPS_FILE")" || return 1
+    [[ -n "$out" ]] && while read -r pat; do _emit_exclude "$pat"; done <<<"$out"
     [[ -n "$root" ]] || return 0
     root="${root%/}"
+    out="$(jq -r '(.excluded // [])[].path' "$GROUPS_FILE")" || return 1
+    [[ -n "$out" ]] || return 0
     while read -r pat; do
         [[ -n "$pat" ]] || continue
         ex="$(_expand "$pat")"
@@ -600,7 +635,7 @@ _rsync_excludes() {
         # slash so it cannot also match a same-named file deeper in the tree.
         [[ "$ex" == "$root"/* ]] || continue
         _emit_exclude "/${ex#"$root"/}"
-    done < <(jq -r '(.excluded // [])[].path' "$GROUPS_FILE")
+    done <<<"$out"
 }
 
 # Collects into staging, NEVER straight into the repo. This is the first of four
@@ -636,7 +671,7 @@ cmd_collect() {
     # that a later, correct collect kept finding and republishing.
     rm -rf "$STAGING"
     mkdir -p "$STAGING"
-    local id mode p e dest n=0
+    local id mode p e dest n=0 excrc rc
     # groups_ids failing here is not a smaller problem than any other -- it is
     # a WORSE one: the manifest this machine's own trusted groups.default.json
     # could not be queried made this loop run zero times, staging (just wiped,
@@ -665,7 +700,16 @@ cmd_collect() {
             # patterns only ever covered descendants of the transfer root, so
             # naming the root itself used to be resolved silently in favour of
             # copying the whole thing.
-            if is_excluded "$e"; then
+            #
+            # rc 2, checked separately from rc 1 -- "excluded" and "the
+            # exclusion list itself could not be answered" used to look the
+            # same to a bare `if is_excluded ...`, and a query failure fell
+            # through to the copy below same as a genuine "no, not excluded"
+            # would. A file this cannot answer for is refused, not copied.
+            is_excluded "$e"; excrc=$?
+            if (( excrc == 2 )); then
+                die "could not check group $id's path $(_tilde "$e") against the exclusion list"
+            elif (( excrc == 0 )); then
                 finding info "$id" path-excluded "declared but excluded on purpose: $p" "$e"
                 continue
             fi
@@ -673,7 +717,15 @@ cmd_collect() {
             mkdir -p "$(dirname "$dest")"
             # Per path, not per group: the exclude patterns have to be relative
             # to the directory rsync is about to walk.
+            #
+            # mapfile from a process substitution has no `$?` of its own to
+            # check -- `wait "$!"` on the substitution's PID right after does.
+            # A failing query inside _rsync_excludes used to be silent: `ex`
+            # came back empty exactly as it would for a group with nothing to
+            # exclude, and the rsync a few lines down copied whatever those
+            # patterns existed to keep out.
             mapfile -t ex < <(_rsync_excludes "$id" "$e")
+            wait "$!" || die "could not read group $id's exclude patterns"
             # Tracked-only is a per-path decision, not a per-group one: a
             # group can mix a directory that should only pull already-tracked
             # names (desktop entries) with a plain file that should always
@@ -692,9 +744,31 @@ cmd_collect() {
             if [[ -n "$trp" ]]; then
                 collect_tracked_only "$e" "$dest" "$id" "$p" || continue
             elif [[ -d "$e" && ! -L "$e" ]]; then
-                rsync -a --exclude '.git/' "${ex[@]}" "$e/" "$dest/"
+                # rsync's own status, checked -- neither call here was, and
+                # `n` counted this path as collected regardless. A PoC (an
+                # rsync wrapper that always fails, exit 1) confirmed the
+                # result: collect reported success, staging held nothing for
+                # this path, and the coverage file it wrote right after
+                # recorded zero files/bytes for a group that looked, from
+                # the exit code alone, like it had just been backed up.
+                #
+                # 23/24 are not that failure -- rsync's own codes for "some
+                # files could not be transferred" (an unreadable
+                # subdirectory it walked past) and "a source file vanished
+                # mid-walk", both already tolerated by design: _staged_size
+                # measures what actually landed afterward and reports THAT
+                # gap on its own terms, rather than this collect aborting a
+                # path that mostly succeeded over one unreadable corner of
+                # it. Anything else -- rsync could not even start, a
+                # destination it could not write to at all -- is not that
+                # case, and is refused rather than counted as collected.
+                rsync -a --exclude '.git/' "${ex[@]}" "$e/" "$dest/"; rc=$?
+                (( rc == 0 || rc == 23 || rc == 24 )) \
+                    || die "could not copy $(_tilde "$e") into staging"
             else
-                rsync -a "$e" "$dest"
+                rsync -a "$e" "$dest"; rc=$?
+                (( rc == 0 || rc == 23 || rc == 24 )) \
+                    || die "could not copy $(_tilde "$e") into staging"
             fi
             n=$((n + 1))
         done <<<"$paths_out"
@@ -915,8 +989,18 @@ collect_tracked_only() {
         # cp, not rsync: one spawn per tracked name, and rsync's startup is ~85x
         # cp's. -L follows the link deliberately here -- a script in ~/.local/bin
         # that is a symlink into a checkout should be backed up as its contents.
-        [[ -f "$live/$base" ]] && { cp -pL "$live/$base" "$dest/" 2>/dev/null; n=$((n + 1)); }
+        #
+        # cp's own status, checked -- `n` counted this name as collected
+        # regardless of whether the copy actually landed, the same shape of
+        # bug the two rsync calls in this file's caller were just closed
+        # against.
+        [[ -f "$live/$base" ]] || continue
+        cp -pL "$live/$base" "$dest/" 2>/dev/null || return 1
+        n=$((n + 1))
     done < <(git -C "$repo" ls-files -z -- "$sub" 2>/dev/null)
+    # git's own status, checked -- a walk that stopped partway backed up
+    # fewer names than the repo actually tracks, silently.
+    wait "$!" || return 1
     # A declared path the repo tracks nothing under backs up nothing while
     # reporting "up to date" -- the phantom coverage verify exists to shout about.
     (( n > 0 )) || finding warn "$id" tracked-empty "nothing tracked under $sub: $(_tilde "$live") backs up nothing yet" "$live"

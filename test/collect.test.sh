@@ -309,3 +309,101 @@ HOME="$CTH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$CTH/g.json" \
     OMABACKUP_STATE="$CTH/home/.state" OMABACKUP_REPO="$CTR" \
     PATH="$CTH/stub:$PATH" XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
     && fail "reported success without ever finding the plugin directory" || ok
+
+# ── a failed exclusion query is refused, not read as "nothing excluded" ─────
+# is_excluded consumed all_excluded_paths through a process substitution
+# with no `$?` a caller could check -- a `.excluded` query that failed
+# looked exactly like a manifest with no exclusions at all, and the file it
+# was declared to keep out of the backup was staged anyway. A PoC confirmed
+# the result: a manifest excluding ~/.config/app/secret, with a jq wrapper
+# failing only that ONE query, staged the secret, rc=0, "1 paths in
+# staging".
+EXH="$(mktemp -d)"; EXR="$EXH/repo"
+git init -q "$EXR"; git -C "$EXR" config user.email t@t; git -C "$EXR" config user.name t
+mkdir -p "$EXR/x"; printf 'x\n' >"$EXR/x/f"
+git -C "$EXR" add -A && git -C "$EXR" commit -qm one
+cat >"$EXH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/app"]}],
+ "excluded":[{"path":"~/.config/app/secret","reason":"test"}]}
+JSON
+mkdir -p "$EXH/home/.config/app"
+printf 'topsecret\n' >"$EXH/home/.config/app/secret"
+printf 'regular\n' >"$EXH/home/.config/app/regular.conf"
+mkdir -p "$EXH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *"(.excluded // [])"* ]] && exit 9; done\n'
+  printf 'exec %s "$@"\n' "$(command -v jq)"
+} >"$EXH/stub/jq"; chmod +x "$EXH/stub/jq"
+
+it "collect refuses when the exclusion list itself cannot be queried"
+HOME="$EXH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$EXH/g.json" \
+    OMABACKUP_STATE="$EXH/home/.state" OMABACKUP_REPO="$EXR" \
+    PATH="$EXH/stub:$PATH" XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
+    && fail "reported success without being able to check the exclusion list" || ok
+
+it "and the excluded file was never staged"
+[[ -z "$(find "$EXH/home/.state/staging" -iname secret 2>/dev/null)" ]] \
+    && ok || fail "the file the manifest excludes leaked into staging"
+
+# ── a group's own exclude-pattern query failing is refused the same way ─────
+# _rsync_excludes fed two separate jq queries into `while read < <(...)`
+# process substitutions, neither checked. A group's own `.exclude` patterns
+# (not the manifest-wide `.excluded` list above) failing to query used to
+# mean rsync ran with no exclude patterns at all, silently copying whatever
+# they existed to keep out of the backup.
+EPH="$(mktemp -d)"; EPR="$EPH/repo"
+git init -q "$EPR"; git -C "$EPR" config user.email t@t; git -C "$EPR" config user.name t
+mkdir -p "$EPR/x"; printf 'x\n' >"$EPR/x/f"
+git -C "$EPR" add -A && git -C "$EPR" commit -qm one
+cat >"$EPH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/app"],
+  "exclude":["node_modules/**"]}]}
+JSON
+mkdir -p "$EPH/home/.config/app/node_modules"
+printf 'noise\n' >"$EPH/home/.config/app/node_modules/junk.js"
+mkdir -p "$EPH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *"(.exclude // [])"* ]] && exit 9; done\n'
+  printf 'exec %s "$@"\n' "$(command -v jq)"
+} >"$EPH/stub/jq"; chmod +x "$EPH/stub/jq"
+
+it "collect refuses when a group's own exclude-pattern query fails"
+HOME="$EPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$EPH/g.json" \
+    OMABACKUP_STATE="$EPH/home/.state" OMABACKUP_REPO="$EPR" \
+    PATH="$EPH/stub:$PATH" XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
+    && fail "reported success without being able to read this group's own exclude patterns" || ok
+
+# ── a full rsync failure aborts collect, but a partial one does not ─────────
+# Neither of collect's two rsync calls checked their own status -- `n`
+# counted a path as collected regardless. A PoC (an rsync wrapper that
+# always exits 1) confirmed the result: collect reported success, staging
+# held nothing, and coverage recorded zero files/bytes for a group that
+# looked, from the exit code alone, like it had just been backed up. Exit
+# 23/24 (rsync's own codes for a partial transfer -- an unreadable
+# subdirectory, a source file that vanished mid-walk) are deliberately NOT
+# refused here: that is what _staged_size's own later measurement already
+# exists to catch and report on its own terms, covered by coverage.test.sh.
+RSH="$(mktemp -d)"; RSR="$RSH/repo"
+git init -q "$RSR"; git -C "$RSR" config user.email t@t; git -C "$RSR" config user.name t
+mkdir -p "$RSR/x"; printf 'x\n' >"$RSR/x/f"
+git -C "$RSR" add -A && git -C "$RSR" commit -qm one
+cat >"$RSH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/app"]}]}
+JSON
+mkdir -p "$RSH/home/.config/app"
+printf 'x\n' >"$RSH/home/.config/app/f.conf"
+mkdir -p "$RSH/stub"
+printf '#!/bin/bash\nexit 1\n' >"$RSH/stub/rsync"; chmod +x "$RSH/stub/rsync"
+
+it "collect refuses when rsync fails outright"
+HOME="$RSH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$RSH/g.json" \
+    OMABACKUP_STATE="$RSH/home/.state" OMABACKUP_REPO="$RSR" \
+    PATH="$RSH/stub:$PATH" XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
+    && fail "reported success despite rsync failing outright" || ok
+
+it "and nothing was staged for it"
+[[ -z "$(find "$RSH/home/.state/staging" -type f 2>/dev/null)" ]] \
+    && ok || fail "staging held a file despite the copy having failed"
