@@ -248,16 +248,24 @@ group_tracked_repo_path() {
 # the inverse of this table, and an inverse only exists if there is one table.
 tracked_path_map() {
     local id p sub e
+    # groups_ids/group_paths fed a process substitution directly used to mean
+    # a jq failure (a manifest this cannot read at all) looked identical to
+    # "no groups, no paths" -- silence, not a status <(...) exposes. Captured
+    # into checked variables instead: the exact shape of the bug the comment
+    # above already names once, reachable again through the query itself
+    # failing rather than the manifest genuinely lacking any trackedRepoPath.
+    local ids_out; ids_out="$(groups_ids)" || return 1
     while read -r id; do
         [[ -n "$id" ]] || continue
+        local paths_out; paths_out="$(group_paths "$id")" || return 1
         while read -r p; do
             [[ -n "$p" ]] || continue
-            sub="$(group_tracked_repo_path "$id" "$p")"
+            sub="$(group_tracked_repo_path "$id" "$p")" || return 1
             [[ -n "$sub" ]] || continue
             e="$(_expand "$p")"
             printf '%s\t%s\n' "${e#$HOME/}" "$sub"
-        done < <(group_paths "$id")
-    done < <(groups_ids)
+        done <<<"$paths_out"
+    done <<<"$ids_out"
 }
 
 # Every path declared by any group, expanded. Probes use this to answer
@@ -299,14 +307,21 @@ is_covered() {
 # after one of Omarchy's own migrations moved the directory.
 probe_declared_paths() {
     local id p e
+    # groups_ids/group_paths via <(...) directly discarded a jq failure the
+    # same way restore_rows once did: an unreadable manifest ran this loop
+    # zero times and probe_declared_paths reported nothing wrong, rather than
+    # the one thing that actually IS wrong here.
+    local ids_out; ids_out="$(groups_ids)" || { finding fail manifest manifest-unreadable "this machine's own group manifest could not be read" ""; return; }
     while read -r id; do
         [[ -n "$id" ]] || continue
+        local paths_out; paths_out="$(group_paths "$id")" \
+            || { finding fail "$id" manifest-unreadable "this group's paths could not be read from the manifest" ""; continue; }
         while read -r p; do
             [[ -n "$p" ]] || continue
             e="$(_expand "$p")"
             [[ -e "$e" || -L "$e" ]] || finding warn "$id" path-missing "declared but missing: $p" "$e"
-        done < <(group_paths "$id")
-    done < <(groups_ids)
+        done <<<"$paths_out"
+    done <<<"$ids_out"
 }
 
 # A mode:link path that stopped being a symlink stopped feeding the repo, in
@@ -314,9 +329,12 @@ probe_declared_paths() {
 # broke the link. See docs/DESIGN.md §11.2.
 probe_link_integrity() {
     local id p e linked plain
+    local ids_out; ids_out="$(groups_ids)" || { finding fail manifest manifest-unreadable "this machine's own group manifest could not be read" ""; return; }
     while read -r id; do
         [[ "$(group_field "$id" mode)" == "link" ]] || continue
         linked=0; plain=0
+        local paths_out; paths_out="$(group_paths "$id")" \
+            || { finding fail "$id" manifest-unreadable "this group's paths could not be read from the manifest" ""; continue; }
         while read -r p; do
             [[ -n "$p" ]] || continue
             e="$(_expand "$p")"
@@ -326,7 +344,7 @@ probe_link_integrity() {
             else
                 plain=$((plain + 1))
             fi
-        done < <(group_paths "$id")
+        done <<<"$paths_out"
         if (( linked > 0 && plain > 0 )); then
             finding fail "$id" link-broken "$plain of $((linked+plain)) stopped being links -- the repo stopped receiving" ""
         elif (( linked > 0 )); then
@@ -334,7 +352,7 @@ probe_link_integrity() {
         elif (( plain > 0 )); then
             finding info "$id" not-linked "$plain paths, link mode not applied yet" ""
         fi
-    done < <(groups_ids)
+    done <<<"$ids_out"
 }
 
 omarchy_identity() {
@@ -374,9 +392,16 @@ cmd_verify() {
     probe_declared_paths
 
     local id probe
+    # A failure here is the same manifest probe_declared_paths just tried and
+    # reported on above -- not repeated as a second finding. `|| true`, not
+    # `|| return`: report() at the end of this function is what actually
+    # prints probe_declared_paths' finding and sets the exit status; returning
+    # early here would skip it and leave the user with a bare failure and no
+    # explanation.
+    local ids_out; ids_out="$(groups_ids)" || true
     while read -r id; do
         [[ -n "$id" ]] || continue
-        probe="$(group_field "$id" probe)"
+        probe="$(group_field "$id" probe)" || continue
         case "$probe" in
             hypr-lua)   probe_hypr ;;
             shell-json) probe_shell_json ;;
@@ -386,7 +411,7 @@ cmd_verify() {
             "")         ;;
             *)          finding warn "$id" probe-unknown "probe declared but not implemented: $probe" "" ;;
         esac
-    done < <(groups_ids)
+    done <<<"$ids_out"
 
     probe_link_integrity
     probe_scheduled
@@ -570,9 +595,17 @@ cmd_collect() {
     rm -rf "$STAGING"
     mkdir -p "$STAGING"
     local id mode p e dest n=0
+    # groups_ids failing here is not a smaller problem than any other -- it is
+    # a WORSE one: the manifest this machine's own trusted groups.default.json
+    # could not be queried made this loop run zero times, staging (just wiped,
+    # a few lines up) stayed empty, and n stayed 0 -- indistinguishable from a
+    # genuinely empty manifest, all the way through to `sync --commit`
+    # potentially committing that empty staging over real, previously-tracked
+    # content. Died on outright, not merely skipped.
+    local ids_out; ids_out="$(groups_ids)" || die "could not read this machine's own group manifest -- refusing to collect against an unreadable schema"
     while read -r id; do
         [[ -n "$id" ]] || continue
-        mode="$(group_field "$id" mode)"
+        mode="$(group_field "$id" mode)" || die "could not read group $id's mode from the manifest"
         case "$mode" in
             gen)    collect_generated "$id"; continue ;;
             triple) collect_triple "$id"; continue ;;
@@ -580,6 +613,7 @@ cmd_collect() {
 
         local -a ex=()
 
+        local paths_out; paths_out="$(group_paths "$id")" || die "could not read group $id's paths from the manifest"
         while read -r p; do
             [[ -n "$p" ]] || continue
             e="$(_expand "$p")"
@@ -610,9 +644,9 @@ cmd_collect() {
                 rsync -a "$e" "$dest"
             fi
             n=$((n + 1))
-        done < <(group_paths "$id")
+        done <<<"$paths_out"
         (( JSON )) || printf '  %s✓%s %s\n' "$GREEN" "$NC" "$id"
-    done < <(groups_ids)
+    done <<<"$ids_out"
 
     # Reported, not fatal: what was collected is on disk and valid either way.
     write_coverage || true
@@ -647,6 +681,11 @@ _retire_coverage() {  # _retire_coverage <why>
 
 write_coverage() {
     local id p e dest files bytes gf gb rows="" failed=0
+    # groups_ids failing here fed the same "zero rows, no error" shape every
+    # per-group measurement failure below is already careful to avoid --
+    # closed the same way, through the SAME failed flag this function already
+    # checks before ever writing a record.
+    local ids_out; ids_out="$(groups_ids)" || failed=1
     while read -r id; do
         [[ -n "$id" ]] || continue
         gf=0; gb=0
@@ -668,7 +707,8 @@ write_coverage() {
                     if tsz="$(_staged_size "$dest")"; then
                         IFS=$'\t' read -r gf gb <<<"$tsz"
                     else failed=1; fi ;;
-            *)      while read -r p; do
+            *)      local gcp_paths; gcp_paths="$(group_paths "$id")" || { failed=1; break; }
+                    while read -r p; do
                         [[ -n "$p" ]] || continue
                         e="$(_expand "$p")"
                         dest="$STAGING/${e#$HOME/}"
@@ -676,7 +716,7 @@ write_coverage() {
                         sz="$(_staged_size "$dest")" || { failed=1; break; }
                         IFS=$'\t' read -r files bytes <<<"$sz"
                         gf=$((gf + files)); gb=$((gb + bytes))
-                    done < <(group_paths "$id") ;;
+                    done <<<"$gcp_paths" ;;
         esac
         # A size this function could not measure is a row it cannot honestly
         # write, and every one of these paths used to leave quietly: two threw
@@ -684,7 +724,7 @@ write_coverage() {
         # retired, so a measurement failure and a clean collect looked alike.
         (( failed )) && break
         rows+="$(printf '%s\t%s\t%s' "$id" "$gf" "$gb")"$'\n'
-    done < <(groups_ids)
+    done <<<"$ids_out"
 
     if (( failed )); then
         _retire_coverage "could not measure what was staged"
@@ -857,10 +897,16 @@ cmd_sync() {
     done
     [[ -n "$repo" && -d "$repo/.git" ]] || die "OMABACKUP_REPO must point at a git repo (got: ${repo:-unset})"
 
-    JSON=0 cmd_collect >/dev/null
+    JSON=0 cmd_collect >/dev/null || die "collect failed -- refusing to publish whatever staging is left in"
     local list="$OMABACKUP_STATE/last-publish"
-    local n
-    n="$(publish_staging "$STAGING" "$repo" "$(tracked_path_map)" "$list")" \
+    local n tpm
+    # Nested inside publish_staging's own argument list, $(tracked_path_map)'s
+    # exit status was never the thing `||` below checked -- only
+    # publish_staging's was. A tracked_path_map that failed handed
+    # publish_staging an empty table, indistinguishable from a manifest that
+    # genuinely has no trackedRepoPath overrides, and publish proceeded on it.
+    tpm="$(tracked_path_map)" || die "could not read the manifest's tracked-path table -- refusing to publish against an incomplete map"
+    n="$(publish_staging "$STAGING" "$repo" "$tpm" "$list")" \
         || die "publish could not write into $(_tilde "$repo") -- refusing to commit a partial backup"
     printf '  %spublished%s %d files into %s\n\n' "$GREEN" "$NC" "$n" "$(_tilde "$repo")"
 

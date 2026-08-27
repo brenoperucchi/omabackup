@@ -1167,3 +1167,44 @@ _res_run "$CFTGT" "$CFH/rstate" "$CFART" --apply >/dev/null 2>&1
 it "and the plan names it quarantined, not restored"
 CFPLAN="$(_res_run "$CFTGT" "$CFH/rstate2" "$CFART")"
 assert_contains "$CFPLAN" "quarantined"
+
+# ── trackedRepoPath cannot read from outside the artifact's own worktree ────
+# _restore_repo_prefix's `flat` answer is trackedRepoPath, taken verbatim from
+# the ARTIFACT's own bundled groups.default.json -- nothing validated it
+# stays inside the worktree before restore_rows read from $wt/$prefix. A PoC
+# confirmed the result: trackedRepoPath "../../../../etc" made that resolve
+# to the real /etc on the machine running restore, and the plan listed real
+# host files (arch-release, fstab, machine-id, ...) as things it would
+# restore -- with --apply, it copied them under $HOME. Every other
+# containment check in this codebase guards the destination; this is the
+# read side, unguarded until now.
+TPH="$(mktemp -d)"; TPR="$TPH/repo"
+mkdir -p "$TPR/configs/app"
+git init -q "$TPR"; git -C "$TPR" config user.email t@t; git -C "$TPR" config user.name t
+printf 'x\n' >"$TPR/configs/app/f.txt"
+git -C "$TPR" add -A && git -C "$TPR" commit -qm one
+cat >"$TPH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"evil","label":"Evil","mode":"copy","coupled":false,"critical":false,
+  "paths":[{"live":"~/.config/app","trackedRepoPath":"../../../../etc"}]}]}
+JSON
+mkdir -p "$TPH/home"
+HOME="$TPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$TPH/g.json" \
+    OMABACKUP_STATE="$TPH/home/.state" OMABACKUP_REPO="$TPR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+TPART="$(ls -t "$TPH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+TPTGT="$(mktemp -d)"
+
+it "a trackedRepoPath escaping the worktree is refused, not read from"
+TPPLAN="$(HOME="$TPTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$TPH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$TPART" 2>&1)"
+assert_contains "$TPPLAN" "0 files would be restored"
+
+it "and specifically names it refused, not silently skipped"
+assert_contains "$TPPLAN" "refused"
+
+it "and --apply writes nothing at all from a filesystem outside the artifact"
+HOME="$TPTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$TPH/rstate2" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$TPART" >/dev/null 2>&1
+[[ -z "$(find "$TPTGT" -type f 2>/dev/null)" ]] \
+    && ok || fail "files from outside the artifact's own worktree were written"

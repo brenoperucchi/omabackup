@@ -337,6 +337,23 @@ restore_rows() {
             IFS=$'\t' read -r prefix kind <<<"$rp"
             [[ -n "$prefix" ]] || continue
             e="$(_expand "$p")"
+            # $prefix, for a `flat` kind, is trackedRepoPath -- verbatim from
+            # the ARTIFACT's own bundled groups.default.json, never validated
+            # against the worktree it is about to be read from. A PoC
+            # confirmed the result: trackedRepoPath ".." (or "../../../etc",
+            # or an absolute path) made $wt/$prefix resolve OUTSIDE the
+            # extracted artifact entirely -- restore read whatever was
+            # actually there on the HOST filesystem (real files under /etc,
+            # in the PoC) and, with --apply, copied it under $HOME. Every
+            # other containment check in this file guards the WRITE side
+            # (the destination); this is the read side, and nothing checked
+            # it. Refused as `escape`, before existence is even asked --
+            # `-e` on a path outside the worktree can be true, which is
+            # exactly the danger.
+            if ! _path_contained "$wt/$prefix" "$wt"; then
+                printf 'escape\t%s\t%s\t%s\n' "$id" "$prefix" "$e"
+                continue
+            fi
             [[ -e "$wt/$prefix" ]] || continue
 
             if [[ "$kind" == flat ]]; then
