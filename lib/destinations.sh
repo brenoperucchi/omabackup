@@ -210,6 +210,15 @@ _dir_is_ours() {
         [[ "$base" == .* ]] && continue
         return 1
     done < <(find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    # find's own status, checked -- a walk that stopped partway (a
+    # subdirectory this process cannot read, say) enumerated fewer entries
+    # than the directory actually holds, and everything seen up to that
+    # point being "ours" read as the whole directory being ours. This gates
+    # the retention stamp -- "the rule that matters most," two functions
+    # away -- so a false "yes" here is not a smaller mistake than a false
+    # "no": it is the one that lets pruning run somewhere it was never
+    # actually confirmed safe to.
+    wait "$!" || return 1
     return 0
 }
 
@@ -219,7 +228,17 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
     [[ -n "$dir" ]] || { printf 'no path configured'; return 1; }
     mkdir -p "$dir" 2>/dev/null || { printf 'cannot create %s' "$dir"; return 1; }
 
-    cp "$bundle" "$dir/$name.tmp" 2>/dev/null && mv "$dir/$name.tmp" "$dir/$name" 2>/dev/null \
+    # --remove-destination: cp, given an existing symlink at the destination,
+    # follows it and writes through to whatever it points at -- confirmed
+    # directly. A `dir` destination is exactly the kind of path another
+    # process could plant something at first: a NAS mount, a removable drive,
+    # anything shared. A symlink pre-planted at this exact "$name.tmp" path,
+    # pointing anywhere this process can write, would otherwise have that
+    # target silently overwritten with bundle content instead of the
+    # destination gaining a bundle. --remove-destination unlinks whatever is
+    # there first, so the write always lands on a fresh file at this path,
+    # never through it.
+    cp --remove-destination "$bundle" "$dir/$name.tmp" 2>/dev/null && mv "$dir/$name.tmp" "$dir/$name" 2>/dev/null \
         || { rm -f "$dir/$name.tmp" 2>/dev/null; printf 'cannot write into %s' "$dir"; return 1; }
     # The stamp is what lets retention delete here, so it can only be granted to
     # a directory this tool actually owns: empty, or holding nothing but its own

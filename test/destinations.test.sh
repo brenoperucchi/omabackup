@@ -458,3 +458,56 @@ assert_contains "$PFOUT" "✓"
 
 it "and the prune failure is visible, not silently discarded"
 assert_contains "$PFOUT" "could not order"
+
+# ── _push_dir must not follow a pre-planted symlink at its own temp path ────
+# cp, given an existing symlink at the destination, follows it and writes
+# THROUGH to whatever it points at -- confirmed directly. A `dir` destination
+# is exactly the kind of path another process could plant something at
+# first: a NAS mount, a removable drive, anything shared. A symlink
+# pre-planted at the exact "<name>.tar.zst.tmp" path this function is about
+# to write to, pointing anywhere this process can write, had its target
+# silently overwritten with bundle content instead of the destination
+# gaining a bundle.
+PDH="$(mktemp -d)"
+mkdir -p "$PDH/dir" "$PDH/outside"
+printf 'sensitive\n' >"$PDH/outside/victim.txt"
+ln -s "$PDH/outside/victim.txt" "$PDH/dir/omabackup-test-bundle.tar.zst.tmp"
+printf 'bundle-content\n' >"$PDH/bundle.tar.zst"
+cat >"$PDH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$PDH/dir","keep":5}]}
+JSON
+
+it "_push_dir does not write through a symlink planted at its temp path"
+DESTINATIONS_FILE="$PDH/destinations.json" bash -c '
+    source lib/bundle.sh; source lib/destinations.sh
+    _push_dir "nas" "$1" "omabackup-test-bundle.tar.zst"
+' _ "$PDH/bundle.tar.zst" >/dev/null 2>&1
+assert_eq "$(cat "$PDH/outside/victim.txt")" "sensitive"
+
+it "and the destination gained a real bundle, not a redirected write"
+assert_eq "$(cat "$PDH/dir/omabackup-test-bundle.tar.zst" 2>/dev/null)" "bundle-content"
+
+# ── _dir_is_ours must not answer "yes" from a walk that stopped partway ─────
+# `done < <(find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)` had no
+# `wait "$!"` afterward -- a walk that stopped early (an unreadable entry, a
+# vanishing mount) enumerated fewer entries than the directory actually
+# holds, and everything seen up to that point reading as "ours" answered yes
+# for the whole directory. This gates the retention stamp -- described two
+# functions away as "the rule that matters most" -- so a false yes here is
+# not a smaller mistake than a false no.
+DIH="$(mktemp -d)/nas"; mkdir -p "$DIH"
+printf 'x\n' >"$DIH/omabackup-my.box-20200101-000000-abc123456789.tar.zst"
+DISTUB="$(mktemp -d)"
+cat >"$DISTUB/find" <<STUB
+#!/bin/bash
+printf '%s\0' "$DIH/omabackup-my.box-20200101-000000-abc123456789.tar.zst"
+exit 9
+STUB
+chmod +x "$DISTUB/find"
+
+it "_dir_is_ours refuses when its own walk fails, rather than answering yes"
+PATH="$DISTUB:$PATH" bash -c '
+    source lib/bundle.sh; source lib/destinations.sh
+    _dir_is_ours "$1" "irrelevant"
+' _ "$DIH" >/dev/null 2>&1 \
+    && fail "answered yes from a walk that stopped partway" || ok
