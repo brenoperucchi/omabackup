@@ -1355,6 +1355,25 @@ HOME="$IOH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$IOH/rstate2" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" restore --into "$IOINTO" --apply "$IOART" >/dev/null 2>&1
 [[ -d "$IOINTO" ]] && ok || fail "--apply did not create the --into target"
 
+# ── a --into target created for a plan that then fails to plan is cleaned up ─
+# mkdir -p "$into" happens before restore_rows is ever called; every die
+# between the two used to skip the rmdir cleanup entirely -- that only ran
+# once the plan branch reached its own normal end. A PoC (a --into target
+# that did not exist yet, restore_rows made to fail by a broken realpath)
+# confirmed the result: this command returned 1, but the target directory
+# it had just created was left behind -- an observable write from a run
+# that made none.
+IFH="$(mktemp -d)"; IFART="$(_res_build "$IFH" '["3.*","4.*"]')"
+IFINTO="$IFH/does-not-exist-yet"
+mkdir -p "$IFH/stub"
+printf '#!/bin/bash\nexit 1\n' >"$IFH/stub/realpath"; chmod +x "$IFH/stub/realpath"
+
+it "a --into target is removed when the plan itself fails, not left behind"
+PATH="$IFH/stub:$PATH" HOME="$IFH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$IFH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --into "$IFINTO" "$IFART" >/dev/null 2>&1
+[[ ! -e "$IFINTO" ]] \
+    && ok || fail "the --into target was left behind after the plan itself failed"
+
 # ── the backup of a replaced file must land inside replaced/, not beside it ─
 # `local keep="$backup/${dest#"$HOME"/}"` stripped $HOME's literal string
 # from $dest -- not the normalized path _restore_contained had just checked
