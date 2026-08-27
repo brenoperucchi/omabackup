@@ -26,7 +26,12 @@ _capture_local() {
 # copy via GIT_INDEX_FILE.
 _capture_patch() {
     local plugin="$1"
-    local tmp_index; tmp_index="$(mktemp)"
+    # Checked, not assumed: an empty tmp_index below would hand
+    # GIT_INDEX_FILE="" to git, which falls through to the plugin's own real
+    # index instead of erroring -- the add -N a few lines down would then mark
+    # intent-to-add against the live index this function exists to leave
+    # untouched, rather than the throwaway copy the comment above promises.
+    local tmp_index; tmp_index="$(mktemp)" || return 1
     local real_index; real_index="$(git -C "$plugin" rev-parse --git-path index 2>/dev/null || true)"
 
     [[ -n "$real_index" && -f "$plugin/$real_index" ]] && cp "$plugin/$real_index" "$tmp_index"

@@ -15,6 +15,40 @@ TMPDIR="$(mktemp -d)"
 export TMPDIR
 trap 'rm -rf "$TMPDIR"' EXIT
 
+# A failed mktemp inside a spec used to be worse than a failed test: dozens of
+# fixtures build a throwaway repo as `r="$(mktemp -d)"` and then run
+# `git -C "$r" add -A && git -C "$r" commit -qm base` against it. mktemp
+# failing (this suite hit exactly that once, mid-run, when /tmp's inode table
+# filled -- the TMPDIR scoping above exists because of it) leaves $r empty on
+# a bare `command mktemp` failure path, and `git -C ""` does not refuse an
+# empty path -- confirmed directly -- it silently operates on the CURRENT
+# directory instead. During a test run that directory is this repository, not
+# a fixture: `git -C "$r" commit -qm base` became a real commit against the
+# real git identity on `main`, git log shows it as commit 142ffb1. Overriding
+# mktemp itself, once, here -- before any spec is sourced, in the same shell
+# every spec runs in -- closes the whole class in one place: no spec
+# anywhere in the suite can ever again turn a disk-full moment into a write
+# against the wrong repository, without auditing the ~250 individual
+# `mktemp -d` call sites this would otherwise require.
+#
+# `exit` alone does not do it: every spec calls this as `r="$(mktemp -d)"`,
+# and `$(...)` always forks a subshell -- `exit` inside this function then
+# only kills THAT subshell, and the spec's own script keeps running past it
+# with $r empty, exactly the bug this exists to close. Confirmed by first
+# writing it that way and watching the fake-failure test below still reach
+# the git commit. `$$` still names the top-level shell's PID from inside a
+# `$(...)` subshell (unlike $BASHPID, which would name the subshell's own),
+# so a signal aimed at $$ reaches the process actually running the spec.
+mktemp() {
+    local out
+    out="$(command mktemp "$@")" || {
+        printf 'FATAL: mktemp failed (disk or inode exhaustion?) -- refusing to let a spec fall through to an empty path\n' >&2
+        kill -s TERM "$$"
+        exit 90
+    }
+    printf '%s' "$out"
+}
+
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; DIM=$'\033[2m'; NC=$'\033[0m'
 PASS=0; FAIL=0; CURRENT=""
 

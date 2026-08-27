@@ -17,12 +17,22 @@ OB="$PWD/bin/omabackup"
 
 # A PATH containing exactly the named tools and nothing else, so "missing" is a
 # fact rather than a simulation.
+#
+# `type -P`, not `command -v`: test/run.sh overrides mktemp as a shell
+# function (a safety net, unrelated to this file -- see its own comment), and
+# `command -v` reports a shadowing function by NAME, not by path, for
+# whichever tool it happens to be defined for. Handed that bare name, `ln -sf`
+# below made a symlink pointing at a relative, nonexistent target instead of
+# the real binary -- silently, since ln -sf does not care whether what it
+# links to exists. `type -P` does a real PATH search and ignores functions
+# entirely, which is the question this helper is actually asking: where does
+# this tool live on disk, not what does this shell currently call it.
 _only_path() {  # _only_path <dir> <tool...>
     local d="$1"; shift
     mkdir -p "$d"
     local t p
     for t in "$@"; do
-        p="$(command -v "$t" 2>/dev/null)" && ln -sf "$p" "$d/$t"
+        p="$(type -P "$t" 2>/dev/null)" && ln -sf "$p" "$d/$t"
     done
 }
 
