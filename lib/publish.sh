@@ -84,6 +84,13 @@ _publish_file() {  # _publish_file <src> <dst> <repo-root>
     # of inside the repo, rc=0. Checked before mkdir -p ever runs, since by
     # the time it has run the escape has already happened.
     _publish_contained "$(dirname "$dst")" "$base" || return 1
+    # --remove-destination unlinks a FILE or a symlink already at $dst; it
+    # does nothing to an existing DIRECTORY there. A PoC confirmed cp then
+    # writes INSIDE it instead -- configs/file.txt/file.txt, rc=0, silent
+    # structural corruption of the repo rather than the intended overwrite.
+    # Refused, not guessed at: this function does not know whether that
+    # directory is meant to be there.
+    [[ ! -d "$dst" ]] || return 1
     mkdir -p "$(dirname "$dst")" || return 1
     # A symlink is content: copied as a link, never followed. Publishing what it
     # points at would silently turn a link into a fat copy of somebody else's
@@ -93,6 +100,12 @@ _publish_file() {  # _publish_file <src> <dst> <repo-root>
         rm -f "$dst" 2>/dev/null
         cp -P "$src" "$dst"
     elif [[ "$dst" == *.json ]] && jq -e . "$src" >/dev/null 2>&1; then
+        # `>` is a plain shell redirection: it follows a symlink already
+        # sitting at "$dst.tmp" the same way plain cp follows one at "$dst"
+        # -- confirmed with a PoC ($dst.tmp pre-planted pointing outside the
+        # repo). --remove-destination has no equivalent for a redirection;
+        # unlinked explicitly first instead, same effect.
+        rm -f "$dst.tmp" 2>/dev/null
         jq -S . "$src" >"$dst.tmp" && mv "$dst.tmp" "$dst"
     else
         # `cp -p`, not `rsync`. rsync costs ~44ms to start against cp's ~0.5ms,
@@ -207,26 +220,61 @@ publish_staging() {
             rels+=(".plugins/patches/${f##*/}"); dsts+=("patches/omarchy-plugins/${f##*/}")
         done
     fi
+    # .plugins/local's own tree, folded in the same way -- a staged plugin
+    # checkout was written by a SEPARATE rsync block below, never compared
+    # against this map at all. A PoC (a regular staged file and a plugin
+    # tree both landing on configs/omarchy/plugins/mytheme/init.lua)
+    # confirmed the result: rc=0, one silently overwrote the other, exactly
+    # the class of bug already closed above for .generated and
+    # .plugins/manifest.txt/patches.
+    if [[ -d "$staging/.plugins/local" ]]; then
+        for f in "$staging"/.plugins/local/*/; do
+            [[ -d "$f" ]] || continue
+            pid="${f%/}"; pid="${pid##*/}"
+            while IFS= read -r -d '' pf; do
+                [[ -n "$pf" ]] || continue
+                rels+=(".plugins/local/$pid/${pf#"$f"}")
+                dsts+=("configs/omarchy/plugins/$pid/${pf#"$f"}")
+            done < <(find "$f" \( -type f -o -type l \) -not -path "*/.git/*" -print0 2>/dev/null)
+            wait "$!" || return 1
+        done
+    fi
 
-    local i n_pairs="${#rels[@]}" existing_dst
-    local -a seen_dst=()
+    # destcount is keyed on the CANONICAL destination (realpath -m
+    # "$repo/$dst"), not the raw repo-relative string -- the same reasoning,
+    # and the same fix, restore_rows' collision maps already got. A PoC
+    # confirmed why: a symlink already inside the repo (shared/alias -> .,
+    # so shared/alias/same.txt and shared/same.txt are the SAME physical
+    # file) made two textually different destinations collide for real
+    # without the raw-string count ever seeing it. realpath -m failing is
+    # refused outright, not silently treated as "no collision" -- a
+    # canonicalization this cannot even attempt proves nothing.
+    local i n_pairs="${#rels[@]}" existing_dst dst_canon
+    local -a dst_canons=() seen_canon=()
     for (( i = 0; i < n_pairs; i++ )); do
-        dst="${dsts[$i]}"
-        destcount[$dst]=$(( ${destcount[$dst]:-0} + 1 ))
-        for existing_dst in "${seen_dst[@]}"; do
-            [[ "$existing_dst" == "$dst" ]] && continue
-            if [[ "$dst" == "$existing_dst"/* || "$existing_dst" == "$dst"/* ]]; then
-                destcount[$dst]=$(( ${destcount[$dst]} + 1 ))
+        dst_canon="$(realpath -m -- "$repo/${dsts[$i]}" 2>/dev/null)" || return 1
+        [[ -n "$dst_canon" ]] || return 1
+        dst_canons+=("$dst_canon")
+        destcount[$dst_canon]=$(( ${destcount[$dst_canon]:-0} + 1 ))
+        for existing_dst in "${seen_canon[@]}"; do
+            [[ "$existing_dst" == "$dst_canon" ]] && continue
+            if [[ "$dst_canon" == "$existing_dst"/* || "$existing_dst" == "$dst_canon"/* ]]; then
+                destcount[$dst_canon]=$(( ${destcount[$dst_canon]} + 1 ))
                 destcount[$existing_dst]=$(( ${destcount[$existing_dst]:-1} + 1 ))
             fi
         done
-        seen_dst+=("$dst")
+        seen_canon+=("$dst_canon")
     done
 
     for (( i = 0; i < n_pairs; i++ )); do
-        rel="${rels[$i]}"; dst="${dsts[$i]}"
+        rel="${rels[$i]}"; dst="${dsts[$i]}"; dst_canon="${dst_canons[$i]}"
+        # .plugins/local's own entries exist in this map only to be counted
+        # against everything else -- the write below is still the rsync
+        # block further down, one call per plugin tree rather than one
+        # _publish_file per file inside it.
+        [[ "$rel" == .plugins/local/* ]] && continue
         f="$staging/$rel"
-        if (( ${destcount[$dst]:-1} > 1 )); then
+        if (( ${destcount[$dst_canon]:-1} > 1 )); then
             printf 'omabackup: %s maps to %s, which more than one staged source maps to -- refusing to publish any of them, one would silently overwrite another\n' \
                 "$rel" "$dst" >&2
             failed=$((failed + 1))
@@ -237,9 +285,28 @@ publish_staging() {
 
     if [[ -d "$staging/.plugins" ]]; then
         if [[ -d "$staging/.plugins/local" ]]; then
+            local j collided
             for f in "$staging"/.plugins/local/*/; do
                 [[ -d "$f" ]] || continue
                 pid="${f%/}"; pid="${pid##*/}"
+                # Checked against the SAME destcount map every other staged
+                # source was folded into above, not written unconditionally --
+                # a collision anywhere in this plugin's own tree refuses the
+                # whole tree, the same "refuse all of them" rule every other
+                # collision in this function follows.
+                collided=0
+                for (( j = 0; j < n_pairs; j++ )); do
+                    [[ "${rels[$j]}" == ".plugins/local/$pid/"* ]] || continue
+                    if (( ${destcount[${dst_canons[$j]}]:-1} > 1 )); then
+                        collided=1
+                        printf 'omabackup: %s maps to %s, which more than one staged source maps to -- refusing to publish any of them, one would silently overwrite another\n' \
+                            "${rels[$j]}" "${dsts[$j]}" >&2
+                    fi
+                done
+                if (( collided )); then
+                    failed=$((failed + 1))
+                    continue
+                fi
                 # Same containment _publish_file's own writes get -- a repo
                 # whose configs/omarchy/plugins directory is itself a
                 # symlink (or has one somewhere in its ancestry) would

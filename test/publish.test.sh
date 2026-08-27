@@ -266,13 +266,18 @@ assert_eq "$(map_to_repo 'root/nested/file.txt' "$T2")" "shared/nested/file.txt"
 # written. Now the whole function returns as soon as the preflight's own
 # walk fails, before either pass over the captured list ever runs.
 PA1H="$(mktemp -d)"
-mkdir -p "$PA1H/staging/configs/app" "$PA1H/repo"
-printf 'x\n' >"$PA1H/staging/configs/app/f1.txt"
+# .config/app/f1.txt, not configs/app/f1.txt: map_to_repo's default case
+# only maps a leading-dot path (its .config/* fallback); the un-dotted
+# spelling map_to_repo already refuses on its own, before the preflight
+# fix is even reached, which made the original spec pass identically
+# against the pre-fix code too -- it wasn't exercising the abort at all.
+mkdir -p "$PA1H/staging/.config/app" "$PA1H/repo"
+printf 'x\n' >"$PA1H/staging/.config/app/f1.txt"
 git init -q "$PA1H/repo"; git -C "$PA1H/repo" config user.email t@t; git -C "$PA1H/repo" config user.name t
 mkdir -p "$PA1H/stub"
 cat >"$PA1H/stub/find" <<STUB
 #!/bin/bash
-printf '%s\0' "$PA1H/staging/configs/app/f1.txt"
+printf '%s\0' "$PA1H/staging/.config/app/f1.txt"
 exit 9
 STUB
 chmod +x "$PA1H/stub/find"
@@ -360,3 +365,85 @@ assert_eq "$(cat "$PA8H/outside/victim.patch")" "sensitive"
 
 it "and the real patch content landed in the repo instead"
 assert_eq "$(cat "$PA8H/repo/patches/omarchy-plugins/a.patch" 2>/dev/null)" "patch-content"
+
+# ── the JSON-normalization tmp file does not follow a pre-planted symlink ───
+# `jq -S . "$src" >"$dst.tmp"` is a plain shell redirection -- it follows a
+# symlink already sitting at "$dst.tmp" the same way plain cp follows one at
+# "$dst". --remove-destination has no equivalent for a redirection; a PoC
+# with configs/app/f.json.tmp -> an outside victim file confirmed it wrote
+# through the link and returned rc=0.
+PA9H="$(mktemp -d)"
+mkdir -p "$PA9H/staging/.config/app" "$PA9H/outside" "$PA9H/repo/configs/app"
+printf '{"a":1}\n' >"$PA9H/staging/.config/app/f.json"
+printf 'sensitive\n' >"$PA9H/outside/victim.json"
+git init -q "$PA9H/repo"; git -C "$PA9H/repo" config user.email t@t; git -C "$PA9H/repo" config user.name t
+ln -s "$PA9H/outside/victim.json" "$PA9H/repo/configs/app/f.json.tmp"
+
+it "the JSON normalization tmp write does not follow a pre-planted symlink"
+publish_staging "$PA9H/staging" "$PA9H/repo" >/dev/null 2>&1
+assert_eq "$(cat "$PA9H/outside/victim.json")" "sensitive"
+
+it "and the normalized JSON landed in the repo instead"
+assert_eq "$(cat "$PA9H/repo/configs/app/f.json" 2>/dev/null)" "$(printf '{\n  "a": 1\n}')"
+
+# ── two destinations that are the same physical file via a repo symlink ─────
+# destcount used to be keyed on the raw declared dst string -- two DIFFERENT
+# trackedRepoPath entries whose destinations are the same file on disk only
+# because one repo directory is a symlink to the other never collided as
+# strings. A PoC (repo/configs/alias -> repo/configs/real) confirmed both
+# published, one silently overwriting the other through the alias.
+PA10H="$(mktemp -d)"
+mkdir -p "$PA10H/staging/.config/appA" "$PA10H/staging/.config/appB" "$PA10H/repo/configs/real"
+printf 'from-A\n' >"$PA10H/staging/.config/appA/f.json"
+printf 'from-B\n' >"$PA10H/staging/.config/appB/f.json"
+git init -q "$PA10H/repo"; git -C "$PA10H/repo" config user.email t@t; git -C "$PA10H/repo" config user.name t
+ln -s "$PA10H/repo/configs/real" "$PA10H/repo/configs/alias"
+PA10TABLE="$(printf '.config/appA\tconfigs/alias\n.config/appB\tconfigs/real\n')"
+
+it "two destinations aliased by a repo symlink refuse, not overwrite"
+publish_staging "$PA10H/staging" "$PA10H/repo" "$PA10TABLE" >/dev/null 2>&1 \
+    && fail "reported success despite a physical destination collision" || ok
+
+it "and neither one silently landed there"
+[[ -z "$(find "$PA10H/repo/configs/real" -mindepth 1 -type f 2>/dev/null)" ]] \
+    && ok || fail "one of the two aliased sources landed anyway"
+
+# ── a pre-existing directory at the destination path is refused ─────────────
+# --remove-destination unlinks a file or a symlink already at $dst; it does
+# nothing to an existing DIRECTORY there. A PoC confirmed cp then wrote
+# INSIDE it instead -- configs/app/f.json/f.json, rc=0, silent structural
+# corruption of the repo rather than the intended overwrite.
+PA11H="$(mktemp -d)"
+mkdir -p "$PA11H/staging/.config/app" "$PA11H/repo/configs/app/f.json"
+printf 'staged-content\n' >"$PA11H/staging/.config/app/f.json"
+printf 'pre-existing\n' >"$PA11H/repo/configs/app/f.json/inner.txt"
+git init -q "$PA11H/repo"; git -C "$PA11H/repo" config user.email t@t; git -C "$PA11H/repo" config user.name t
+
+it "a pre-existing directory at the destination path is refused, not written into"
+publish_staging "$PA11H/staging" "$PA11H/repo" >/dev/null 2>&1 \
+    && fail "reported success despite a directory sitting at the destination" || ok
+
+it "and the directory's own contents are untouched"
+assert_eq "$(cat "$PA11H/repo/configs/app/f.json/inner.txt" 2>/dev/null)" "pre-existing"
+
+# ── a plugin tree colliding with a regular staged file is caught too ────────
+# .plugins/local was written by its own rsync block, never compared against
+# the destcount map every other staged source (including .generated and
+# .plugins/manifest.txt/patches) is folded into. A PoC confirmed the result:
+# a regular staged file and a plugin's own tree both landing on
+# configs/omarchy/plugins/mytheme/init.lua published, one silently
+# overwrote the other, rc=0.
+PA12H="$(mktemp -d)"
+mkdir -p "$PA12H/staging/.plugins/local/mytheme" "$PA12H/staging/.config/mytheme" "$PA12H/repo"
+printf 'plugin-tree-content\n' >"$PA12H/staging/.plugins/local/mytheme/init.lua"
+printf 'staged-collision\n' >"$PA12H/staging/.config/mytheme/init.lua"
+git init -q "$PA12H/repo"; git -C "$PA12H/repo" config user.email t@t; git -C "$PA12H/repo" config user.name t
+PA12TABLE="$(printf '.config/mytheme\tconfigs/omarchy/plugins/mytheme\n')"
+
+it "a plugin tree file colliding with a regular staged destination is refused"
+publish_staging "$PA12H/staging" "$PA12H/repo" "$PA12TABLE" >/dev/null 2>&1 \
+    && fail "published despite the plugin-tree/staged-file collision" || ok
+
+it "and neither one silently landed there"
+[[ ! -e "$PA12H/repo/configs/omarchy/plugins/mytheme/init.lua" ]] \
+    && ok || fail "one of the two colliding sources landed anyway"

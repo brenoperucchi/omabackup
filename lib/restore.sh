@@ -324,7 +324,12 @@ restore_rows() {
             IFS=$'\t' read -r prefix kind <<<"$rp"
             [[ -n "$prefix" ]] || continue
             e="$(_expand "$p")"
-            local ec; ec="$(realpath -m -- "$e" 2>/dev/null)"; [[ -n "$ec" ]] || ec="$e"
+            local ec; ec="$(realpath -m -- "$e" 2>/dev/null)" || return 1
+            # A fallback to the raw string here -- ec="$e" on failure -- would
+            # have made a broken realpath (missing binary, an environment
+            # hostile enough to make -m itself fail) quietly reopen the exact
+            # string-comparison bug this canonicalization exists to close.
+            [[ -n "$ec" ]] || return 1
             prefixcount[$prefix]=$(( ${prefixcount[$prefix]:-0} + 1 ))
             destcount[$ec]=$(( ${destcount[$ec]:-0} + 1 ))
             local existing_e
@@ -395,7 +400,18 @@ restore_rows() {
         # question this floor asks was not answered "no" -- it could not be
         # asked at all, and a floor that cannot be checked must not be
         # skipped.
-        if [[ -n "$opgroups" && -r "$opgroups" ]]; then
+        if [[ -n "$opgroups" ]]; then
+            # -r alone used to gate this: a file that EXISTS but cannot be
+            # READ (permissions, ownership drift) failed -r the same way a
+            # path that was never given at all does, and the floor skipped
+            # itself silently either way. A PoC confirmed the result: a
+            # local schema at mode 000, artifact claiming coupled:false,
+            # restored anyway. $opgroups being genuinely EMPTY (the third
+            # argument simply not passed -- an older caller, a test) is the
+            # only case this floor has nothing to add for; a non-empty path
+            # this cannot read is a floor that cannot be checked, and one
+            # that cannot be checked must refuse, not skip.
+            [[ -r "$opgroups" ]] || return 1
             local local_coupled
             local_coupled="$(jq -r --arg id "$id" \
                 '.groups[]? | select(.id==$id) | .coupled // empty' "$opgroups")" || return 1
@@ -417,7 +433,12 @@ restore_rows() {
             # destcount/poisoned_e -- a lookup against the raw $e here would
             # miss both maps for the exact spellings (trailing slash, a
             # symlink alias) they exist to catch.
-            local ec; ec="$(realpath -m -- "$e" 2>/dev/null)"; [[ -n "$ec" ]] || ec="$e"
+            local ec; ec="$(realpath -m -- "$e" 2>/dev/null)" || return 1
+            # A fallback to the raw string here -- ec="$e" on failure -- would
+            # have made a broken realpath (missing binary, an environment
+            # hostile enough to make -m itself fail) quietly reopen the exact
+            # string-comparison bug this canonicalization exists to close.
+            [[ -n "$ec" ]] || return 1
             # $prefix, for a `flat` kind, is trackedRepoPath -- verbatim from
             # the ARTIFACT's own bundled groups.default.json, never validated
             # against the worktree it is about to be read from. A PoC

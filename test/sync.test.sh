@@ -326,3 +326,26 @@ printf 'new\n' >"$TSH/.local/bin/tool"
 it "sync --commit publishes through a trailing-slash declared live path"
 _sync_env "$TSH" "$TSR" "$TSG" sync --commit >/dev/null
 assert_eq "$(cat "$TSR/scripts/local-bin/tool" 2>/dev/null)" "new"
+
+# ── the same holds through a DOUBLE trailing slash, not just one ────────────
+# `${e%/}` in _expand strips exactly one trailing slash -- a declared live
+# path with TWO ("~/.local/bin//") built a trackedRepoPath prefix STILL
+# ending in "/" (one of the two survived), reproducing the identical
+# silently-dropped-group bug through the slash ${e%/} left behind. _expand
+# now loops until every trailing slash is gone, not just the first.
+TS2H="$(mktemp -d)"; TS2R="$TS2H/repo"; _dest_repo "$TS2R"
+mkdir -p "$TS2R/scripts/local-bin"
+printf 'old\n' >"$TS2R/scripts/local-bin/tool"
+git -C "$TS2R" add -A && git -C "$TS2R" -c user.email=t@t -c user.name=t commit -qm base
+TS2G="$TS2H/g.json"
+cat >"$TS2G" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"scripts","label":"Scripts","mode":"copy","coupled":false,"critical":false,
+  "paths":[{"live":"~/.local/bin//","trackedRepoPath":"scripts/local-bin"}]}]}
+JSON
+mkdir -p "$TS2H/.local/bin"
+printf 'new\n' >"$TS2H/.local/bin/tool"
+
+it "sync --commit publishes through a double-trailing-slash declared live path"
+_sync_env "$TS2H" "$TS2R" "$TS2G" sync --commit >/dev/null
+assert_eq "$(cat "$TS2R/scripts/local-bin/tool" 2>/dev/null)" "new"

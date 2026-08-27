@@ -104,7 +104,15 @@ _tilde() { printf '%s' "${1/#$HOME/\~}"; }
 # with no error. Stripped once, here, rather than at each of the many places
 # that read this function's output -- the same reasoning DESIGN.md already
 # gives for _path_contained being general instead of copied per caller.
-_expand() { local e="${1/#\~/$HOME}"; printf '%s' "${e%/}"; }
+_expand() {
+    local e="${1/#\~/$HOME}"
+    # ${e%/} strips exactly one trailing slash -- confirmed insufficient on
+    # its own: "~/.local/bin//" (two) reproduced the identical silently-
+    # dropped-group bug through the one slash ${e%/} left behind. Looped so
+    # any number of trailing slashes is gone, not just the first.
+    while [[ "$e" == */ ]]; do e="${e%/}"; done
+    printf '%s' "$e"
+}
 
 # `uname -n`, never `hostname`: the latter ships in `inetutils`, which nothing
 # on a stock Omarchy requires -- on this machine it is "Explicitly installed /

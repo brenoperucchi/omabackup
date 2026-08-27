@@ -1483,3 +1483,98 @@ it "two declared paths aliased by a real symlink are caught, apply writes nothin
 HOME="$SAH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$SAH/rstate" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$SAART" >/dev/null 2>&1
 assert_eq "$(cat "$SAH/home/.config/foo/f.txt")" "operator-original"
+
+# ── the coupled floor refuses on a local schema it cannot READ, not just ────
+# ── one it cannot PARSE ──────────────────────────────────────────────────────
+# The floor used to be gated by `-r` alone: a local groups.default.json that
+# EXISTS but cannot be read (permissions, ownership drift) failed -r the same
+# way a path that was never given at all does, and the floor skipped itself
+# silently either way -- indistinguishable from "this operator has no opinion
+# on this group." A PoC confirmed the result: a local schema at mode 000,
+# artifact claiming compositor coupled:false, restored anyway even though the
+# unreadable local file would have said coupled:true had anyone been able to
+# check it.
+CFRH="$(mktemp -d)"; CFRR="$CFRH/repo"
+mkdir -p "$CFRR/configs/hypr"
+git init -q "$CFRR"; git -C "$CFRR" config user.email t@t; git -C "$CFRR" config user.name t
+printf 'bind = SUPER, Q\n' >"$CFRR/configs/hypr/bindings.conf"
+git -C "$CFRR" add -A && git -C "$CFRR" commit -qm one
+cat >"$CFRH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["3.*"],"groups":[
+ {"id":"compositor","label":"Compositor","mode":"copy","coupled":false,"critical":true,
+  "paths":["~/.config/hypr"]}]}
+JSON
+mkdir -p "$CFRH/home"
+HOME="$CFRH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$CFRH/g.json" \
+    OMABACKUP_STATE="$CFRH/home/.state" OMABACKUP_REPO="$CFRR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+CFRART="$(ls -t "$CFRH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+CFRTGT="$(mktemp -d)"
+cat >"$CFRH/local-unreadable.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["3.*"],"groups":[
+ {"id":"compositor","label":"Compositor","mode":"copy","coupled":true,"critical":true,
+  "paths":["~/.config/hypr"]}]}
+JSON
+chmod 000 "$CFRH/local-unreadable.json"
+
+it "restore refuses when the floor's own local manifest cannot be read"
+HOME="$CFRTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$CFRH/local-unreadable.json" \
+    OMABACKUP_STATE="$CFRH/rstate" XDG_RUNTIME_DIR=/nonexistent \
+    "$OB" restore --apply "$CFRART" >/dev/null 2>&1 \
+    && fail "restored using the artifact's own answer while the local floor could not be read" || ok
+
+it "and nothing from the coupled group was written"
+[[ ! -e "$CFRTGT/.config/hypr/bindings.conf" ]] \
+    && ok || fail "compositor config was restored despite the unreadable local floor"
+chmod 644 "$CFRH/local-unreadable.json"
+
+# ── a broken realpath refuses to plan, not silently falls back to raw ───────
+# ── string comparison for the ancestor/descendant collision check ──────────
+# The canonicalization added to close the ancestor/descendant collision fell
+# back to the RAW path on its own failure (`ec="$e"` if realpath came back
+# empty) -- a broken or missing realpath quietly reopened the exact
+# string-comparison bug the canonicalization exists to close, rather than
+# refusing. A stub that fails everywhere also trips OTHER, already-hardened
+# realpath call sites (e.g. _restore_one's own dest_rp, which already
+# refuses on failure) for an unrelated reason, so the earlier version of
+# this spec passed even against the pre-fix code -- it never isolated the
+# ONE call site being tested. Narrowed to fail on exactly one declared
+# path's realpath call, reusing the alias/foo symlink-collision fixture:
+# with the raw-string fallback, the aliased entry keeps its RAW,
+# un-resolved spelling while its twin resolves normally, the two no longer
+# look identical, and the collision this pair exists to prove goes
+# undetected.
+RPH="$(mktemp -d)"; RPR="$RPH/repo"
+mkdir -p "$RPR/configs/foo"
+git init -q "$RPR"; git -C "$RPR" config user.email t@t; git -C "$RPR" config user.name t
+printf 'from-backup\n' >"$RPR/configs/foo/f.txt"
+git -C "$RPR" add -A && git -C "$RPR" commit -qm one
+cat >"$RPH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"a","label":"A","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/alias"]},
+ {"id":"b","label":"B","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/foo"]}]}
+JSON
+mkdir -p "$RPH/home/.config/foo"
+printf 'operator-original\n' >"$RPH/home/.config/foo/f.txt"
+ln -s "$RPH/home/.config/foo" "$RPH/home/.config/alias"
+HOME="$RPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$RPH/g.json" \
+    OMABACKUP_STATE="$RPH/home/.state" OMABACKUP_REPO="$RPR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+RPART="$(ls -t "$RPH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+mkdir -p "$RPH/stub"
+cat >"$RPH/stub/realpath" <<STUB
+#!/bin/bash
+for a in "\$@"; do
+    [[ "\$a" == "$RPH/home/.config/alias" ]] && exit 1
+done
+exec /usr/bin/realpath "\$@"
+STUB
+chmod +x "$RPH/stub/realpath"
+
+it "restore refuses to plan when realpath fails on just one declared path"
+PATH="$RPH/stub:$PATH" HOME="$RPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$RPH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$RPART" >/dev/null 2>&1 \
+    && fail "restore proceeded despite realpath being unusable for one of the two aliased paths" || ok
+
+it "and the operator's original file is untouched"
+assert_eq "$(cat "$RPH/home/.config/foo/f.txt")" "operator-original"
