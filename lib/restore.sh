@@ -307,6 +307,31 @@ restore_rows() {
     # THIS machine's real filesystem, where the alias genuinely is one.
     local -A prefixcount=() destcount=() poisoned_e=()
     local -a seen_e=()
+    # frow_* capture every individual FILE this walk would enumerate under a
+    # flat or tree declared path, one snapshot pass, not re-walked later --
+    # the same TOCTOU reasoning publish_staging's own single-pass capture is
+    # built on. Collision detection above (prefixcount/destcount/poisoned_e)
+    # only ever compared the DECLARED bases against each other; it has
+    # nothing to say about two files from two UNRELATED, non-overlapping
+    # bases landing on the same live destination because a symlink partway
+    # INSIDE one of the trees points at the other. A PoC confirmed the
+    # result: group `foo` (tree) and group `bar` (tree) declare unrelated,
+    # non-aliased paths; the artifact's own `foo/link/` is an ordinary
+    # tracked directory, but the LIVE target already has `~/.config/foo/link
+    # -> ~/.config/bar` -- a symlink that exists only on the machine being
+    # restored to, not in the artifact. Restoring `foo`'s tree writes
+    # through that link into bar/, restoring `bar`'s own declared path
+    # writes there directly, and whichever one runs second backs up what
+    # the first one just wrote over the operator's real original --
+    # permanently: the ONLY backup slot for bar/file now holds the first
+    # restore's borrowed content, not the file that was actually there
+    # before either ran. Every declared-path check above is blind to this:
+    # `foo` and `bar` are not ancestors of each other, not aliases of each
+    # other, and neither string nor realpath -m says otherwise. Only
+    # walking each tree's actual FILES and canonicalizing each one's
+    # resolved destination -- following exactly the live symlinks a real
+    # write would follow -- catches it.
+    local -a frow_id=() frow_prefix=() frow_rel=() frow_dest=()
     while read -r id; do
         [[ -n "$id" ]] || continue
         gm="$(group_field "$id" mode)" || return 1
@@ -341,8 +366,88 @@ restore_rows() {
                 fi
             done
             seen_e+=("$ec")
+
+            # The same walk the emit loop below used to do itself, moved
+            # here and captured instead of printed immediately: this is the
+            # ONE pass over each tree/flat directory's contents, and the
+            # emit loop reuses what is captured here rather than walking
+            # again.
+            #
+            # Gated by the SAME containment check the emit loop's own escape
+            # row is built from, checked here too rather than assumed -- a
+            # prefix that resolves outside the worktree (trackedRepoPath
+            # from the artifact's own manifest, never validated against the
+            # worktree it names) would otherwise have `find` walk whatever
+            # is actually there on the host filesystem before the emit
+            # loop's escape check ever gets a chance to refuse it. Nothing
+            # from such a walk is ever restored -- the emit loop's escape
+            # check still fires first and skips straight past this id's
+            # flat/tree branch entirely -- but there is no reason to walk a
+            # path this is never going to use.
+            if _path_contained "$wt/$prefix" "$wt" && [[ -e "$wt/$prefix" ]]; then
+                if [[ "$kind" == flat ]]; then
+                    while IFS= read -r -d '' f; do
+                        local frel="${f##*/}"
+                        frow_id+=("$id"); frow_prefix+=("$prefix")
+                        frow_rel+=("$frel"); frow_dest+=("$e/$frel")
+                    done < <(find "$wt/$prefix" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
+                    wait "$!" || return 1
+                elif [[ -d "$wt/$prefix" ]]; then
+                    while IFS= read -r -d '' f; do
+                        local frel="${f#"$wt/$prefix"/}"
+                        frow_id+=("$id"); frow_prefix+=("$prefix")
+                        frow_rel+=("$frel"); frow_dest+=("$e/$frel")
+                    done < <(find "$wt/$prefix" \( -type f -o -type l \) -print0 2>/dev/null)
+                    wait "$!" || return 1
+                fi
+            fi
+            # A `tree`-kind prefix that resolves to neither branch here (no
+            # directory in the worktree at all) has one row, `dest=$e`
+            # itself, in the emit loop's own `else` -- no walk, no alias
+            # risk: there is nothing to enumerate.
         done <<<"$paths_out"
     done <<<"$ids_out"
+
+    # Canonicalized the same way publish_staging's own per-file destination
+    # map is: realpath -m follows every symlink that actually exists along
+    # the path, ancestors included -- the exact mechanism that resolves
+    # `foo/link/file` and `bar/file` to the SAME physical location when
+    # `foo/link` is a live symlink to `bar`, which neither string comparison
+    # nor the declared-path-only canonicalization above could ever see.
+    # Poisoning is by ancestor-directory lookup, not a pairwise scan, for
+    # the same reason publish_staging's own scan was rewritten this way:
+    # O(n^2) here is exactly the same blowup over exactly the same shape of
+    # data (hundreds of individual files across a real machine's groups),
+    # just discovered a round later.
+    local n_frow="${#frow_id[@]}" k fdc anc
+    local -a frow_dc=()
+    local -A fdestcount=() fleaf_seen=() fdir_seen=() fpoisoned=()
+    for (( k = 0; k < n_frow; k++ )); do
+        fdc="$(realpath -m -- "${frow_dest[$k]}" 2>/dev/null)" || return 1
+        [[ -n "$fdc" ]] || return 1
+        frow_dc+=("$fdc")
+        fdestcount[$fdc]=$(( ${fdestcount[$fdc]:-0} + 1 ))
+        anc="$fdc"
+        while [[ "$anc" == */* && "$anc" != "/" ]]; do
+            anc="${anc%/*}"
+            [[ -n "$anc" ]] || break
+            fdir_seen[$anc]=1
+        done
+        fleaf_seen[$fdc]=1
+    done
+    for (( k = 0; k < n_frow; k++ )); do
+        fdc="${frow_dc[$k]}"
+        [[ -n "${fdir_seen[$fdc]:-}" ]] && fpoisoned[$fdc]=1
+        anc="$fdc"
+        while [[ "$anc" == */* && "$anc" != "/" ]]; do
+            anc="${anc%/*}"
+            [[ -n "$anc" ]] || break
+            if [[ -n "${fleaf_seen[$anc]:-}" ]]; then
+                fpoisoned[$fdc]=1
+                fpoisoned[$anc]=1
+            fi
+        done
+    done
 
     while read -r id; do
         [[ -n "$id" ]] || continue
@@ -458,10 +563,19 @@ restore_rows() {
             fi
             [[ -e "$wt/$prefix" ]] || continue
 
-            if [[ "$kind" == flat ]]; then
-                while IFS= read -r -d '' f; do
-                    sub="${f##*/}"
-                    dest="$e/$sub"
+            if [[ "$kind" == flat || -d "$wt/$prefix" ]]; then
+                # Iterated from the single capture pass above, not walked
+                # again -- a second walk here is exactly the TOCTOU window
+                # publish_staging's own preflight-then-rsync gap turned out
+                # to have: a file that appears between the two walks is in
+                # neither collision map, but a second find would still
+                # enumerate and write it.
+                local fk
+                for (( fk = 0; fk < n_frow; fk++ )); do
+                    [[ "${frow_id[$fk]}" == "$id" && "${frow_prefix[$fk]}" == "$prefix" ]] || continue
+                    sub="${frow_rel[$fk]}"
+                    dest="${frow_dest[$fk]}"
+                    local dc="${frow_dc[$fk]}"
                     # find -print0/read -d '' carries the name through correctly
                     # -- the row this prints does not. It is one line of TSV,
                     # and a name holding a literal tab or newline (a file git
@@ -486,59 +600,21 @@ restore_rows() {
                         printf 'escape\t%s\t%s/<name with embedded tab or newline>\t%s\n' "$id" "$prefix" "$sdest"
                     elif ! _restore_contained "$dest"; then
                         printf 'escape\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
-                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$ec]:-1} > 1 )) || [[ -n "${poisoned_e[$ec]:-}" ]]; then
+                    # prefixcount/destcount/poisoned_e catch two DECLARED
+                    # bases colliding; fdestcount/fpoisoned catch two
+                    # individual FILES colliding once each is resolved
+                    # through whatever symlinks actually exist on the live
+                    # filesystem -- two different, non-subsuming checks, the
+                    # same way prefixcount and destcount above are.
+                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$ec]:-1} > 1 || ${fdestcount[$dc]:-1} > 1 )) \
+                         || [[ -n "${poisoned_e[$ec]:-}" || -n "${fpoisoned[$dc]:-}" ]]; then
                         printf 'ambiguous\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
-                    # held was checked in the tree branch only. A manifest is
-                    # free to declare a trackedRepoPath override for the
-                    # migrations directory itself, which routes it through
-                    # `flat` instead -- the shipped manifest never does this,
-                    # but nothing stops one from declaring it, and a forward
-                    # verdict restoring an old marker through that path would
-                    # be exactly the contradiction the tree branch's held check
-                    # exists to prevent.
                     elif [[ "$verdict" == forward ]] && _path_contained "$dest" "$migdir"; then
                         printf 'held\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
                     else
                         printf '%s\t%s\t%s/%s\t%s\n' "$action" "$id" "$prefix" "$sub" "$dest"
                     fi
-                done < <(find "$wt/$prefix" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
-                # find's own status, checked -- the same fail-open scan_files
-                # and prune_bundles were already closed, still open here: a
-                # walk that stopped partway produced fewer rows, and "N files
-                # would be restored" was printed as a fact about a directory
-                # this never finished reading.
-                wait "$!" || return 1
-            elif [[ -d "$wt/$prefix" ]]; then
-                while IFS= read -r -d '' f; do
-                    rel="${f#"$wt/$prefix"/}"
-                    dest="$e/$rel"
-                    # Same injection as the flat branch above, through a
-                    # relative path instead of a bare filename -- either a
-                    # tracked file or an intermediate directory named with an
-                    # embedded tab or newline reaches this row the same way.
-                    if [[ "$rel" == *$'\n'* || "$rel" == *$'\t'* ]]; then
-                        local sdest="${dest//$'\n'/\\n}"; sdest="${sdest//$'\t'/\\t}"
-                        printf 'escape\t%s\t%s/<name with embedded tab or newline>\t%s\n' "$id" "$prefix" "$sdest"
-                    elif ! _restore_contained "$dest"; then
-                        printf 'escape\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
-                    # The collision map was checked for `flat` only. Two groups
-                    # are free to declare the same live directory -- nothing
-                    # stops two ids both naming ~/.config/hypr -- and for
-                    # `tree` that means both enumerate the SAME $wt/$prefix and
-                    # each emit a `restore` row for every file in it. The
-                    # second one to run in _restore_one backs up what the
-                    # FIRST one just wrote, not the real original, and the real
-                    # original is gone from both the destination and the one
-                    # place kept to protect it.
-                    elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$ec]:-1} > 1 )) || [[ -n "${poisoned_e[$ec]:-}" ]]; then
-                        printf 'ambiguous\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
-                    elif [[ "$verdict" == forward ]] && _path_contained "$dest" "$migdir"; then
-                        printf 'held\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
-                    else
-                        printf '%s\t%s\t%s/%s\t%s\n' "$action" "$id" "$prefix" "$rel" "$dest"
-                    fi
-                done < <(find "$wt/$prefix" \( -type f -o -type l \) -print0 2>/dev/null)
-                wait "$!" || return 1
+                done
             else
                 dest="$e"
                 if ! _restore_contained "$dest"; then
@@ -595,6 +671,21 @@ restore_rows() {
 _restore_one() {
     local x="$1" rel="$2" dest="$3" backup="$4"
     local src="$x/worktree/$rel"
+    # Every OTHER containment check in this file guards $dest, the WRITE
+    # side; nothing guarded $src, the READ side, at all. restore_rows is the
+    # only caller and only ever hands this a $rel it itself built from a safe
+    # walk -- but a caller that writes wherever $rel points must not trust
+    # that its only caller got $rel right, the same reasoning _restore_contained
+    # below is re-checked for $dest rather than trusted from the plan. A
+    # crafted group id containing an embedded tab (closed at its source in
+    # groups_ids now, but this is the second, independent gate) shifted a
+    # printed row's fields so $rel arrived here as "../../../../etc/hostname"
+    # instead of the row's real relative path; a PoC confirmed the result
+    # before this check existed: _restore_one read /etc/hostname off the HOST
+    # filesystem and copied it into the target under an unrelated name.
+    # Refused before existence is even asked -- -e on a path outside the
+    # worktree can be true, which is exactly the danger.
+    _path_contained "$src" "$x/worktree" || return 1
     [[ -e "$src" || -L "$src" ]] || return 1
     # Checked here too, not only when the row was planned. restore_rows decides
     # whether a row is ever offered to this function, but a function that

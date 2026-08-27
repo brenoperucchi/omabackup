@@ -239,12 +239,30 @@ groups_ids() {
     # "shellrc") -- restore inherited this the moment it started filtering by
     # $ONLY like every other command, and a filter meant to narrow one group
     # silently pulled in another.
+    #
+    # An id containing a tab or newline is refused here, in jq itself, before
+    # any of them ever become a line of output -- restore_rows prints `$id`
+    # unescaped as one field of a tab-separated row, and bin/omabackup's own
+    # apply loop parses that row back with `read -r a g rel dest`. A PoC
+    # confirmed the result: an id of "base<TAB>../../../../etc/hostname<TAB>
+    # x/victim" turned ONE row into six fields instead of four, and the
+    # attacker-chosen "../../../../etc/hostname" landed in `rel` -- the field
+    # _restore_one uses to build its READ path. Checking for the embedded
+    # byte after `jq -r` has already flattened everything to newline-
+    # separated text is too late: an id with an embedded NEWLINE would
+    # already look like two ordinary ids by then, indistinguishable from a
+    # manifest that just happens to declare two groups. Checked here, against
+    # the JSON string itself, before that flattening ever happens.
     jq -r --arg only "$ONLY" '
-        ($only | if . == "" then [] else split(",") end) as $ids
-        | .groups
-        | map(select(.enabled != false))
-        | map(select(($ids | length) == 0 or (.id as $i | $ids | index($i) != null)))
-        | .[].id' "$GROUPS_FILE"
+        if any(.groups[]?; (.enabled != false) and ((.id // "") | test("[\t\n]")))
+        then error("a group id contains a tab or newline")
+        else
+            ($only | if . == "" then [] else split(",") end) as $ids
+            | .groups
+            | map(select(.enabled != false))
+            | map(select(($ids | length) == 0 or (.id as $i | $ids | index($i) != null)))
+            | .[].id
+        end' "$GROUPS_FILE"
 }
 group_field() { jq -r --arg id "$1" --arg f "$2" '.groups[] | select(.id==$id) | .[$f] // empty' "$GROUPS_FILE"; }
 group_paths() {

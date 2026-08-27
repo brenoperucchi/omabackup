@@ -1578,3 +1578,138 @@ PATH="$RPH/stub:$PATH" HOME="$RPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$
 
 it "and the operator's original file is untouched"
 assert_eq "$(cat "$RPH/home/.config/foo/f.txt")" "operator-original"
+
+# ── a symlink partway INSIDE a tree, not just at a declared path, is caught ──
+# prefixcount/destcount/poisoned_e only ever compared the DECLARED bases of
+# two groups against each other. Two groups declaring genuinely unrelated
+# paths (~/.config/foo and ~/.config/bar, tree mode) never collide there --
+# but if the artifact's own "foo/link/" is an ordinary tracked directory,
+# and the TARGET machine already has ~/.config/foo/link as a live symlink
+# to ~/.config/bar, restoring `foo`'s tree writes through that link into
+# bar/ while `bar`'s own declared path writes there directly. A PoC
+# confirmed the result: "restored 2 files", bar/file left holding whichever
+# group wrote last, and the ONE backup slot meant to protect the operator's
+# real original holding the OTHER group's content instead -- the real
+# original gone from both places at once, permanently. Every per-file
+# destination is now canonicalized and checked against every other group's,
+# not just each group's own declared base.
+MTH="$(mktemp -d)"; MTR="$MTH/repo"
+mkdir -p "$MTR/configs/foo/link" "$MTR/configs/bar"
+git init -q "$MTR"; git -C "$MTR" config user.email t@t; git -C "$MTR" config user.name t
+printf 'A\n' >"$MTR/configs/foo/link/file"
+printf 'B\n' >"$MTR/configs/bar/file"
+git -C "$MTR" add -A && git -C "$MTR" commit -qm one
+cat >"$MTH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"foo","label":"Foo","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/foo"]},
+ {"id":"bar","label":"Bar","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/bar"]}]}
+JSON
+mkdir -p "$MTH/home/.config/foo/link" "$MTH/home/.config/bar"
+printf 'A\n' >"$MTH/home/.config/foo/link/file"
+printf 'B\n' >"$MTH/home/.config/bar/file"
+HOME="$MTH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$MTH/g.json" \
+    OMABACKUP_STATE="$MTH/home/.state" OMABACKUP_REPO="$MTR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+MTART="$(ls -t "$MTH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+MTTGT="$(mktemp -d)"
+mkdir -p "$MTTGT/.config/foo" "$MTTGT/.config/bar"
+printf 'ORIGINAL\n' >"$MTTGT/.config/bar/file"
+ln -s "$MTTGT/.config/bar" "$MTTGT/.config/foo/link"
+
+it "restore --apply does not lose the original through a mid-tree symlink alias"
+HOME="$MTTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$MTH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$MTART" >/dev/null 2>&1
+assert_eq "$(cat "$MTTGT/.config/bar/file")" "ORIGINAL"
+
+# ── a group id with an embedded tab or newline is refused, not printed raw ──
+# restore_rows prints $id unescaped as one field of a tab-separated row, and
+# bin/omabackup's own apply loop parses that row back with a fixed 4-field
+# `read`. A PoC confirmed the result: an id of "base<TAB>../../../../etc/
+# hostname<TAB>x/victim" shifted a row's fields so the attacker-chosen
+# "../../../../etc/hostname" landed in the field _restore_one uses to build
+# its READ path, and the host's own /etc/hostname was copied into the
+# target under an unrelated name. groups_ids() now refuses any id
+# containing a tab or newline before any row is ever built.
+TIH="$(mktemp -d)"; TIR="$TIH/repo"
+mkdir -p "$TIR/configs/hypr"
+git init -q "$TIR"; git -C "$TIR" config user.email t@t; git -C "$TIR" config user.name t
+printf 'bind = SUPER, Q\n' >"$TIR/configs/hypr/bindings.conf"
+git -C "$TIR" add -A && git -C "$TIR" commit -qm one
+cat >"$TIH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"compositor","label":"Compositor","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/hypr"]}]}
+JSON
+mkdir -p "$TIH/home"
+HOME="$TIH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$TIH/g.json" \
+    OMABACKUP_STATE="$TIH/home/.state" OMABACKUP_REPO="$TIR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+TIRAW="$(ls -t "$TIH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+TIX="$(mktemp -d)"; tar -C "$TIX" -xf <(zstd -dc "$TIRAW")
+python3 -c "
+import json
+p = '$TIX/tool/groups.default.json'
+g = json.load(open(p))
+g['groups'][0]['id'] = 'base\t../../../../etc/hostname\tx/victim'
+json.dump(g, open(p,'w'))
+"
+( cd "$TIX" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+TIART="$TIH/tampered.tar.zst"
+tar -C "$TIX" -cf - . | zstd -q -19 -T0 -o "$TIART"
+
+it "restore refuses a group id containing an embedded tab"
+HOME="$TIH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$TIH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$TIART" >/dev/null 2>&1 \
+    && fail "restore proceeded despite a tab-embedded group id" || ok
+
+it "and nothing was written at all"
+[[ -z "$(find "$TIH/home/.config" -type f 2>/dev/null)" ]] \
+    && ok || fail "a file was written despite the tampered group id"
+
+# The two specs above go through the whole restore pipeline, where an
+# unrelated containment check on the resulting garbled row happens to also
+# fail for this exact crafted id -- confirmed by running them against
+# 1523d70-era code: they still refuse, just not because of this fix.
+# groups_ids() itself is checked directly here instead, where the only
+# thing that can make it refuse is the check this fix added.
+GIH="$(mktemp -d)"
+cat >"$GIH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"ok","label":"OK","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/ok"]}]}
+JSON
+
+it "groups_ids succeeds on an ordinary manifest"
+GIOUT="$(OMABACKUP_GROUPS="$GIH/g.json" bash -c 'source bin/omabackup >/dev/null 2>&1; groups_ids')"
+assert_eq "$GIOUT" "ok"
+
+python3 -c "
+import json
+g = json.load(open('$GIH/g.json'))
+g['groups'][0]['id'] = 'base\tinjected'
+json.dump(g, open('$GIH/g.json', 'w'))
+"
+
+it "groups_ids refuses a manifest whose own id has an embedded tab"
+OMABACKUP_GROUPS="$GIH/g.json" bash -c 'source bin/omabackup >/dev/null 2>&1; groups_ids' >/dev/null 2>&1 \
+    && fail "groups_ids printed the tab-embedded id instead of refusing" || ok
+
+# ── _restore_one refuses a source outside the worktree, defense in depth ────
+# Every OTHER containment check in this file guards $dest, the write side;
+# nothing guarded $src, the read side. restore_rows is the only real
+# caller and only ever hands it a $rel it built from a safe walk, but this
+# is checked independently rather than trusted from the plan -- the same
+# reasoning _restore_contained is re-checked immediately before the write
+# rather than trusted from earlier in the same function.
+SOH="$(mktemp -d)"
+mkdir -p "$SOH/x/worktree" "$SOH/target/.config/app" "$SOH/backup"
+printf 'sensitive-host-file\n' >"$SOH/outside-secret.txt"
+
+it "_restore_one refuses a rel that escapes the worktree via .."
+HOME="$SOH/target" bash -c '
+    source lib/restore.sh
+    _restore_one "$1" "../../outside-secret.txt" "$HOME/.config/app/leaked.txt" "$2"
+' _ "$SOH/x" "$SOH/backup" \
+    && fail "_restore_one succeeded reading a source outside the worktree" || ok
+
+it "and nothing was written"
+[[ ! -e "$SOH/target/.config/app/leaked.txt" ]] \
+    && ok || fail "the host file was copied into the target"
