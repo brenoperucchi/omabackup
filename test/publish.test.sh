@@ -447,3 +447,66 @@ publish_staging "$PA12H/staging" "$PA12H/repo" "$PA12TABLE" >/dev/null 2>&1 \
 it "and neither one silently landed there"
 [[ ! -e "$PA12H/repo/configs/omarchy/plugins/mytheme/init.lua" ]] \
     && ok || fail "one of the two colliding sources landed anyway"
+
+# ── a file that appears in a plugin tree AFTER the collision check is not ───
+# ── copied by the rsync that follows it ──────────────────────────────────────
+# rsync used to be pointed at the plugin's whole directory and left to walk
+# it again on its own at write time -- a file that appeared between the
+# preflight collision check above and that second walk was never checked
+# against the collision map at all, but rsync copied it anyway. A PoC (a
+# stub find that plants a new file into the plugin directory right after
+# answering the preflight walk, simulating the race) confirmed the result:
+# the raced-in file silently overwrote a regular staged file already
+# sitting at the identical destination. rsync is now given the EXACT file
+# list the preflight walk captured via --files-from, incapable of copying
+# anything outside it by construction.
+PA13H="$(mktemp -d)"
+mkdir -p "$PA13H/staging/.plugins/local/mytheme" "$PA13H/staging/.config/other" "$PA13H/repo"
+printf 'plugin-a\n' >"$PA13H/staging/.plugins/local/mytheme/a.txt"
+printf 'staged-regular\n' >"$PA13H/staging/.config/other/new.txt"
+git init -q "$PA13H/repo"; git -C "$PA13H/repo" config user.email t@t; git -C "$PA13H/repo" config user.name t
+PA13TABLE="$(printf '.config/other\tconfigs/omarchy/plugins/mytheme\n')"
+mkdir -p "$PA13H/stub"
+cat >"$PA13H/stub/find" <<STUB
+#!/bin/bash
+if [[ "\$1" == "$PA13H/staging/.plugins/local/mytheme/" && ! -e "$PA13H/.raced" ]]; then
+    touch "$PA13H/.raced"
+    $(type -P find) "\$@"
+    printf 'race-injected\n' >"$PA13H/staging/.plugins/local/mytheme/new.txt"
+else
+    exec $(type -P find) "\$@"
+fi
+STUB
+chmod +x "$PA13H/stub/find"
+
+PATH="$PA13H/stub:$PATH" publish_staging "$PA13H/staging" "$PA13H/repo" "$PA13TABLE" >/dev/null 2>&1
+
+it "a file racing into a plugin tree after the preflight check is not copied over another"
+assert_eq "$(cat "$PA13H/repo/configs/omarchy/plugins/mytheme/new.txt" 2>/dev/null)" "staged-regular"
+
+# ── a $dst.tmp that cannot be unlinked is refused before the redirect opens ──
+# rm -f "$dst.tmp"'s own status used to be discarded (2>/dev/null swallows
+# it, and nothing checked the exit code either). A directory that refuses
+# to let an entry be removed -- but still lets an EXISTING file reached
+# through it be opened for writing, since that needs permission on the
+# FILE, not the directory -- left a pre-planted symlink standing, and the
+# `jq -S ... >"$dst.tmp"` redirect right after wrote straight through it.
+# A PoC confirmed the result: mv failed afterward (permission denied on the
+# directory), publish reported rc=1 -- but the external file was already
+# overwritten with the normalized JSON by the time anything could react to
+# that failure. The later refusal does not undo an external write that
+# already happened.
+PDTH="$(mktemp -d)"
+mkdir -p "$PDTH/staging/.config/app" "$PDTH/outside" "$PDTH/repo/configs/app"
+printf '{"a":1}\n' >"$PDTH/staging/.config/app/f.json"
+printf 'victim-original\n' >"$PDTH/outside/victim.json"
+chmod 666 "$PDTH/outside/victim.json"
+git init -q "$PDTH/repo"; git -C "$PDTH/repo" config user.email t@t; git -C "$PDTH/repo" config user.name t
+ln -s "$PDTH/outside/victim.json" "$PDTH/repo/configs/app/f.json.tmp"
+chmod 555 "$PDTH/repo/configs/app"
+
+publish_staging "$PDTH/staging" "$PDTH/repo" >/dev/null 2>&1
+chmod 755 "$PDTH/repo/configs/app" 2>/dev/null
+
+it "a dst.tmp that cannot be unlinked is refused before the redirect can write through it"
+assert_eq "$(cat "$PDTH/outside/victim.json" 2>/dev/null)" "victim-original"

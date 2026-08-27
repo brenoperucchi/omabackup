@@ -115,7 +115,19 @@ _publish_file() {  # _publish_file <src> <dst> <repo-root> [<repo-root-rp>]
         # -- confirmed with a PoC ($dst.tmp pre-planted pointing outside the
         # repo). --remove-destination has no equivalent for a redirection;
         # unlinked explicitly first instead, same effect.
-        rm -f "$dst.tmp" 2>/dev/null
+        #
+        # rm's own status, checked, and nothing past it runs on failure -- a
+        # PoC confirmed the gap: a directory that refuses to let $dst.tmp be
+        # unlinked (but still lets an existing file through it be opened for
+        # writing) left the pre-planted symlink standing, `rm -f`'s discarded
+        # failure said nothing, and the redirect just below wrote the
+        # normalized JSON straight through it into a file outside the repo.
+        # The eventual refusal this function still reports does not undo
+        # that write -- it already happened by the time anything downstream
+        # could react to it. Refused before the redirect ever opens.
+        if ! rm -f "$dst.tmp" 2>/dev/null || [[ -e "$dst.tmp" || -L "$dst.tmp" ]]; then
+            return 1
+        fi
         jq -S . "$src" >"$dst.tmp" && mv "$dst.tmp" "$dst"
     else
         # `cp -p`, not `rsync`. rsync costs ~44ms to start against cp's ~0.5ms,
@@ -339,7 +351,24 @@ publish_staging() {
                 # staged file per plugin -- the same n_pairs comparison
                 # repeated for each of a handful of plugins was another
                 # O(pids * n_pairs) term on top of the ancestor scan below.
+                #
+                # Captured into pfiles, not just counted -- this exact list
+                # is what rsync is told to copy below, not the directory
+                # itself. rsync used to be pointed at $f and left to walk it
+                # AGAIN on its own at write time: a file that appeared
+                # between this preflight check and that second walk was
+                # never checked against the collision map at all, but rsync
+                # copied it anyway. A PoC (a wrapper that adds a new file to
+                # the plugin directory between the check above and the
+                # rsync call) confirmed the result: the new file, invisible
+                # to the preflight snapshot, silently overwrote a regular
+                # staged file already sitting at the identical destination.
+                # --files-from makes rsync incapable of copying anything
+                # outside this exact list, by construction, the same
+                # reasoning publish_staging's own single find snapshot
+                # exists for everything else in this function.
                 collided=0
+                local -a pfiles=()
                 while IFS= read -r -d '' pf; do
                     [[ -n "$pf" ]] || continue
                     prel=".plugins/local/$pid/${pf#"$f"}"
@@ -351,6 +380,7 @@ publish_staging() {
                         printf 'omabackup: %s maps to %s, which more than one staged source maps to -- refusing to publish any of them, one would silently overwrite another\n' \
                             "$prel" "${dsts[$pidx]}" >&2
                     fi
+                    pfiles+=("${pf#"$f"}")
                 done < <(find "$f" \( -type f -o -type l \) -not -path "*/.git/*" -print0 2>/dev/null)
                 wait "$!" || { failed=$((failed + 1)); continue; }
                 if (( collided )); then
@@ -364,13 +394,21 @@ publish_staging() {
                 _publish_contained "$repo/configs/omarchy/plugins/$pid" "$repo" "$repo_rp" \
                     || { failed=$((failed + 1)); continue; }
                 mkdir -p "$repo/configs/omarchy/plugins/$pid" || { failed=$((failed + 1)); continue; }
-                rsync -a --exclude '.git/' "$f" "$repo/configs/omarchy/plugins/$pid/" \
-                    || { failed=$((failed + 1)); continue; }
-                while IFS= read -r -d '' pf; do
-                    [[ -n "$pf" ]] || continue
-                    written+=("configs/omarchy/plugins/$pid/${pf#"$f"}")
-                done < <(find "$f" \( -type f -o -type l \) -not -path "*/.git/*" -print0 2>/dev/null)
-                wait "$!" || failed=$((failed + 1))
+                (( ${#pfiles[@]} )) || continue
+                # A real file, not --files-from=<(...): rsync opens that
+                # argument itself rather than reading it as redirected
+                # stdin, and a process substitution's fd was not reliably
+                # there by the time it did.
+                local pflist; pflist="$(mktemp)" || { failed=$((failed + 1)); continue; }
+                printf '%s\0' "${pfiles[@]}" >"$pflist"
+                rsync -a --exclude '.git/' --files-from="$pflist" --from0 \
+                    "$f" "$repo/configs/omarchy/plugins/$pid/"
+                local rsync_rc=$?
+                rm -f "$pflist"
+                (( rsync_rc == 0 )) || { failed=$((failed + 1)); continue; }
+                for pf in "${pfiles[@]}"; do
+                    written+=("configs/omarchy/plugins/$pid/$pf")
+                done
             done
         fi
     fi
