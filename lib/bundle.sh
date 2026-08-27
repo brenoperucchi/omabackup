@@ -92,9 +92,13 @@ _bundle_manifest() {
     # verbatim, neither "unreadable" nor a real watermark. Refused the same
     # way -- a bundle built from it would embed a migrationWatermark no
     # future restore could compare against anything.
-    if [[ "$om" == unreadable || ! "$om" =~ ^[0-9]+$ ]]; then
-        printf 'omabackup: this machine'"'"'s own migration state could not be confirmed -- refusing to build a bundle nobody could ever restore with confidence\n' \
-            >&2
+    if [[ "$om" == unreadable ]]; then
+        printf 'omabackup: this machine'"'"'s own migration state could not be confirmed -- refusing to build a bundle nobody could ever restore with confidence (check %s: could not be listed or read)\n' \
+            "$(_tilde "$(_expand '~/.local/state/omarchy/migrations')")" >&2
+        return 1
+    elif [[ ! "$om" =~ ^[0-9]+$ ]]; then
+        printf 'omabackup: this machine'"'"'s own migration state could not be confirmed -- refusing to build a bundle nobody could ever restore with confidence (check %s: a filename there resolved to %q, not a plain number)\n' \
+            "$(_tilde "$(_expand '~/.local/state/omarchy/migrations')")" "$om" >&2
         return 1
     fi
     dirty="$(git -C "$repo" status --porcelain 2>/dev/null)"
@@ -103,6 +107,33 @@ _bundle_manifest() {
     # restores this needs to know *what* was broken when it was taken.
     local vdoc; vdoc="$(FINDINGS=(); JSON=1 cmd_verify 2>/dev/null)"
     [[ -n "$vdoc" ]] || vdoc='{}'
+
+    # The staged member listing, built separately and checked before it ever
+    # reaches the big jq -n below -- restore_rows' own TSV rows carry the
+    # exact same shape of risk (a tracked file's name is free to hold a tab
+    # or a newline; nothing stops it) and were fixed by refusing it BY NAME,
+    # not by accident. This used to rely on --argjson rejecting the mangled
+    # JSON that a name like that produces -- true, but only because nothing
+    # downstream ever gave that JSON a `// []` convenience default, and the
+    # refusal it produced was a raw jq parse error with no pointer to which
+    # file, or that a filename was ever the reason. -print0/-d '' carries the
+    # byte-exact name; a name found to hold a tab or newline is refused here,
+    # by name, before it ever becomes an unlabeled downstream parse failure.
+    local contents_tsv
+    contents_tsv="$(cd "$stage" && find . -type f ! -name manifest.json ! -name SHA256SUMS -print0 2>/dev/null \
+        | while IFS= read -r -d '' p; do
+              p="${p#./}"
+              if [[ "$p" == *$'\n'* || "$p" == *$'\t'* ]]; then
+                  printf 'omabackup: a staged file'"'"'s name contains a tab or newline (%q) -- refusing to build a manifest that cannot list it safely\n' "$p" >&2
+                  exit 1
+              fi
+              sz="$(stat -c %s "$p" 2>/dev/null)" || exit 1
+              h="$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)" || exit 1
+              printf '%s\t%s\t%s\n' "$h" "$sz" "$p"
+          done)" || return 1
+    local contents_json
+    contents_json="$(printf '%s' "$contents_tsv" | jq -R -s 'split("\n") | map(select(length>0) | split("\t")
+                | {path:.[2], sha256:.[0], size:(.[1]|tonumber)})')" || return 1
 
     jq -n \
         --arg host "$(_hostname)" \
@@ -122,13 +153,7 @@ _bundle_manifest() {
                                              critical: (.critical // false),
                                              enabled: (.enabled != false)}]' "$GROUPS_FILE")" \
         --argjson verify "$vdoc" \
-        --argjson contents "$(cd "$stage" \
-            && find . -type f ! -name manifest.json ! -name SHA256SUMS -printf '%s\t%P\n' 2>/dev/null \
-            | while IFS=$'\t' read -r sz p; do
-                  printf '%s\t%s\t%s\n' "$(sha256sum "$p" 2>/dev/null | cut -d' ' -f1)" "$sz" "$p"
-              done \
-            | jq -R -s 'split("\n") | map(select(length>0) | split("\t")
-                        | {path:.[2], sha256:.[0], size:(.[1]|tonumber)})')" \
+        --argjson contents "$contents_json" \
         '{schemaVersion: 1,
           tool: {name: "omabackup", commit: $toolcommit},
           host: $host, createdAt: $created, name: $name,

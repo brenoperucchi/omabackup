@@ -506,3 +506,20 @@ PCPATH2="$(printf '%s' "$PCOUT" | jq -r '.path')"
 PCX2="$(_unpack "$PCPATH2")"
 diff -q "$PCX2/tool/groups.default.json" "$PWD/groups.default.json" >/dev/null 2>&1 \
     && ok || fail "the rebuilt cache still does not match the real groups.default.json"
+
+# ── a tracked filename with an embedded tab or newline is refused by name ───
+# _bundle_manifest's own `contents` listing has the exact shape restore_rows'
+# TSV rows were fixed against: find -printf/read split on \t and \n over a
+# path free to contain either. This used to fail closed only by accident --
+# a mangled name broke `--argjson`'s JSON parse, and the refusal was a raw
+# jq error with no pointer to which file, or that a filename was the cause
+# at all. Fixed by refusing it by name, before the mangled JSON is ever built.
+NLH="$(mktemp -d)"; NLR="$NLH/repo"
+mkdir -p "$NLR/configs/app"
+git init -q "$NLR"; git -C "$NLR" config user.email t@t; git -C "$NLR" config user.name t
+printf 'content\n' >"$NLR/configs/app/$(printf 'x\ninjected')"
+git -C "$NLR" add -A && git -C "$NLR" commit -qm one
+
+it "bundle refuses a tracked filename with an embedded newline, by name"
+NLOUT="$(_bundle_env "$NLH" "$NLR" bundle)"
+assert_contains "$NLOUT" "contains a tab or newline"

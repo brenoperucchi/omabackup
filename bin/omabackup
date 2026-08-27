@@ -1505,9 +1505,9 @@ cmd_restore() {
     # actually needed rebuilding.
     local vout vrc; vout="$(_restore_verdict "$x/manifest.json")"; vrc=$?
     if (( vrc == 1 )); then
-        rm -rf "$x"; die "could not determine this machine's own migration state -- refusing to judge compatibility blind"
+        rm -rf "$x"; die "could not determine this machine's own migration state -- refusing to judge compatibility blind (check $(_tilde "$(_expand '~/.local/state/omarchy/migrations')"): a filename there that is not a plain number is enough to cause this)"
     elif (( vrc == 2 )); then
-        rm -rf "$x"; die "this artifact's own migration state could not be confirmed when it was built -- rebuild it on a healthy machine"
+        rm -rf "$x"; die "this artifact's own migration state could not be confirmed when it was built -- rebuild it on a healthy machine (check ~/.local/state/omarchy/migrations on the machine that built it)"
     fi
     IFS=$'\t' read -r verdict why <<<"$vout"
 
