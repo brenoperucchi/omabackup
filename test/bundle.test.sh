@@ -299,18 +299,24 @@ GROUPS_FILE="$GMH/missing.json" OMABACKUP_ROOT="$PWD" bash -c '
 # build_bundle needs the full set of helpers bin/omabackup defines (_tilde,
 # omarchy_identity, _hostname...), not just what lib/bundle.sh brings in on
 # its own.
-CVH="$(mktemp -d)"; CVR="$CVH/repo"; CVC="$CVH/home/.state/bundles"
+CVH="$(mktemp -d)"; CVR="$CVH/repo"
 git init -q "$CVR" 2>/dev/null; printf 'x\n' >"$CVR/a"
 git -C "$CVR" add a 2>/dev/null
 git -C "$CVR" -c user.email=t@t -c user.name=t commit -q -m ok 2>/dev/null
-CVKEY="$(OMABACKUP_ROOT="$PWD" GROUPS_FILE="$PWD/groups.default.json" bash -c '
-    source lib/bundle.sh; bundle_cache_path "$1" "$2"' _ "$CVR" "$CVC" 2>/dev/null)"
-mkdir -p "$CVC"; printf 'not a real bundle, just garbage\n' >"$CVKEY"
+# CVKEY comes from an actual build through the real CLI, not a standalone
+# recomputation of bundle_cache_path's inputs -- the key now also folds in
+# omarchy_identity and the deny-list's hash (see the cache-key spec further
+# below), both of which need bin/omabackup's own env handling and $HOME
+# wiring to answer consistently with what a later real build will see. Two
+# independent computations of the same key drifted the moment one of them
+# skipped that.
+CVKEY="$(_bundle_env "$CVH" "$CVR" bundle --json | jq -r '.path // empty' 2>/dev/null)"
+printf 'not a real bundle, just garbage\n' >"$CVKEY"
 # Not _bundle_env: it merges stderr into stdout, and rebuilding past a
 # corrupted cache entry prints a diagnostic on stderr by design -- mixed into
 # stdout, that diagnostic breaks the JSON this needs to parse cleanly.
-CVOUT="$(HOME="$CVH/home" OMABACKUP_GROUPS="$PWD/groups.default.json" \
-    OMABACKUP_STATE="$CVH/home/.state" OMABACKUP_REPO="$CVR" \
+CVOUT="$(HOME="$CVH" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$CVH/.state" OMABACKUP_REPO="$CVR" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" bundle --json 2>/dev/null)"
 CVPATH="$(printf '%s' "$CVOUT" | jq -r '.path // empty' 2>/dev/null)"
 
@@ -439,3 +445,34 @@ HOME="$ADH/home" OMABACKUP_GROUPS="$PWD/groups.default.json" OMABACKUP_STATE="$A
     OMABACKUP_REPO="$ADR" OMABACKUP_SECRETS_DENY="$ADH/deny.json" XDG_RUNTIME_DIR=/nonexistent \
     "$OB" bundle >/dev/null 2>&1 \
     && fail "built a bundle from a deny-list assert_deny_understood would have refused" || ok
+
+# ── the cache key tracks migration state and the deny-list, not just the repo ─
+# bundle_cache_path hashed HEAD, the tool, refs and GROUPS_FILE -- nothing a
+# migration landing or a deny-list edit ever touches, since both are dynamic
+# machine state, not repo content. A PoC confirmed the result: build, let a
+# new migration marker appear, build again -- "reused," with the manifest
+# INSIDE the reused artifact still reporting the watermark from before the
+# migration. Any restore comparing against it would be judged against a
+# number that stopped being this machine's the moment the migration ran.
+WMH="$(mktemp -d)"; WMR="$WMH/repo"
+_bundle_repo "$WMR"
+# _bundle_env sets HOME="$h" directly (not "$h/home") -- the migrations dir
+# has to live under THAT, or omarchy_identity never sees either marker and
+# both builds read watermark 0, proving nothing about this fix.
+mkdir -p "$WMH/.local/state/omarchy/migrations"
+printf 'm1\n' >"$WMH/.local/state/omarchy/migrations/1700000000.sh"
+WMOUT1="$(_bundle_env "$WMH" "$WMR" bundle --json)"
+WMPATH1="$(printf '%s' "$WMOUT1" | jq -r '.path // empty' 2>/dev/null)"
+printf 'm2\n' >"$WMH/.local/state/omarchy/migrations/1800000000.sh"
+WMOUT2="$(_bundle_env "$WMH" "$WMR" bundle --json)"
+WMPATH2="$(printf '%s' "$WMOUT2" | jq -r '.path // empty' 2>/dev/null)"
+
+it "a new migration marker invalidates the cache, not just a repo change"
+# Not `.reused // empty` -- jq's // treats a literal `false` as absent too,
+# same as null, so that expression silently swallows the exact value this
+# assertion needs to see.
+assert_eq "$(printf '%s' "$WMOUT2" | jq -r '.reused')" "false"
+
+it "and the reported watermark is the current one, not the stale cached one"
+WMX2="$(_unpack "$WMPATH2")"
+assert_eq "$(jq -r '.omarchy.migrationWatermark' "$WMX2/manifest.json")" "1800000000"

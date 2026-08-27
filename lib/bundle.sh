@@ -217,7 +217,23 @@ bundle_cache_path() {
     # described what actually shipped.
     gh="$(sha256sum "$GROUPS_FILE" 2>/dev/null)" || return 1
     [[ -n "$gh" ]] || return 1
-    key="$(printf '%s\n%s\n%s\n%s\n' "$head" "$fp" "$refs" "$gh" | sha256sum | cut -c1-16)"
+    # Two more things a cache hit used to serve stale, silently: this
+    # machine's own Omarchy identity, and the deny-list a build's own
+    # scan_files pass was judged against. Neither one is reachable from HEAD,
+    # the tool, refs, or GROUPS_FILE -- a migration landing changes nothing
+    # any of those four track. A PoC confirmed the result: build, let a new
+    # migration marker appear, build again -- "reused," and the manifest
+    # INSIDE the reused artifact still reported the watermark from before the
+    # migration. Any restore comparing against it would be comparing against
+    # a number that was never actually this machine's, at the moment that
+    # restore needed it to be. Included here the same way GROUPS_FILE is, so
+    # either one changing forces a real rebuild instead of serving a manifest
+    # -- or a scan result -- that no longer describes the machine or the
+    # rules it was judged by.
+    local ident deny
+    ident="$(omarchy_identity)"
+    deny="$(sha256sum "$SECRETS_DENY_FILE" 2>/dev/null)"
+    key="$(printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$head" "$fp" "$refs" "$gh" "$ident" "$deny" | sha256sum | cut -c1-16)"
     printf '%s/%s.tar.zst' "$cache" "$key"
 }
 
