@@ -85,8 +85,19 @@ _restore_verdict() {
     # healthy machine when an old artifact was what actually needed rebuilding.
     [[ "$tm" == unreadable ]] && return 1
     [[ "$bm" == unreadable ]] && return 2
-    [[ "$bm" =~ ^[0-9]+$ ]] || bm=0
-    [[ "$tm" =~ ^[0-9]+$ ]] || tm=0
+    # A watermark that is neither a valid non-negative integer nor the
+    # "unreadable" sentinel is not a legitimate "no migrations yet" -- that
+    # case already produces "0" explicitly, which the regex below matches
+    # fine. It is a migrations directory holding a file whose name, once
+    # `.sh` is stripped, is not a number (a stray `junk.sh` is enough) on the
+    # tm side, or a manifest field some other value got written into on the
+    # bm side. Defaulting either to 0 read a genuinely unreadable watermark as
+    # the most permissive possible one -- a fresh install, applying coupled
+    # config unconditionally -- exactly backwards from the migrations
+    # directory existing but not being trustworthy. Refused the same way the
+    # sentinel already is, not silently downgraded to it.
+    [[ "$tm" =~ ^[0-9]+$ ]] || return 1
+    [[ "$bm" =~ ^[0-9]+$ ]] || return 2
     if (( tm == bm )); then
         printf 'same\tsame migration watermark (%s): the coupled groups and the migration markers both apply' "$bm"
     elif (( tm > bm )); then
@@ -209,12 +220,38 @@ _restore_repo_prefix() {
 # but the global flag parser consumes that flag before cmd_restore's argument
 # loop ever sees it, so that parsing was dead code and the flag silently did
 # nothing.
+#
+# <operator-groups-file>, optional: this MACHINE's own, locally-installed
+# groups.default.json, distinct from the artifact's bundled copy that every
+# group_field/groups_ids/group_paths call above queries. A PoC confirmed why
+# it is needed: an artifact whose manifest.json calls a group coupled, but
+# whose OWN bundled groups.default.json quietly omits `coupled` for that same
+# id, restored it as an ordinary file even while quarantined -- manifest.json
+# and groups.default.json are not independent sources for an artifact built
+# by an attacker; both are written by the same build, from the same file, so
+# checking one against the other proves nothing. The operator's own local
+# file is genuinely independent: the artifact cannot edit it. Used only as a
+# FLOOR, never a ceiling -- the artifact can still mark something coupled the
+# local schema has never heard of (a newer group id), it just cannot talk the
+# local schema's OWN classification of a group it recognizes down to false.
 restore_rows() {
-    local x="$1" verdict="$2" id p prefix kind e f rel sub dest action gm coupled
+    local x="$1" verdict="$2" opgroups="${3:-}" id p prefix kind e f rel sub dest action gm coupled
     local wt="$x/worktree"
     [[ -d "$wt" ]] || return 1
 
     local migdir; migdir="$(_expand '~/.local/state/omarchy/migrations')"
+
+    # Captured once, checked, reused for both loops below -- not fed straight
+    # into `done < <(groups_ids)`. A process substitution's own exit status is
+    # not directly observable at the `done` that closes it (no `$?` slot to
+    # check, and `wait "$!"` is unreliable here because loop bodies below spawn
+    # their OWN process substitutions -- find, group_paths -- each overwriting
+    # $! before control ever returns to this one). A manifest jq cannot parse
+    # at all previously produced empty output the SAME way a manifest with
+    # genuinely zero groups does: `while read` over either just runs zero
+    # times, restore_rows returns 0, and "0 files would be restored" reported
+    # as fact about an artifact whose manifest was never actually readable.
+    local ids_out; ids_out="$(groups_ids)" || return 1
 
     # Two collision maps, not one -- they catch two different things that both
     # end in the same loss. prefixcount, keyed by repo-side prefix, is what
@@ -235,6 +272,7 @@ restore_rows() {
         [[ -n "$id" ]] || continue
         gm="$(group_field "$id" mode)" || return 1
         [[ "$gm" == gen ]] && continue
+        local paths_out; paths_out="$(group_paths "$id")" || return 1
         while read -r p; do
             [[ -n "$p" ]] || continue
             # <<<"$(...)" loses the inner command's exit status -- read's own
@@ -249,8 +287,8 @@ restore_rows() {
             e="$(_expand "$p")"
             prefixcount[$prefix]=$(( ${prefixcount[$prefix]:-0} + 1 ))
             destcount[$e]=$(( ${destcount[$e]:-0} + 1 ))
-        done < <(group_paths "$id")
-    done < <(groups_ids)
+        done <<<"$paths_out"
+    done <<<"$ids_out"
 
     while read -r id; do
         [[ -n "$id" ]] || continue
@@ -275,9 +313,22 @@ restore_rows() {
         fi
 
         coupled="$(group_field "$id" coupled)" || return 1
+        # The floor described above the function's own comment: the artifact
+        # cannot talk this id's coupling down below what the operator's own
+        # installed schema, if it recognizes the id at all, already says.
+        # Read failures on the operator's own file are not this artifact's
+        # fault -- if it cannot be read or the query cannot run, this simply
+        # has nothing to add, and the artifact's own answer above stands.
+        if [[ -n "$opgroups" && -r "$opgroups" ]]; then
+            local local_coupled
+            local_coupled="$(jq -r --arg id "$id" \
+                '.groups[]? | select(.id==$id) | .coupled // empty' "$opgroups" 2>/dev/null)"
+            [[ "$local_coupled" == true ]] && coupled=true
+        fi
         action=restore
         [[ "$coupled" == true && "$verdict" == quarantine ]] && action=quarantine
 
+        local paths_out2; paths_out2="$(group_paths "$id")" || return 1
         while read -r p; do
             [[ -n "$p" ]] || continue
             local rp; rp="$(_restore_repo_prefix "$id" "$p")"; local rprc=$?
@@ -292,7 +343,29 @@ restore_rows() {
                 while IFS= read -r -d '' f; do
                     sub="${f##*/}"
                     dest="$e/$sub"
-                    if ! _restore_contained "$dest"; then
+                    # find -print0/read -d '' carries the name through correctly
+                    # -- the row this prints does not. It is one line of TSV,
+                    # and a name holding a literal tab or newline (a file git
+                    # tracked under that name; nothing stops it) rides straight
+                    # into the row unescaped. A PoC named one
+                    # "x<newline>restore<tab>app<tab>foo": the printf below
+                    # split at the embedded newline, and everything after it
+                    # became a second, well-formed row -- action "restore",
+                    # ending in this SAME $dest -- entirely independent of
+                    # whatever action this file's row was actually supposed to
+                    # carry. A quarantined file's row can inject a `restore`
+                    # row for its own destination this way, and whatever reads
+                    # these rows line-by-line has no way to tell the difference.
+                    # Refused as `escape`, the same category already used for
+                    # a destination that resolves outside where it should.
+                    if [[ "$sub" == *$'\n'* || "$sub" == *$'\t'* ]]; then
+                        # $dest itself carries the dangerous bytes here (it is
+                        # built from $sub) -- sanitized before printing, not
+                        # raw, so THIS row cannot become the same injection it
+                        # exists to report.
+                        local sdest="${dest//$'\n'/\\n}"; sdest="${sdest//$'\t'/\\t}"
+                        printf 'escape\t%s\t%s/<name with embedded tab or newline>\t%s\n' "$id" "$prefix" "$sdest"
+                    elif ! _restore_contained "$dest"; then
                         printf 'escape\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
                     elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$e]:-1} > 1 )); then
                         printf 'ambiguous\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$sub" "$dest"
@@ -320,7 +393,14 @@ restore_rows() {
                 while IFS= read -r -d '' f; do
                     rel="${f#"$wt/$prefix"/}"
                     dest="$e/$rel"
-                    if ! _restore_contained "$dest"; then
+                    # Same injection as the flat branch above, through a
+                    # relative path instead of a bare filename -- either a
+                    # tracked file or an intermediate directory named with an
+                    # embedded tab or newline reaches this row the same way.
+                    if [[ "$rel" == *$'\n'* || "$rel" == *$'\t'* ]]; then
+                        local sdest="${dest//$'\n'/\\n}"; sdest="${sdest//$'\t'/\\t}"
+                        printf 'escape\t%s\t%s/<name with embedded tab or newline>\t%s\n' "$id" "$prefix" "$sdest"
+                    elif ! _restore_contained "$dest"; then
                         printf 'escape\t%s\t%s/%s\t%s\n' "$id" "$prefix" "$rel" "$dest"
                     # The collision map was checked for `flat` only. Two groups
                     # are free to declare the same live directory -- nothing
@@ -350,7 +430,7 @@ restore_rows() {
                     printf '%s\t%s\t%s\t%s\n' "$action" "$id" "$prefix" "$dest"
                 fi
             fi
-        done < <(group_paths "$id")
+        done <<<"$paths_out2"
 
         # The plugins group is `triple`: local plugin directories are restored
         # by the path loop above like any tree, but publish also writes an
@@ -373,12 +453,20 @@ restore_rows() {
             if [[ -d "$wt/patches/omarchy-plugins" ]]; then
                 while IFS= read -r -d '' f; do
                     rel="${f#"$wt"/}"
-                    printf 'report\t%s\t%s\t-\n' "$id" "$rel"
+                    # Same TSV injection as the flat/tree branches above --
+                    # this row's action is only ever "report" (never applied),
+                    # but the row it can forge by riding an embedded newline
+                    # is not: this is as much an injection vector as those.
+                    if [[ "$rel" == *$'\n'* || "$rel" == *$'\t'* ]]; then
+                        printf 'escape\t%s\t%s\t-\n' "$id" "patches/omarchy-plugins/<name with embedded tab or newline>"
+                    else
+                        printf 'report\t%s\t%s\t-\n' "$id" "$rel"
+                    fi
                 done < <(find "$wt/patches/omarchy-plugins" -maxdepth 1 -type f -name '*.patch' -print0 2>/dev/null)
                 wait "$!" || return 1
             fi
         fi
-    done < <(groups_ids)
+    done <<<"$ids_out"
 }
 
 # _restore_one <extracted> <repo-relative> <destination> <backup-dir>

@@ -1442,6 +1442,14 @@ cmd_restore() {
     local HOME="${into:-$HOME}"
     [[ -z "$into" ]] || mkdir -p "$into" || { rm -rf "$x"; die "could not make $(_tilde "$into")"; }
 
+    # Captured before the override two lines down replaces it -- this
+    # machine's OWN, locally-installed groups.default.json, not the
+    # artifact's. restore_rows uses it as a floor under `coupled`, never a
+    # ceiling: an artifact is free to mark something coupled that this
+    # machine's schema does not know about, but not to mark something
+    # UNcoupled that this machine's own trusted schema says is.
+    local operator_groups_file="$GROUPS_FILE"
+
     # Described by the manifest that made it. A restore driven by whatever
     # manifest this machine carries would look for groups the artefact never
     # had, and would place files by rules written after it.
@@ -1454,7 +1462,7 @@ cmd_restore() {
         rm -rf "$x"; die "--groups names a group this artifact's manifest does not have: $badg"
     }
 
-    local rows; rows="$(restore_rows "$x" "$verdict")" \
+    local rows; rows="$(restore_rows "$x" "$verdict" "$operator_groups_file")" \
         || { rm -rf "$x"; die "could not plan against the artifact's own manifest"; }
 
     local bv bm

@@ -334,13 +334,16 @@ assert_eq "$(cat "$BHTGT/.config/hypr/bindings.conf" 2>/dev/null)" 'bind = SUPER
 # coupled", and a quarantine verdict silently restored a coupled group instead
 # of holding it.
 GFH="$(mktemp -d)"; GFART="$(_res_build "$GFH" '["3.*"]')"
-# A manifest that fails to PARSE would already be refused one gate earlier, by
+# A manifest that fails to PARSE used to be refused one gate earlier, by
 # _verify_extracted's own bundled status --json self-check reading the exact
-# same file -- so that shape can never reach restore_rows to prove anything
-# about IT specifically. What group_field actually needs to survive is one
-# QUERY failing (a transient jq crash, a read hiccup) while the file itself is
-# fine and every other query on it succeeds -- which a stub jq that fails only
-# on the exact `coupled` query reproduces without touching the file at all.
+# same file -- but that self-check no longer runs on the restore path at all
+# (restore always passes run-embedded=0, see lib/bundle.sh), so a genuinely
+# unparseable tool/groups.default.json now DOES reach restore_rows directly;
+# see the "a manifest restore_rows cannot even PARSE" block below for that
+# exact shape. What THIS fixture needs is narrower: one QUERY failing (a
+# transient jq crash, a read hiccup) while the file itself is fine and every
+# other query on it succeeds -- which a stub jq that fails only on the exact
+# `coupled` query reproduces without touching the file at all.
 mkdir -p "$GFH/stub"
 { printf '#!/bin/bash\n'
   printf 'for a in "$@"; do [[ "$a" == coupled ]] && exit 9; done\n'
@@ -356,6 +359,33 @@ HOME="$GFTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$GFH/rstate" \
 it "and specifically: nothing from the coupled group is written"
 [[ ! -e "$GFTGT/.config/hypr/bindings.conf" ]] \
     && ok || fail "a coupled file was written despite the coupled query failing"
+
+# ── a manifest restore_rows cannot even PARSE refuses, not "0 files" ────────
+# groups_ids/group_paths fed a process substitution directly -- `while read
+# ... done < <(groups_ids)` -- and a process substitution's exit status is
+# not observable at the `done` that closes it: jq failing on a genuinely
+# malformed tool/groups.default.json produced no output, the while loop ran
+# zero times, restore_rows returned 0 with zero rows, and "0 files would be
+# restored" was printed as fact about an artifact whose manifest could not be
+# read at all. Reproduced exactly as found: the artifact's OWN bundled
+# groups.default.json replaced with invalid JSON, SHA256SUMS recomputed so it
+# stays self-consistent.
+PJH="$(mktemp -d)"; PJRAW="$(_res_build "$PJH" '["3.*"]')"
+PJX="$(mktemp -d)"; tar -C "$PJX" -xf <(zstd -dc "$PJRAW")
+printf '{not valid json' >"$PJX/tool/groups.default.json"
+( cd "$PJX" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+PJART="$PJH/badmanifest.tar.zst"
+tar -C "$PJX" -cf - . | zstd -q -19 -T0 -o "$PJART"
+
+it "restore refuses when the artifact's own groups manifest cannot be parsed"
+PJTGT="$(mktemp -d)"
+HOME="$PJTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$PJH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$PJART" >/dev/null 2>&1 \
+    && fail "planned or applied against a manifest it could not parse" || ok
+
+it "and not one byte of the coupled group was written"
+[[ ! -e "$PJTGT/.config/hypr/bindings.conf" ]] \
+    && ok || fail "a coupled file was written from an unparseable manifest"
 
 # ── plugins: the list and the patches, not just the local plugin trees ──────
 # publish also writes an enabled-plugins list and per-plugin patches that no
@@ -552,11 +582,29 @@ mv "$R5X/manifest.json.new" "$R5X/manifest.json"
 R5ART="$R5H/badwatermark.tar.zst"
 tar -C "$R5X" -cf - . | zstd -q -19 -T0 -o "$R5ART"
 R5TGT="$(mktemp -d)"
-R5OUT="$(HOME="$R5TGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$R5H/rstate" \
-    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --json "$R5ART" 2>/dev/null)"
+it "a non-integer watermark is refused, not silently read as 0"
+HOME="$R5TGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$R5H/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --json "$R5ART" >/dev/null 2>&1 \
+    && fail "proceeded with a compatibility verdict computed from a watermark that was never an integer" \
+    || ok
 
-it "--json still emits valid JSON when the watermark is not a bare integer"
-printf '%s' "$R5OUT" | jq -e . >/dev/null 2>&1 && ok || fail "not valid JSON: $R5OUT"
+# The regex fallback used to read "2026-08-13" as 0 -- the most PERMISSIVE
+# watermark there is -- and 0 against this machine's own real watermark
+# (nonzero on any machine with real migration history) read as "forward":
+# coupled groups apply, only the markers are held back. A PoC on the real
+# machine this was fixed on: a manifest saying "2026-08-13" was accepted, the
+# verdict came back forward, and --apply wrote the coupled compositor config.
+it "and the refusal names the artifact's own migration state, not this machine's"
+R5OUT2="$(HOME="$R5TGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$R5H/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --json "$R5ART" 2>&1)"
+assert_contains "$R5OUT2" "artifact's own migration state"
+
+it "and nothing -- coupled or otherwise -- was written from it"
+R5TGT2="$(mktemp -d)"
+HOME="$R5TGT2" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$R5H/rstate2" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$R5ART" >/dev/null 2>&1
+[[ -z "$(find "$R5TGT2" -type f 2>/dev/null)" ]] \
+    && ok || fail "files were written despite the watermark never having been an integer"
 
 # ── a trailing slash on a declared path does not leak a temp dir into the report ─
 R9H="$(mktemp -d)"; R9RAW="$(_res_build "$R9H" '["4.*"]')"
@@ -1000,16 +1048,29 @@ HOME="$BEH/home" OMABACKUP_ROOT="$BESTAGE" OMABACKUP_GROUPS="$BESTAGE/groups.def
 # (( run_embedded )) is arithmetic -- "2", "1+1", and other non-0/1 values all
 # evaluate truthy there. Both real callers pass literals today, so this is
 # not a live bypass, but the function's own stated contract ("0 or 1") was
-# not actually enforced. Called directly, bypassing both callers, to check
-# the function's own domain rather than anything a caller currently does.
-it "an out-of-domain run-embedded value is refused, not treated as truthy"
-RDH="$(mktemp -d)"
-bash -c 'source lib/bundle.sh; _verify_extracted "$1" 2' _ "$RDH" >/dev/null 2>&1 \
-    && fail "run-embedded=2 was accepted" || ok
+# not actually enforced.
+#
+# Run against an EMPTY directory first, these specs proved nothing: a bare
+# `mktemp -d` fails _verify_extracted's SHA256SUMS/git-clone checks on its
+# own, for every run-embedded value, valid or not -- so a refusal there is
+# not evidence the domain check did anything. Run instead against a
+# genuinely valid, freshly-built-and-extracted artifact -- one this SAME spec
+# proves passes with run-embedded=1 -- so a value outside {0,1} has nothing
+# else left to blame the refusal on.
+RDH="$(mktemp -d)"; RDRAW="$(_res_build "$RDH" '["4.*"]')"
+RDX="$(mktemp -d)"; tar -C "$RDX" -xf <(zstd -dc "$RDRAW")
 
-it "and an empty run-embedded value is refused too, not silently treated as 0"
-bash -c 'source lib/bundle.sh; _verify_extracted "$1" ""' _ "$RDH" >/dev/null 2>&1 \
-    && fail "an empty run-embedded value was accepted" || ok
+it "a genuinely valid extraction verifies with run-embedded=1"
+bash -c 'source lib/bundle.sh; _verify_extracted "$1" 1' _ "$RDX" >/dev/null 2>&1 \
+    && ok || fail "the fixture itself does not verify -- the domain specs below would prove nothing"
+
+it "an out-of-domain run-embedded value is refused on that SAME valid extraction"
+bash -c 'source lib/bundle.sh; _verify_extracted "$1" 2' _ "$RDX" >/dev/null 2>&1 \
+    && fail "run-embedded=2 was accepted on a fixture that verifies fine at 0 and 1" || ok
+
+it "and an empty run-embedded value is refused there too, not silently treated as 0"
+bash -c 'source lib/bundle.sh; _verify_extracted "$1" ""' _ "$RDX" >/dev/null 2>&1 \
+    && fail "an empty run-embedded value was accepted on a fixture that verifies fine at 0 and 1" || ok
 
 # ── a zstd stream with trailing garbage after a valid frame is not accepted ─
 # tar -xf <(zstd -dc ...) discards zstd's own exit status: the process
@@ -1032,3 +1093,77 @@ _res_run "$ZGTGT" "$ZGH/rstate" "$ZGART" --apply >/dev/null 2>&1 \
 it "and nothing from it was written"
 [[ -z "$(find "$ZGTGT" -type f 2>/dev/null)" ]] \
     && ok || fail "files were written despite the extraction being refused"
+
+# ── an artifact-supplied filename cannot inject a phantom TSV row ───────────
+# find -print0/read -d '' carries a name with an embedded tab or newline
+# through correctly -- the plan row restore_rows printed for it did not: one
+# line of TSV, and the name rode straight into it unescaped. A file
+# literally named "x<newline>restore<tab>coupled<tab>hijacked.conf" split the
+# printf'd row at the embedded newline; everything after it read back as a
+# SECOND, well-formed row when re-parsed line by line -- action "restore",
+# an entirely different (attacker-chosen) repo path, ending in the SAME
+# destination the first (correctly quarantined) row was headed for. The
+# destination stayed inside $HOME either way -- this is not a path-traversal
+# bypass -- but the ACTION attached to it was forged.
+TIH="$(mktemp -d)"; TIR="$TIH/repo"
+mkdir -p "$TIR/configs/hypr"
+git init -q "$TIR"; git -C "$TIR" config user.email t@t; git -C "$TIR" config user.name t
+printf 'bind = SUPER, Q\n' >"$TIR/configs/hypr/bindings.conf"
+# The dangerous name itself: a real newline, then text shaped exactly like a
+# second TSV row whose action is "restore" and whose repo-relative path is
+# one this same commit also carries real content for.
+TINAME=$'x\nrestore\tcompositor\tbindings.conf'
+printf 'hijacked\n' >"$TIR/configs/hypr/$TINAME"
+git -C "$TIR" add -A && git -C "$TIR" commit -qm one
+cat >"$TIH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["3.*"],"groups":[
+ {"id":"compositor","label":"Compositor","mode":"copy","coupled":true,"critical":true,
+  "paths":["~/.config/hypr"]}]}
+JSON
+mkdir -p "$TIH/home"
+HOME="$TIH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$TIH/g.json" \
+    OMABACKUP_STATE="$TIH/home/.state" OMABACKUP_REPO="$TIR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+TIART="$(ls -t "$TIH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+TITGT="$(mktemp -d)"
+
+it "a filename with an embedded newline/tab does not inject a restore row"
+TIPLAN="$(_res_run "$TITGT" "$TIH/rstate" "$TIART")"
+assert_not_contains "$TIPLAN" $'restore\tcompositor\tbindings.conf'
+
+it "and --apply writes nothing at all from the quarantined, tampered group"
+_res_run "$TITGT" "$TIH/rstate2" "$TIART" --apply >/dev/null 2>&1
+[[ -z "$(find "$TITGT" -type f 2>/dev/null)" ]] \
+    && ok || fail "something was written from a quarantined group via the injected name"
+
+# ── the artifact cannot talk a group's coupling down below what the operator's ─
+# ── own installed schema already says it is ──────────────────────────────────
+# group_field returns success with EMPTY output when a field genuinely does
+# not exist in the JSON -- correct for an ordinary uncoupled group, since
+# most of them never declare `coupled` at all. But GROUPS_FILE, for the whole
+# of cmd_restore, is the ARTIFACT's own bundled groups.default.json (by
+# design -- an old artifact can carry groups this machine's current schema
+# does not), and manifest.json's own recorded `coupled` value is computed
+# FROM that same file at build time, so the two are not independent sources
+# for an artifact an attacker built: a crafted artifact can simply omit
+# `coupled` for a group its own manifest.json claims is coupled, and nothing
+# inside the artifact will ever disagree with itself. A PoC confirmed the
+# result: an out-of-range artifact (verdict quarantine) whose bundled schema
+# quietly drops `coupled` for `compositor` restored ~/.config/hypr anyway.
+CFH="$(mktemp -d)"; CFRAW="$(_res_build "$CFH" '["3.*"]')"
+CFX="$(mktemp -d)"; tar -C "$CFX" -xf <(zstd -dc "$CFRAW")
+CFG="$(jq '(.groups[] | select(.id=="compositor")) |= del(.coupled)' "$CFX/tool/groups.default.json")"
+printf '%s' "$CFG" >"$CFX/tool/groups.default.json"
+( cd "$CFX" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+CFART="$CFH/uncoupled-lie.tar.zst"
+tar -C "$CFX" -cf - . | zstd -q -19 -T0 -o "$CFART"
+CFTGT="$(mktemp -d)"
+
+it "the artifact's own lie about coupled is not enough to escape quarantine"
+_res_run "$CFTGT" "$CFH/rstate" "$CFART" --apply >/dev/null 2>&1
+[[ ! -e "$CFTGT/.config/hypr/bindings.conf" ]] \
+    && ok || fail "compositor config was restored despite this machine's own schema saying compositor is coupled"
+
+it "and the plan names it quarantined, not restored"
+CFPLAN="$(_res_run "$CFTGT" "$CFH/rstate2" "$CFART")"
+assert_contains "$CFPLAN" "quarantined"

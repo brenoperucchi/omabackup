@@ -356,9 +356,20 @@ it "a tampered CACHED bundle's embedded tool does not run on the next cache hit"
 _bundle_env "$CEH" "$CER" bundle >/dev/null 2>&1
 [[ ! -e "$CEMARK" ]] && ok || fail "the cached file's own binary ran during a cache-hit rebuild"
 
-it "and the cache is rebuilt from the real repo instead, not served tampered"
-CENEW="$(bash -c 'source lib/bundle.sh; verify_bundle "$1" 0' _ "$CEPATH" >/dev/null 2>&1 && echo verifies || echo broken)"
-assert_eq "$CENEW" "verifies"
+# Not executing it is only half the fix. verify_bundle "$1" 0 above data-only
+# checks (SHA256SUMS, git-bundle vs worktree) -- a tampered cache with
+# recomputed SHA256SUMS is internally consistent BY CONSTRUCTION, the same
+# way every artifact-tampering PoC in this file is, so a data-only check
+# alone would say "verifies" about the tampered bytes forever and this
+# assertion would prove nothing. What actually needs checking is that the
+# tampered file was DISCARDED and rebuilt from the real repo -- confirmed
+# here by extracting what is now at $CEPATH and checking its embedded tool is
+# byte-identical to the real bin/omabackup again, not the "echo pwned" stub.
+CEX2="$(_unpack "$CEPATH")"
+
+it "and the cache is rebuilt from the real repo, not merely left self-consistent"
+diff -q "$CEX2/tool/bin/omabackup" "$PWD/bin/omabackup" >/dev/null 2>&1 \
+    && ok || fail "the cached file's embedded tool is still not the real one"
 
 # ── tar failing mid-archive is not masked by zstd's own success ─────────────
 # $? after `tar | zstd -o out` with no pipefail is zstd's status alone: a tar

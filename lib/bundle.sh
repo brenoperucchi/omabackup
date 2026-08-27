@@ -60,6 +60,21 @@ _tool_fingerprint() {
     printf '%s' "$h"
 }
 
+# The same hash, computed instead from an already-extracted artifact's own
+# embedded copy at <dir>/tool -- used to check a CACHED bundle's actual bytes
+# against what _tool_fingerprint() says $OMABACKUP_ROOT would produce right
+# now, since the cache key committing to a fingerprint is not the same as the
+# file on disk still matching it.
+_tool_fingerprint_of() {
+    local dir="$1" blob h
+    [[ -r "$dir/tool/bin/omabackup" ]] || return 1
+    blob="$(cat "$dir/tool/bin/omabackup" "$dir/tool"/lib/*.sh 2>/dev/null)" || return 1
+    [[ -n "$blob" ]] || return 1
+    h="$(printf '%s' "$blob" | sha256sum 2>/dev/null | cut -c1-16)" || return 1
+    [[ -n "$h" ]] || return 1
+    printf '%s' "$h"
+}
+
 # _bundle_manifest <repo> <staging> — everything a restore needs, in one file.
 _bundle_manifest() {
     local repo="$1" stage="$2" dirty ov oc om
@@ -71,7 +86,13 @@ _bundle_manifest() {
     # nobody could ever actually answer. Build time is the moment this is
     # fixable (check the migrations directory); a restore months later, on a
     # different machine, is not.
-    if [[ "$om" == unreadable ]]; then
+    # Not just the "unreadable" sentinel: a migrations directory holding a
+    # stray file whose name is not a number once `.sh` is stripped (a
+    # `junk.sh`, say) makes omarchy_identity's own scan return that name
+    # verbatim, neither "unreadable" nor a real watermark. Refused the same
+    # way -- a bundle built from it would embed a migrationWatermark no
+    # future restore could compare against anything.
+    if [[ "$om" == unreadable || ! "$om" =~ ^[0-9]+$ ]]; then
         printf 'omabackup: this machine'"'"'s own migration state could not be confirmed -- refusing to build a bundle nobody could ever restore with confidence\n' \
             >&2
         return 1
@@ -221,14 +242,19 @@ build_bundle() {
     # a truncated file at the exact cache key a later run would compute, was
     # served as though it were whole every time after, never re-checked again.
     #
-    # 0: this file was not just built by this call -- it is whatever has been
+    # This file was not just built by this call -- it is whatever has been
     # sitting at this cache path since some earlier run, and the cache key
     # (HEAD + tool fingerprint + refs + GROUPS_FILE) only proves this
     # invocation WOULD have built the same bundle again, not that the bytes
-    # on disk still are that bundle. Running its embedded tool as proof of
-    # restorability would trust a file this process never wrote a byte of.
+    # on disk still are that bundle. _verify_cache_entry checks data (like
+    # restore's 0 does, and for the same reason: this call did not just write
+    # these bytes) AND that the embedded tool inside it still fingerprints as
+    # what $OMABACKUP_ROOT would produce right now -- the specific gap a data-
+    # only check cannot see, since a swapped tool with recomputed SHA256SUMS
+    # is internally consistent by construction, same as every other artifact-
+    # tampering PoC in this file.
     if [[ -f "$out" ]]; then
-        verify_bundle "$out" 0 && { printf '%s\treused' "$out"; return 0; }
+        _verify_cache_entry "$out" && { printf '%s\treused' "$out"; return 0; }
         printf 'omabackup: the cached bundle at %s failed its own restore check -- rebuilding\n' \
             "$(_tilde "$out")" >&2
         rm -f "$out"
@@ -416,5 +442,39 @@ verify_bundle() {
     _zstd_extract "$path" "$x" || { rm -rf "$x"; return 1; }
     _verify_extracted "$x" "$run_embedded"; rc=$?
     rm -rf "$x"
+    return $rc
+}
+
+# _verify_cache_entry <path> -- build_bundle's cache-hit gate specifically,
+# not a restore path and not verify_bundle's fresh-build path either. The
+# data-only checks (0, same as restore -- this file was not just built by
+# this call) prove the cached bytes are internally consistent; a PoC showed
+# that alone is not enough here: a cached bundle whose embedded tool was
+# replaced, with SHA256SUMS recomputed to stay self-consistent, is internally
+# consistent AND still tampered. Restore cannot use this same extra check --
+# an old artifact legitimately carries an old tool, built by different code,
+# and refusing that would break the one thing restore exists to do. A cache
+# entry has no such excuse: bundle_cache_path's own key already commits to
+# _tool_fingerprint() matching $OMABACKUP_ROOT, so this is the one place that
+# commitment gets checked against the actual bytes on disk, not trusted
+# because the path happened to match.
+#
+# Skipped, not failed, when OMABACKUP_TOOL_ID is set: that override tells
+# _tool_fingerprint() to answer with an arbitrary operator-chosen string
+# instead of a content hash, and no extraction of a cached file's bytes can
+# ever reproduce an arbitrary string -- every cache hit would "fail" this
+# check forever, which is a broken cache, not a caught tamper.
+_verify_cache_entry() {
+    local path="$1" cx rc=0
+    cx="$(mktemp -d)" || return 1
+    _zstd_extract "$path" "$cx" || { rm -rf "$cx"; return 1; }
+    _verify_extracted "$cx" 0 || rc=1
+    if (( rc == 0 )) && [[ -z "${OMABACKUP_TOOL_ID:-}" ]]; then
+        local cached_fp live_fp
+        cached_fp="$(_tool_fingerprint_of "$cx")" || rc=1
+        live_fp="$(_tool_fingerprint)" || rc=1
+        [[ -n "$cached_fp" && "$cached_fp" == "$live_fp" ]] || rc=1
+    fi
+    rm -rf "$cx"
     return $rc
 }
