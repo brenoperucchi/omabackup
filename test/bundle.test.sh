@@ -422,3 +422,20 @@ RUOUT2="$(HOME="$RUH/home" OMABACKUP_GROUPS="$PWD/groups.default.json" \
     OMABACKUP_STATE="$RUH/home/.state" OMABACKUP_REPO="$RUR" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" bundle --json 2>/dev/null)"
 assert_eq "$(printf '%s' "$RUOUT2" | jq -r '.reused')" "true"
+
+# ── build_bundle enforces the same deny-list bar push does ──────────────────
+# push gates through assert_deny_understood before ever calling build_bundle;
+# `bundle`, called directly, did not -- scan_files alone tolerates a pattern
+# that works fine as a regex but is missing its required "reason" field,
+# since scan_files only needs id+regex to scan with. assert_deny_understood
+# checks the policy scan_files does not: every pattern must be justified.
+ADH="$(mktemp -d)"; ADR="$ADH/repo"
+_bundle_repo "$ADR"
+mkdir -p "$ADH/home"
+printf '{"patterns":[{"id":"no-reason","regex":"NEVER-MATCHES-ANYTHING-XYZ"}]}' >"$ADH/deny.json"
+
+it "bundle refuses a deny-list pattern missing its reason, same as push would"
+HOME="$ADH/home" OMABACKUP_GROUPS="$PWD/groups.default.json" OMABACKUP_STATE="$ADH/home/.state" \
+    OMABACKUP_REPO="$ADR" OMABACKUP_SECRETS_DENY="$ADH/deny.json" XDG_RUNTIME_DIR=/nonexistent \
+    "$OB" bundle >/dev/null 2>&1 \
+    && fail "built a bundle from a deny-list assert_deny_understood would have refused" || ok

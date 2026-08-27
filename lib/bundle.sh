@@ -285,6 +285,20 @@ build_bundle() {
     # repository and then this function copies in the tool, the manifest and the
     # restore notes -- files the gate never saw, riding to the same destinations
     # as the rest. The manifest is the user's own and free to name anything.
+    # push gates through assert_deny_understood before it ever calls this --
+    # scan_files alone tolerates a deny-list build_bundle called directly
+    # never would have: a pattern missing its required "reason", or an
+    # exception no pattern can actually produce (dead protection that reads
+    # as covered). Neither is a bypass scan_files itself misses -- an empty
+    # or otherwise degenerate regex was tried here as a PoC and grep matched
+    # EVERYTHING with it, refusing the build outright rather than passing
+    # silently -- but `bundle` should not be a laxer gate than `push` for
+    # the SAME deny-list just because it was reached a different way. No
+    # `||` here: assert_deny_understood calls die() on any problem, which
+    # exits the process outright rather than returning -- $stage is left for
+    # the OS, same as every other die() already reachable from a build in
+    # progress elsewhere in this codebase.
+    assert_deny_understood "$SECRETS_DENY_FILE"
     local extra
     extra="$(scan_files "$stage" "$SECRETS_DENY_FILE" 2>&1)" || {
         printf '%somabackup: the secret scan could not run over the staged artefact%s\n' \
