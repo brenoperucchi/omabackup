@@ -66,16 +66,26 @@ map_to_repo() {
 # the parts of <path> that exist (following any symlink along the way) and
 # normalizes the rest lexically, in one pass -- the two ways a path escapes
 # its base, whether or not <path> itself exists yet.
+# A 4th arg, when the caller already resolved base's realpath -e (every
+# publish_staging call site does, once, up front instead of once per file
+# published -- realpath is a fork per call, and re-resolving the same
+# $repo hundreds of times was a measured third of publish_staging's own
+# process-spawn cost on a 1200-file staging). Optional so this stays
+# callable the way its own doc comment above promises: standalone, base_rp
+# unresolved, for anything outside publish_staging that only has <path>
+# and <base>.
 _publish_contained() {
-    local p="$1" base="$2" rp base_rp
+    local p="$1" base="$2" base_rp="${3:-}" rp
     rp="$(realpath -m -- "$p" 2>/dev/null)" || return 1
-    base_rp="$(realpath -e -- "$base" 2>/dev/null)" || return 1
+    if [[ -z "$base_rp" ]]; then
+        base_rp="$(realpath -e -- "$base" 2>/dev/null)" || return 1
+    fi
     [[ -n "$rp" && -n "$base_rp" ]] || return 1
     [[ "$rp" == "$base_rp" || "$rp" == "$base_rp"/* ]]
 }
 
-_publish_file() {  # _publish_file <src> <dst> <repo-root>
-    local src="$1" dst="$2" base="$3"
+_publish_file() {  # _publish_file <src> <dst> <repo-root> [<repo-root-rp>]
+    local src="$1" dst="$2" base="$3" base_rp="${4:-}"
     # --remove-destination two lines down protects the FINAL component --
     # confirmed separately that it does nothing for a symlink higher up the
     # path. A PoC: repo/configs -> /tmp/outside (an existing symlinked
@@ -83,7 +93,7 @@ _publish_file() {  # _publish_file <src> <dst> <repo-root>
     # any real directory would, and the write landed in /tmp/outside instead
     # of inside the repo, rc=0. Checked before mkdir -p ever runs, since by
     # the time it has run the escape has already happened.
-    _publish_contained "$(dirname "$dst")" "$base" || return 1
+    _publish_contained "$(dirname "$dst")" "$base" "$base_rp" || return 1
     # --remove-destination unlinks a FILE or a symlink already at $dst; it
     # does nothing to an existing DIRECTORY there. A PoC confirmed cp then
     # writes INSIDE it instead -- configs/file.txt/file.txt, rc=0, silent
@@ -156,6 +166,11 @@ _generated_repo_name() {
 publish_staging() {
     local staging="$1" repo="$2" table="${3:-}" list="${4:-}" f pf pid rel dst failed=0
     local -a written=()
+
+    # Resolved once, not once per file inside _publish_contained -- $repo
+    # never changes mid-publish, so re-running realpath -e on it for every
+    # single write (hundreds, on a real machine) was pure repeated work.
+    local repo_rp; repo_rp="$(realpath -e -- "$repo" 2>/dev/null)" || return 1
 
     # A snapshot, not two independent `find` calls. The first version ran
     # find TWICE -- once to count destinations, once to write -- and a PoC
@@ -249,21 +264,47 @@ publish_staging() {
     # without the raw-string count ever seeing it. realpath -m failing is
     # refused outright, not silently treated as "no collision" -- a
     # canonicalization this cannot even attempt proves nothing.
-    local i n_pairs="${#rels[@]}" existing_dst dst_canon
-    local -a dst_canons=() seen_canon=()
+    local i n_pairs="${#rels[@]}" dst_canon anc
+    local -a dst_canons=()
+    local -A rel_idx=() leaf_seen=() dir_seen=() poisoned=()
     for (( i = 0; i < n_pairs; i++ )); do
         dst_canon="$(realpath -m -- "$repo/${dsts[$i]}" 2>/dev/null)" || return 1
         [[ -n "$dst_canon" ]] || return 1
         dst_canons+=("$dst_canon")
+        rel_idx["${rels[$i]}"]="$i"
         destcount[$dst_canon]=$(( ${destcount[$dst_canon]:-0} + 1 ))
-        for existing_dst in "${seen_canon[@]}"; do
-            [[ "$existing_dst" == "$dst_canon" ]] && continue
-            if [[ "$dst_canon" == "$existing_dst"/* || "$existing_dst" == "$dst_canon"/* ]]; then
-                destcount[$dst_canon]=$(( ${destcount[$dst_canon]} + 1 ))
-                destcount[$existing_dst]=$(( ${destcount[$existing_dst]:-1} + 1 ))
+        # Ancestor/descendant poisoning, keyed on ancestor DIRECTORIES rather
+        # than compared against every previously seen destination -- the
+        # original O(n^2) form (each new path checked against the full list
+        # of every path before it) was fine for the handful of declared
+        # paths restore_rows deals with, but measured quadratic here: 300
+        # staged files ran in under a second, 2400 took roughly a minute.
+        # leaf_seen holds every destination itself; dir_seen holds every
+        # directory ANY destination passes through. A path is poisoned if it
+        # is itself a directory some other destination sits inside
+        # (dir_seen), or if any of ITS OWN ancestor directories is itself a
+        # registered destination (leaf_seen) -- the same two conditions the
+        # old pairwise compare caught, just looked up instead of scanned.
+        anc="$dst_canon"
+        while [[ "$anc" == */* && "$anc" != "/" ]]; do
+            anc="${anc%/*}"
+            [[ -n "$anc" ]] || break
+            dir_seen[$anc]=1
+        done
+        leaf_seen[$dst_canon]=1
+    done
+    for (( i = 0; i < n_pairs; i++ )); do
+        dst_canon="${dst_canons[$i]}"
+        [[ -n "${dir_seen[$dst_canon]:-}" ]] && poisoned[$dst_canon]=1
+        anc="$dst_canon"
+        while [[ "$anc" == */* && "$anc" != "/" ]]; do
+            anc="${anc%/*}"
+            [[ -n "$anc" ]] || break
+            if [[ -n "${leaf_seen[$anc]:-}" ]]; then
+                poisoned[$dst_canon]=1
+                poisoned[$anc]=1
             fi
         done
-        seen_canon+=("$dst_canon")
     done
 
     for (( i = 0; i < n_pairs; i++ )); do
@@ -274,35 +315,44 @@ publish_staging() {
         # _publish_file per file inside it.
         [[ "$rel" == .plugins/local/* ]] && continue
         f="$staging/$rel"
-        if (( ${destcount[$dst_canon]:-1} > 1 )); then
+        if (( ${destcount[$dst_canon]:-1} > 1 )) || [[ -n "${poisoned[$dst_canon]:-}" ]]; then
             printf 'omabackup: %s maps to %s, which more than one staged source maps to -- refusing to publish any of them, one would silently overwrite another\n' \
                 "$rel" "$dst" >&2
             failed=$((failed + 1))
             continue
         fi
-        if _publish_file "$f" "$repo/$dst" "$repo"; then written+=("$dst"); else failed=$((failed + 1)); fi
+        if _publish_file "$f" "$repo/$dst" "$repo" "$repo_rp"; then written+=("$dst"); else failed=$((failed + 1)); fi
     done
 
     if [[ -d "$staging/.plugins" ]]; then
         if [[ -d "$staging/.plugins/local" ]]; then
-            local j collided
+            local prel pidx collided
             for f in "$staging"/.plugins/local/*/; do
                 [[ -d "$f" ]] || continue
                 pid="${f%/}"; pid="${pid##*/}"
-                # Checked against the SAME destcount map every other staged
-                # source was folded into above, not written unconditionally --
-                # a collision anywhere in this plugin's own tree refuses the
-                # whole tree, the same "refuse all of them" rule every other
-                # collision in this function follows.
+                # Checked against the SAME destcount/poisoned maps every
+                # other staged source was folded into above, not written
+                # unconditionally -- a collision anywhere in this plugin's
+                # own tree refuses the whole tree, the same "refuse all of
+                # them" rule every other collision in this function follows.
+                # Looked up by rel_idx rather than scanned across every
+                # staged file per plugin -- the same n_pairs comparison
+                # repeated for each of a handful of plugins was another
+                # O(pids * n_pairs) term on top of the ancestor scan below.
                 collided=0
-                for (( j = 0; j < n_pairs; j++ )); do
-                    [[ "${rels[$j]}" == ".plugins/local/$pid/"* ]] || continue
-                    if (( ${destcount[${dst_canons[$j]}]:-1} > 1 )); then
+                while IFS= read -r -d '' pf; do
+                    [[ -n "$pf" ]] || continue
+                    prel=".plugins/local/$pid/${pf#"$f"}"
+                    pidx="${rel_idx[$prel]:-}"
+                    [[ -n "$pidx" ]] || continue
+                    dst_canon="${dst_canons[$pidx]}"
+                    if (( ${destcount[$dst_canon]:-1} > 1 )) || [[ -n "${poisoned[$dst_canon]:-}" ]]; then
                         collided=1
                         printf 'omabackup: %s maps to %s, which more than one staged source maps to -- refusing to publish any of them, one would silently overwrite another\n' \
-                            "${rels[$j]}" "${dsts[$j]}" >&2
+                            "$prel" "${dsts[$pidx]}" >&2
                     fi
-                done
+                done < <(find "$f" \( -type f -o -type l \) -not -path "*/.git/*" -print0 2>/dev/null)
+                wait "$!" || { failed=$((failed + 1)); continue; }
                 if (( collided )); then
                     failed=$((failed + 1))
                     continue
@@ -311,7 +361,7 @@ publish_staging() {
                 # whose configs/omarchy/plugins directory is itself a
                 # symlink (or has one somewhere in its ancestry) would
                 # otherwise have this rsync follow it same as mkdir -p does.
-                _publish_contained "$repo/configs/omarchy/plugins/$pid" "$repo" \
+                _publish_contained "$repo/configs/omarchy/plugins/$pid" "$repo" "$repo_rp" \
                     || { failed=$((failed + 1)); continue; }
                 mkdir -p "$repo/configs/omarchy/plugins/$pid" || { failed=$((failed + 1)); continue; }
                 rsync -a --exclude '.git/' "$f" "$repo/configs/omarchy/plugins/$pid/" \
