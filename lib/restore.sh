@@ -399,12 +399,30 @@ restore_rows() {
                         frow_rel+=("$frel"); frow_dest+=("$e/$frel")
                     done < <(find "$wt/$prefix" \( -type f -o -type l \) -print0 2>/dev/null)
                     wait "$!" || return 1
+                else
+                    # A `tree`-kind prefix that is not a directory in the
+                    # worktree at all -- a single-file group, the emit
+                    # loop's own `else` branch (dest=$e, no walk). The
+                    # reasoning that skipped this case entirely -- "no walk,
+                    # no alias risk: there is nothing to enumerate" -- is
+                    # true about this branch PRODUCING an alias, but wrong
+                    # about it being the TARGET of one: another group's tree
+                    # walk can land on this exact file through a live
+                    # symlink neither string comparison nor declared-base
+                    # ancestry sees, and this branch being absent from the
+                    # file-level map meant nobody ever checked it from
+                    # either side. A PoC (two declared bases unrelated by
+                    # either measure -- one a lone file, the other a tree
+                    # containing a live-symlink alias into it) confirmed the
+                    # result: no ambiguous verdict, 2 files restored, and
+                    # the operator's real original gone -- not just from the
+                    # live destination, but from the ONE backup slot meant
+                    # to protect it, because _restore_one keys that slot on
+                    # the same canonical destination both sides alias to.
+                    frow_id+=("$id"); frow_prefix+=("$prefix")
+                    frow_rel+=(""); frow_dest+=("$e")
                 fi
             fi
-            # A `tree`-kind prefix that resolves to neither branch here (no
-            # directory in the worktree at all) has one row, `dest=$e`
-            # itself, in the emit loop's own `else` -- no walk, no alias
-            # risk: there is nothing to enumerate.
         done <<<"$paths_out"
     done <<<"$ids_out"
 
@@ -617,9 +635,19 @@ restore_rows() {
                 done
             else
                 dest="$e"
+                # The matching single-file entry frow_* captured for this
+                # exact (id, prefix): there is at most one, since this
+                # branch never walks a directory.
+                local fk2 dc2=""
+                for (( fk2 = 0; fk2 < n_frow; fk2++ )); do
+                    [[ "${frow_id[$fk2]}" == "$id" && "${frow_prefix[$fk2]}" == "$prefix" ]] || continue
+                    dc2="${frow_dc[$fk2]}"
+                    break
+                done
                 if ! _restore_contained "$dest"; then
                     printf 'escape\t%s\t%s\t%s\n' "$id" "$prefix" "$dest"
-                elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$ec]:-1} > 1 )) || [[ -n "${poisoned_e[$ec]:-}" ]]; then
+                elif (( ${prefixcount[$prefix]:-1} > 1 || ${destcount[$ec]:-1} > 1 || ${fdestcount[$dc2]:-1} > 1 )) \
+                     || [[ -n "${poisoned_e[$ec]:-}" || ( -n "$dc2" && -n "${fpoisoned[$dc2]:-}" ) ]]; then
                     printf 'ambiguous\t%s\t%s\t%s\n' "$id" "$prefix" "$dest"
                 else
                     printf '%s\t%s\t%s\t%s\n' "$action" "$id" "$prefix" "$dest"

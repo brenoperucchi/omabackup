@@ -1732,3 +1732,46 @@ HOME="$SOH/target" bash -c '
 it "and nothing was written"
 [[ ! -e "$SOH/target/.config/app/leaked.txt" ]] \
     && ok || fail "the host file was copied into the target"
+
+# ── a single-file group can be the TARGET of a mid-tree alias too ───────────
+# f3cea20's file-level collision map only ever ran inside the flat/tree
+# walk -- a single-file group (kind==tree but $wt/$prefix is not a
+# directory, dest=$e directly, no walk) was left out entirely. The
+# reasoning that skipped it -- "no walk, no alias risk: there is nothing to
+# enumerate" -- is true about this branch PRODUCING an alias, but wrong
+# about it being the TARGET of one. Two declared bases unrelated by either
+# string comparison OR ancestor canonicalization (one a lone file, the
+# other a tree whose artifact content includes a path that, only on the
+# live target, is reached through a symlink back to the file's own
+# directory) went straight through: no ambiguous verdict, "restored 2
+# files", and the operator's real original gone -- not just from the live
+# destination, but from the ONE backup slot meant to protect it, since
+# _restore_one keys that slot on the canonical destination both sides
+# alias to.
+SFH="$(mktemp -d)"; SFR="$SFH/repo"
+mkdir -p "$SFR/configs" "$SFR/configs/bar/alias"
+git init -q "$SFR"; git -C "$SFR" config user.email t@t; git -C "$SFR" config user.name t
+printf '{"from":"group A - single file"}\n' >"$SFR/configs/a.json"
+printf '{"from":"group B - via alias"}\n' >"$SFR/configs/bar/alias/a.json"
+git -C "$SFR" add -A && git -C "$SFR" commit -qm one
+cat >"$SFH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"ga","label":"GA","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/a.json"]},
+ {"id":"gb","label":"GB","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/bar"]}]}
+JSON
+mkdir -p "$SFH/home/.config/bar/alias"
+printf '{"from":"group A - single file"}\n' >"$SFH/home/.config/a.json"
+printf '{"from":"group B - via alias"}\n' >"$SFH/home/.config/bar/alias/a.json"
+HOME="$SFH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$SFH/g.json" \
+    OMABACKUP_STATE="$SFH/home/.state" OMABACKUP_REPO="$SFR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+SFART="$(ls -t "$SFH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+SFTGT="$(mktemp -d)"
+mkdir -p "$SFTGT/.config/bar"
+printf '{"ORIGINAL":"operator original"}\n' >"$SFTGT/.config/a.json"
+ln -s "$SFTGT/.config" "$SFTGT/.config/bar/alias"
+
+it "restore --apply does not lose a single-file group's original through an alias"
+HOME="$SFTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$SFH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$SFART" >/dev/null 2>&1
+assert_eq "$(cat "$SFTGT/.config/a.json")" '{"ORIGINAL":"operator original"}'
