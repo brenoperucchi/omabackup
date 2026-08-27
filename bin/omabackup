@@ -1388,7 +1388,7 @@ cmd_restore() {
     # used: extract, verify that exact directory, and only then read it.
     local x; x="$(mktemp -d)" || die "could not make a working directory"
     printf '  %schecking the artifact%s\n' "$DIM" "$NC" >&2
-    tar -C "$x" -xf <(zstd -dc "$artifact" 2>/dev/null) 2>/dev/null \
+    _zstd_extract "$artifact" "$x" \
         || { rm -rf "$x"; die "could not extract $(_tilde "$artifact")"; }
     # 0: never run the artifact's own tool/bin/omabackup here. A PoC confirmed
     # that a crafted artifact can replace that binary and have it execute --

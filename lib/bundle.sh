@@ -220,8 +220,15 @@ build_bundle() {
     # written by a process that crashed or hit a full disk mid-write, and left
     # a truncated file at the exact cache key a later run would compute, was
     # served as though it were whole every time after, never re-checked again.
+    #
+    # 0: this file was not just built by this call -- it is whatever has been
+    # sitting at this cache path since some earlier run, and the cache key
+    # (HEAD + tool fingerprint + refs + GROUPS_FILE) only proves this
+    # invocation WOULD have built the same bundle again, not that the bytes
+    # on disk still are that bundle. Running its embedded tool as proof of
+    # restorability would trust a file this process never wrote a byte of.
     if [[ -f "$out" ]]; then
-        verify_bundle "$out" && { printf '%s\treused' "$out"; return 0; }
+        verify_bundle "$out" 0 && { printf '%s\treused' "$out"; return 0; }
         printf 'omabackup: the cached bundle at %s failed its own restore check -- rebuilding\n' \
             "$(_tilde "$out")" >&2
         rm -f "$out"
@@ -287,7 +294,11 @@ build_bundle() {
     # to live in cmd_bundle alone, so `push` -- the verb that actually sends --
     # built or reused an artifact and shipped it unchecked. Restorability is a
     # property of the artifact.
-    if ! verify_bundle "$out"; then
+    #
+    # 1: unlike the cache-hit check above, this file is what the lines just
+    # above wrote, in this process, from this machine's own repo -- the one
+    # case where proving the embedded tool actually runs is worth doing.
+    if ! verify_bundle "$out" 1; then
         rm -f "$out"
         printf 'omabackup: the bundle did not survive its own restore check\n' >&2
         return 1
@@ -295,10 +306,6 @@ build_bundle() {
     printf '%s\tbuilt' "$out"
 }
 
-# verify_bundle <path>
-# §11.4 as a check rather than a claim: extract, clone, compare both halves,
-# confirm the checksums and run the embedded tool. Offline throughout, because
-# cloning from a .bundle file is offline by definition.
 # _verify_extracted <already-extracted-dir> <run-embedded:0|1>
 # The checks over a directory the caller extracted and owns. Split out of
 # verify_bundle so a caller that needs the content afterward -- restore is the
@@ -329,6 +336,16 @@ build_bundle() {
 _verify_extracted() {
     local x="$1" run_embedded="${2?_verify_extracted requires an explicit run-embedded argument (0 or 1)}"
     local clone rc=0
+    # ${2?...} refuses an OMITTED argument, but not an empty or malformed one
+    # -- and (( run_embedded )) is arithmetic, so "2" or "1+1" both evaluate
+    # truthy. An explicit allow-list closes that: anything but the two literal
+    # values this function actually understands is refused, not guessed at.
+    case "$run_embedded" in
+        0|1) ;;
+        *) printf 'omabackup: _verify_extracted called with an invalid run-embedded value: %q\n' \
+               "$run_embedded" >&2
+           return 1 ;;
+    esac
     [[ -d "$x" ]] || return 1
 
     ( cd "$x" && sha256sum -c --quiet SHA256SUMS >/dev/null 2>&1 ) || rc=1
@@ -355,14 +372,49 @@ _verify_extracted() {
     return $rc
 }
 
-# Called only from build_bundle's own self-check, right after creating an
-# artifact on THIS machine from THIS repo -- trusted by construction, and the
-# one case where "does the embedded tool actually run" is worth proving.
+# _zstd_extract <archive> <dest-dir>
+# tar -xf <(zstd -dc ...) discards zstd's own exit status: the process
+# substitution runs zstd in a separate process feeding a pipe, and $? after
+# tar reflects only tar's exit, never zstd's. Confirmed with a PoC: a
+# .tar.zst holding one complete, valid frame followed by trailing garbage
+# bytes extracts every file successfully -- tar reads exactly what it needs
+# and exits 0 before zstd's own later failure on the garbage is ever
+# observed. A real pipe with pipefail set is checked instead, the same
+# reasoning already applied to this file's compression side (build_bundle's
+# tar | zstd -o "$out.tmp"): $? reflects the worse of the two commands, not
+# whichever one the shell happened to still be waiting on.
+_zstd_extract() {
+    local archive="$1" dest="$2"
+    local _had_pf=0; [[ -o pipefail ]] && _had_pf=1
+    set -o pipefail
+    zstd -dc "$archive" 2>/dev/null | tar -C "$dest" -x 2>/dev/null
+    local rc=$?
+    (( _had_pf )) || set +o pipefail
+    return $rc
+}
+
+# verify_bundle <path> <run-embedded:0|1>
+# §11.4 as a check rather than a claim: extract, clone, compare both halves,
+# confirm the checksums and, when asked, run the embedded tool. Offline
+# throughout, because cloning from a .bundle file is offline by definition.
+#
+# <run-embedded> is required for the same reason _verify_extracted's is, and
+# for a reason specific to this function's own two callers inside
+# build_bundle: the fresh-build self-check verifies output THIS call just
+# produced, in this process, from this machine's own repo -- trusted, passes
+# 1. The cache-hit re-check verifies a file already sitting on disk from
+# some EARLIER call, possibly long past -- not "just built" by anything
+# happening now, so it cannot inherit that trust. A PoC confirmed the gap
+# this closes: a cached bundle whose tool/bin/omabackup was replaced after
+# the fact, with SHA256SUMS recomputed to match, ran the replacement during
+# a later cache-hit rebuild -- the exact same class of execution restore was
+# fixed against, reopened through the cache instead of the artifact file.
 verify_bundle() {
-    local path="$1" x rc
+    local path="$1" run_embedded="${2?verify_bundle requires an explicit run-embedded argument (0 or 1)}"
+    local x rc
     x="$(mktemp -d)" || return 1
-    tar -C "$x" -xf <(zstd -dc "$path" 2>/dev/null) 2>/dev/null || { rm -rf "$x"; return 1; }
-    _verify_extracted "$x" 1; rc=$?
+    _zstd_extract "$path" "$x" || { rm -rf "$x"; return 1; }
+    _verify_extracted "$x" "$run_embedded"; rc=$?
     rm -rf "$x"
     return $rc
 }

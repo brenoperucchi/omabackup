@@ -957,12 +957,20 @@ _res_run "$MXTGT" "$MXH/rstate2" "$MXART" --apply >/dev/null 2>&1
 [[ ! -e "$MXMARK" ]] && ok || fail "the artifact's own binary ran during --apply"
 
 # ── build_bundle still self-checks its own freshly-built output ─────────────
-# The embedded-tool self-check stays for build_bundle: it verifies output it
-# JUST built, on this machine, from this machine's own repo -- there is no
-# untrusted party in that path, and it is the one place actually proving the
-# embedded copy runs. A tool broken in a way SHA256SUMS cannot see (it is
-# computed from the very files being checked, so a break introduced before
-# publish is self-consistent too) must still fail the build.
+# The embedded-tool self-check stays for build_bundle's fresh-build path: it
+# verifies output it JUST built, on this machine, from this machine's own
+# repo -- there is no untrusted party in that path, and it is the one place
+# actually proving the embedded copy runs. This spec does not discriminate
+# this commit from before it -- that path's run_embedded value was 1 before
+# this change and still is -- it is a regression guard for a property this
+# commit must NOT touch, not evidence of what it fixed. The cache-hit path,
+# which this commit DID change, has its own PoC-based spec in
+# test/bundle.test.sh ("a tampered CACHED bundle's embedded tool does not run
+# on the next cache hit").
+#
+# A tool broken in a way SHA256SUMS cannot see (it is computed from the very
+# files being checked, so a break introduced before publish is
+# self-consistent too) must still fail the build.
 BEH="$(mktemp -d)"; BER="$BEH/repo"
 mkdir -p "$BER/configs/app"
 git init -q "$BER"; git -C "$BER" config user.email t@t; git -C "$BER" config user.name t
@@ -986,3 +994,41 @@ HOME="$BEH/home" OMABACKUP_ROOT="$BESTAGE" OMABACKUP_GROUPS="$BESTAGE/groups.def
     OMABACKUP_STATE="$BEH/home/.state" OMABACKUP_REPO="$BER" XDG_RUNTIME_DIR=/nonexistent \
     "$BESTAGE/bin/omabackup" bundle >/dev/null 2>&1 \
     && fail "built and accepted a bundle whose own embedded tool cannot run" || ok
+
+# ── run-embedded's contract is a closed domain, not "anything truthy" ───────
+# ${2?...} refuses an OMITTED argument but not an empty or malformed one, and
+# (( run_embedded )) is arithmetic -- "2", "1+1", and other non-0/1 values all
+# evaluate truthy there. Both real callers pass literals today, so this is
+# not a live bypass, but the function's own stated contract ("0 or 1") was
+# not actually enforced. Called directly, bypassing both callers, to check
+# the function's own domain rather than anything a caller currently does.
+it "an out-of-domain run-embedded value is refused, not treated as truthy"
+RDH="$(mktemp -d)"
+bash -c 'source lib/bundle.sh; _verify_extracted "$1" 2' _ "$RDH" >/dev/null 2>&1 \
+    && fail "run-embedded=2 was accepted" || ok
+
+it "and an empty run-embedded value is refused too, not silently treated as 0"
+bash -c 'source lib/bundle.sh; _verify_extracted "$1" ""' _ "$RDH" >/dev/null 2>&1 \
+    && fail "an empty run-embedded value was accepted" || ok
+
+# ── a zstd stream with trailing garbage after a valid frame is not accepted ─
+# tar -xf <(zstd -dc ...) discards zstd's own exit status: the process
+# substitution runs zstd separately, and $? after tar reflects only tar's
+# exit. A PoC confirmed a .tar.zst holding one complete, valid frame followed
+# by garbage bytes extracted every file successfully anyway -- tar reads
+# exactly what it needs and exits 0 before zstd's later failure on the
+# trailing bytes is ever seen by the calling shell. restore used to accept
+# such a file as verified and, with --apply, write from it.
+ZGH="$(mktemp -d)"; ZGRAW="$(_res_build "$ZGH" '["4.*"]')"
+ZGART="$ZGH/trailing-garbage.tar.zst"
+cp "$ZGRAW" "$ZGART"
+printf 'GARBAGEGARBAGEGARBAGE' >>"$ZGART"
+
+it "a valid artifact with trailing garbage after the zstd frame is refused"
+ZGTGT="$(mktemp -d)"
+_res_run "$ZGTGT" "$ZGH/rstate" "$ZGART" --apply >/dev/null 2>&1 \
+    && fail "restored from a stream zstd itself considered corrupt" || ok
+
+it "and nothing from it was written"
+[[ -z "$(find "$ZGTGT" -type f 2>/dev/null)" ]] \
+    && ok || fail "files were written despite the extraction being refused"

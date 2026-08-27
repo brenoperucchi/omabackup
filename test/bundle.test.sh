@@ -318,11 +318,47 @@ it "a corrupted file already sitting at the cache key is not served as-is"
 [[ -n "$CVPATH" && -f "$CVPATH" ]] && ok || fail "did not rebuild past the corrupted cache entry: $CVOUT"
 
 it "and what came back verifies for real"
-bash -c 'source lib/bundle.sh; verify_bundle "$1"' _ "$CVPATH" >/dev/null 2>&1 \
+# 0: this check runs in a separate process from the build a few lines above,
+# reading whatever is sitting at CVPATH now -- not something this call just
+# produced, the same distinction build_bundle's own cache-hit path draws.
+bash -c 'source lib/bundle.sh; verify_bundle "$1" 0' _ "$CVPATH" >/dev/null 2>&1 \
     && ok || fail "returned a path that still does not verify"
 
 it "and it landed at the SAME cache key, not a new one"
 assert_eq "$CVPATH" "$CVKEY"
+
+# ── a cache hit never re-executes a file it did not just build ──────────────
+# A PoC confirmed a second execution hole, the same shape as restore's: the
+# cache-hit branch above used to call verify_bundle unconditionally, which ran
+# the CACHED file's own tool/bin/omabackup as part of "does it verify" -- but
+# that file was written by some EARLIER invocation, not this one, so nothing
+# here actually knows it is still what that earlier build produced. Tamper
+# with the cached bytes directly (replace the embedded tool, recompute
+# SHA256SUMS so it stays self-consistent -- exactly the restore PoC, aimed at
+# the cache file on disk instead of a handed-over artifact) and a second
+# `bundle` invocation, hitting the SAME cache key, ran it.
+CEH="$(mktemp -d)"; CER="$CEH/repo"
+_bundle_repo "$CER"
+_bundle_env "$CEH" "$CER" bundle >/dev/null 2>&1
+CEPATH="$(ls -t "$CEH/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+CEX="$(_unpack "$CEPATH")"
+CEMARK="$CEH/pwned-cache"
+cat >"$CEX/tool/bin/omabackup" <<SH
+#!/bin/bash
+echo pwned >"$CEMARK"
+echo '{}'
+SH
+chmod +x "$CEX/tool/bin/omabackup"
+( cd "$CEX" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+tar -C "$CEX" -cf - . | zstd -q -19 -T0 -f -o "$CEPATH"
+
+it "a tampered CACHED bundle's embedded tool does not run on the next cache hit"
+_bundle_env "$CEH" "$CER" bundle >/dev/null 2>&1
+[[ ! -e "$CEMARK" ]] && ok || fail "the cached file's own binary ran during a cache-hit rebuild"
+
+it "and the cache is rebuilt from the real repo instead, not served tampered"
+CENEW="$(bash -c 'source lib/bundle.sh; verify_bundle "$1" 0' _ "$CEPATH" >/dev/null 2>&1 && echo verifies || echo broken)"
+assert_eq "$CENEW" "verifies"
 
 # ── tar failing mid-archive is not masked by zstd's own success ─────────────
 # $? after `tar | zstd -o out` with no pipefail is zstd's status alone: a tar
