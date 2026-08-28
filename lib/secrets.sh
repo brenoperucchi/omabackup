@@ -77,7 +77,23 @@ assert_deny_understood() {
     # with "a" answered a narrower one: "a?" matches "a" with content and so
     # looked healthy, while on any line without an "a" it matches nothing at
     # all -- zero-width for most of the repository.
-    local pid3 pre3 zwrc
+    # Every jq query below, captured into a variable and checked before
+    # looping over it via <<< -- not fed straight into `while read < <(jq
+    # ...)`. A process substitution's own exit status has no `$?` a
+    # caller can check directly, and this file's inner loops start their
+    # OWN nested substitutions (mapfile < <(... | grep ...) a few lines
+    # down), which would clobber `$!` before a `wait "$!"` after `done`
+    # ever got to see the right PID. A PoC (jq stubbed to fail only on
+    # this exact query) confirmed the gap this closes: a deny-list
+    # pattern "^" -- matches every line, reports none, exactly the
+    # zero-width case this loop exists to refuse -- passed
+    # assert_deny_understood silently, rc=0, when the query meant to
+    # catch it failed to run at all. This file's own header promises
+    # "everything here fails closed"; this loop was the one place that
+    # wasn't.
+    local pid3 pre3 zwrc pats
+    pats="$(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)"' "$file" 2>/dev/null)" \
+        || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
     while IFS=$'\t' read -r pid3 pre3; do
         [[ -n "$pid3" && -n "$pre3" ]] || continue
         ( [[ "" =~ $pre3 ]] ) 2>/dev/null; zwrc=$?
@@ -87,9 +103,13 @@ assert_deny_understood() {
           && [[ -z "$( [[ "" =~ $pre3 ]] 2>/dev/null; printf '%s' "${BASH_REMATCH[0]}" )" ]]; then
             bad="${bad:+$bad$'\n'}pattern $pid3 can match the empty string: it would match every line and report none"
         fi
-    done < <(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)"' "$file" 2>/dev/null)
+    done <<<"$pats"
 
-    local exid2 exm2 reach
+    local exid2 exm2 reach pats2 excs
+    pats2="$(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' "$file" 2>/dev/null)" \
+        || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
+    excs="$(jq -r '(.exceptions // [])[] | "\(.id)\t\(.match)"' "$file" 2>/dev/null)" \
+        || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
     while IFS=$'\t' read -r exid2 exm2; do
         [[ -n "$exm2" ]] || continue
         reach=0
@@ -107,9 +127,9 @@ assert_deny_understood() {
                 else [[ "$hit" == "$exm2" ]] && { reach=1; break; }; fi
             done
             (( reach )) && break
-        done < <(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' "$file" 2>/dev/null)
+        done <<<"$pats2"
         (( reach )) || bad="${bad:+$bad$'\n'}exception $exid2 is unreachable: no pattern produces exactly this text"
-    done < <(jq -r '(.exceptions // [])[] | "\(.id)\t\(.match)"' "$file" 2>/dev/null)
+    done <<<"$excs"
 
     [[ -z "$bad" ]] && return 0
     printf '%somabackup: the deny-list declares what the scanner cannot honor:%s\n' "$RED" "$NC" >&2

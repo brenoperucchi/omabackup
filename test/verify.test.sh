@@ -74,6 +74,29 @@ assert_eq "$(jq -r .ok <<<"$OUT")" "false"
 it "the transitive module is named in the finding"
 assert_contains "$(jq -r '.findings[]|select(.code=="lua-uncovered")|.path' <<<"$OUT")" "meu/extra.lua"
 
+# -- a broken require() extraction is a finding, not a silent "covered" -------
+# probe_hypr_lua_files' own grep -oP call, walking the require() chain, had
+# its status thrown away entirely (fed straight into a `< <(...)` loop whose
+# own `$!` the require_all.files branch's nested substitutions would go on
+# to clobber before anything checked it). A PoC (grep stubbed to fail only
+# on the require() extraction pattern) confirmed the result on this SAME
+# fixture: the walk silently stopped at the entry point, meu/extra.lua was
+# never reached, and verify reported ok:true -- the exact silent
+# under-reporting §0 exists to catch, one level removed from the
+# format-drift case it was built for.
+GSH="$(mktemp -d)"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *"require"* ]] && exit 2; done\n'
+  printf 'exec /usr/bin/grep "$@"\n'
+} >"$GSH/grep"; chmod +x "$GSH/grep"
+
+it "verify fails, rather than passing, when the require() trace itself cannot run"
+GSOUT="$(PATH="$GSH:$PATH" _verify "$H" "$G")"
+assert_eq "$(jq -r .ok <<<"$GSOUT")" "false"
+
+it "and names it as an incomplete trace, not a clean pass"
+assert_contains "$(jq -r '.findings[]|select(.code=="lua-trace-incomplete")|.code' <<<"$GSOUT")" "lua-trace-incomplete"
+
 # -- a deliberate exclusion silences it, with a versioned reason ---------------
 H="$(_home)"; G="$H/groups.json"
 mkdir -p "$H/.local/state/meu"

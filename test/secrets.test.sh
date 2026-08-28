@@ -1064,3 +1064,69 @@ assert_contains "$NLOUT" "AKIA1234567890ABCDEF"
 
 it "and the full name is in the report, not truncated at the embedded newline"
 assert_contains "$NLOUT" "$NLNAME"
+
+# ── the zero-width-pattern check cannot pass by failing to run at all ───────
+# Its own jq query fed `< <(jq ...)` straight into the while loop with no
+# status a caller could check -- a query that failed produced the same
+# empty read the check gets when a deny-list genuinely has no patterns at
+# all, and a pattern that matches every line while reporting none (this
+# file's own worked example is "^") passed validation silently. This
+# file's own header promises "everything here fails closed"; this was the
+# one gap in that promise. A PoC (jq stubbed to fail only on the query
+# that feeds this specific check) confirmed push refused for the wrong
+# reason before the fix -- die was never reached at all, since nothing
+# downstream of the silent empty loop ever noticed.
+ZQH="$(mktemp -d)"
+cat >"$ZQH/zerowidth.json" <<'JSON'
+{"schemaVersion":1,
+ "patterns":[{"id":"broken","regex":"^","reason":"matches every line, reports none"}],
+ "exceptions":[]}
+JSON
+mkdir -p "$ZQH/stub"
+# A heredoc with a quoted delimiter, not printf -- printf's own backslash
+# processing turned a literal `\t` (the two bytes jq's argv actually
+# carries; the shell's single quotes around the jq PROGRAM leave escapes
+# to jq's own parser, never bash's) into a real tab byte, which never
+# matched jq's actual argument and made the stub a silent no-op.
+#
+# Matched by exact equality, not `*...*` -- scan_secrets' own pattern
+# query (three fields: id, regex, ignoreCase) has this two-field query
+# as a literal PREFIX, and a substring match caught both.
+#
+# assert_deny_understood is called directly here, not through a full
+# `push` -- with THIS exact pattern ("^"), the real scan a few steps
+# later happens to block anyway (it matches everywhere the scan looks,
+# including git's own internal object listing, coincidentally not
+# through the zero-width gap this spec exists to isolate), which made an
+# end-to-end push refuse regardless of whether this specific check ran
+# at all and masked the very gap being tested.
+cat >"$ZQH/stub/jq" <<'STUB'
+#!/bin/bash
+for a in "$@"; do
+    if [[ "$a" == '(.patterns // [])[] | "\(.id)\t\(.regex)"' ]]; then
+        exit 2
+    fi
+done
+exec /usr/bin/jq "$@"
+STUB
+chmod +x "$ZQH/stub/jq"
+
+it "assert_deny_understood refuses when the zero-width-pattern check's own query fails"
+PATH="$ZQH/stub:$PATH" bash -c '
+    ob="$1"; denyfile="$2"
+    set --
+    source "$ob" >/dev/null 2>&1
+    source lib/secrets.sh
+    assert_deny_understood "$denyfile"
+' _ "$OB" "$ZQH/zerowidth.json" >/dev/null 2>&1 \
+    && fail "assert_deny_understood succeeded despite its own query failing" || ok
+
+it "and a genuinely broken zero-width pattern is still caught when the query works"
+ZQOUT="$(bash -c '
+    ob="$1"; denyfile="$2"
+    set --
+    source "$ob" >/dev/null 2>&1
+    source lib/secrets.sh
+    assert_deny_understood "$denyfile"
+' _ "$OB" "$ZQH/zerowidth.json" 2>&1)"
+assert_contains "$ZQOUT" "match the empty string"

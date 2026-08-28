@@ -48,11 +48,24 @@ probe_hypr_entry() {
 # so the quoted literals on that line are tried against each root. That is how
 # ~/.local/state/omarchy/toggles/hypr gets in: default/hypr/toggles.lua calls
 # require_all.files(paths.state_home .. "/omarchy/toggles/hypr").
+# Prints every file this closure reaches on stdout, same as before; ALSO
+# returns non-zero if any single step's own extraction failed partway
+# through -- a caller reading only the printed list, same as the "never
+# aborts" doctrine above asks for, still gets every file this managed to
+# find. But a caller that wants to know whether the closure is COMPLETE
+# (this file's own reason to exist: does the backup cover everything
+# actually read) has to check the status too. Both `grep -oP` calls below
+# had that status thrown away entirely -- a PoC (grep stubbed to fail
+# only on the require() pattern) confirmed the result: a live hyprland.lua
+# requiring a module in ~/.local/state, NOT covered by the declared
+# group, produced `ok: true` with zero findings -- the exact silent
+# under-reporting §0 exists to catch, just one level removed from the
+# format-drift case it was built for.
 probe_hypr_lua_files() {
     local entry="$1"
     [[ -f "$entry" ]] || return 0
     declare -A seen=()
-    local queue=("$entry") cur mod frag root dir f
+    local queue=("$entry") cur mod frag root dir f failed=0
 
     while ((${#queue[@]})); do
         cur="${queue[0]}"; queue=("${queue[@]:1}")
@@ -60,12 +73,29 @@ probe_hypr_lua_files() {
         seen[$cur]=1
         printf '%s\n' "$cur"
 
+        # Captured into a variable and looped via <<<, not `< <(...)` --
+        # `$!` after a process substitution loop is only reliable if
+        # nothing else backgrounds a process during the loop body, and the
+        # require_all.files branch below starts its OWN nested
+        # substitutions (find, _lua_roots) that would clobber it before a
+        # `wait "$!"` here ever got to check the right PID. grep's exit
+        # code is checked directly instead: 0 (matched) and 1 (genuinely
+        # no require() in this file, an ordinary leaf) both mean the
+        # extraction itself worked; only 2 (a real grep error) counts as
+        # a failure -- anything else here would flag every leaf file with
+        # no requires as a probe failure, which it is not.
+        local reqs grc
+        reqs="$(grep -oP '(?<=require\(")[^"]+(?=")' "$cur" 2>/dev/null)"; grc=$?
+        (( grc == 0 || grc == 1 )) || failed=1
         while read -r mod; do
             [[ -n "$mod" ]] || continue
             f="$(_resolve_module "$mod")" && queue+=("$f")
-        done < <(grep -oP '(?<=require\(")[^"]+(?=")' "$cur" 2>/dev/null)
+        done <<<"$reqs"
 
         grep -q 'require_all\.files' "$cur" 2>/dev/null || continue
+        local frags
+        frags="$(grep -oP '(?<=")[^"]+(?=")' "$cur" 2>/dev/null)"; grc=$?
+        (( grc == 0 || grc == 1 )) || failed=1
         while read -r frag; do
             [[ "$frag" == /* ]] || continue
             while read -r root; do
@@ -74,8 +104,9 @@ probe_hypr_lua_files() {
                 while read -r f; do [[ -n "$f" ]] && queue+=("$f"); done \
                     < <(find "$dir" -maxdepth 1 -type f -name '*.lua' 2>/dev/null)
             done < <(_lua_roots)
-        done < <(grep -oP '(?<=")[^"]+(?=")' "$cur" 2>/dev/null)
+        done <<<"$frags"
     done
+    (( failed == 0 ))
 }
 
 probe_hypr() {
@@ -98,8 +129,22 @@ probe_hypr() {
             finding fail compositor lua-uncovered "live Lua outside every group: $(_tilde "$f")" "$f"
         fi
     done < <(probe_hypr_lua_files "$entry")
-    (( n_out == 0 )) && finding pass compositor lua-covered \
-        "$n_lua user .lua covered ($n_pkg from the package, $n_exc excluded on purpose)" ""
+    # probe_hypr_lua_files' own status, checked -- its two grep -oP calls
+    # had theirs discarded entirely (one inside a `< <(...)` this loop's
+    # own body could clobber `$!` for, fixed there by capturing into a
+    # variable instead). A PoC (grep stubbed to fail only on the
+    # require() extraction) confirmed the result: a live hyprland.lua
+    # requiring a module NOT in any declared group produced "ok: true",
+    # zero findings -- the trace silently stopped at the entry point, and
+    # "found nothing uncovered" was reported as fact about a walk that
+    # never actually reached the file in question.
+    if ! wait "$!"; then
+        finding fail compositor lua-trace-incomplete \
+            "could not fully trace this config's own require() chain -- coverage below is a partial answer, not a complete one" "$entry"
+    elif (( n_out == 0 )); then
+        finding pass compositor lua-covered \
+            "$n_lua user .lua covered ($n_pkg from the package, $n_exc excluded on purpose)" ""
+    fi
 
     # .conf files the compositor stopped reading with Quattro. Not a failure --
     # dead weight, and §11.7 wants it visible so it is never restored as
