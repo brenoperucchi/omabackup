@@ -2091,3 +2091,60 @@ TPOUT="$(PATH="$TPH/stub:$PATH" HOME="$TPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP
 
 it "and refuses to plan instead"
 assert_contains "$TPOUT" "could not be confirmed"
+
+# ── a declared tree whose root is itself a symlink in the artifact ──────────
+# find does not dereference a symlink given as its OWN starting argument
+# unless told to with -L or a trailing slash. A tree-kind $prefix that is
+# itself a symlink to a directory (an ordinary, git-trackable "shared
+# config" pattern) made find report only the symlink's own path -- never
+# descending into it -- and the prefix-strip a line below never matched
+# an entry with no "/" after $wt/$prefix at all, since there was none. A
+# PoC (worktree/configs/foo -> bar, a real tracked symlink) confirmed the
+# result: one garbled row ("~/.config/foo//tmp/.../worktree/configs/foo"),
+# and every real file actually inside the symlinked tree invisible to the
+# plan entirely -- not applied at all, not even reported, unlike a leaf
+# symlink (already correctly preserved as content).
+SRH="$(mktemp -d)"; SRR="$SRH/repo"
+mkdir -p "$SRR/configs/bar"
+git init -q "$SRR"; git -C "$SRR" config user.email t@t; git -C "$SRR" config user.name t
+printf 'content1\n' >"$SRR/configs/bar/file1"
+printf 'content2\n' >"$SRR/configs/bar/file2"
+( cd "$SRR/configs" && ln -s bar foo )
+git -C "$SRR" add -A && git -C "$SRR" commit -qm one
+cat >"$SRH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"g","label":"G","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/foo"]}]}
+JSON
+mkdir -p "$SRH/home/.config/bar"
+printf 'content1\n' >"$SRH/home/.config/bar/file1"
+printf 'content2\n' >"$SRH/home/.config/bar/file2"
+( cd "$SRH/home/.config" && ln -s bar foo )
+HOME="$SRH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$SRH/g.json" \
+    OMABACKUP_STATE="$SRH/home/.state" OMABACKUP_REPO="$SRR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+SRART="$(ls -t "$SRH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+
+it "a tree whose declared root is itself a symlink in the artifact restores its real files"
+SRPLAN="$(HOME="$SRH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$SRH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$SRART" 2>&1)"
+assert_contains "$SRPLAN" "2 files would be restored"
+
+it "and both real files are named cleanly, not a garbled worktree path"
+assert_contains "$SRPLAN" "~/.config/foo/file1"
+
+# ── a nested --into target's PARENT directories are cleaned up too ──────────
+# Bare `rmdir "$into"` only ever removed the FINAL component mkdir -p
+# created -- a --into target nested under parents that did not exist yet
+# (--into a/b/target, none of a, a/b, or a/b/target there before) left a/
+# and a/b/ behind at every cleanup site, including the ordinary plan-only
+# run at the very end of this command, which promises "nothing was
+# written." A PoC against a real artifact confirmed the result: rc=0, the
+# target itself absent, but its two parent directories left on disk.
+NIH="$(mktemp -d)"; NIART="$(_res_build "$NIH" '["3.*","4.*"]')"
+NIINTO="$NIH/a/b/target"
+
+it "a plan with a nested --into target cleans up the parents it created too"
+HOME="$NIH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$NIH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --into "$NIINTO" "$NIART" >/dev/null 2>&1
+[[ ! -e "$NIH/a" ]] \
+    && ok || fail "the --into target's parent directories were left behind: $(find "$NIH/a" 2>/dev/null)"

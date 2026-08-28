@@ -1616,6 +1616,23 @@ cmd_push() {
     return $rc
 }
 
+# _into_cleanup <into> <boundary>
+# Removes <into> and any newly-empty ancestor directory up to, but not
+# including, <boundary> -- the deepest ancestor that already existed
+# before cmd_restore created anything under it (or <into> itself, when
+# <into> already existed: the loop below then does nothing). rmdir -p
+# alone is not safe here: it keeps climbing past whatever this specific
+# call actually created, into directories that existed before and merely
+# happened to be empty at this moment -- not this cleanup's to remove.
+_into_cleanup() {
+    local into="$1" boundary="$2" d="$into"
+    [[ -n "$into" ]] || return 0
+    while [[ "$d" != "$boundary" && -n "$d" && "$d" != "/" ]]; do
+        rmdir "$d" 2>/dev/null || return 0
+        d="$(dirname "$d")"
+    done
+}
+
 # ── restore ──────────────────────────────────────────────────────────────────
 cmd_restore() {
     local artifact="" apply=0 into=""
@@ -1711,16 +1728,38 @@ cmd_restore() {
     # one command that promises "nothing was written." Removed again, best-
     # effort, at the end of the plan branch below, if it is still exactly
     # what this call made: empty, and ours.
-    local into_created=0
+    local into_created=0 into_boundary=""
     if [[ -n "$into" ]]; then
-        [[ -d "$into" ]] || into_created=1
+        if [[ -d "$into" ]]; then
+            into_boundary="$into"
+        else
+            into_created=1
+            # The deepest ancestor that already exists, walked BEFORE
+            # mkdir -p ever runs -- every _into_cleanup call below stops
+            # there, never removing anything that existed before this
+            # call. A bare `rmdir "$into"` only ever removed the FINAL
+            # component mkdir -p created: a --into target nested under
+            # parents that did not exist yet (--into a/b/target, none of
+            # a, a/b, or a/b/target there before) left a/ and a/b/ behind
+            # on every path that cleans up, not just the die sites --
+            # including the ordinary plan-only run at the very end of this
+            # function, which promises "nothing was written." A PoC (a
+            # nested --into target against a real artifact) confirmed the
+            # result: rc=0, the target itself absent, but its two parent
+            # directories left on disk.
+            local anc="$into"
+            while [[ ! -e "$anc" && "$anc" != "/" && -n "$anc" ]]; do
+                anc="$(dirname "$anc")"
+            done
+            into_boundary="$anc"
+        fi
         # into_created used here too, not only at the three die sites
         # after this one -- mkdir -p can fail partway (an intermediate
         # component created, a later one refused) and still leave
         # something behind at or under $into, and this die skipped the
         # same cleanup every later one already gets.
         mkdir -p "$into" || {
-            (( into_created )) && rmdir "$into" 2>/dev/null
+            _into_cleanup "$into" "$into_boundary"
             rm -rf "$x"; die "could not make $(_tilde "$into")"
         }
     fi
@@ -1745,7 +1784,7 @@ cmd_restore() {
     # returned 1, but the target directory it had just created stayed
     # behind, an observable write from a run that made none.
     [[ -f "$GROUPS_FILE" ]] || {
-        (( into_created )) && rmdir "$into" 2>/dev/null
+        _into_cleanup "$into" "$into_boundary"
         rm -rf "$x"; die "the artifact carries no manifest of its own"
     }
     # assert_manifest_understood validates mode against KNOWN_MODES for
@@ -1762,23 +1801,23 @@ cmd_restore() {
     local badm; badm="$(jq -r --argjson m "$KNOWN_MODES" \
         '.groups[]? | select(.mode as $x | $m | index($x) | not) | "\(.id) (mode \(.mode))"' \
         "$GROUPS_FILE")" || {
-        (( into_created )) && rmdir "$into" 2>/dev/null
+        _into_cleanup "$into" "$into_boundary"
         rm -rf "$x"; die "could not check this artifact's own manifest for modes this build understands"
     }
     if [[ -n "$badm" ]]; then
-        (( into_created )) && rmdir "$into" 2>/dev/null
+        _into_cleanup "$into" "$into_boundary"
         rm -rf "$x"; die "this artifact's own manifest declares a mode this build does not understand: $badm"
     fi
     # Deferred from the top-level check, which runs against this machine's own
     # manifest -- wrong file for restore. Checked here, now that $GROUPS_FILE
     # is the artifact's.
     local badg; badg="$(_assert_groups_filter_understood)" || {
-        (( into_created )) && rmdir "$into" 2>/dev/null
+        _into_cleanup "$into" "$into_boundary"
         rm -rf "$x"; die "--groups names a group this artifact's manifest does not have: $badg"
     }
 
     local rows; rows="$(restore_rows "$x" "$verdict" "$operator_groups_file")" || {
-        (( into_created )) && rmdir "$into" 2>/dev/null
+        _into_cleanup "$into" "$into_boundary"
         rm -rf "$x"; die "could not plan against the artifact's own manifest"
     }
 
@@ -1871,7 +1910,7 @@ cmd_restore() {
         # empty, a permissions oddity) is not this command's problem to
         # report, and the promise this keeps is "created nothing," not
         # "guaranteed to remove everything ever placed at this path."
-        (( into_created )) && rmdir "$into" 2>/dev/null
+        _into_cleanup "$into" "$into_boundary"
         return 0
     fi
 

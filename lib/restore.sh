@@ -427,14 +427,27 @@ restore_rows() {
                         local frel="${f##*/}"
                         frow_id+=("$id"); frow_prefix+=("$prefix")
                         frow_rel+=("$frel"); frow_dest+=("$e/$frel")
-                    done < <(find "$wt/$prefix" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
+                    # A trailing slash on the argument -- not "$wt/$prefix"
+                    # bare. find does not dereference a symlink given as ITS
+                    # OWN starting argument unless told to with -L or a
+                    # trailing slash; without either, a $prefix that is
+                    # itself a symlink to a directory (a shared-config
+                    # pattern a repo can legitimately track) makes find
+                    # report only the symlink's own path, matching -type l,
+                    # and never descend into it at all. A PoC confirmed the
+                    # result: one garbled row (the prefix-strip below never
+                    # matches an entry with no "/" after it, so `frel` was
+                    # the whole absolute worktree path) and every real file
+                    # actually inside the symlinked tree invisible to
+                    # restore entirely.
+                    done < <(find "$wt/$prefix/" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
                     wait "$!" || return 1
                 elif [[ -d "$wt/$prefix" ]]; then
                     while IFS= read -r -d '' f; do
                         local frel="${f#"$wt/$prefix"/}"
                         frow_id+=("$id"); frow_prefix+=("$prefix")
                         frow_rel+=("$frel"); frow_dest+=("$e/$frel")
-                    done < <(find "$wt/$prefix" \( -type f -o -type l \) -print0 2>/dev/null)
+                    done < <(find "$wt/$prefix/" \( -type f -o -type l \) -print0 2>/dev/null)
                     wait "$!" || return 1
                 else
                     # A `tree`-kind prefix that is not a directory in the

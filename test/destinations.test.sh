@@ -511,3 +511,43 @@ PATH="$DISTUB:$PATH" bash -c '
     _dir_is_ours "$1" "irrelevant"
 ' _ "$DIH" >/dev/null 2>&1 \
     && fail "answered yes from a walk that stopped partway" || ok
+
+# ── an unparseable destinations.json is refused, not read as "nothing wrong" ─
+# `bad="$(jq ... 2>/dev/null)"` had its own status discarded -- a
+# destinations.json this cannot even PARSE (not just an unknown field)
+# produced the same empty $bad a genuinely clean file does, and
+# `[[ -z "$bad" ]] && return 0` read "could not check" as "checked fine".
+# A PoC ({not-json) confirmed assert_destinations_understood returned 0
+# silently.
+DJH="$(mktemp -d)"
+printf '{not-json' >"$DJH/destinations.json"
+
+it "assert_destinations_understood refuses when destinations.json is not valid JSON"
+bash -c '
+    source lib/destinations.sh
+    DESTINATIONS_FILE="$1"
+    assert_destinations_understood
+' _ "$DJH/destinations.json" >/dev/null 2>&1 \
+    && fail "returned success against unparseable JSON" || ok
+
+# ── prune_bundles' own rm failure is reflected in its return status ─────────
+# `rm -f -- "$dir/$f" && removed=$((removed + 1))` only ever counted a
+# SUCCESSFUL removal; the function's own return status, falling through to
+# `printf '%s' "$removed"`, was always 0 regardless of whether a removal
+# that SHOULD have happened actually failed. A PoC (rm stubbed to always
+# fail, three bundles, keep=1) confirmed the result: removed=0, rc=0 --
+# indistinguishable from "nothing needed pruning".
+PBH="$(mktemp -d)"
+touch "$PBH/.omabackup-destination"
+touch -d "2020-01-01 00:00:00" "$PBH/omabackup-myhost-20200101-000000-abc111111111.tar.zst"
+touch -d "2020-01-02 00:00:00" "$PBH/omabackup-myhost-20200102-000000-abc222222222.tar.zst"
+touch -d "2020-01-03 00:00:00" "$PBH/omabackup-myhost-20200103-000000-abc333333333.tar.zst"
+mkdir -p "$PBH/stub"
+printf '#!/bin/bash\nexit 1\n' >"$PBH/stub/rm"; chmod +x "$PBH/stub/rm"
+
+it "prune_bundles refuses when its own rm fails, rather than reporting a clean prune"
+PATH="$PBH/stub:$PATH" bash -c '
+    source lib/destinations.sh
+    prune_bundles "$1" myhost 1 >/dev/null
+' _ "$PBH" \
+    && fail "prune_bundles reported success despite rm failing" || ok

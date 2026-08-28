@@ -31,6 +31,16 @@ KNOWN_DEST_TYPES='["dir"]'
 assert_destinations_understood() {
     [[ -f "$DESTINATIONS_FILE" ]] || return 0
     local bad line
+    # jq's own status, checked -- a destinations.json this cannot even
+    # PARSE (invalid JSON, not just an unknown field) produced the same
+    # empty $bad a genuinely clean file does, and `[[ -z "$bad" ]] && return
+    # 0` read "could not check" as "checked fine, nothing wrong". A PoC
+    # ({not-json) confirmed the result: assert_destinations_understood
+    # returned 0 silently, and push went on to treat a destinations file it
+    # never actually validated as though it had -- a directory destination
+    # this file declares can then be skipped by whatever reads it next
+    # while a configured GitHub remote (which needs no entry here at all)
+    # still gets pushed to, the operator never told the file was unreadable.
     bad="$(jq -r --argjson k "$KNOWN_DEST_FIELDS" --argjson t "$KNOWN_DEST_TYPES" '
         [ ((.destinations // [])[] | . as $d | (keys[] | select(. as $f | $k | index($f) | not))
             | "unknown field \(.) in destination \($d.id)")
@@ -40,7 +50,10 @@ assert_destinations_understood() {
             | "destination \(.id) needs keep >= 1: retention that keeps nothing is not retention")
         , ((.destinations // [])[] | select((.id // "") == "" or (.path // "") == "")
             | "destination missing id or path")
-        ] | .[]' "$DESTINATIONS_FILE" 2>/dev/null)"
+        ] | .[]' "$DESTINATIONS_FILE" 2>/dev/null)" || {
+        printf '%somabackup: destinations.json could not be read as JSON at all%s\n' "$RED" "$NC" >&2
+        exit 1
+    }
     [[ -z "$bad" ]] && return 0
     printf '%somabackup: destinations.json declares what push cannot honor:%s\n' "$RED" "$NC" >&2
     while IFS= read -r line; do printf '  %s\n' "$line" >&2; done <<<"$bad"
@@ -178,14 +191,28 @@ prune_bundles() {  # prune_bundles <dir> <host> <keep> -> prints how many it rem
         fi
         mapfile -t found <<<"$sorted"
     fi
+    # rm's own status, checked -- `removed` only ever counted a SUCCESSFUL
+    # removal, and this function's own return status (falling through to
+    # `printf '%s' "$removed"`, always 0) never reflected a failed one at
+    # all. A PoC (rm stubbed to fail for the one bundle past retention)
+    # confirmed the result: prune_bundles printed removed=0 and returned
+    # 0, indistinguishable from "nothing needed removing" -- a caller
+    # logging this push as clean retention had no way to tell that
+    # something SHOULD have been removed and was not.
+    local prune_failed=0
     for f in "${found[@]:-}"; do
         [[ -n "$f" ]] || continue
         n=$((n + 1))
         (( n > keep )) || continue
         [[ -f "$dir/$f" && ! -L "$dir/$f" ]] || continue
-        rm -f -- "$dir/$f" && removed=$((removed + 1))
+        if rm -f -- "$dir/$f"; then
+            removed=$((removed + 1))
+        else
+            prune_failed=1
+        fi
     done
     printf '%s' "$removed"
+    (( prune_failed == 0 ))
 }
 
 # ── drivers ──────────────────────────────────────────────────────────────────
