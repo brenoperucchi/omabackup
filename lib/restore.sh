@@ -803,7 +803,20 @@ _restore_one() {
         # file the original.
         local dest_dir_rp; dest_dir_rp="$(realpath -m -- "$(dirname "$dest")" 2>/dev/null)" || return 1
         local dest_rp="$dest_dir_rp/$(basename "$dest")"
-        local keep="$backup/${dest_rp#"$HOME"/}"
+        # Stripped against realpath -e "$HOME", not $HOME's own raw
+        # spelling -- the same canonical form containment was just
+        # checked against a few lines up (_restore_contained resolves its
+        # base the same way). $HOME with a symlink component (a common
+        # /home/user -> /mnt/data/user layout) or a relative --into target
+        # never literally prefixes the now-canonicalized $dest_rp, so the
+        # `#"$HOME"/` strip removed nothing at all: the backup landed at
+        # replaced/<dest_rp's full path> instead of replaced/<the path
+        # relative to $HOME> -- contained inside $backup still, but filed
+        # under a name nobody restoring by hand would think to look for.
+        # This is the same mislaying class the leaf-symlink fix just
+        # closed, reopened by the OTHER half of what "$HOME" can mean.
+        local home_rp; home_rp="$(realpath -e -- "$HOME" 2>/dev/null)" || return 1
+        local keep="$backup/${dest_rp#"$home_rp"/}"
         mkdir -p "$(dirname "$keep")" 2>/dev/null || return 1
         cp -Pp "$dest" "$keep" 2>/dev/null || return 1
     fi

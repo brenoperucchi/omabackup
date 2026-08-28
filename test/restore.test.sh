@@ -1973,3 +1973,42 @@ assert_eq "$(cat "$DSVENDOR/alacritty.toml")" 'font = "package default"'
 it "and the pre-existing content backs up under its own path, not the symlink's target"
 [[ -n "$(find "$DSH/rstate2/restore" -path '*/replaced/.config/alacritty/alacritty.toml' 2>/dev/null)" ]] \
     && ok || fail "the backup was not filed at replaced/.config/alacritty/alacritty.toml"
+
+# ── the backup slot's $HOME strip has to match what containment compared ────
+# ── against, not $HOME's own raw spelling ────────────────────────────────────
+# dest_rp (the backup-slot path) is canonicalized via realpath -m; the strip
+# that turns it into a $backup-relative path used the raw $HOME string.
+# _restore_contained resolves ITS base with realpath -e "$HOME" a few
+# lines up -- when $HOME itself has a symlink component (an ordinary
+# /home/user -> /mnt/data/user layout) or --into was given a relative
+# path, the canonical $dest_rp never literally starts with the raw $HOME
+# string, the `#"$HOME"/` strip removes nothing, and the backup landed at
+# replaced/<dest_rp's entire absolute path> instead of the expected
+# replaced/.config/.../file -- contained inside $backup still, but filed
+# under a name nobody restoring by hand would think to look for. The
+# exact same mislaying class the leaf-symlink fix above just closed,
+# reopened by the other half of what "$HOME" can mean.
+HLH="$(mktemp -d)"; HLREAL="$HLH/real"; mkdir -p "$HLREAL"
+ln -s "$HLREAL" "$HLH/link"
+HLR="$HLH/repo"
+mkdir -p "$HLR/configs/alacritty"
+git init -q "$HLR"; git -C "$HLR" config user.email t@t; git -C "$HLR" config user.name t
+printf 'font = "customized"\n' >"$HLR/configs/alacritty/alacritty.toml"
+git -C "$HLR" add -A && git -C "$HLR" commit -qm one
+cat >"$HLH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"terminal","label":"Terminal","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/alacritty"]}]}
+JSON
+mkdir -p "$HLREAL/.config/alacritty"
+printf 'font = "customized"\n' >"$HLREAL/.config/alacritty/alacritty.toml"
+HOME="$HLH/link" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$HLH/g.json" \
+    OMABACKUP_STATE="$HLREAL/.state" OMABACKUP_REPO="$HLR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+HLART="$(ls -t "$HLREAL/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+printf 'font = "ORIGINAL"\n' >"$HLREAL/.config/alacritty/alacritty.toml"
+
+it "the backup slot lands correctly even when HOME itself has a symlink component"
+HOME="$HLH/link" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$HLREAL/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$HLART" >/dev/null 2>&1
+[[ -n "$(find "$HLREAL/rstate/restore" -path '*/replaced/.config/alacritty/alacritty.toml' 2>/dev/null)" ]] \
+    && ok || fail "the backup was not filed at replaced/.config/alacritty/alacritty.toml"
