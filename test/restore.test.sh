@@ -1910,3 +1910,66 @@ it "restore refuses to plan when a generated group's own generator field cannot 
 PATH="$GBH/stub:$PATH" HOME="$GBH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$GBH/rstate" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$GBART" >/dev/null 2>&1 \
     && fail "restore planned successfully despite the generator field query failing" || ok
+
+# ── the mirror of the source-containment fix: the WRITE side followed the ───
+# ── destination's own live symlink too, refusing a file that was actually ──
+# ── safe to restore ──────────────────────────────────────────────────────────
+# _restore_contained checked realpath -m on the whole $dest, same as $src
+# did before its own fix -- and a live destination that is STILL a
+# symlink to a package-installed default (the exact file most likely to
+# need restoring on a recovery machine: the one the operator never
+# customized away from its default) was refused as "resolves outside the
+# target home", even though _restore_one's actual write (rm -f, then
+# cp -Pp) never follows that symlink -- it unlinks first. A PoC (the
+# write mechanism simulated directly, outside restore_rows entirely)
+# confirmed the refusal protected nothing: the write always lands a
+# regular file inside $HOME regardless of what the pre-existing symlink
+# pointed to. Checked against dirname($dest) now, the identical
+# distinction the source-side fix already draws.
+DSH="$(mktemp -d)"; DSR="$DSH/repo"
+mkdir -p "$DSR/configs/alacritty"
+git init -q "$DSR"; git -C "$DSR" config user.email t@t; git -C "$DSR" config user.name t
+printf 'font = "customized by user"\n' >"$DSR/configs/alacritty/alacritty.toml"
+git -C "$DSR" add -A && git -C "$DSR" commit -qm one
+cat >"$DSH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"terminal","label":"Terminal","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/alacritty"]}]}
+JSON
+mkdir -p "$DSH/home/.config/alacritty"
+printf 'font = "customized by user"\n' >"$DSH/home/.config/alacritty/alacritty.toml"
+HOME="$DSH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$DSH/g.json" \
+    OMABACKUP_STATE="$DSH/home/.state" OMABACKUP_REPO="$DSR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+DSART="$(ls -t "$DSH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+DSTGT="$(mktemp -d)"; DSVENDOR="$(mktemp -d)"
+mkdir -p "$DSTGT/.config/alacritty"
+printf 'font = "package default"\n' >"$DSVENDOR/alacritty.toml"
+ln -s "$DSVENDOR/alacritty.toml" "$DSTGT/.config/alacritty/alacritty.toml"
+
+it "a destination that is a live symlink to outside HOME still restores"
+DSPLAN="$(HOME="$DSTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$DSH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$DSART" 2>&1)"
+assert_contains "$DSPLAN" "1 files would be restored"
+
+it "and --apply writes the real content, not through the symlink"
+HOME="$DSTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$DSH/rstate2" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$DSART" >/dev/null 2>&1
+assert_eq "$(cat "$DSTGT/.config/alacritty/alacritty.toml")" 'font = "customized by user"'
+
+it "and the package default the symlink pointed to is untouched"
+assert_eq "$(cat "$DSVENDOR/alacritty.toml")" 'font = "package default"'
+
+# ── the backup slot for that same file is filed under its OWN path, not ─────
+# ── under wherever the live symlink used to point ───────────────────────────
+# dest_rp was realpath -m on the whole $dest -- the same full-path
+# resolution the containment check just stopped doing, still present in
+# the backup-slot computation right below it. A live symlink at $dest
+# made the backup land under the SYMLINK'S TARGET path instead of under
+# $dest's own -- contained inside $backup still (the strip only removes a
+# literal $HOME/), but archived under a name nobody restoring by hand
+# would think to look for: the real original silently mislaid rather than
+# protected. Fixed the same way: dirname($dest) resolved, plus $dest's
+# own lexical basename, not realpath -m on the whole path.
+it "and the pre-existing content backs up under its own path, not the symlink's target"
+[[ -n "$(find "$DSH/rstate2/restore" -path '*/replaced/.config/alacritty/alacritty.toml' 2>/dev/null)" ]] \
+    && ok || fail "the backup was not filed at replaced/.config/alacritty/alacritty.toml"

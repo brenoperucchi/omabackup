@@ -147,7 +147,21 @@ _path_contained() {
 # _path_contained. --into does not change what this checks: HOME is
 # reassigned to the target before this ever runs, so containment is always
 # relative to wherever the restore is actually landing.
-_restore_contained() { _path_contained "$1" "$HOME"; }
+# dirname($1)'s containment, not $1's own -- the same distinction $src's
+# own check in _restore_one draws, and for the same reason: realpath -m
+# follows the FINAL component too, and a destination this file has not
+# customized yet can legitimately still BE a live symlink to a package-
+# installed default living outside $HOME. _restore_one never follows that
+# symlink to write through it -- it unlinks first (rm -f, then cp -Pp) --
+# so refusing on the symlink's OWN target protected nothing: a PoC
+# confirmed the actual write mechanism, simulated directly, lands a
+# regular file inside $HOME regardless of what the pre-existing symlink at
+# $dest pointed to. Checking only that the DIRECTORY $dest lives in stays
+# contained still catches the traversal this exists to close (a declared
+# path or an ancestor directory that itself escapes), without also
+# refusing the single file on a machine most likely to need restoring --
+# exactly the one nobody has customized away from its package default yet.
+_restore_contained() { _path_contained "$(dirname "$1")" "$HOME"; }
 
 # _restore_repo_prefix <group-id> <declared-path>
 # "<repo-relative-prefix>\t<kind>", where kind is `tree` (the repo mirrors the
@@ -773,7 +787,22 @@ _restore_one() {
         # it, while the report goes on naming $backup as where it landed.
         # realpath -m first, so the suffix stripped is the path containment
         # was actually checked against, not its unresolved spelling.
-        local dest_rp; dest_rp="$(realpath -m -- "$dest" 2>/dev/null)" || return 1
+        #
+        # dirname($dest), resolved, plus $dest's own LEXICAL basename --
+        # not realpath -m on the whole path. The full-path form followed a
+        # pre-existing symlink AT $dest to wherever it pointed (a package
+        # default outside $HOME, say) and filed the backup under THAT
+        # path instead: contained inside $backup still, since the prefix
+        # strip only ever removes a literal $HOME/ and nothing worse
+        # happens, but archived under a name nobody restoring by hand
+        # would ever think to look for -- the live original silently
+        # mislaid rather than protected. The write below never follows
+        # that symlink either (cp -Pp copies it as a link, and the branch
+        # this runs in is about to rm -f it and write fresh content), so
+        # the backup slot should not follow it when computing where to
+        # file the original.
+        local dest_dir_rp; dest_dir_rp="$(realpath -m -- "$(dirname "$dest")" 2>/dev/null)" || return 1
+        local dest_rp="$dest_dir_rp/$(basename "$dest")"
         local keep="$backup/${dest_rp#"$HOME"/}"
         mkdir -p "$(dirname "$keep")" 2>/dev/null || return 1
         cp -Pp "$dest" "$keep" 2>/dev/null || return 1
