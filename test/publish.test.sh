@@ -545,3 +545,23 @@ it "publish_staging does not report a plugin file as published when its files-fr
 it "and the file was not actually copied into the repo"
 [[ -z "$(find "$PFH/repo/configs/omarchy/plugins" -type f 2>/dev/null)" ]] \
     && ok || fail "a file landed in the repo despite the list write failing"
+
+# ── map_to_repo's own refusal is reported, not silently swallowed ───────────
+# `dst="$(map_to_repo "$rel" "$table")" || continue` dropped a file that
+# map_to_repo deliberately refuses to place (.local/bin with no
+# trackedRepoPath override, the documented "refuse rather than guess"
+# case) with no record at all: not published, not counted as failed,
+# nothing said. A PoC (a staged file under .local/bin/, no trackedRepoPath
+# table entry naming it) confirmed the result: publish_staging returned
+# rc=0 with 0 files published -- indistinguishable from a clean sync with
+# genuinely nothing to do.
+MTH2="$(mktemp -d)"; MTR2="$MTH2/repo"
+git init -q "$MTR2"; git -C "$MTR2" config user.email t@t; git -C "$MTR2" config user.name t
+mkdir -p "$MTR2/x"; printf 'x\n' >"$MTR2/x/f"
+git -C "$MTR2" add -A && git -C "$MTR2" commit -qm one
+mkdir -p "$MTH2/staging/.local/bin"
+printf '#!/bin/bash\necho hi\n' >"$MTH2/staging/.local/bin/tool"
+
+it "publish_staging reports failure when map_to_repo refuses to place a file"
+publish_staging "$MTH2/staging" "$MTR2" >/dev/null 2>&1 \
+    && fail "reported success despite map_to_repo refusing to map a staged file" || ok

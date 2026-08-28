@@ -221,7 +221,20 @@ publish_staging() {
     while IFS= read -r -d '' f; do
         rel="${f#"$staging"/}"
         [[ "$rel" == .generated/* || "$rel" == .plugins/* ]] && continue
-        dst="$(map_to_repo "$rel" "$table")" || continue
+        # map_to_repo's own refusal (a path this cannot map without
+        # guessing -- .local/bin with no trackedRepoPath override, say)
+        # used to vanish into a bare `continue`: the file stayed staged,
+        # never published, and nothing here ever said so. A PoC (a
+        # critical copy-mode group pointed at ~/.local/bin with no
+        # trackedRepoPath) confirmed the result: sync reported rc=0,
+        # "published 0 files", "up to date -- nothing changed" -- while
+        # the file sat in staging, collected but never synced, forever.
+        if ! dst="$(map_to_repo "$rel" "$table")"; then
+            printf 'omabackup: %s has no repo destination this can determine without guessing -- refusing to publish it silently\n' \
+                "$rel" >&2
+            failed=$((failed + 1))
+            continue
+        fi
         rels+=("$rel"); dsts+=("$dst")
     done < <(find "$staging" \( -type f -o -type l \) -print0 2>/dev/null)
     # find's own status, checked BEFORE anything below ever runs -- the

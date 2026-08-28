@@ -395,7 +395,17 @@ probe_link_integrity() {
     local id p e linked plain
     local ids_out; ids_out="$(groups_ids)" || { finding fail manifest manifest-unreadable "this machine's own group manifest could not be read" ""; return; }
     while read -r id; do
-        [[ "$(group_field "$id" mode)" == "link" ]] || continue
+        # group_field's own status, checked -- a bare `[[ "$(...)" ==
+        # "link" ]] || continue` treated a failed query the same as a
+        # group that genuinely is not mode:link: both are empty, neither
+        # equals "link", and the loop just moved on. A PoC (jq failing
+        # only the --arg f mode query, for a real mode:link group whose
+        # declared path had stopped being a symlink) confirmed the result:
+        # verify --json reported ok=true with an empty links findings
+        # list -- the check that should have caught it never ran at all.
+        local gmode2; gmode2="$(group_field "$id" mode)" \
+            || { finding fail "$id" manifest-unreadable "this group's mode could not be read from the manifest" ""; continue; }
+        [[ "$gmode2" == "link" ]] || continue
         linked=0; plain=0
         local paths_out; paths_out="$(group_paths "$id")" \
             || { finding fail "$id" manifest-unreadable "this group's paths could not be read from the manifest" ""; continue; }

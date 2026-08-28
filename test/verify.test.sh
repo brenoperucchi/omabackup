@@ -135,3 +135,31 @@ assert_eq "$(jq -r '.ok' <<<"$VPOUT")" "false"
 
 it "and names it as a manifest problem, not silence"
 assert_contains "$VPOUT" "probe could not be read"
+
+# ── a mode:link group whose own mode query fails is not silently skipped ────
+# `[[ "$(group_field "$id" mode)" == "link" ]] || continue` treated a
+# failed query the same as a group that genuinely is not mode:link -- both
+# are empty output, neither equals "link", and the loop just moved on
+# without ever checking whether the declared path had stopped being a
+# symlink. A PoC (jq failing only the --arg f mode query, for a real
+# mode:link group whose path is now a plain file) confirmed the result:
+# verify --json reported ok:true with no finding for that group at all.
+VLH="$(mktemp -d)"
+cat >"$VLH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"editorconf","label":"EditorConf","mode":"link","coupled":false,"critical":true,"paths":["~/.bashrc"]}]}
+JSON
+printf 'not a link anymore\n' >"$VLH/.bashrc"
+mkdir -p "$VLH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == "mode" ]] && exit 9; done\n'
+  printf 'exec %s "$@"\n' "$(command -v jq)"
+} >"$VLH/stub/jq"; chmod +x "$VLH/stub/jq"
+VLOUT="$(PATH="$VLH/stub:$PATH" HOME="$VLH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$VLH/g.json" \
+    OMABACKUP_STATE="$VLH/.state" XDG_RUNTIME_DIR=/nonexistent "$OB" verify --json 2>/dev/null)"
+
+it "verify fails a mode:link group whose own mode query cannot be answered"
+assert_eq "$(jq -r '.ok' <<<"$VLOUT")" "false"
+
+it "and does not silently skip the link-integrity check for it"
+assert_contains "$VLOUT" "editorconf"
