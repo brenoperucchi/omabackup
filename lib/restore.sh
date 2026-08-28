@@ -16,14 +16,24 @@
 # _restore_in_range <version> <targets-json>
 # Whether a version string matches one of the manifest's declared targets.
 # The targets are globs ("4.*"), which is what the manifest has always held.
+# Returns 2 for "the targets list itself could not be parsed" -- distinct
+# from 1, "parsed fine, this version is not in it". A process substitution
+# has no `$?` a caller can check on the loop that reads from it, so a jq
+# failure here (an unlikely second parse of a string this function's own
+# caller just fetched with jq, but not impossible) used to look exactly
+# like "genuinely out of range": the while loop ran zero times either way,
+# and this returned 1 regardless. A PoC confirmed the result: a quarantine
+# verdict citing "the backup declares it can restore onto <empty>" printed
+# as a real incompatibility rather than "could not confirm compatibility".
 _restore_in_range() {
-    local v="$1" targets="$2" t
+    local v="$1" targets="$2" t out
     [[ -n "$v" && "$v" != unknown ]] || return 1
+    out="$(printf '%s' "$targets" | jq -r '.[]?' 2>/dev/null)" || return 2
     while read -r t; do
         [[ -n "$t" ]] || continue
         # shellcheck disable=SC2053 -- the glob is the point
         [[ "$v" == $t ]] && return 0
-    done < <(printf '%s' "$targets" | jq -r '.[]?' 2>/dev/null)
+    done <<<"$out"
     return 1
 }
 
@@ -72,7 +82,10 @@ _restore_verdict() {
     targets="$(jq -c '.supportedTargets // []' "$m" 2>/dev/null)" || return 2
     IFS=$'\t' read -r tv tc tm <<<"$(omarchy_identity)"
 
-    if ! _restore_in_range "$tv" "$targets"; then
+    _restore_in_range "$tv" "$targets"; local range_rc=$?
+    if (( range_rc == 2 )); then
+        return 2
+    elif (( range_rc != 0 )); then
         printf 'quarantine\tthis machine runs Omarchy %s, and the backup declares it can restore onto %s' \
             "$tv" "$(printf '%s' "$targets" | jq -r 'join(", ")' 2>/dev/null)"
         return 0

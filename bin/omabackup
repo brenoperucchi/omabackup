@@ -1748,6 +1748,27 @@ cmd_restore() {
         (( into_created )) && rmdir "$into" 2>/dev/null
         rm -rf "$x"; die "the artifact carries no manifest of its own"
     }
+    # assert_manifest_understood validates mode against KNOWN_MODES for
+    # THIS machine's own manifest, at collect time -- restore_rows never
+    # ran the same check against the ARTIFACT's own tool/groups.default.json.
+    # Every mode restore_rows recognizes is checked explicitly (gm==gen,
+    # kind==tree/flat); anything else fell through to the ordinary
+    # copy-restore path unconditionally. A PoC (a group declared
+    # mode:future-mode, a semantics this build has never heard of) confirmed
+    # the result: restore_rows planned and offered a plain `restore` row for
+    # it anyway, as though an unknown mode were simply mode:copy -- an
+    # artifact built by a newer version of this tool, using a mode this one
+    # does not understand, would be applied by guesswork rather than refused.
+    local badm; badm="$(jq -r --argjson m "$KNOWN_MODES" \
+        '.groups[]? | select(.mode as $x | $m | index($x) | not) | "\(.id) (mode \(.mode))"' \
+        "$GROUPS_FILE")" || {
+        (( into_created )) && rmdir "$into" 2>/dev/null
+        rm -rf "$x"; die "could not check this artifact's own manifest for modes this build understands"
+    }
+    if [[ -n "$badm" ]]; then
+        (( into_created )) && rmdir "$into" 2>/dev/null
+        rm -rf "$x"; die "this artifact's own manifest declares a mode this build does not understand: $badm"
+    fi
     # Deferred from the top-level check, which runs against this machine's own
     # manifest -- wrong file for restore. Checked here, now that $GROUPS_FILE
     # is the artifact's.

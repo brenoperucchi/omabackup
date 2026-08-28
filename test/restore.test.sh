@@ -2012,3 +2012,82 @@ HOME="$HLH/link" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$HLREAL/rstate" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$HLART" >/dev/null 2>&1
 [[ -n "$(find "$HLREAL/rstate/restore" -path '*/replaced/.config/alacritty/alacritty.toml' 2>/dev/null)" ]] \
     && ok || fail "the backup was not filed at replaced/.config/alacritty/alacritty.toml"
+
+# ── an artifact declaring a mode this build does not understand is refused ──
+# restore_rows checks gm=="gen" explicitly and treats everything else as an
+# ordinary copy-restore -- no validation that the artifact's own mode is
+# one this build actually understands, unlike assert_manifest_understood's
+# KNOWN_MODES check at collect time (never run against the ARTIFACT's own
+# manifest). A PoC (a group manifest hand-edited to mode:future-mode)
+# confirmed the result: restore planned and offered a plain restore row
+# for it, exactly as though an unknown mode were simply mode:copy.
+UMH="$(mktemp -d)"; UMR="$UMH/repo"
+mkdir -p "$UMR/configs/foo"
+git init -q "$UMR"; git -C "$UMR" config user.email t@t; git -C "$UMR" config user.name t
+printf 'x\n' >"$UMR/configs/foo/file"
+git -C "$UMR" add -A && git -C "$UMR" commit -qm one
+cat >"$UMH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"g","label":"G","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/foo"]}]}
+JSON
+mkdir -p "$UMH/home/.config/foo"
+printf 'x\n' >"$UMH/home/.config/foo/file"
+HOME="$UMH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$UMH/g.json" \
+    OMABACKUP_STATE="$UMH/home/.state" OMABACKUP_REPO="$UMR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+UMART="$(ls -t "$UMH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+UMX="$(mktemp -d)"; tar -C "$UMX" -xf <(zstd -dc "$UMART")
+python3 -c "
+import json
+p = '$UMX/tool/groups.default.json'
+g = json.load(open(p))
+g['groups'][0]['mode'] = 'future-mode'
+json.dump(g, open(p,'w'))
+"
+( cd "$UMX" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+UMTAMPERED="$UMH/tampered.tar.zst"
+tar -C "$UMX" -cf - . | zstd -q -19 -T0 -o "$UMTAMPERED"
+
+it "restore refuses an artifact whose manifest declares an unknown mode"
+HOME="$UMH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$UMH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$UMTAMPERED" >/dev/null 2>&1 \
+    && fail "restore planned successfully against an unknown mode" || ok
+
+# ── a targets-list parse failure is a distinct refusal, not a quarantine ────
+# _restore_in_range's own inner jq parse of $targets had no status a caller
+# could check -- a failure there produced the same empty read-loop a
+# genuinely out-of-range version does, and _restore_verdict printed a
+# `quarantine` verdict citing a real-looking (but never actually checked)
+# incompatibility instead of refusing to plan at all.
+TPH="$(mktemp -d)"; TPR="$TPH/repo"
+mkdir -p "$TPR/configs/hypr"
+git init -q "$TPR"; git -C "$TPR" config user.email t@t; git -C "$TPR" config user.name t
+printf 'bind = SUPER, Q\n' >"$TPR/configs/hypr/bindings.conf"
+git -C "$TPR" add -A && git -C "$TPR" commit -qm one
+cat >"$TPH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"compositor","label":"Compositor","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/hypr"]}]}
+JSON
+mkdir -p "$TPH/home"
+HOME="$TPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$TPH/g.json" \
+    OMABACKUP_STATE="$TPH/home/.state" OMABACKUP_REPO="$TPR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+TPART="$(ls -t "$TPH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+mkdir -p "$TPH/stub"
+cat >"$TPH/stub/jq" <<STUBEOF
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == '.[]?' ]]; then exit 9; fi
+done
+exec $(command -v jq) "\$@"
+STUBEOF
+chmod +x "$TPH/stub/jq"
+
+it "restore does not report quarantine when the targets list itself fails to parse"
+TPOUT="$(PATH="$TPH/stub:$PATH" HOME="$TPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$TPH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$TPART" 2>&1)"
+[[ "$TPOUT" != *quarantine* ]] \
+    && ok || fail "reported quarantine instead of a distinct parse failure: $TPOUT"
+
+it "and refuses to plan instead"
+assert_contains "$TPOUT" "could not be confirmed"
