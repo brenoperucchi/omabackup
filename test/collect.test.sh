@@ -462,3 +462,155 @@ PATH="$PCH/stub:$PATH" HOME="$PCH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="
     OMABACKUP_STATE="$PCH/home/.state" OMABACKUP_REPO="$PCR" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
     && fail "reported success despite the plugin's own rsync copy failing" || ok
+
+# ── a partial staging wipe is refused, not treated as a clean collect ───────
+# rm -rf "$STAGING" had its own status ignored, and mkdir -p right after
+# only confirms the directory still exists -- it says nothing about what
+# is left inside it. A PoC (a stub rm that fails only for $STAGING, with a
+# stale file already sitting there) confirmed the result: collect reported
+# success, and the stale file stayed in staging alongside the new
+# collection, ready for a later sync to republish it.
+STH="$(mktemp -d)"
+mkdir -p "$STH/.config/app"
+printf 'new\n' >"$STH/.config/app/current.conf"
+cat >"$STH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/app"]}]}
+JSON
+mkdir -p "$STH/.state/staging/.config/old"
+printf 'leftover\n' >"$STH/.state/staging/.config/old/leftover"
+mkdir -p "$STH/stub"
+cat >"$STH/stub/rm" <<'STUB'
+#!/bin/bash
+for a in "$@"; do [[ "$a" == *staging ]] && exit 9; done
+exec /usr/bin/rm "$@"
+STUB
+chmod +x "$STH/stub/rm"
+
+it "collect refuses when it cannot clear stale staging content first"
+PATH="$STH/stub:$PATH" HOME="$STH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$STH/g.json" \
+    OMABACKUP_STATE="$STH/.state" XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
+    && fail "reported success despite stale staging content surviving" || ok
+
+# ── a dirty plugin whose status query fails is not treated as clean ─────────
+# `[[ -z "$(git status --porcelain 2>/dev/null)" ]]` read a FAILED query
+# the same way it reads a genuinely clean plugin -- both are empty output.
+# A PoC (git status stubbed to fail only for this plugin) confirmed the
+# result: a plugin with real uncommitted customization was classified
+# "git" with no patch at all, and the customization never entered the
+# backup.
+DPH="$(mktemp -d)"; DPR="$DPH/repo"
+mkdir -p "$DPR/x"
+git init -q "$DPR"; git -C "$DPR" config user.email t@t; git -C "$DPR" config user.name t
+printf 'x\n' >"$DPR/x/f"
+git -C "$DPR" add -A && git -C "$DPR" commit -qm one
+cat >"$DPH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"plugins","label":"Plugins","mode":"triple","coupled":false,"critical":false,
+  "paths":["~/.config/omarchy/plugins"]}]}
+JSON
+mkdir -p "$DPH/upstream"
+git init -q --bare "$DPH/upstream" >/dev/null 2>&1
+mkdir -p "$DPH/home/.config/omarchy/plugins/myplugin"
+git -C "$DPH/home/.config/omarchy/plugins/myplugin" init -q
+git -C "$DPH/home/.config/omarchy/plugins/myplugin" config user.email t@t
+git -C "$DPH/home/.config/omarchy/plugins/myplugin" config user.name t
+git -C "$DPH/home/.config/omarchy/plugins/myplugin" remote add origin "$DPH/upstream"
+printf 'x\n' >"$DPH/home/.config/omarchy/plugins/myplugin/init.lua"
+git -C "$DPH/home/.config/omarchy/plugins/myplugin" add -A
+git -C "$DPH/home/.config/omarchy/plugins/myplugin" commit -qm base
+printf 'CUSTOMIZED\n' >"$DPH/home/.config/omarchy/plugins/myplugin/init.lua"
+mkdir -p "$DPH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'if [[ "$1" == "-C" && "$3" == "status" ]]; then exit 9; fi\n'
+  printf 'exec /usr/bin/git "$@"\n'
+} >"$DPH/stub/git"; chmod +x "$DPH/stub/git"
+
+it "collect refuses when a dirty plugin's own status query fails"
+PATH="$DPH/stub:$PATH" HOME="$DPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$DPH/g.json" \
+    OMABACKUP_STATE="$DPH/home/.state" OMABACKUP_REPO="$DPR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
+    && fail "reported success despite the plugin's own status query failing" || ok
+
+# ── a plugin patch that could not actually be computed is not reported as ───
+# ── captured ──────────────────────────────────────────────────────────────
+# _capture_patch's own body ended in `rm -f "$tmp_index"`, so its return
+# status was ALWAYS that rm's (almost always 0) regardless of whether
+# `git diff HEAD` right before it succeeded. A PoC (git diff stubbed to
+# fail) confirmed the result: an empty patch file, classification
+# "git+patch" printed anyway, rc=0 -- the customization silently reduced
+# to nothing.
+GDH="$(mktemp -d)"
+mkdir -p "$GDH/upstream"
+git init -q --bare "$GDH/upstream" >/dev/null 2>&1
+mkdir -p "$GDH/plugin"
+git -C "$GDH/plugin" init -q
+git -C "$GDH/plugin" config user.email t@t
+git -C "$GDH/plugin" config user.name t
+git -C "$GDH/plugin" remote add origin "$GDH/upstream"
+printf 'x\n' >"$GDH/plugin/init.lua"
+git -C "$GDH/plugin" add -A
+git -C "$GDH/plugin" commit -qm base
+printf 'CUSTOMIZED\n' >"$GDH/plugin/init.lua"
+mkdir -p "$GDH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'if [[ "$1" == "-C" && "$3" == "diff" ]]; then exit 9; fi\n'
+  printf 'exec /usr/bin/git "$@"\n'
+} >"$GDH/stub/git"; chmod +x "$GDH/stub/git"
+
+it "capture_plugin refuses when git diff HEAD fails while writing the patch"
+GDOUT="$(PATH="$GDH/stub:$PATH" bash -c '
+    source lib/plugin-capture.sh
+    mkdir -p "$1/patches" "$1/local"
+    capture_plugin "$2" "$1/patches" "$1/local" "$1/manifest.txt"
+    echo "rc=$?"
+' _ "$GDH/out" "$GDH/plugin")"
+[[ "$GDOUT" == *"rc=1"* ]] \
+    && ok || fail "expected rc=1, got: $GDOUT"
+
+it "and no empty patch file was left claiming the customization was captured"
+[[ ! -s "$GDH/out/patches/plugin.patch" ]] \
+    && ok || fail "a patch file exists despite git diff having failed"
+
+# ── a manifest entry write that fails is refused, not silently skipped ──────
+# printf ... >>"$manifest" had its own status discarded -- a manifest this
+# cannot append to (pointing at a nonexistent directory here) left the
+# plugin classified "git" and reported successfully, with no entry
+# recorded to reinstall it from.
+MWH="$(mktemp -d)"
+mkdir -p "$MWH/upstream"
+git init -q --bare "$MWH/upstream" >/dev/null 2>&1
+mkdir -p "$MWH/plugin"
+git -C "$MWH/plugin" init -q
+git -C "$MWH/plugin" config user.email t@t
+git -C "$MWH/plugin" config user.name t
+git -C "$MWH/plugin" remote add origin "$MWH/upstream"
+printf 'x\n' >"$MWH/plugin/init.lua"
+git -C "$MWH/plugin" add -A
+git -C "$MWH/plugin" commit -qm base
+
+it "capture_plugin refuses when it cannot write the plugin manifest entry"
+bash -c '
+    source lib/plugin-capture.sh
+    mkdir -p "$1/patches" "$1/local"
+    capture_plugin "$2" "$1/patches" "$1/local" "/does/not/exist/manifest.txt"
+' _ "$MWH/out" "$MWH/plugin" >/dev/null 2>&1 \
+    && fail "capture_plugin succeeded despite the manifest write failing" || ok
+
+# ── a mode:gen group with no generator this tool recognizes is refused ──────
+# The case statement in collect_generated had no catch-all: an empty or
+# unrecognized generator field fell through every branch having generated
+# nothing, and collect still counted the group as collected. A manifest
+# this cannot interpret is refused, not treated as a group with nothing to
+# generate.
+UGH="$(mktemp -d)"
+mkdir -p "$UGH/.config/app"
+cat >"$UGH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"weird","label":"Weird","mode":"gen","coupled":false,"critical":true,"generator":"nonexistent-thing"}]}
+JSON
+
+it "collect refuses a mode:gen group whose generator field names nothing this tool runs"
+HOME="$UGH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$UGH/g.json" \
+    OMABACKUP_STATE="$UGH/.state" XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
+    && fail "reported success for a generator this tool does not recognize" || ok

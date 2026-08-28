@@ -669,8 +669,26 @@ cmd_collect() {
     # publish_staging happily republishes it. Proven by the desktop group's
     # first run, before trackedRepoPath existed, leaving 63 stray files behind
     # that a later, correct collect kept finding and republishing.
-    rm -rf "$STAGING"
-    mkdir -p "$STAGING"
+    # A partial wipe (one nested file this cannot remove) used to fall
+    # straight through to mkdir -p, which merely confirms the directory
+    # still exists and says nothing about what is left inside it. A PoC
+    # (a stub rm that fails only for $STAGING) confirmed the result:
+    # collect reported success, and a stale file from a group that no
+    # longer declares that path stayed in staging alongside the new
+    # collection -- exactly what this rm exists to prevent,
+    # publish_staging happily republishing it on the next sync.
+    #
+    # rm's own status is not checked directly, though -- rm -rf can fail
+    # to remove the now-empty directory SHELL itself (its parent lacking
+    # write permission is enough) while still having cleared everything
+    # actually inside it, which mkdir -p a line down handles fine either
+    # way. What matters is whether anything is left INSIDE staging after
+    # both have run, checked explicitly rather than inferred from rm's
+    # exit code alone.
+    rm -rf "$STAGING" 2>/dev/null
+    mkdir -p "$STAGING" || die "could not create $(_tilde "$STAGING")"
+    [[ -z "$(find "$STAGING" -mindepth 1 -print -quit 2>/dev/null)" ]] \
+        || die "could not clear $(_tilde "$STAGING") before collecting into it -- stale files remain"
     local id mode p e dest n=0 excrc rc
     # groups_ids failing here is not a smaller problem than any other -- it is
     # a WORSE one: the manifest this machine's own trusted groups.default.json
@@ -816,13 +834,24 @@ write_coverage() {
     while read -r id; do
         [[ -n "$id" ]] || continue
         gf=0; gb=0
-        case "$(group_field "$id" mode)" in
+        # group_field's own status, checked before it decides the case --
+        # a failed query and a mode this switch does not recognize looked
+        # identical (both empty, falling to the path-measurement branch
+        # below with the wrong semantics for a gen/triple group).
+        local gmode; gmode="$(group_field "$id" mode)" || { failed=1; break; }
+        case "$gmode" in
             # Every generator writes into the same .generated/ directory, so
             # counting the directory gave each group the whole of it -- packages
             # and systemd both reporting a number neither of them owned. Counted
             # per generator instead, from the same names collect_generated writes.
             gen)    local gen_id f
-                    gen_id="$(group_field "$id" generator)"
+                    # This query's own status, checked -- a failure here
+                    # produced the same empty string _generated_files
+                    # returns for an id with no entry, the for loop ran
+                    # zero times, and this group's line was written with
+                    # files=0 bytes=0 as though that were a real
+                    # measurement rather than one that could not be taken.
+                    gen_id="$(group_field "$id" generator)" || { failed=1; break; }
                     for f in $(_generated_files "$gen_id"); do
                         local gsz
                         gsz="$(_staged_size "$STAGING/.generated/$f")" || { failed=1; break; }
@@ -948,7 +977,7 @@ collect_triple() {
     dir="$(_expand "$(head -1 <<<"$gp")")"
     [[ -d "$dir" ]] || return 0
     mkdir -p "$STAGING/.plugins/patches" "$STAGING/.plugins/local"
-    : >"$STAGING/.plugins/manifest.txt"
+    : >"$STAGING/.plugins/manifest.txt" || die "could not create $(_tilde "$STAGING/.plugins/manifest.txt")"
     for p in "$dir"/*/; do
         [[ -d "$p" ]] || continue
         pid="$(basename "$p")"; [[ "$pid" == .* ]] && continue
@@ -1014,20 +1043,18 @@ collect_tracked_only() {
 }
 
 collect_generated() {
-    local id="$1" gen; gen="$(group_field "$id" generator)"
+    local id="$1" gen; gen="$(group_field "$id" generator)" || die "could not read group $id's generator from the manifest"
     mkdir -p "$STAGING/.generated"
-    # Every command below, checked -- none was. A PoC (pacman replaced with
-    # something that always exits 1) confirmed the result: collect reported
-    # success, and all three package lists were staged EMPTY rather than
-    # not staged at all. sync --commit publishing that is not a missing
-    # update, it is erasing hundreds of real package names the repo
-    # already held with a file that has none -- worse than the collect
-    # simply having skipped this group.
-    # `>` truncates/creates its target as part of setting up the redirect,
-    # before the command on its left ever runs -- an empty list from a
-    # failing command is not "not written," it is written empty. Removed
-    # explicitly on the way out, so a refused generator leaves nothing
-    # behind for a later run (or a careless glob) to mistake for real data.
+    # Every command below has its own status checked, and refuses rather
+    # than silently writing empty: `>` truncates/creates its target as
+    # part of setting up the redirect, before the command on its left ever
+    # runs, so an empty list from a failing command is not "not written,"
+    # it is written empty -- a PoC (pacman replaced with something that
+    # always exits 1) confirmed collect otherwise reports success while
+    # staging all three package lists empty, and sync --commit publishing
+    # that erases hundreds of real package names the repo already held.
+    # Removed explicitly on refusal, so nothing is left behind for a later
+    # run (or a careless glob) to mistake for real data.
     case "$gen" in
         packages)
             pacman -Qqe >"$STAGING/.generated/pkgs-explicit.txt" 2>/dev/null \
@@ -1045,6 +1072,13 @@ collect_generated() {
                 | awk '{print $1}' >"$STAGING/.generated/systemd-system.txt"
             (( ${PIPESTATUS[0]} == 0 )) \
                 || { rm -f "$STAGING/.generated/systemd-system.txt"; die "could not list enabled system units (systemctl failed)"; } ;;
+        # A group declared mode:gen with no generator field at all, or one
+        # naming a generator this switch does not recognize, fell through
+        # every branch above and reached the end having generated nothing
+        # -- collect still counted this group as collected. A manifest
+        # this cannot interpret is refused, not treated as a group with
+        # nothing to generate.
+        *) die "group $id is mode:gen but its generator ('$gen') is not one this tool knows how to run" ;;
     esac
     (( JSON )) || printf '  %s✓%s %s %s(generated)%s\n' "$GREEN" "$NC" "$id" "$DIM" "$NC"
 }

@@ -38,8 +38,14 @@ _capture_patch() {
     [[ -n "$real_index" && -f "$real_index" ]] && cp "$real_index" "$tmp_index"
 
     GIT_INDEX_FILE="$tmp_index" git -C "$plugin" add -N -- . 2>/dev/null || true
+    # git diff's own status, checked -- a bare `rm -f "$tmp_index"` right
+    # after it, with nothing capturing diff's exit code first, made this
+    # function's own return status whatever `rm -f` reported (almost always
+    # 0) regardless of whether the diff itself succeeded.
     GIT_INDEX_FILE="$tmp_index" git -C "$plugin" diff HEAD
+    local diff_rc=$?
     rm -f "$tmp_index"
+    return "$diff_rc"
 }
 
 # capture_plugin <plugin_dir> <patch_dir> <local_dir> <manifest_file>
@@ -74,14 +80,28 @@ capture_plugin() {
     # The commit matters as much as the URL: without it a restore installs
     # whatever upstream HEAD is today, which may have moved -- and then the
     # patch no longer applies.
-    printf '%s %s %s\n' "$id" "$url" "$sha" >>"$manifest"
+    #
+    # This write's own status, checked -- a manifest this cannot append to
+    # (the destination pointing at a directory, a disk-full moment) used
+    # to be silent: collect proceeded, classified the plugin "git", and
+    # the one line that lets a restore reinstall it never landed anywhere.
+    printf '%s %s %s\n' "$id" "$url" "$sha" >>"$manifest" || return 1
 
-    if [[ -z "$(git -C "$plugin" status --porcelain 2>/dev/null)" ]]; then
+    # git status's own status, checked -- a query that failed produced the
+    # same empty output a genuinely clean plugin does, and a dirty plugin
+    # was classified "git" with no patch at all: the local customization
+    # this whole function exists to capture never entered the backup, and
+    # collect still reported success.
+    local porcelain; porcelain="$(git -C "$plugin" status --porcelain 2>/dev/null)" || return 1
+    if [[ -z "$porcelain" ]]; then
         rm -f "$patch_dir/$id.patch"
         echo "git"
         return
     fi
 
-    _capture_patch "$plugin" >"$patch_dir/$id.patch"
+    # _capture_patch's own status, checked -- git diff HEAD failing used
+    # to write an empty patch file and still classify the plugin
+    # "git+patch", indistinguishable from a genuinely trivial diff.
+    _capture_patch "$plugin" >"$patch_dir/$id.patch" || return 1
     echo "git+patch"
 }

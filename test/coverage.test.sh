@@ -261,3 +261,38 @@ printf '#!/bin/bash\nexit 1\n' >"$GJH/stub/sha256sum"; chmod +x "$GJH/stub/sha25
 
 it "and reads as unknown, not as a match, once sha256sum breaks at read time"
 assert_eq "$(PATH="$GJH/stub:$PATH" _cov_env "$GJH" verify --json | jq -r '.groups[0].files')" "null"
+
+# ── write_coverage's own generator-field query failing is not a real zero ───
+# gen_id="$(group_field "$id" generator)" had its status discarded -- a
+# failed query produced the same empty string _generated_files returns for
+# an id with no entry, the for loop over it ran zero times, and this
+# group's coverage line was written with files=0 bytes=0 as though that
+# were a genuine measurement of an actually-empty group, not one that
+# could not be measured at all. Called directly (not through collect,
+# which now refuses this same query failure earlier, before
+# write_coverage ever runs) to isolate write_coverage's own check.
+WGH="$(mktemp -d)"
+mkdir -p "$WGH/.state/staging/.generated"
+printf 'pkg1\npkg2\n' >"$WGH/.state/staging/.generated/pkgs-explicit.txt"
+cat >"$WGH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"packages","label":"Packages","mode":"gen","coupled":false,"critical":true,"generator":"packages"}]}
+JSON
+mkdir -p "$WGH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *"generator"* ]] && exit 9; done\n'
+  printf 'exec %s "$@"\n' "$(command -v jq)"
+} >"$WGH/stub/jq"; chmod +x "$WGH/stub/jq"
+
+it "write_coverage refuses when a generated group's own generator field cannot be queried"
+WGOUT="$(PATH="$WGH/stub:$PATH" HOME="$WGH" OMABACKUP_GROUPS="$WGH/g.json" OMABACKUP_STATE="$WGH/.state" bash -c '
+    source bin/omabackup >/dev/null 2>&1
+    write_coverage
+    echo "rc=$?"
+')"
+[[ "$WGOUT" == *"rc=1"* ]] \
+    && ok || fail "expected rc=1, got: $WGOUT"
+
+it "and no false zero-count record was written"
+[[ ! -s "$WGH/.state/coverage.json" ]] \
+    && ok || fail "a coverage record was written despite the measurement having failed"
