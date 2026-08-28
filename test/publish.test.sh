@@ -510,3 +510,38 @@ chmod 755 "$PDTH/repo/configs/app" 2>/dev/null
 
 it "a dst.tmp that cannot be unlinked is refused before the redirect can write through it"
 assert_eq "$(cat "$PDTH/outside/victim.json" 2>/dev/null)" "victim-original"
+
+# ── a failed write of the --files-from list is not reported as published ────
+# printf '%s\0' "${pfiles[@]}" >"$pflist" had its own status discarded --
+# a write that failed left $pflist empty or truncated, --files-from copied
+# fewer files than pfiles actually named, rsync itself still exited 0 for
+# whatever it WAS given, and every name in pfiles was still added to
+# written regardless. `enable -n printf` plus a stub that fails only on
+# this exact format string (%s\0, used nowhere else printf builds this
+# specific list) reproduces it without touching any other printf call in
+# the same run.
+PFH="$(mktemp -d)"
+mkdir -p "$PFH/staging/.plugins/local/mytheme" "$PFH/repo"
+printf 'plugin-a\n' >"$PFH/staging/.plugins/local/mytheme/a.txt"
+git init -q "$PFH/repo"; git -C "$PFH/repo" config user.email t@t; git -C "$PFH/repo" config user.name t
+mkdir -p "$PFH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'if [[ "$1" == '"'"'%%s\\0'"'"' ]]; then exit 1; fi\n'
+  printf 'exec /usr/bin/printf "$@"\n'
+} >"$PFH/stub/printf"; chmod +x "$PFH/stub/printf"
+
+PFOUT="$(bash -c '
+    enable -n printf
+    PATH="$1/stub:$PATH"
+    source lib/publish.sh
+    n="$(publish_staging "$2" "$3")"
+    printf "rc=%s n=%s" "$?" "$n"
+' _ "$PFH" "$PFH/staging" "$PFH/repo")"
+
+it "publish_staging does not report a plugin file as published when its files-from list failed to write"
+[[ "$PFOUT" == rc=1* ]] \
+    && ok || fail "expected a nonzero rc, got: $PFOUT"
+
+it "and the file was not actually copied into the repo"
+[[ -z "$(find "$PFH/repo/configs/omarchy/plugins" -type f 2>/dev/null)" ]] \
+    && ok || fail "a file landed in the repo despite the list write failing"

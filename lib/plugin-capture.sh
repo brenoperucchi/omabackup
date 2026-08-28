@@ -48,7 +48,15 @@ capture_plugin() {
     local plugin="${1%/}" patch_dir="$2" local_dir="$3" manifest="$4"
     local id; id="$(basename "$plugin")"
 
-    [[ -d "$plugin/.git" ]] || { _capture_local "$plugin" "$local_dir" "$id"; echo "local"; return; }
+    # _capture_local's own status, checked at both call sites below -- a
+    # compound `{ _capture_local ...; echo "local"; return; }` discarded it
+    # either way, since a bare `return` reports the LAST command's status,
+    # and that was always the `echo`. A PoC (rsync stubbed to always fail)
+    # confirmed the result: a plugin whose rsync copy failed was still
+    # classified "local" and this function still returned 0 -- collect
+    # reported success for a plugin directory that was never actually
+    # copied into staging.
+    [[ -d "$plugin/.git" ]] || { _capture_local "$plugin" "$local_dir" "$id" || return 1; echo "local"; return; }
 
     local url sha
     url="$(git -C "$plugin" remote get-url origin 2>/dev/null || true)"
@@ -58,7 +66,7 @@ capture_plugin() {
     # patch has no base to apply against. Such a plugin used to be classified
     # "git" and stored nowhere at all -- it disappeared completely.
     if [[ -z "$url" || -z "$sha" ]]; then
-        _capture_local "$plugin" "$local_dir" "$id"
+        _capture_local "$plugin" "$local_dir" "$id" || return 1
         echo "local"
         return
     fi

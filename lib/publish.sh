@@ -400,7 +400,15 @@ publish_staging() {
                 # stdin, and a process substitution's fd was not reliably
                 # there by the time it did.
                 local pflist; pflist="$(mktemp)" || { failed=$((failed + 1)); continue; }
-                printf '%s\0' "${pfiles[@]}" >"$pflist"
+                # printf's own status, checked -- a write that failed (disk
+                # full, the temp directory going away mid-write) left
+                # $pflist empty or truncated, --files-from copied fewer
+                # files than pfiles actually names, rsync itself still
+                # exited 0 for the files it WAS given, and every name in
+                # pfiles was still added to written below regardless of
+                # whether rsync actually put it there.
+                printf '%s\0' "${pfiles[@]}" >"$pflist" \
+                    || { rm -f "$pflist"; failed=$((failed + 1)); continue; }
                 rsync -a --exclude '.git/' --files-from="$pflist" --from0 \
                     "$f" "$repo/configs/omarchy/plugins/$pid/"
                 local rsync_rc=$?

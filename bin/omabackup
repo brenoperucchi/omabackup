@@ -952,7 +952,13 @@ collect_triple() {
     for p in "$dir"/*/; do
         [[ -d "$p" ]] || continue
         pid="$(basename "$p")"; [[ "$pid" == .* ]] && continue
-        capture_plugin "$p" "$STAGING/.plugins/patches" "$STAGING/.plugins/local" "$STAGING/.plugins/manifest.txt" >/dev/null
+        # capture_plugin's own status, checked -- its own rsync/git-patch
+        # failures now propagate (lib/plugin-capture.sh), but this call
+        # site discarded whatever reached it (>/dev/null on the
+        # classification, no exit-code check at all) and counted the
+        # plugin as collected regardless.
+        capture_plugin "$p" "$STAGING/.plugins/patches" "$STAGING/.plugins/local" "$STAGING/.plugins/manifest.txt" >/dev/null \
+            || die "could not capture plugin $(_tilde "$p")"
         n=$((n + 1))
     done
     (( JSON )) || printf '  %s✓%s %s %s(%d, triple strategy)%s\n' "$GREEN" "$NC" "$id" "$DIM" "$n" "$NC"
@@ -1010,16 +1016,35 @@ collect_tracked_only() {
 collect_generated() {
     local id="$1" gen; gen="$(group_field "$id" generator)"
     mkdir -p "$STAGING/.generated"
+    # Every command below, checked -- none was. A PoC (pacman replaced with
+    # something that always exits 1) confirmed the result: collect reported
+    # success, and all three package lists were staged EMPTY rather than
+    # not staged at all. sync --commit publishing that is not a missing
+    # update, it is erasing hundreds of real package names the repo
+    # already held with a file that has none -- worse than the collect
+    # simply having skipped this group.
+    # `>` truncates/creates its target as part of setting up the redirect,
+    # before the command on its left ever runs -- an empty list from a
+    # failing command is not "not written," it is written empty. Removed
+    # explicitly on the way out, so a refused generator leaves nothing
+    # behind for a later run (or a careless glob) to mistake for real data.
     case "$gen" in
         packages)
-            pacman -Qqe >"$STAGING/.generated/pkgs-explicit.txt" 2>/dev/null
-            pacman -Qqem >"$STAGING/.generated/pkgs-aur.txt" 2>/dev/null
-            pacman -Qqen >"$STAGING/.generated/pkgs-arch.txt" 2>/dev/null ;;
+            pacman -Qqe >"$STAGING/.generated/pkgs-explicit.txt" 2>/dev/null \
+                || { rm -f "$STAGING/.generated/pkgs-explicit.txt"; die "could not list explicitly installed packages (pacman -Qqe failed)"; }
+            pacman -Qqem >"$STAGING/.generated/pkgs-aur.txt" 2>/dev/null \
+                || { rm -f "$STAGING/.generated/pkgs-aur.txt"; die "could not list foreign packages (pacman -Qqem failed)"; }
+            pacman -Qqen >"$STAGING/.generated/pkgs-arch.txt" 2>/dev/null \
+                || { rm -f "$STAGING/.generated/pkgs-arch.txt"; die "could not list native packages (pacman -Qqen failed)"; } ;;
         systemd)
             systemctl --user list-unit-files --state=enabled --no-legend 2>/dev/null \
                 | awk '{print $1}' >"$STAGING/.generated/systemd-user.txt"
+            (( ${PIPESTATUS[0]} == 0 )) \
+                || { rm -f "$STAGING/.generated/systemd-user.txt"; die "could not list enabled user units (systemctl --user failed)"; }
             systemctl list-unit-files --state=enabled --no-legend 2>/dev/null \
-                | awk '{print $1}' >"$STAGING/.generated/systemd-system.txt" ;;
+                | awk '{print $1}' >"$STAGING/.generated/systemd-system.txt"
+            (( ${PIPESTATUS[0]} == 0 )) \
+                || { rm -f "$STAGING/.generated/systemd-system.txt"; die "could not list enabled system units (systemctl failed)"; } ;;
     esac
     (( JSON )) || printf '  %s✓%s %s %s(generated)%s\n' "$GREEN" "$NC" "$id" "$DIM" "$NC"
 }
@@ -1645,7 +1670,15 @@ cmd_restore() {
     local into_created=0
     if [[ -n "$into" ]]; then
         [[ -d "$into" ]] || into_created=1
-        mkdir -p "$into" || { rm -rf "$x"; die "could not make $(_tilde "$into")"; }
+        # into_created used here too, not only at the three die sites
+        # after this one -- mkdir -p can fail partway (an intermediate
+        # component created, a later one refused) and still leave
+        # something behind at or under $into, and this die skipped the
+        # same cleanup every later one already gets.
+        mkdir -p "$into" || {
+            (( into_created )) && rmdir "$into" 2>/dev/null
+            rm -rf "$x"; die "could not make $(_tilde "$into")"
+        }
     fi
 
     # Captured before the override two lines down replaces it -- this

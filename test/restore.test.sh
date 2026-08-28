@@ -1374,6 +1374,31 @@ PATH="$IFH/stub:$PATH" HOME="$IFH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$
 [[ ! -e "$IFINTO" ]] \
     && ok || fail "the --into target was left behind after the plan itself failed"
 
+# ── and when mkdir -p "$into" itself is the thing that fails ────────────────
+# The cleanup above covers every die AFTER $into is created; mkdir -p
+# "$into" failing was a fourth site with the same gap, and mkdir -p can
+# fail partway (an intermediate component created, a later one refused)
+# and still leave something behind. A PoC (a wrapper that runs the real
+# mkdir -- so the directory genuinely exists afterward -- then reports
+# failure anyway) confirmed the result: rc=1, and the target directory
+# stayed behind.
+MDIH="$(mktemp -d)"; MDIART="$(_res_build "$MDIH" '["3.*","4.*"]')"
+MDIINTO="$MDIH/into-target"
+mkdir -p "$MDIH/stub"
+cat >"$MDIH/stub/mkdir" <<STUB
+#!/bin/bash
+/usr/bin/mkdir "\$@"
+if [[ "\$*" == *"$MDIINTO"* ]]; then exit 1; fi
+exit 0
+STUB
+chmod +x "$MDIH/stub/mkdir"
+
+it "a --into target is removed even when mkdir -p itself is what failed"
+PATH="$MDIH/stub:$PATH" HOME="$MDIH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$MDIH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --into "$MDIINTO" "$MDIART" >/dev/null 2>&1
+[[ ! -e "$MDIINTO" ]] \
+    && ok || fail "the --into target was left behind after mkdir -p itself failed"
+
 # ── the backup of a replaced file must land inside replaced/, not beside it ─
 # `local keep="$backup/${dest#"$HOME"/}"` stripped $HOME's literal string
 # from $dest -- not the normalized path _restore_contained had just checked
@@ -1775,3 +1800,113 @@ it "restore --apply does not lose a single-file group's original through an alia
 HOME="$SFTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$SFH/rstate" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$SFART" >/dev/null 2>&1
 assert_eq "$(cat "$SFTGT/.config/a.json")" '{"ORIGINAL":"operator original"}'
+
+# ── a symlink pointing OUTSIDE $HOME is still legitimate content ────────────
+# _restore_one's own source-containment check (added to close the tab-
+# injection source escape) used realpath -m on $src's FULL path, which
+# follows the final component too -- and $src can legitimately BE a
+# symlink whose own target lives outside $HOME (a config symlinked to a
+# package-installed default is an ordinary, honest thing to back up). A PoC
+# confirmed the regression this introduced: an artifact carrying exactly
+# such a symlink, nothing malicious about it, was refused outright by the
+# new check -- "restored 0 files, 1 could not be written" -- where the
+# pre-f3cea20 _restore_one had correctly restored it as a symlink (-P,
+# never followed). Checked against dirname($src) now instead, the same
+# distinction _publish_contained already draws for the write side: the
+# traversal this exists to catch (an injected $rel with ".." in it) is
+# fully caught by the DIRECTORY containing $src resolving outside the
+# worktree, without also refusing a symlink whose own target is legitimate
+# content.
+SLH="$(mktemp -d)"; SLR="$SLH/repo"
+mkdir -p "$SLR/configs/app"
+git init -q "$SLR"; git -C "$SLR" config user.email t@t; git -C "$SLR" config user.name t
+ln -s /etc/hostname "$SLR/configs/app/config.link"
+git -C "$SLR" add -A && git -C "$SLR" commit -qm one
+cat >"$SLH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/app"]}]}
+JSON
+mkdir -p "$SLH/home/.config/app"
+ln -s /etc/hostname "$SLH/home/.config/app/config.link"
+HOME="$SLH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$SLH/g.json" \
+    OMABACKUP_STATE="$SLH/home/.state" OMABACKUP_REPO="$SLR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+SLART="$(ls -t "$SLH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+SLTGT="$(mktemp -d)"
+
+it "a symlink whose own target is outside HOME still restores as a symlink"
+HOME="$SLTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$SLH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$SLART" >/dev/null 2>&1
+assert_eq "$(readlink "$SLTGT/.config/app/config.link" 2>/dev/null)" "/etc/hostname"
+
+# ── a jq failure in _restore_verdict is refused, not taken as a real answer ─
+# bv/bm/targets were all captured with their own status discarded --
+# `// "0"` only degrades a query that SUCCEEDED against a null/absent
+# field, and says nothing about one that never completed. A PoC (a jq stub
+# that prints "0" for the watermark query and then exits 1) confirmed the
+# result: the fake "0" passed the numeric-format check same as a genuine
+# "no migrations" answer would, and a forward verdict was computed and
+# offered against an artifact whose own manifest could not actually be
+# read.
+JVH="$(mktemp -d)"; JVR="$JVH/repo"
+mkdir -p "$JVR/configs/hypr"
+git init -q "$JVR"; git -C "$JVR" config user.email t@t; git -C "$JVR" config user.name t
+printf 'bind = SUPER, Q\n' >"$JVR/configs/hypr/bindings.conf"
+git -C "$JVR" add -A && git -C "$JVR" commit -qm one
+cat >"$JVH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"compositor","label":"Compositor","mode":"copy","coupled":true,"critical":false,"paths":["~/.config/hypr"]}]}
+JSON
+mkdir -p "$JVH/home/.local/state/omarchy/migrations"
+printf 'old\n' >"$JVH/home/.local/state/omarchy/migrations/123.sh"
+HOME="$JVH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$JVH/g.json" \
+    OMABACKUP_STATE="$JVH/home/.state" OMABACKUP_REPO="$JVR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+JVART="$(ls -t "$JVH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+JVTGT="$(mktemp -d)"
+mkdir -p "$JVTGT/.local/state/omarchy/migrations"
+printf 'x\n' >"$JVTGT/.local/state/omarchy/migrations/999999999.sh"
+mkdir -p "$JVH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *"migrationWatermark"* ]] && { echo 0; exit 1; }; done\n'
+  printf 'exec %s "$@"\n' "$(command -v jq)"
+} >"$JVH/stub/jq"; chmod +x "$JVH/stub/jq"
+
+it "restore refuses when the watermark query fails, even if it printed a valid-looking 0"
+PATH="$JVH/stub:$PATH" HOME="$JVTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$JVH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$JVART" >/dev/null 2>&1 \
+    && fail "restore planned a verdict from a watermark query that failed" || ok
+
+# ── restore_rows refuses when a generated group's own generator query fails ─
+# group_field "$id" generator was nested directly inside
+# $(_generated_files "$(...)") -- a failed query produced the same empty
+# string _generated_files' own case statement returns for an id it
+# genuinely has no entry for, and the for loop over its output ran zero
+# times either way. A PoC (jq failing only the .generator query) confirmed
+# the result: "0 files would be restored", with no mention at all of the
+# generated package list a healthy plan would have pointed the operator at
+# to read themselves.
+GBH="$(mktemp -d)"; GBR="$GBH/repo"
+mkdir -p "$GBR/lists"
+git init -q "$GBR"; git -C "$GBR" config user.email t@t; git -C "$GBR" config user.name t
+printf 'pkg1\npkg2\n' >"$GBR/lists/pkgs-explicit.txt"
+git -C "$GBR" add -A && git -C "$GBR" commit -qm one
+cat >"$GBH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"packages","label":"Packages","mode":"gen","coupled":false,"critical":true,"generator":"packages"}]}
+JSON
+mkdir -p "$GBH/home"
+HOME="$GBH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$GBH/g.json" \
+    OMABACKUP_STATE="$GBH/home/.state" OMABACKUP_REPO="$GBR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+GBART="$(ls -t "$GBH/home/.state/bundles"/*.tar.zst 2>/dev/null | head -1)"
+mkdir -p "$GBH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'for a in "$@"; do [[ "$a" == *"generator"* ]] && exit 9; done\n'
+  printf 'exec %s "$@"\n' "$(command -v jq)"
+} >"$GBH/stub/jq"; chmod +x "$GBH/stub/jq"
+
+it "restore refuses to plan when a generated group's own generator field cannot be queried"
+PATH="$GBH/stub:$PATH" HOME="$GBH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$GBH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$GBART" >/dev/null 2>&1 \
+    && fail "restore planned successfully despite the generator field query failing" || ok

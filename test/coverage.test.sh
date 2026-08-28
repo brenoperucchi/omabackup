@@ -90,7 +90,19 @@ cat >"$GH/g.json" <<'JSON'
  {"id":"packages","label":"Packages","mode":"gen","coupled":false,"critical":true,"generator":"packages"},
  {"id":"systemd","label":"Services","mode":"gen","coupled":false,"critical":false,"generator":"systemd"}]}
 JSON
-_cov_env "$GH" collect >/dev/null
+# systemctl --user has no session bus to talk to under this suite's own
+# XDG_RUNTIME_DIR=/nonexistent (deliberate, to keep tests from touching the
+# real user's systemd) -- genuinely fails here, which collect_generated now
+# refuses on rather than silently staging empty lists. Stubbed so this spec
+# tests count attribution, not whether a login session bus exists.
+mkdir -p "$GH/stub"
+{ printf '#!/bin/bash\n'
+  printf 'case "$*" in\n'
+  printf '  *--user*) echo "a.service enabled enabled" ;;\n'
+  printf '  *)        echo "b.service enabled enabled" ;;\n'
+  printf 'esac\n'
+} >"$GH/stub/systemctl"; chmod +x "$GH/stub/systemctl"
+PATH="$GH/stub:$PATH" _cov_env "$GH" collect >/dev/null
 GP="$(_cov_env "$GH" verify --json | jq -r '.groups[] | select(.id=="packages") | .files')"
 GS="$(_cov_env "$GH" verify --json | jq -r '.groups[] | select(.id=="systemd") | .files')"
 

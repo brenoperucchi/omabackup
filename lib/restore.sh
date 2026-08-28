@@ -57,9 +57,19 @@ _restore_in_range() {
 #              and found broken hours later.
 _restore_verdict() {
     local m="$1" bv bm targets tv tc tm
-    bv="$(jq -r '.omarchy.version // "unknown"' "$m" 2>/dev/null)"
-    bm="$(jq -r '.omarchy.migrationWatermark // "0"' "$m" 2>/dev/null)"
-    targets="$(jq -c '.supportedTargets // []' "$m" 2>/dev/null)"
+    # Each query's own status, checked -- 2>/dev/null discarded stderr, but
+    # nothing checked jq's exit code either. `// "0"` only degrades a query
+    # that SUCCEEDED against a null/absent field; it says nothing about one
+    # that never completed at all. A PoC confirmed the gap: a jq that
+    # printed "0" and then exited 1 produced a watermark that passed the
+    # numeric-format check below same as a genuine "no migrations" answer
+    # would, and the verdict this artifact's manifest could not actually be
+    # read for was decided anyway. Refused as return 2 -- this is the
+    # artifact's own manifest, the same side of the distinction this
+    # function's other two returns already draw.
+    bv="$(jq -r '.omarchy.version // "unknown"' "$m" 2>/dev/null)" || return 2
+    bm="$(jq -r '.omarchy.migrationWatermark // "0"' "$m" 2>/dev/null)" || return 2
+    targets="$(jq -c '.supportedTargets // []' "$m" 2>/dev/null)" || return 2
     IFS=$'\t' read -r tv tc tm <<<"$(omarchy_identity)"
 
     if ! _restore_in_range "$tv" "$targets"; then
@@ -482,7 +492,17 @@ restore_rows() {
             # renames these on the way in (systemd-user.txt becomes
             # lists/systemd-user-enabled.txt) and a restore that looked for the
             # staging name would find nothing and say nothing.
-            for f in $(_generated_files "$(group_field "$id" generator)"); do
+            # group_field's own status, checked -- nested directly inside
+            # $(_generated_files "$(...)") it was not, and a failed query
+            # produced the same empty string _generated_files' own case
+            # statement returns for an id it genuinely has no entry for.
+            # Either way the for loop below ran zero times and said
+            # nothing: "no generated lists for this group" and "could not
+            # find out which lists this group generates" looked identical,
+            # and a recovery plan silently omitted the report rows that
+            # point at whatever this artifact's package/systemd lists are.
+            local gen; gen="$(group_field "$id" generator)" || return 1
+            for f in $(_generated_files "$gen"); do
                 rel="$(_generated_repo_name "$f")" || continue
                 [[ -e "$wt/$rel" ]] && printf 'report\t%s\t%s\t-\n' "$id" "$rel"
             done
@@ -713,7 +733,22 @@ _restore_one() {
     # filesystem and copied it into the target under an unrelated name.
     # Refused before existence is even asked -- -e on a path outside the
     # worktree can be true, which is exactly the danger.
-    _path_contained "$src" "$x/worktree" || return 1
+    #
+    # dirname($src)'s containment, not $src's own -- realpath -m follows
+    # the FINAL component too, and $src can legitimately be a symlink whose
+    # own target lives outside the worktree (a theme config symlinked to a
+    # package-installed default, say). A PoC confirmed the regression this
+    # introduced: an honest artifact with such a symlink -- unrelated to
+    # the injection this check exists to close -- was refused outright,
+    # rc=1, "could not be written", where fe29845's _restore_one had
+    # correctly restored it as a symlink (never following it, per the `-P`
+    # a few lines below). The traversal this exists to catch (a $rel with
+    # "../" in it, not a symlink at the leaf) is fully caught by the
+    # DIRECTORY containing $src resolving outside the worktree -- checking
+    # only that, the same distinction _publish_contained already draws for
+    # the write side in lib/publish.sh, closes the injection without also
+    # refusing legitimate content.
+    _path_contained "$(dirname "$src")" "$x/worktree" || return 1
     [[ -e "$src" || -L "$src" ]] || return 1
     # Checked here too, not only when the row was planned. restore_rows decides
     # whether a row is ever offered to this function, but a function that

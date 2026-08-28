@@ -407,3 +407,58 @@ HOME="$RSH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$RSH/g.json" \
 it "and nothing was staged for it"
 [[ -z "$(find "$RSH/home/.state/staging" -type f 2>/dev/null)" ]] \
     && ok || fail "staging held a file despite the copy having failed"
+
+# ── a generator's own command failing is refused, not staged empty ──────────
+# collect_generated ran pacman/systemctl with their status discarded --
+# not even fed to a variable, just redirected and forgotten. A PoC (pacman
+# replaced with something that always exits 1) confirmed the result:
+# collect reported success, and the three package lists were staged EMPTY
+# rather than not staged at all. Publishing that is not a missing update --
+# it is erasing whatever real package list the repo already held with a
+# file that names none.
+GEH="$(mktemp -d)"
+mkdir -p "$GEH/.config/app"; printf 'x\n' >"$GEH/.config/app/f.txt"
+cat >"$GEH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"packages","label":"Packages","mode":"gen","coupled":false,"critical":true,"generator":"packages"}]}
+JSON
+mkdir -p "$GEH/stub"
+printf '#!/bin/bash\nexit 1\n' >"$GEH/stub/pacman"; chmod +x "$GEH/stub/pacman"
+
+it "collect refuses when a generator's own command fails"
+PATH="$GEH/stub:$PATH" HOME="$GEH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$GEH/g.json" \
+    OMABACKUP_STATE="$GEH/.state" XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
+    && fail "reported success despite pacman failing outright" || ok
+
+it "and no empty package list was staged in its place"
+[[ -z "$(find "$GEH/.state/staging" -type f 2>/dev/null)" ]] \
+    && ok || fail "an empty generated list was staged despite the generator failing"
+
+# ── a plugin's local capture failing is refused, not counted as collected ───
+# _capture_local's own rsync copy was never checked by either of its two
+# callers in capture_plugin -- both discarded it via a compound
+# `{ _capture_local ...; echo "local"; return; }`, where a bare `return`
+# reports the LAST command's status (the echo, always 0), not
+# _capture_local's. A PoC (rsync stubbed to always fail) confirmed the
+# result: collect reported success for a plugin directory that was never
+# actually copied into staging.
+PCH="$(mktemp -d)"; PCR="$PCH/repo"
+mkdir -p "$PCR/x"
+git init -q "$PCR"; git -C "$PCR" config user.email t@t; git -C "$PCR" config user.name t
+printf 'x\n' >"$PCR/x/f"
+git -C "$PCR" add -A && git -C "$PCR" commit -qm one
+cat >"$PCH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"plugins","label":"Plugins","mode":"triple","coupled":false,"critical":false,
+  "paths":["~/.config/omarchy/plugins"]}]}
+JSON
+mkdir -p "$PCH/home/.config/omarchy/plugins/myplugin"
+printf 'x\n' >"$PCH/home/.config/omarchy/plugins/myplugin/f.txt"
+mkdir -p "$PCH/stub"
+printf '#!/bin/bash\nexit 1\n' >"$PCH/stub/rsync"; chmod +x "$PCH/stub/rsync"
+
+it "collect refuses when a plugin's local capture fails to copy"
+PATH="$PCH/stub:$PATH" HOME="$PCH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$PCH/g.json" \
+    OMABACKUP_STATE="$PCH/home/.state" OMABACKUP_REPO="$PCR" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
+    && fail "reported success despite the plugin's own rsync copy failing" || ok
