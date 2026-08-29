@@ -135,7 +135,19 @@ _bundle_manifest() {
     contents_json="$(printf '%s' "$contents_tsv" | jq -R -s 'split("\n") | map(select(length>0) | split("\t")
                 | {path:.[2], sha256:.[0], size:(.[1]|tonumber)})')" || return 1
 
-    jq -n \
+    # contents_json goes through a FILE, not --argjson: Linux caps any single
+    # argv string at MAX_ARG_STRLEN (128KB), independent of the total ARG_MAX
+    # budget -- a review round confirmed the real machine this project runs
+    # on is already at roughly half that (~712 tracked files), and a repo of
+    # ~1000+ files (not an exotic dotfiles size) crossed it outright: `jq:
+    # Argument list too long`, the manifest never built, and the message
+    # named neither the limit nor the fix. --slurpfile reads the array
+    # through a file descriptor, which has no such per-argument ceiling.
+    local contents_file; contents_file="$(mktemp)" || return 1
+    printf '%s' "$contents_json" >"$contents_file"
+
+    local doc rc
+    doc="$(jq -n \
         --arg host "$(_hostname)" \
         --arg created "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
         --arg toolcommit "$(_tool_commit)" \
@@ -153,7 +165,7 @@ _bundle_manifest() {
                                              critical: (.critical // false),
                                              enabled: (.enabled != false)}]' "$GROUPS_FILE")" \
         --argjson verify "$vdoc" \
-        --argjson contents "$contents_json" \
+        --slurpfile contentsArr "$contents_file" \
         '{schemaVersion: 1,
           tool: {name: "omabackup", commit: $toolcommit},
           host: $host, createdAt: $created, name: $name,
@@ -162,7 +174,7 @@ _bundle_manifest() {
           supportedTargets: $targets,
           groups: $groups,
           verify: $verify,
-          contents: $contents,
+          contents: $contentsArr[0],
           destinations: [],
           restore: [
             "zstd -dc <this file> | tar -x -C <somewhere>",
@@ -170,7 +182,10 @@ _bundle_manifest() {
             "# or read <somewhere>/worktree/ directly -- no git required",
             "# the tool that made this is at <somewhere>/tool/bin/omabackup",
             "cd restored-repo && git remote set-url origin <the URL under .repo.remotes>"
-          ]}'
+          ]}')"; rc=$?
+    rm -f "$contents_file"
+    (( rc == 0 )) || return $rc
+    printf '%s' "$doc"
 }
 
 _restore_readme() {

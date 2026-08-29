@@ -77,6 +77,15 @@ dest_state() { jq -r "${2}" "$(dest_state_file "$1")" 2>/dev/null || printf ''; 
 dest_state_write() {
     local id="$1" doc="$2" p; p="$(dest_state_file "$id")"
     mkdir -p "$(dirname "$p")" || return 1
+    # rm -f first: `>` follows a symlink already sitting at "$p.tmp" instead
+    # of replacing it -- the exact defect `_publish_file` (lib/publish.sh)
+    # was already fixed against, spotted here by a review round of the
+    # restore journal's own copy of this idiom (restore_record in
+    # lib/restore.sh). A pre-planted "$p.tmp" -> somewhere-else would have
+    # this write land through the link, and the mv right after would move
+    # the LINK itself over the real state file -- every future write for
+    # this destination silently redirected from then on.
+    rm -f "$p.tmp" 2>/dev/null
     printf '%s\n' "$doc" >"$p.tmp" && mv "$p.tmp" "$p"
 }
 

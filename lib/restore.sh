@@ -868,3 +868,88 @@ _restore_one() {
     if [[ -e "$dest" || -L "$dest" ]]; then return 1; fi
     cp -Pp "$src" "$dest" 2>/dev/null || return 1
 }
+
+# ── the durable restore journal ─────────────────────────────────────────────
+# `restore --apply` is deliberately never launched by the panel itself (the
+# restore-panel design round settled on a terminal handoff, not an in-panel
+# apply) -- but the panel still needs to say something once that terminal
+# closes, and it cannot watch a process it never started. This is the
+# record that makes that possible: one file, one destination-state-style
+# atomic write (mkdir -p + write-to-.tmp + mv, the same idiom
+# dest_state_write already uses), holding the outcome of the most recent
+# --apply run regardless of whether it succeeded, partially succeeded, or
+# failed outright. A plan-only run writes nothing here, the same as it
+# writes nothing anywhere else.
+#
+# A SIBLING of restore/, not a file inside it: restore/ is the directory
+# holding one mktemp -d slot per --apply run (.../restore/<stamp>-XXXX/), and
+# a spec (`ls "$state/restore" | wc -l` counting how many such slots exist)
+# confirmed directly that a file dropped into that same directory is counted
+# as a slot too, off-by-one against every caller that enumerates it that way.
+RESTORE_LAST_FILE_REL="restore-last.json"
+
+# restore_record <json-doc> -- overwrites the durable record with <json-doc>.
+# Never dies on failure: a restore that ran to completion but could not save
+# its own receipt should still exit reporting what it actually did, not fail
+# the whole command over a state-directory write -- but it DOES warn on
+# stderr now (a review round pointed out that "silent by design" and "silent
+# by omission" looked identical before this: a read-only state directory or a
+# full disk made the journal indistinguishable from one that had simply never
+# run). `rm -f "$p.tmp"` first, not `>` straight onto whatever name is
+# already there: a review round confirmed this is the exact symlink-follow
+# `_publish_file` (lib/publish.sh) was already fixed against -- a `.tmp` path
+# pre-planted as a symlink gets written THROUGH, and the `mv` right after
+# moves the link itself over the real file, leaving every future record
+# silently redirected wherever that link pointed.
+restore_record() {
+    local doc="$1" p="$OMABACKUP_STATE/$RESTORE_LAST_FILE_REL"
+    mkdir -p "$(dirname "$p")" 2>/dev/null || {
+        printf 'omabackup: could not make %s -- the restore journal was not saved\n' \
+            "$(dirname "$p")" >&2
+        return 1
+    }
+    rm -f "$p.tmp" 2>/dev/null
+    if printf '%s\n' "$doc" >"$p.tmp" 2>/dev/null && mv "$p.tmp" "$p" 2>/dev/null; then
+        return 0
+    fi
+    printf 'omabackup: could not save the restore journal at %s\n' "$p" >&2
+    rm -f "$p.tmp" 2>/dev/null
+    return 1
+}
+
+# restore_last_json -- the durable record; JSON null means exactly one thing
+# (no --apply has EVER run against this state directory -- the file does not
+# exist). A record that DOES exist but cannot be read as valid JSON
+# (truncated, corrupted, permissions) is a different fact and must never
+# collapse into that same null -- it becomes {"unreadable":true} instead, so
+# a consumer can never mistake "nothing to report" for "something happened
+# and I can't tell what."
+#
+# A review round found the previous version actively lying in this exact
+# spot: `jq -e .` PRINTS its value and only THEN exits non-zero when the
+# last token is itself `null`/`false`, or when valid JSON is followed by
+# trailing garbage -- so `jq -e . "$p" 2>/dev/null || printf 'null'` emitted
+# the parsed record with a second `null` appended right after it
+# ('{"ok":true} null'), which is not valid JSON at all. That went straight
+# into cmd_status's `--argjson lastrestore "$(restore_last_json)"` with no
+# `|| echo null` fallback (the only one of five neighbouring --argjson calls
+# missing it) -- jq refused the whole document, and `status --json` died
+# with NO field reaching the panel, not just this one. Captured into a
+# variable and validated BEFORE anything is printed, so this function now
+# only ever emits one clean, complete value.
+restore_last_json() {
+    local p="$OMABACKUP_STATE/$RESTORE_LAST_FILE_REL" raw jrc
+    [[ -f "$p" ]] || { printf 'null'; return 0; }
+    # jq's own exit status is checked, not just what it printed: jq parses a
+    # STREAM of top-level values by default, so a valid record followed by
+    # trailing garbage prints the valid value to stdout and only THEN fails
+    # on the garbage -- capturing stdout alone (the first version here)
+    # caught that record, re-validated it in isolation, and served it as
+    # good. A file is not "the bytes jq managed to emit before it choked."
+    raw="$(jq -c . "$p" 2>/dev/null)"; jrc=$?
+    if (( jrc == 0 )) && [[ -n "$raw" ]] && jq -e . >/dev/null 2>&1 <<<"$raw"; then
+        printf '%s' "$raw"
+        return 0
+    fi
+    printf '{"unreadable":true}'
+}

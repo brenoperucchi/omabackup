@@ -523,3 +523,27 @@ git -C "$NLR" add -A && git -C "$NLR" commit -qm one
 it "bundle refuses a tracked filename with an embedded newline, by name"
 NLOUT="$(_bundle_env "$NLH" "$NLR" bundle)"
 assert_contains "$NLOUT" "contains a tab or newline"
+
+# ── review round: a repo large enough to cross argv's per-string limit ─────
+# _bundle_manifest's `contents` array used to go through --argjson, and Linux
+# caps any SINGLE argv string at MAX_ARG_STRLEN (128KB) regardless of the
+# total ARG_MAX budget. A machine tracking ~700 files was already at roughly
+# half that; 1200 ordinary small files crosses it outright. Routed through a
+# file via --slurpfile instead, which has no such per-argument ceiling.
+LGH="$(mktemp -d)"; LGR="$LGH/repo"
+mkdir -p "$LGR/configs"
+git init -q "$LGR"; git -C "$LGR" config user.email t@t; git -C "$LGR" config user.name t
+for i in $(seq 1 1200); do printf 'x\n' >"$LGR/configs/file$i.txt"; done
+git -C "$LGR" add -A && git -C "$LGR" commit -qm one -q
+LGOUT="$(_bundle_env "$LGH" "$LGR" bundle)"
+
+it "bundle builds a manifest for a repo large enough to cross argv's per-string limit"
+assert_contains "$LGOUT" "verified restorable"
+
+it "and the artifact really carries all 1200 tracked files, not a truncated list"
+LGART="$(ls -t "$LGH/.state/bundles"/*.tar.zst | head -1)"
+LGX="$(mktemp -d)"; tar -C "$LGX" -xf <(zstd -dc "$LGART")
+# .contents lists every staged file, not just the repo's own -- the embedded
+# tool and worktree/restore metadata add a handful more entries, so this
+# counts the "configs/" ones specifically rather than the array's raw length.
+assert_eq "$(jq '[.contents[] | select(.path | startswith("worktree/configs/"))] | length' "$LGX/manifest.json")" "1200"

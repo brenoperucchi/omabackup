@@ -144,6 +144,94 @@ JSON
 it "an unknown mode aborts collect"
 assert_contains "$(_env "$H" "$G" collect)" "telepathy"
 
+# -- two groups cannot share one id ------------------------------------------------
+# id is the primary key group_field/group_paths/groups_ids trust to name
+# exactly one group -- a review round found that two objects sharing an id
+# (one enabled, one not) made those lookups return BOTH, merged, and a
+# disabled duplicate's own paths ended up restored as part of the enabled
+# group's plan. Refused at the manifest level now, for every command that
+# validates a manifest this way -- not only restore's own copy of this check
+# against an artifact's manifest.
+H="$(mktemp -d)"; G="$H/g.json"
+mkdir -p "$H/.config/a" "$H/.config/b"
+cat >"$G" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"g","label":"A","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/a"]},
+ {"id":"g","label":"B","mode":"copy","coupled":false,"critical":false,"enabled":false,"paths":["~/.config/b"]}]}
+JSON
+DUPOUT="$(_env "$H" "$G" collect)"
+
+it "a duplicate group id aborts collect"
+assert_contains "$DUPOUT" "duplicate group id"
+
+it "and names the id, not just that something is wrong"
+assert_contains "$DUPOUT" "duplicate group id g"
+
+it "and leaves no half-built staging either"
+[[ ! -d "$H/.state/staging" ]] && ok || fail "staging was created before aborting on a duplicate id"
+
+# -- review round: --groups' own gate must not accept a query that failed ---
+# `mapfile -t known < <(jq ...)` discarded the process substitution's exit
+# status -- a jq that emitted one real id and THEN failed left `known`
+# holding that partial read, and the loop below found the named group in it
+# same as it would have from a genuinely complete list. A jq wrapper that
+# fails only this one query (still printing a real id first) confirmed the
+# gap directly.
+GGH="$(mktemp -d)"; GGG="$GGH/g.json"
+mkdir -p "$GGH/.config/terminal"
+cat >"$GGG" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"terminal","label":"T","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/terminal"]}]}
+JSON
+GGSTUB="$(mktemp -d)"
+cat >"$GGSTUB/jq" <<'SH'
+#!/bin/bash
+for a in "$@"; do [[ "$a" == '.groups[]?.id // empty' ]] && { echo terminal; exit 9; }; done
+exec /usr/bin/jq "$@"
+SH
+chmod +x "$GGSTUB/jq"
+GGOUT="$(PATH="$GGSTUB:$PATH" HOME="$GGH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$GGG" \
+    OMABACKUP_STATE="$GGH/.state" XDG_RUNTIME_DIR=/nonexistent "$OB" collect --groups terminal 2>&1)"
+GGRC=$?
+
+it "a --groups gate whose own id query fails partway is refused, not accepted"
+[[ $GGRC -ne 0 ]] && ok || fail "collect --groups exited 0 despite its own gate query failing"
+
+it "and says the query itself is the problem"
+assert_contains "$GGOUT" "could not read"
+
+# -- review round: a live path with an embedded newline/tab is refused ------
+# group_paths emits paths newline-separated, and the plan JSON built from
+# restore_rows' output is tab-separated -- a live value containing either
+# byte desyncs what gets reported from what actually gets written. Refused
+# at manifest-validation time, the same way an id with the same bytes
+# already is.
+NLH="$(mktemp -d)"; NLG="$NLH/g.json"
+cat >"$NLG" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"weird","label":"W","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/foo\n~/.config/bar"]}]}
+JSON
+NLOUT="$(_env "$NLH" "$NLG" collect)"
+
+it "a live path containing an embedded newline aborts collect"
+assert_contains "$NLOUT" "tab or newline"
+
+it "and names the group, not just that something is wrong"
+assert_contains "$NLOUT" "group weird"
+
+TBH="$(mktemp -d)"; TBG="$TBH/g.json"
+cat >"$TBG" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"weird","label":"W","mode":"copy","coupled":false,"critical":false,
+  "paths":[{"live":"~/.config/foo\tbar","trackedRepoPath":"configs/safe"}]}]}
+JSON
+TBOUT="$(_env "$TBH" "$TBG" collect)"
+
+it "a live path containing an embedded tab aborts collect too"
+assert_contains "$TBOUT" "tab or newline"
+
 # -- staging never accumulates stale content --------------------------------------
 # A path a group used to declare, or a trackedOnly name that stopped matching,
 # must not survive into the next collect: staging mirrors "right now", it is

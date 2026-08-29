@@ -221,9 +221,23 @@ finding() {
 # not.
 _assert_groups_filter_understood() {
     [[ -n "$ONLY" ]] || return 0
-    local want
+    local want known_out
     local -a known=() wanted=()
-    mapfile -t known < <(jq -r '.groups[]?.id // empty' "$GROUPS_FILE" 2>/dev/null)
+    # Captured and checked before populating the array, not fed straight into
+    # `mapfile -t known < <(...)` -- a process substitution's exit status is
+    # not observable at the `<` that closes it, so a jq failure here (an
+    # unreadable manifest, exactly the case this whole function exists to
+    # gate on) used to leave `known` simply empty, indistinguishable from a
+    # manifest that genuinely declares no groups. A review round's PoC (a jq
+    # wrapper failing only this one query) confirmed the result: --groups
+    # naming a real group still passed, because "unknown, could not check"
+    # and "known, and it is there" both read as the loop finding nothing to
+    # object to.
+    known_out="$(jq -r '.groups[]?.id // empty' "$GROUPS_FILE" 2>/dev/null)" || {
+        printf 'could not read this manifest'"'"'s own group ids at all'
+        return 1
+    }
+    mapfile -t known <<<"$known_out"
     IFS=',' read -r -a wanted <<<"$ONLY"
     for want in "${wanted[@]}"; do
         [[ -n "$want" ]] || continue
@@ -264,15 +278,29 @@ groups_ids() {
             | .[].id
         end' "$GROUPS_FILE"
 }
-group_field() { jq -r --arg id "$1" --arg f "$2" '.groups[] | select(.id==$id) | .[$f] // empty' "$GROUPS_FILE"; }
+# `select(.enabled != false)` on all three -- the same filter groups_ids()
+# already applies -- and not an accident of style: a review round found that
+# without it, a manifest declaring two objects with the SAME id (one
+# enabled, one not) made these functions return BOTH matches concatenated by
+# jq -r's one-line-per-match output, silently merging a disabled group's
+# `mode`/`paths` into whatever the caller expected to be a single enabled
+# group's own value. A PoC artifact with an enabled group "g" and a second
+# object also declaring "id":"g" but "enabled":false confirmed the result: a
+# `restore` plan produced by the enabled group's compatible mode still
+# included the DISABLED entry's paths, restoring content the manifest says
+# should not participate at all. groups_ids() itself already filtered this
+# way; these three never did, despite every caller assuming an id it got
+# FROM groups_ids() names exactly one group.
+group_field() { jq -r --arg id "$1" --arg f "$2" \
+    '.groups[] | select(.id==$id and .enabled != false) | .[$f] // empty' "$GROUPS_FILE"; }
 group_paths() {
-    jq -r --arg id "$1" '.groups[] | select(.id==$id) |
+    jq -r --arg id "$1" '.groups[] | select(.id==$id and .enabled != false) |
         (.paths // [])[] | if type=="object" then .live else . end' "$GROUPS_FILE"
 }
 # The repo subdirectory a trackedOnly path should be checked against, e.g.
 # ~/.local/bin -> scripts/local-bin. Empty when the entry has no override.
 group_tracked_repo_path() {
-    jq -r --arg id "$1" --arg live "$2" '.groups[] | select(.id==$id) |
+    jq -r --arg id "$1" --arg live "$2" '.groups[] | select(.id==$id and .enabled != false) |
         (.paths // [])[] | select(type=="object" and .live==$live) | .trackedRepoPath // empty' "$GROUPS_FILE"
 }
 
@@ -589,6 +617,11 @@ KNOWN_MODES='["link","copy","gen","triple"]'
 assert_manifest_understood() {
     local bad line
     local path_fields='["live","trackedRepoPath"]'
+    # The duplicate-id check below exists because id is the primary key every
+    # group_field/group_paths/groups_ids lookup trusts to name exactly one
+    # group -- two objects sharing one id silently merge in those lookups
+    # (jq -r prints one line per match), which is how a disabled duplicate
+    # was found leaking its own paths into an enabled group's restore.
     bad="$(jq -r --argjson k "$KNOWN_FIELDS" --argjson m "$KNOWN_MODES" --argjson pf "$path_fields" '
         [ (.groups[] | . as $g | (keys[] | select(. as $f | $k | index($f) | not)
             | "unknown field \(.) in group \($g.id)"))
@@ -597,6 +630,25 @@ assert_manifest_understood() {
         , (.groups[] | . as $g | ((.paths // [])[] | select(type=="object") | keys[]
             | select(. as $f | $pf | index($f) | not))
             | "unknown path field \(.) in group \($g.id)")
+        , (.groups | group_by(.id) | .[] | select(length > 1) | .[0].id
+            | "duplicate group id \(.) -- two groups cannot share one id")
+        # A tab or newline in a declared live/trackedRepoPath is a legal
+        # filesystem byte but not a legal byte in this project own
+        # tab-framed row format (restore_rows own action-group-rel-dest
+        # rows, and the plan JSON built straight from it): a review round
+        # found a live value containing an embedded newline turned ONE
+        # declared path into what every downstream newline-based reader
+        # treated as TWO, and a tab in one truncated the destination the
+        # plan JSON reported -- the apply wrote the real, full name; the
+        # plan described a different, shorter one. groups_ids already
+        # refuses this for id, for the identical reason; extended here to
+        # the path fields that feed the same pipeline.
+        , (.groups[] | . as $g | ((.paths // [])[] | if type=="object" then .live else . end)
+            | select(test("[\t\n]"))
+            | "group \($g.id) declares a live path containing a tab or newline")
+        , (.groups[] | . as $g | ((.paths // [])[] | select(type=="object") | .trackedRepoPath // empty)
+            | select(test("[\t\n]"))
+            | "group \($g.id) declares a trackedRepoPath containing a tab or newline")
         ] | .[]' "$GROUPS_FILE")"
     [[ -z "$bad" ]] && return 0
     printf '%somabackup: the manifest declares what the collector cannot honor:%s\n' "$RED" "$NC" >&2
@@ -1652,6 +1704,11 @@ cmd_restore() {
     done
     [[ -n "$artifact" ]] || die "restore needs an artifact: omabackup restore <file.tar.zst>"
     [[ -f "$artifact" ]] || die "no such artifact: $(_tilde "$artifact")"
+    # Canonicalized once, up front, and reused everywhere this run needs to
+    # name the artifact -- including the earliest journal write below, well
+    # before target/verdict are known.
+    local artifact_abs; artifact_abs="$(realpath -e "$artifact" 2>/dev/null || printf '%s' "$artifact")"
+    local started_at; started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     # realpath is what _restore_contained refuses on when it is missing --
     # correctly, since a containment check it cannot run is not a check. But
     # that failure is silent per file: every row would then be refused as
@@ -1717,6 +1774,25 @@ cmd_restore() {
         rm -rf "$x"; die "this artifact's own migration state could not be confirmed when it was built -- rebuild it on a healthy machine (check ~/.local/state/omarchy/migrations on the machine that built it)"
     fi
     IFS=$'\t' read -r verdict why <<<"$vout"
+
+    # An early, partial pending record -- apply only, and best-effort (never
+    # dies, same as every restore_record call). A review round pointed out
+    # that the contract promises the journal is written "regardless of
+    # outcome, even total failure," but every failure between here and the
+    # fuller pending write later (manifest mode validation, --groups
+    # filtering, restore_rows planning) used to `die` with no record ever
+    # created -- the panel would see whatever the PREVIOUS --apply had left,
+    # or nothing, either way indistinguishable from "this attempt never
+    # happened." target is not known yet (that needs $HOME's override and
+    # $into below) and is left null; the fuller write right before files
+    # start moving overwrites this with the complete picture once it exists.
+    if (( apply )); then
+        restore_record "$(jq -n \
+            --arg started "$started_at" --arg artifact "$artifact_abs" \
+            --arg verdict "$verdict" --arg why "$why" \
+            '{schemaVersion:1, startedAt:$started, finishedAt:null,
+              artifact:$artifact, target:null, verdict:$verdict, why:$why, ok:null}')"
+    fi
 
     local HOME="${into:-$HOME}"
     # Made regardless of plan or apply: _restore_contained needs $HOME to
@@ -1808,6 +1884,41 @@ cmd_restore() {
         _into_cleanup "$into" "$into_boundary"
         rm -rf "$x"; die "this artifact's own manifest declares a mode this build does not understand: $badm"
     fi
+    # Same reasoning as assert_manifest_understood's own duplicate-id check,
+    # run here against the ARTIFACT's manifest specifically -- a review round's
+    # PoC built exactly this: an artifact declaring an enabled group "g" and a
+    # second object ALSO id:"g" but enabled:false. group_field/group_paths
+    # (used throughout restore_rows below) matched both and merged them, so
+    # the disabled duplicate's own paths still ended up restored as part of
+    # the enabled group's plan. group_field/group_paths were fixed to filter
+    # enabled themselves too, but an artifact is untrusted input regardless --
+    # this refuses the ambiguity outright rather than depending on every
+    # future caller of those two functions getting the filter right.
+    local badd; badd="$(jq -r '.groups | group_by(.id) | .[] | select(length > 1) | .[0].id' \
+        "$GROUPS_FILE")" || {
+        _into_cleanup "$into" "$into_boundary"
+        rm -rf "$x"; die "could not check this artifact's own manifest for duplicate group ids"
+    }
+    if [[ -n "$badd" ]]; then
+        _into_cleanup "$into" "$into_boundary"
+        rm -rf "$x"; die "this artifact's own manifest declares the same group id more than once: $badd"
+    fi
+    # Same reasoning as assert_manifest_understood's tab/newline path check,
+    # run here against the ARTIFACT's manifest: restore_rows' row format and
+    # the plan JSON built from it are both tab-framed, and a `live` value
+    # carrying an embedded tab or newline (a legal filesystem byte, refused
+    # here anyway because it is not a legal byte in this framing) desynced
+    # what the plan reported from what --apply actually wrote.
+    local badp; badp="$(jq -r '
+        .groups[] | . as $g | ((.paths // [])[] | if type=="object" then .live else . end)
+        | select(test("[\t\n]")) | $g.id' "$GROUPS_FILE")" || {
+        _into_cleanup "$into" "$into_boundary"
+        rm -rf "$x"; die "could not check this artifact's own manifest for unsafe path characters"
+    }
+    if [[ -n "$badp" ]]; then
+        _into_cleanup "$into" "$into_boundary"
+        rm -rf "$x"; die "this artifact's own manifest declares a path with a tab or newline in group(s): $(printf '%s' "$badp" | tr '\n' ' ')"
+    fi
     # Deferred from the top-level check, which runs against this machine's own
     # manifest -- wrong file for restore. Checked here, now that $GROUPS_FILE
     # is the artifact's.
@@ -1821,9 +1932,24 @@ cmd_restore() {
         rm -rf "$x"; die "could not plan against the artifact's own manifest"
     }
 
+    # Both queries' own status is checked, not only their content: a review
+    # round pointed out that a query that FAILS (not "the field is absent,"
+    # which // "unknown" / // "0" already handle as a real default, but jq
+    # itself erroring) previously left $bv/$bm empty, and an empty $bm still
+    # passed straight through to the non-numeric-fallback guard below as
+    # though it had been legitimately read as zero -- the exact "an unknown
+    # failure quietly reads as a known-good value" shape this project treats
+    # as its central defect class, one field over from where it was already
+    # guarded.
     local bv bm
-    bv="$(jq -r '.omarchy.version // "unknown"' "$x/manifest.json")"
-    bm="$(jq -r '.omarchy.migrationWatermark // "0"' "$x/manifest.json")"
+    bv="$(jq -r '.omarchy.version // "unknown"' "$x/manifest.json")" || {
+        _into_cleanup "$into" "$into_boundary"
+        rm -rf "$x"; die "could not read this artifact's own Omarchy version from its manifest"
+    }
+    bm="$(jq -r '.omarchy.migrationWatermark // "0"' "$x/manifest.json")" || {
+        _into_cleanup "$into" "$into_boundary"
+        rm -rf "$x"; die "could not read this artifact's own migration watermark from its manifest"
+    }
     # Guarded the same way _restore_verdict guards its own copy. Unguarded, a
     # watermark that is not a bare integer -- read straight from a manifest
     # field nothing here controls -- reached --argjson as a literal and jq
@@ -1848,11 +1974,30 @@ cmd_restore() {
         esac
     fi
 
-    local a g rel dest nr=0 nq=0 nrep=0 na=0 nheld=0 nesc=0
+    # new vs replaced is a question `restore_rows` never answers on its own --
+    # its rows say WHAT would be written, not whether something is already
+    # sitting at that destination. Checked here, once, against the exact same
+    # $dest a plan or an apply would act on (this runs before either branch,
+    # under the same $HOME=${into:-$HOME} override both use), so the count is
+    # true of whichever one actually happens next. -L alongside -e: a
+    # dangling symlink already at $dest is something a restore would still
+    # replace, and -e alone is false for one.
+    #
+    # A snapshot, not a promise: for a PLAN this can go stale before an
+    # operator ever runs the --apply it describes (the handoff is to a
+    # separate terminal, on the operator's own schedule, possibly minutes
+    # later) -- something could appear or disappear at $dest in between. Not
+    # a safety gap: _restore_one makes its own -e/-L check at write time
+    # regardless of what this counted, so nothing is ever overwritten (or not)
+    # based on a stale read. This is informational only, and a UI should not
+    # present it as a guarantee.
+    local a g rel dest nr=0 nq=0 nrep=0 na=0 nheld=0 nesc=0 nnew=0 nreplaced=0
     while IFS=$'\t' read -r a g rel dest; do
         [[ -n "$a" ]] || continue
         case "$a" in
-            restore)    nr=$((nr + 1)) ;;
+            restore)    nr=$((nr + 1))
+                        if [[ -e "$dest" || -L "$dest" ]]; then nreplaced=$((nreplaced + 1))
+                        else nnew=$((nnew + 1)); fi ;;
             quarantine) nq=$((nq + 1)) ;;
             report)     nrep=$((nrep + 1)) ;;
             ambiguous)  na=$((na + 1)) ;;
@@ -1861,19 +2006,77 @@ cmd_restore() {
         esac
     done <<<"$rows"
 
+    # Blocked, not just counted: ambiguous and escape are the two row kinds
+    # that mean this artifact and this target actively disagree (a flattened
+    # collision, a destination outside the target home) -- the restore-panel
+    # mockup round asked for a single signal a UI can gate a handoff CTA on,
+    # rather than making every consumer re-derive "is this plan safe to act
+    # on" from six separate counters itself.
+    local blocked; blocked=$([[ $na -gt 0 || $nesc -gt 0 ]] && echo true || echo false)
+
+    # Absolute, always -- $HOME here is already the effective target
+    # (into:-$HOME, set above before either branch), so this is the same
+    # canonicalization for a --into preview directory and for the real home;
+    # a restore-picking UI showing this MUST say which machine's real home it
+    # is about to touch, per the restore-panel mockup round.
+    #
+    # realpath -e deliberately RESOLVES symlinks -- a review round noted this
+    # is a conscious choice, not an accident: on a machine where $HOME is
+    # itself a symlink (/home/user -> /mnt/data/user), this field names the
+    # real physical location the write lands on, not the nominal path a shell
+    # would print. That is the more useful fact for a field whose whole
+    # purpose is "which real place is about to be touched" -- the CLI command
+    # a UI hands to the terminal still uses $HOME as typed, and the two can
+    # cosmetically differ; they name the same place either way.
+    local target_mode="home" target_path
+    [[ -n "$into" ]] && target_mode="into"
+    target_path="$(realpath -e "$HOME" 2>/dev/null || printf '%s' "$HOME")"
+
     if (( ! apply )); then
         if (( JSON )); then
-            jq -n --arg verdict "$verdict" --arg why "$why" --arg version "$bv" \
-                --argjson watermark "$bm" \
-                --argjson counts "$(jq -n --argjson r "$nr" --argjson q "$nq" \
-                    --argjson h "$nheld" --argjson a "$na" --argjson g "$nrep" --argjson e "$nesc" \
-                    '{restore:$r, quarantine:$q, held:$h, ambiguous:$a, report:$g, escape:$e}')" \
-                --argjson rows "$(printf '%s' "$rows" | jq -R -s '
-                    split("\n") | map(select(length > 0) | split("\t")
-                    | {action:.[0], group:.[1], repo:.[2], dest:.[3]})')" \
-                '{schemaVersion:1, verdict:$verdict, why:$why,
+            # Every jq call that contributes to the document is checked now --
+            # a review round confirmed the gap directly: a jq wrapper made to
+            # fail on only ONE of these (rows_json, the groups summary, or the
+            # final assembly) made `restore --json` print NOTHING and still
+            # exit 0. A consumer that trusts exit status over content -- which
+            # is the whole point of using --json instead of scraping text --
+            # would read that as "an empty, trivially successful plan," not as
+            # the command having failed to report at all.
+            local rows_json counts_json groups_json plan_json
+            rows_json="$(printf '%s' "$rows" | jq -R -s '
+                split("\n") | map(select(length > 0) | split("\t")
+                | {action:.[0], group:.[1], repo:.[2], dest:.[3]})')" \
+                || { rm -rf "$x"; _into_cleanup "$into" "$into_boundary"
+                     die "could not serialize the plan's rows to JSON"; }
+            counts_json="$(jq -n --argjson r "$nr" --argjson q "$nq" \
+                --argjson h "$nheld" --argjson a "$na" --argjson g "$nrep" --argjson e "$nesc" \
+                --argjson nn "$nnew" --argjson nrp "$nreplaced" \
+                '{restore:$r, new:$nn, replaced:$nrp, quarantine:$q, held:$h,
+                  ambiguous:$a, report:$g, escape:$e}')" \
+                || { rm -rf "$x"; _into_cleanup "$into" "$into_boundary"
+                     die "could not serialize the plan's counts to JSON"; }
+            groups_json="$(printf '%s' "$rows_json" | jq '
+                group_by(.group) | map({
+                    id: .[0].group,
+                    restore: (map(select(.action=="restore"))|length),
+                    quarantine: (map(select(.action=="quarantine"))|length),
+                    held: (map(select(.action=="held"))|length),
+                    ambiguous: (map(select(.action=="ambiguous"))|length),
+                    report: (map(select(.action=="report"))|length),
+                    escape: (map(select(.action=="escape"))|length)})')" \
+                || { rm -rf "$x"; _into_cleanup "$into" "$into_boundary"
+                     die "could not serialize the plan's group summary to JSON"; }
+            plan_json="$(jq -n --arg verdict "$verdict" --arg why "$why" --arg version "$bv" \
+                --argjson watermark "$bm" --argjson blocked "$blocked" \
+                --arg tmode "$target_mode" --arg tpath "$target_path" \
+                --argjson counts "$counts_json" --argjson rows "$rows_json" --argjson groups "$groups_json" \
+                '{schemaVersion:1, verdict:$verdict, why:$why, blocked:$blocked,
+                  target:{mode:$tmode, path:$tpath},
                   from:{version:$version, migrationWatermark:$watermark},
-                  counts:$counts, rows:$rows}'
+                  counts:$counts, groups:$groups, rows:$rows}')" \
+                || { rm -rf "$x"; _into_cleanup "$into" "$into_boundary"
+                     die "could not build the plan's JSON document"; }
+            printf '%s\n' "$plan_json"
             rm -rf "$x"
             return 0
         fi
@@ -1921,6 +2124,10 @@ cmd_restore() {
     # Created only here, in the apply branch: a plan run used to make this
     # directory too, so "nothing was written" was said after something already
     # had been.
+    # started_at/artifact_abs are already set, from the top of this
+    # function -- startedAt names when this restore ATTEMPT began, not when
+    # writing began, so an early preflight failure's pending record (below)
+    # and this one agree on what "started" meant.
     local base
     mkdir -p "$OMABACKUP_STATE/restore" 2>/dev/null \
         || { rm -rf "$x"; die "could not make $(_tilde "$OMABACKUP_STATE/restore")"; }
@@ -1933,6 +2140,22 @@ cmd_restore() {
     # resolve, and one made lazily by mkdir -p alongside the write it was
     # meant to guard would have to exist already to pass that very check.
     mkdir -p "$quar" || { rm -rf "$x"; die "could not make $(_tilde "$quar")"; }
+
+    # A PENDING record, written before a single file moves -- a review round
+    # pointed out that without this, a process killed partway through the
+    # loop below (the exact moment the panel's handoff-and-wait exists to
+    # observe) left the PREVIOUS run's record in place, reporting an old
+    # success as though it were this run's outcome. finishedAt/ok stay null
+    # until the real one overwrites this after the loop; a reader that only
+    # ever sees this pending shape (the process died before finishing) now
+    # has an honest "incomplete," never a stale "done."
+    restore_record "$(jq -n \
+        --arg started "$started_at" --arg artifact "$artifact_abs" \
+        --arg tmode "$target_mode" --arg tpath "$target_path" \
+        --arg verdict "$verdict" --arg why "$why" \
+        '{schemaVersion:1, startedAt:$started, finishedAt:null,
+          artifact:$artifact, target:{mode:$tmode, path:$tpath},
+          verdict:$verdict, why:$why, ok:null}')"
 
     local ok=0 bad=0 qok=0 qbad=0
     while IFS=$'\t' read -r a g rel dest; do
@@ -1958,15 +2181,56 @@ cmd_restore() {
         esac
     done <<<"$rows"
 
+    # Recorded regardless of how this run turns out to be reported below --
+    # partially, or entirely, failed included. This is the ONLY way the panel
+    # (which never runs --apply itself; it hands the operator a command for
+    # their own terminal) can ever learn what happened once that terminal
+    # closes. A restore that fails to save its own receipt still reports its
+    # real outcome on stdout/exit status; restore_record swallows its own
+    # failure rather than turning a state-directory write into the reason the
+    # actual restore gets reported as having failed.
+    local finished_at run_ok journal_doc; finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    run_ok=$([[ $bad -eq 0 && $qbad -eq 0 && $nesc -eq 0 && $na -eq 0 ]] && echo true || echo false)
+    # journal_doc's own build is checked before restore_record ever sees it --
+    # a review round found the inner jq -n's status thrown away entirely: a
+    # wrapper failing that ONE call made restore_record receive an empty
+    # string, which it happily wrote as a valid-looking (but empty) file,
+    # `mv`'d into place with rc=0 -- a real, successful --apply left a journal
+    # indistinguishable from "nothing here to read." The PENDING record
+    # written before the loop above is deliberately left in place on this
+    # path instead: an honest "started, outcome unknown" beats an empty file
+    # that looks like a parseable non-answer.
+    if journal_doc="$(jq -n \
+        --arg started "$started_at" --arg finished "$finished_at" \
+        --arg artifact "$artifact_abs" --arg tmode "$target_mode" --arg tpath "$target_path" \
+        --arg verdict "$verdict" --arg why "$why" \
+        --argjson ok "$ok" --argjson bad "$bad" --argjson qok "$qok" --argjson qbad "$qbad" \
+        --argjson held "$nheld" --argjson ambiguous "$na" --argjson escaped "$nesc" \
+        --arg backup "$backup" --arg quar "$quar" --argjson runok "$run_ok" \
+        '{schemaVersion:1, startedAt:$started, finishedAt:$finished,
+          artifact:$artifact, target:{mode:$tmode, path:$tpath},
+          verdict:$verdict, why:$why,
+          restored:$ok, failed:$bad, quarantined:$qok, quarantineFailed:$qbad,
+          held:$held, ambiguous:$ambiguous, escaped:$escaped,
+          replacedAt:$backup, quarantineAt:$quar, ok:$runok}')" && [[ -n "$journal_doc" ]]
+    then
+        restore_record "$journal_doc"
+    else
+        printf 'omabackup: could not build the restore journal document -- the pending record from the start of this run was left in place\n' >&2
+    fi
+
     if (( JSON )); then
-        jq -n --arg verdict "$verdict" --arg why "$why" \
+        local apply_json
+        apply_json="$(jq -n --arg verdict "$verdict" --arg why "$why" \
             --argjson ok "$ok" --argjson bad "$bad" --argjson qok "$qok" --argjson qbad "$qbad" \
             --argjson held "$nheld" --argjson ambiguous "$na" --argjson escaped "$nesc" \
             --arg backup "$backup" --arg quar "$quar" \
             '{schemaVersion:1, verdict:$verdict, why:$why,
               restored:$ok, failed:$bad, quarantined:$qok, quarantineFailed:$qbad,
               held:$held, ambiguous:$ambiguous, escaped:$escaped,
-              replacedAt:$backup, quarantineAt:$quar}'
+              replacedAt:$backup, quarantineAt:$quar}')" \
+            || { rm -rf "$x"; die "restore wrote its files but could not build the JSON result document -- check the journal at $(_tilde "$OMABACKUP_STATE/$RESTORE_LAST_FILE_REL") for what actually happened"; }
+        printf '%s\n' "$apply_json"
     else
         printf '  %s✓%s restored %s files\n' "$GREEN" "$NC" "$ok"
         (( bad )) && printf '  %s✗%s %s could not be written\n' "$RED" "$NC" "$bad" >&2
@@ -2017,18 +2281,82 @@ cmd_status() {
               --arg destfile "$DESTINATIONS_FILE" \
               --arg denyfile "$SECRETS_DENY_FILE" \
               --arg statedir "$OMABACKUP_STATE" \
+              --argjson lastrestore "$(restore_last_json || echo null)" \
               '{schemaVersion:1, omarchy:{version:$v,channel:$c,migrationWatermark:$m},
                 supportedTargets:$t, staging:$s, destinations:$d,
                 scheduler:{active:$sch, fix:"omabackup install",
                            sync:$syncsched, push:$pushsched},
                 config:{repo:$repo, destinationsFile:$destfile,
                         denyList:$denyfile, state:$statedir},
-                stale:$stale, lastSync:$lastsync, lastSyncAgeSec:$age}'
+                stale:$stale, lastSync:$lastsync, lastSyncAgeSec:$age,
+                lastRestore:$lastrestore}'
     else
         printf '  Omarchy %s (%s) - migration watermark %s\n' "$ov" "$oc" "$om"
         printf '  restore range: %s\n' "$(jq -r '.supportedTargets|join(", ")' "$GROUPS_FILE")"
         printf '  groups: %s\n' "$(groups_ids | wc -l)"
         printf '  staging: %s\n' "$([ -d "$STAGING" ] && _tilde "$STAGING" || echo 'not collected yet')"
+    fi
+}
+
+# ── artifacts ────────────────────────────────────────────────────────────────
+# What `restore` could be pointed at. Exists because a restore-picking UI
+# cannot list a `dir` destination itself -- Quickshell.Io.Process is the only
+# I/O the panel is allowed, the same invariant status/verify already honor --
+# and because "no artifacts here" and "could not tell" must never render the
+# same way to a human about to trust one of these to restore their machine.
+cmd_artifacts() {
+    reject_flags artifacts "${@}"
+    require_tools jq find zstd tar
+    if (( JSON )); then
+        artifacts_json
+    else
+        local doc; doc="$(artifacts_json)"
+        local n; n="$(jq '.destinations | length' <<<"$doc")"
+        if (( n == 0 )); then
+            printf '  %sno dir destinations configured%s\n' "$DIM" "$NC"
+            return 0
+        fi
+        # "-" for a null error, not "": read with IFS=$'\t' collapses
+        # consecutive tabs the same way it collapses spaces (tab is one of
+        # bash's IFS-whitespace characters even when IFS is set to it alone),
+        # so an empty middle field here silently ate the delimiter and shifted
+        # every field after it by one -- confirmed directly, count read back
+        # empty for a destination with exactly one artifact.
+        jq -r '.destinations[] |
+            "\(.id)\t\(.path // "-")\t\(.state)\t\(.error // "-")\t\(.artifacts | length)"' <<<"$doc" \
+        | while IFS=$'\t' read -r id path state err count; do
+            [[ "$path" == "-" ]] && path=""
+            [[ "$err" == "-" ]] && err=""
+            case "$state" in
+                ok)          printf '  %s%-11s%s %s %s(%s artifact%s)%s\n' \
+                                 "$GREEN" "$id" "$NC" "$(_tilde "$path")" "$DIM" "$count" \
+                                 "$([[ "$count" == 1 ]] || echo s)" "$NC" ;;
+                empty)       printf '  %s%-11s%s %s %s(no artifacts yet)%s\n' \
+                                 "$DIM" "$id" "$NC" "$(_tilde "$path")" "$DIM" "$NC" ;;
+                unreachable) printf '  %s%-11s%s %s %sunreachable: %s%s\n' \
+                                 "$RED" "$id" "$NC" "$(_tilde "$path")" "$RED" "$err" "$NC" ;;
+                list-failed) printf '  %s%-11s%s %s %scould not list: %s%s\n' \
+                                 "$RED" "$id" "$NC" "$(_tilde "$path")" "$RED" "$err" "$NC" ;;
+            esac
+            # Every artifact this destination reports, valid or not -- the
+            # count above already includes invalid ones (a manifest that
+            # cannot be read does not make the file disappear from the
+            # destination), so the listing below must not silently drop them
+            # either. A review round caught exactly this: "(2 artifacts)"
+            # over a single visible row.
+            jq -r --arg id "$id" \
+                '.destinations[] | select(.id == $id) | .artifacts[] |
+                if .valid then "    \(.file)\t\(.host // "?")\t\(.omarchy.version // "?")\t\(.createdAt // "?")\tok"
+                else "    \(.file)\t-\t-\t-\tinvalid: \(.error // "unknown")" end' \
+                <<<"$doc" 2>/dev/null | while IFS=$'\t' read -r f host ver created ok; do
+                [[ -n "$f" ]] || continue
+                if [[ "$ok" == ok ]]; then
+                    printf '    %s%s%s  %s  omarchy %s  %s\n' "$DIM" "$f" "$NC" "$host" "$ver" "$created"
+                else
+                    printf '    %s%s%s  %s%s%s\n' "$DIM" "$f" "$NC" "$RED" "$ok" "$NC"
+                fi
+            done
+        done
     fi
 }
 
@@ -2040,6 +2368,7 @@ source "$OMABACKUP_ROOT/lib/bundle.sh"
 source "$OMABACKUP_ROOT/lib/destinations.sh"
 source "$OMABACKUP_ROOT/lib/secrets.sh"
 source "$OMABACKUP_ROOT/lib/restore.sh"
+source "$OMABACKUP_ROOT/lib/artifacts.sh"
 
 # Two levels: the loop below owns only what every command understands and
 # hands the rest, in order, to the command itself. It used to consume and shift
@@ -2088,6 +2417,7 @@ case "$CMD" in
     push)    cmd_push "${ARGS[@]}" ;;
     status)  reject_flags status "${ARGS[@]}"; cmd_status ;;
     restore) cmd_restore "${ARGS[@]}" ;;
+    artifacts) cmd_artifacts "${ARGS[@]}" ;;
     ""|help)
         cat <<'USAGE'
 omabackup <command> [--json] [--groups a,b]
@@ -2098,6 +2428,7 @@ omabackup <command> [--json] [--groups a,b]
   disable   stop them; nothing runs until enable
   collect   collect the groups into staging (does not touch the repo)
   verify    check that the backup covers what the system actually reads
+  artifacts list what a `dir` destination holds, with each one's own manifest
   restore   plan a restore from an artifact; --apply to write it
 
 The full cycle is collect -> diff -> verify -> commit. `collect` and `verify`

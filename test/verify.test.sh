@@ -146,7 +146,7 @@ cat >"$VPH/g.json" <<'JSON'
 JSON
 mkdir -p "$VPH/stub"
 { printf '#!/bin/bash\n'
-  printf 'for a in "$@"; do [[ "$a" == *"select(.id==\$id) | .[\$f]"* ]] && exit 9; done\n'
+  printf 'for a in "$@"; do [[ "$a" == *".[\$f] // empty"* ]] && exit 9; done\n'
   printf 'exec %s "$@"\n' "$(command -v jq)"
 } >"$VPH/stub/jq"; chmod +x "$VPH/stub/jq"
 

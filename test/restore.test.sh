@@ -48,6 +48,12 @@ _res_run() {  # _res_run <target-home> <state> <args...>
         XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$@" 2>&1
 }
 
+_res_status() {  # _res_status <target-home> <state>
+    local h="$1" st="$2"
+    HOME="$h" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$st" \
+        XDG_RUNTIME_DIR=/nonexistent "$OB" status --json 2>&1
+}
+
 RH="$(mktemp -d)"
 RART="$(_res_build "$RH" '["3.*","4.*"]')"
 
@@ -81,6 +87,157 @@ assert_eq "$(cat "$RTGT/.config/hypr/bindings.conf" 2>/dev/null)" 'bind = SUPER,
 
 it "including the state group, which lives outside .config"
 assert_eq "$(cat "$RTGT/.local/state/omarchy/theme" 2>/dev/null)" 'tokyo-night'
+
+# ── the durable restore journal ─────────────────────────────────────────────
+# The panel never runs --apply itself (the restore-panel design settled on a
+# terminal handoff), so this file is the only way it can ever learn what an
+# --apply run someone launched from a terminal actually did.
+it "an --apply run leaves a durable record behind"
+[[ -f "$RH/rstate/restore-last.json" ]] && ok || fail "no durable restore record was written"
+
+it "and the record's own restored count matches what actually happened"
+assert_eq "$(jq -r '.restored' "$RH/rstate/restore-last.json")" "3"
+
+it "status --json surfaces it as lastRestore"
+RSTATUS="$(_res_status "$RTGT" "$RH/rstate")"
+assert_eq "$(printf '%s' "$RSTATUS" | jq -r '.lastRestore.restored')" "3"
+
+it "lastRestore carries the target actually used, not just a count"
+assert_eq "$(printf '%s' "$RSTATUS" | jq -r '.lastRestore.target.path')" "$(realpath "$RTGT")"
+
+it "and lastRestore.target.mode is home -- no --into was given"
+assert_eq "$(printf '%s' "$RSTATUS" | jq -r '.lastRestore.target.mode')" "home"
+
+it "a clean run is marked ok"
+assert_eq "$(printf '%s' "$RSTATUS" | jq -r '.lastRestore.ok')" "true"
+
+it "a plan-only run never writes a durable record"
+NRSTATE="$(mktemp -d)"
+_res_run "$RTGT" "$NRSTATE" "$RART" >/dev/null 2>&1
+[[ ! -f "$NRSTATE/restore-last.json" ]] && ok || fail "a plan-only run wrote a durable record"
+
+it "before any --apply has ever run, status --json reports lastRestore as null, not missing or false"
+NULLSTATE="$(mktemp -d)"
+NULLSTATUS="$(_res_status "$RTGT" "$NULLSTATE")"
+assert_eq "$(printf '%s' "$NULLSTATUS" | jq -r '.lastRestore')" "null"
+
+# ── review round: a corrupted journal must not collapse into the same null ─
+# jq -e alone used to PRINT a truncated/garbage-suffixed value and only THEN
+# fail -- the printed fragment went straight into --argjson with no
+# validation, and status --json died with nothing reaching the panel at all.
+UNH="$(mktemp -d)"
+printf 'not json at all' >"$UNH/restore-last.json"
+UNOUT="$(_res_status "$(mktemp -d)" "$UNH")"
+
+it "an unreadable restore record is reported distinctly, not as null"
+assert_eq "$(printf '%s' "$UNOUT" | jq -r '.lastRestore.unreadable')" "true"
+
+it "and status --json itself still produces a valid, complete document"
+printf '%s' "$UNOUT" | jq -e . >/dev/null 2>&1 && ok || fail "status --json broke over a corrupted journal"
+
+GJH="$(mktemp -d)"
+printf '{"ok":true}\ngarbage-after-a-valid-value' >"$GJH/restore-last.json"
+GJOUT="$(_res_status "$(mktemp -d)" "$GJH")"
+
+it "valid JSON followed by trailing garbage is rejected as unreadable, not silently accepted"
+assert_eq "$(printf '%s' "$GJOUT" | jq -r '.lastRestore.unreadable')" "true"
+
+it "and does not crash status --json either"
+printf '%s' "$GJOUT" | jq -e . >/dev/null 2>&1 && ok || fail "status --json died on a corrupted journal"
+
+NLH="$(mktemp -d)"
+printf 'null' >"$NLH/restore-last.json"
+NLOUT="$(_res_status "$(mktemp -d)" "$NLH")"
+
+it "a record file that is literally the word null on disk is unreadable, not 'never ran'"
+assert_eq "$(printf '%s' "$NLOUT" | jq -r '.lastRestore.unreadable')" "true"
+
+# ── review round: restore_record must not write through a pre-planted symlink ─
+SLH="$(mktemp -d)"
+mkdir -p "$SLH/state" "$SLH/outside"
+printf 'sensitive\n' >"$SLH/outside/victim.json"
+ln -s "$SLH/outside/victim.json" "$SLH/state/restore-last.json.tmp"
+OMABACKUP_STATE="$SLH/state" bash -c 'source lib/restore.sh; restore_record "{\"ok\":true}"' >/dev/null 2>&1
+
+it "restore_record does not write through a symlink planted at its temp path"
+assert_eq "$(cat "$SLH/outside/victim.json")" "sensitive"
+
+it "and the real record still lands at the real path"
+assert_contains "$(cat "$SLH/state/restore-last.json" 2>/dev/null)" 'ok'
+
+# ── review round: a journal that cannot be saved warns, rather than staying silent ─
+RESTUB="$(mktemp -d)/locked"; mkdir -p "$RESTUB"; chmod 000 "$RESTUB" 2>/dev/null
+RERR="$(OMABACKUP_STATE="$RESTUB/nested" bash -c 'source lib/restore.sh; restore_record "{}"' 2>&1 >/dev/null)"
+chmod 755 "$RESTUB" 2>/dev/null
+
+it "restore_record warns on stderr when it cannot save, rather than failing silently"
+assert_contains "$RERR" "could not"
+
+# ── review round: every jq call building the plan JSON is now checked ──────
+# A wrapper failing just ONE of them (rows_json here) used to make
+# `restore --json` print nothing and still exit 0 -- a consumer trusting exit
+# status over content would read that as a trivially empty, successful plan.
+JFSTUB="$(mktemp -d)"
+cat >"$JFSTUB/jq" <<'SH'
+#!/bin/bash
+for a in "$@"; do [[ "$a" == "-R" ]] && exit 9; done
+exec /usr/bin/jq "$@"
+SH
+chmod +x "$JFSTUB/jq"
+JFTGT="$(mktemp -d)"
+JFOUT="$(PATH="$JFSTUB:$PATH" HOME="$JFTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$(mktemp -d)" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --json "$RART" 2>&1)"
+JFRC=$?
+
+it "a jq failure while serializing the plan's rows fails the command, not a silent empty success"
+[[ $JFRC -ne 0 ]] && ok || fail "restore --json exited 0 despite failing to serialize its own rows"
+
+it "and says what happened"
+assert_contains "$JFOUT" "could not serialize"
+
+# ── review round: a failed read of the artifact's own version/watermark ────
+# is refused, not silently reported as if it had succeeded.
+JBSTUB="$(mktemp -d)"
+cat >"$JBSTUB/jq" <<'SH'
+#!/bin/bash
+for a in "$@"; do [[ "$a" == *"omarchy.version"* ]] && exit 9; done
+exec /usr/bin/jq "$@"
+SH
+chmod +x "$JBSTUB/jq"
+JBTGT="$(mktemp -d)"
+JBRC=0
+PATH="$JBSTUB:$PATH" HOME="$JBTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$(mktemp -d)" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore "$RART" >/dev/null 2>&1 || JBRC=$?
+
+it "a failed query for the artifact's own Omarchy version fails the plan"
+[[ $JBRC -ne 0 ]] && ok || fail "restore exited 0 despite failing to read the artifact's own version"
+
+# ── review round: a preflight failure during --apply still leaves a record ─
+# Every die() between the verdict being computed and the write loop starting
+# used to leave NOTHING in the journal -- indistinguishable from an attempt
+# that never happened, or worse, from whatever a PREVIOUS --apply had left.
+JPSTUB="$(mktemp -d)"
+cat >"$JPSTUB/jq" <<'SH'
+#!/bin/bash
+for a in "$@"; do [[ "$a" == *'select(.mode as $x | $m | index($x) | not)'* ]] && exit 9; done
+exec /usr/bin/jq "$@"
+SH
+chmod +x "$JPSTUB/jq"
+JPTGT="$(mktemp -d)"; JPSTATE="$(mktemp -d)"
+PATH="$JPSTUB:$PATH" HOME="$JPTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$JPSTATE" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --apply "$RART" >/dev/null 2>&1
+
+it "a preflight failure during --apply still leaves a pending journal record, not nothing"
+[[ -f "$JPSTATE/restore-last.json" ]] && ok || fail "no journal record at all after a preflight failure"
+
+it "and the pending record is honest about not having finished"
+assert_eq "$(jq -r '.finishedAt' "$JPSTATE/restore-last.json")" "null"
+
+it "and does not claim ok:true or ok:false -- it never got that far"
+assert_eq "$(jq -r '.ok' "$JPSTATE/restore-last.json")" "null"
+
+it "but it does carry the artifact and the verdict already computed by that point"
+assert_eq "$(jq -r '.verdict' "$JPSTATE/restore-last.json")" "same"
 
 # ── what it replaces, it keeps ──────────────────────────────────────────────
 printf 'my own edit\n' >"$RTGT/.config/alacritty/alacritty.toml"
@@ -154,6 +311,85 @@ assert_contains "$(_res_run "$RTGT" "$RH/rstate" "$RART" "$RART")" "not two"
 
 it "an unknown flag is refused rather than ignored"
 assert_contains "$(_res_run "$RTGT" "$RH/rstate" "$RART" --force)" "unknown flag"
+
+# ── review round: two groups sharing one id, one of them disabled ──────────
+# group_field/group_paths matched BOTH objects and merged their output
+# (jq -r prints one line per match) -- a disabled duplicate's own paths ended
+# up restored as part of the enabled group's plan. This is the artifact's
+# OWN tool/groups.default.json that restore_rows actually consults, not
+# manifest.json's separate `groups` summary field -- tampering the wrong one
+# leaves the vulnerable path untouched, which is what a first version of
+# this fixture did.
+DUPH="$(mktemp -d)"; DUPR="$DUPH/repo"
+mkdir -p "$DUPR/configs/a" "$DUPR/configs/b"
+git init -q "$DUPR"; git -C "$DUPR" config user.email t@t; git -C "$DUPR" config user.name t
+printf 'ok\n' >"$DUPR/configs/a/f.txt"
+printf 'should never leak\n' >"$DUPR/configs/b/f.txt"
+git -C "$DUPR" add -A && git -C "$DUPR" commit -qm one -q
+cat >"$DUPH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"g","label":"G","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/a"]}]}
+JSON
+mkdir -p "$DUPH/home"
+HOME="$DUPH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$DUPH/g.json" OMABACKUP_STATE="$DUPH/home/.state" \
+    OMABACKUP_REPO="$DUPR" XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+DUPART="$(ls -t "$DUPH/home/.state/bundles"/*.tar.zst | head -1)"
+DUPX="$(mktemp -d)"
+tar -C "$DUPX" -xf <(zstd -dc "$DUPART")
+jq '.groups += [{"id":"g","label":"G2","mode":"copy","coupled":false,"critical":false,
+                 "enabled":false,"paths":["~/.config/b"]}]' \
+    "$DUPX/tool/groups.default.json" >"$DUPX/tool/groups.default.json.new" \
+    && mv "$DUPX/tool/groups.default.json.new" "$DUPX/tool/groups.default.json"
+( cd "$DUPX" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+DUPTAMPERED="$DUPH/tampered.tar.zst"
+( cd "$DUPX" && tar -cf - . | zstd -q -19 -T0 -o "$DUPTAMPERED" )
+DUPTGT="$(mktemp -d)"
+DUPOUT="$(_res_run "$DUPTGT" "$DUPH/rstate" "$DUPTAMPERED" --apply)"
+DUPRC=$?
+
+it "restore refuses an artifact whose own manifest declares a duplicate group id"
+[[ $DUPRC -ne 0 ]] && ok || fail "restore succeeded against a duplicate-id artifact"
+
+it "and says which id, rather than failing some other, unrelated way"
+assert_contains "$DUPOUT" "declares the same group id more than once: g"
+
+it "the disabled duplicate's content never reached the target"
+[[ ! -e "$DUPTGT/.config/b/f.txt" ]] && ok || fail "a disabled group's file leaked through a duplicate id"
+
+# ── review round: a live path with an embedded tab/newline in an artifact ──
+# Same reasoning as the manifest-level check above, exercised here against
+# the artifact's own tool/groups.default.json -- the file restore_rows
+# actually reads group definitions from.
+TNH="$(mktemp -d)"; TNR="$TNH/repo"
+mkdir -p "$TNR/configs/app"
+git init -q "$TNR"; git -C "$TNR" config user.email t@t; git -C "$TNR" config user.name t
+printf 'x\n' >"$TNR/configs/app/f.txt"
+git -C "$TNR" add -A && git -C "$TNR" commit -qm one -q
+cat >"$TNH/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/app"]}]}
+JSON
+mkdir -p "$TNH/home"
+HOME="$TNH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$TNH/g.json" OMABACKUP_STATE="$TNH/home/.state" \
+    OMABACKUP_REPO="$TNR" XDG_RUNTIME_DIR=/nonexistent "$OB" bundle >/dev/null 2>&1
+TNART="$(ls -t "$TNH/home/.state/bundles"/*.tar.zst | head -1)"
+TNX="$(mktemp -d)"
+tar -C "$TNX" -xf <(zstd -dc "$TNART")
+jq '.groups[0].paths = ["~/.config/app\n~/.config/evil"]' \
+    "$TNX/tool/groups.default.json" >"$TNX/tool/groups.default.json.new" \
+    && mv "$TNX/tool/groups.default.json.new" "$TNX/tool/groups.default.json"
+( cd "$TNX" && find . -type f ! -name SHA256SUMS -print0 | xargs -0 sha256sum >SHA256SUMS )
+TNTAMPERED="$TNH/tampered.tar.zst"
+( cd "$TNX" && tar -cf - . | zstd -q -19 -T0 -o "$TNTAMPERED" )
+TNTGT="$(mktemp -d)"
+TNOUT="$(_res_run "$TNTGT" "$TNH/rstate" "$TNTAMPERED")"
+TNRC=$?
+
+it "restore refuses an artifact whose manifest declares a path with an embedded newline"
+[[ $TNRC -ne 0 ]] && ok || fail "restore succeeded against a newline-in-path artifact"
+
+it "and names the group"
+assert_contains "$TNOUT" "app"
 
 # ── a declared path that reads past $HOME ────────────────────────────────────
 # `~/../<mark>/evil.conf` expands to a sibling of $HOME rather than anything
@@ -257,6 +493,22 @@ it "and it is not restored to either group's directory"
 _res_run "$COLTGT" "$COLH/rstate" "$COLART" --apply >/dev/null 2>&1
 [[ ! -e "$COLTGT/.config/one/a.txt" && ! -e "$COLTGT/.config/two/a.txt" ]] \
     && ok || fail "an ambiguous file was placed somewhere anyway"
+
+it "and the plan JSON reports blocked:true -- a UI can gate a handoff on this alone"
+COLJSON="$(HOME="$COLTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$COLH/rstate2" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --json "$COLART" 2>/dev/null)"
+assert_eq "$(printf '%s' "$COLJSON" | jq -r '.blocked')" "true"
+
+it "and the durable journal from the earlier --apply marks the run NOT ok"
+# rstate (not rstate2) is where the --apply two specs up actually wrote --
+# the ambiguous rows it hit make this the case a UI needs to render as
+# incomplete/failed, not indistinguishable from a clean restore.
+assert_eq "$(jq -r '.ok' "$COLH/rstate/restore-last.json")" "false"
+
+it "and its ambiguous count matches what the apply run actually reported"
+# Both colliding groups produce their own ambiguous row -- one destination
+# but two declarations that both claim it -- so this is 2, not 1.
+assert_eq "$(jq -r '.ambiguous' "$COLH/rstate/restore-last.json")" "2"
 
 # ── the migration markers, on a forward restore ──────────────────────────────
 # _restore_verdict said "the markers do not apply" while restore_rows applied
@@ -471,6 +723,56 @@ printf '%s' "$JSOUT" | jq -e . >/dev/null 2>&1 && ok || fail "not valid JSON: $J
 
 it "and it carries the verdict"
 assert_eq "$(printf '%s' "$JSOUT" | jq -r '.verdict')" "same"
+
+# ── the plan JSON carries the target, structured, always ────────────────────
+# The restore-panel mockup round's own reasoning: a picker showing this MUST
+# say which machine's real home a handoff command is about to touch, not
+# leave it implicit in the absence of an `--into` flag.
+it "target.mode is home when --into was not given"
+assert_eq "$(printf '%s' "$JSOUT" | jq -r '.target.mode')" "home"
+
+it "and target.path is the real target home, absolute"
+assert_eq "$(printf '%s' "$JSOUT" | jq -r '.target.path')" "$(realpath "$JSTGT")"
+
+it "target.mode is into when --into was given"
+INTOTGT="$(mktemp -d)"
+INTOOUT="$(HOME="$(mktemp -d)" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$JSH/rstate2" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --json "$JSART" --into "$INTOTGT" 2>/dev/null)"
+assert_eq "$(printf '%s' "$INTOOUT" | jq -r '.target.mode')" "into"
+
+it "and target.path is the --into directory, not the real HOME"
+assert_eq "$(printf '%s' "$INTOOUT" | jq -r '.target.path')" "$(realpath "$INTOTGT")"
+
+# ── blocked is a single signal, not something a UI must derive itself ──────
+it "blocked is false on a clean, compatible plan"
+assert_eq "$(printf '%s' "$JSOUT" | jq -r '.blocked')" "false"
+
+# ── the plan lists a per-group breakdown, not only a flat row list ─────────
+it "groups lists every group the plan actually touched"
+assert_eq "$(printf '%s' "$JSOUT" | jq -r '[.groups[].id] | sort | join(",")')" \
+    "compositor,state,terminal"
+
+it "and a group's restore count matches its own rows, not the whole plan's"
+assert_eq "$(printf '%s' "$JSOUT" | jq -r '.groups[] | select(.id=="terminal") | .restore')" \
+    "$(printf '%s' "$JSOUT" | jq -r '[.rows[] | select(.group=="terminal" and .action=="restore")] | length')"
+
+# ── new vs replaced: a plan already knows this without writing anything ────
+NRH="$(mktemp -d)"; NRART="$(_res_build "$NRH" '["4.*"]')"
+NRTGT="$(mktemp -d)"
+mkdir -p "$NRTGT/.config/alacritty"
+printf 'pre-existing\n' >"$NRTGT/.config/alacritty/alacritty.toml"
+NROUT="$(HOME="$NRTGT" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$NRH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --json "$NRART" 2>/dev/null)"
+
+it "a file already at the target is counted as replaced, not new"
+assert_eq "$(printf '%s' "$NROUT" | jq -r '.counts.replaced')" "1"
+
+it "new + replaced equals the restore count exactly"
+assert_eq "$(printf '%s' "$NROUT" | jq -r '.counts.new + .counts.replaced')" \
+    "$(printf '%s' "$NROUT" | jq -r '.counts.restore')"
+
+it "a plan run still writes nothing -- computing new/replaced does not touch the target"
+assert_eq "$(cat "$NRTGT/.config/alacritty/alacritty.toml")" "pre-existing"
 
 # ── two groups sharing a TREE destination lose the real original ────────────
 # The collision map was built once, across every group -- the right fix for
