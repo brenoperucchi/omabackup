@@ -1010,10 +1010,15 @@ groups_json() {
                 && cov="$(cat "$COVERAGE_FILE" 2>/dev/null)"
         fi
     fi
+    # paths carries the actual declared live paths now (e.g. "~/.config/hypr"),
+    # not just their count -- the panel's Groups tooltip reads this to show
+    # what a group actually covers. `if type=="object" then .live else . end`
+    # is the same normalization group_paths() itself already applies to a
+    # path entry, since a path can be a bare string or {live,trackedRepoPath}.
     jq -n --argjson m "$(jq '[.groups[] | select(.enabled != false)
                              | {id, label, mode, coupled:(.coupled // false),
                                 critical:(.critical // false),
-                                paths:((.paths // []) | length)}]' "$GROUPS_FILE")" \
+                                paths:((.paths // []) | map(if type=="object" then .live else . end))}]' "$GROUPS_FILE")" \
           --argjson c "$cov" '
         [ $m[] as $g
         | ($c.groups // [] | map(select(.id == $g.id)) | first) as $x

@@ -126,6 +126,13 @@ OUT="$(_verify "$H" "$G")"
 it "the report carries the Omarchy version"
 assert_contains "$(jq -r .omarchy.version <<<"$OUT")" "."
 
+# ── a group's declared paths, for the panel's own Groups tooltip ───────────
+it "each group in the report carries its own declared paths, not just a count"
+assert_eq "$(jq -r '.groups[0].paths | type' <<<"$OUT")" "array"
+
+it "and the actual path string, not an object wrapper"
+assert_eq "$(jq -r '.groups[0].paths[0]' <<<"$OUT")" "~/.config/hypr"
+
 it "the report carries the migration watermark"
 [[ "$(jq -r .omarchy.migrationWatermark <<<"$OUT")" =~ ^[0-9]+$ ]] && ok || fail "watermark is not numeric"
 

@@ -275,7 +275,8 @@ Panel {
         mode: asText(g.mode),
         coupled: g.coupled === true, critical: g.critical === true,
         enabled: g.enabled !== false,
-        files: asCount(g.files), bytes: asCount(g.bytes)
+        files: asCount(g.files), bytes: asCount(g.bytes),
+        paths: asList(g.paths).filter(function(p) { return typeof p === "string" })
       })
     }
     return out
@@ -1425,6 +1426,20 @@ Panel {
                 width: groupGrid.cellWidth
                 spacing: Style.space(7)
 
+                // A tooltip naming the actual configured paths -- attached
+                // properties, not a child Item, so this is safe to put
+                // directly on a Row (a Positioner): a MouseArea/HoverHandler
+                // added as a plain CHILD here with anchors.fill would hit
+                // the same "Column/Row will not function" restriction a
+                // review round already found and fixed once, in the
+                // artifact list. HoverHandler is a pointer handler, not a
+                // positioned Item, so Row never tries to lay it out.
+                HoverHandler { id: groupHover }
+                ToolTip.visible: groupHover.hovered
+                                 && groupRow.modelData.paths && groupRow.modelData.paths.length > 0
+                ToolTip.text: groupRow.modelData.paths ? groupRow.modelData.paths.join("\n") : ""
+                ToolTip.delay: 400
+
                 // A 3px rail, not a toggle. This reports state; it does not set
                 // it, and a switch that cannot be switched invites the click it
                 // then ignores. Red when the group covers nothing -- zero
@@ -1593,7 +1608,7 @@ Panel {
               anchors.left: cHdr.right
               anchors.leftMargin: Style.space(4)
               anchors.verticalCenter: cHdr.verticalCenter
-              text: root.configExpanded ? "▾" : "▸"
+              text: root.configExpanded ? "-" : "+"
               color: Color.foreground
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
