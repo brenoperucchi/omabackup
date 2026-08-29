@@ -1590,10 +1590,11 @@ Panel {
             implicitHeight: cHdr.implicitHeight + Style.space(5)
             PanelSectionHeader { id: cHdr; anchors.left: parent.left; text: "Config" }
             Text {
-              anchors.right: parent.right
+              anchors.left: cHdr.right
+              anchors.leftMargin: Style.space(4)
               anchors.verticalCenter: cHdr.verticalCenter
               text: root.configExpanded ? "▾" : "▸"
-              color: Color.muted
+              color: Color.foreground
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
             }
