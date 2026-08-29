@@ -5,6 +5,14 @@ recente e ainda em movimento (`docs/DESIGN.md`, 2026-08-24) — **confira
 `docs/PLAN.md` antes de assumir que algo abaixo já está implementado**; isso
 aqui são invariantes de design, não garantia de que o código atual as cumpre.
 
+## Isolamento
+
+Você é a única lente nesta rodada (a outra roda em paralelo, cega, num
+diretório irmão — ver `request.md`). Não invoque skills de revisão
+multi-agente (`dual-r`, `tri-r`, `pair-i`, `codex-r`, `codex-i`) nem delegue
+via subagente/`agentrelay`/`dispatch`. Se faltar informação, diga o que
+faltou — não busque segunda opinião pra preencher a lacuna.
+
 ## Separação de repositório — sempre verdade, independente de implementação
 
 - `~/Devs/omabackup` (este repo) é **só código**, público, GitHub. Dado de
