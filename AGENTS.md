@@ -29,4 +29,8 @@ resolve their findings (CONFIRMED/UNIQUE/CONFLICT) before considering the
 work done. The same pair can also weigh in on an open design question
 *before* you build something — see the `herdr-ask` skill for that case.
 Requires `HERDR_ENV=1`; if that's unset, you're not in a Herdr-managed pane
-and none of this applies.
+and none of this applies. Never use your own CLI's native sub-agent
+mechanism (e.g. Codex's `agents`/`pipeline_reviewer`, Claude's `Agent` tool)
+as a substitute for this — those spawn ephemeral, invisible processes
+outside Herdr with no pane and no persistent identity. Every review round,
+including an extra or "final" one, goes back through `herdr-review`.
