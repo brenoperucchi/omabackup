@@ -133,6 +133,21 @@ assert_eq "$(jq -r '.groups[0].paths | type' <<<"$OUT")" "array"
 it "and the actual path string, not an object wrapper"
 assert_eq "$(jq -r '.groups[0].paths[0]' <<<"$OUT")" "~/.config/hypr"
 
+# ── a mode:gen group has no paths -- the tooltip needs its generator instead ─
+GH="$(mktemp -d)"; GG="$GH/g.json"
+mkdir -p "$GH/.config/hypr"
+cat >"$GG" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"packages","label":"Packages","mode":"gen","coupled":false,"critical":true,"generator":"packages"}]}
+JSON
+GOUT="$(_verify "$GH" "$GG")"
+
+it "a mode:gen group's own generator command is reported, for the panel's tooltip fallback"
+assert_eq "$(jq -r '.groups[0].generator' <<<"$GOUT")" "packages"
+
+it "and its paths array is empty, not missing"
+assert_eq "$(jq -r '.groups[0].paths | length' <<<"$GOUT")" "0"
+
 it "the report carries the migration watermark"
 [[ "$(jq -r .omarchy.migrationWatermark <<<"$OUT")" =~ ^[0-9]+$ ]] && ok || fail "watermark is not numeric"
 

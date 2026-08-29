@@ -1015,10 +1015,15 @@ groups_json() {
     # what a group actually covers. `if type=="object" then .live else . end`
     # is the same normalization group_paths() itself already applies to a
     # path entry, since a path can be a bare string or {live,trackedRepoPath}.
+    # generator rides along too: a mode:gen group (packages, systemd) has no
+    # `paths` at all -- what it covers is the command named here instead --
+    # so the tooltip has something to fall back to rather than showing
+    # nothing for exactly the two groups a user asked about first.
     jq -n --argjson m "$(jq '[.groups[] | select(.enabled != false)
                              | {id, label, mode, coupled:(.coupled // false),
                                 critical:(.critical // false),
-                                paths:((.paths // []) | map(if type=="object" then .live else . end))}]' "$GROUPS_FILE")" \
+                                paths:((.paths // []) | map(if type=="object" then .live else . end)),
+                                generator:(.generator // null)}]' "$GROUPS_FILE")" \
           --argjson c "$cov" '
         [ $m[] as $g
         | ($c.groups // [] | map(select(.id == $g.id)) | first) as $x

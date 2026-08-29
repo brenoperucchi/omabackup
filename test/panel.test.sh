@@ -55,3 +55,7 @@ _qml_probe test/qml/target-mode-polarity-agrees.qml \
 it "an artifact row's click target has real, nonzero geometry"
 _qml_probe test/qml/artifact-row-click-area-has-geometry.qml \
     && ok || fail "the artifact row's MouseArea had zero-size geometry -- an invalid anchors.fill inside a Column"
+
+it "a group row's custom-styled tooltip does not break the Row's own layout"
+_qml_probe test/qml/group-row-tooltip-is-safe-in-row.qml \
+    && ok || fail "adding a HoverHandler/ToolTip child broke the Row's geometry"
