@@ -2450,3 +2450,737 @@ HOME="$NIH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$NIH/rstate" \
     XDG_RUNTIME_DIR=/nonexistent "$OB" restore --into "$NIINTO" "$NIART" >/dev/null 2>&1
 [[ ! -e "$NIH/a" ]] \
     && ok || fail "the --into target's parent directories were left behind: $(find "$NIH/a" 2>/dev/null)"
+
+# ── the terminal handoff must survive an empty destination list ─────────────
+# `omarchy-launch-tui` closes its terminal when the command exits. Before this
+# regression, `restore` printed its no-bundle message and returned 1 at the
+# first screen, so the user saw a terminal flash and disappear with no way to
+# configure a destination or retry. The helper drives a real PTY through a
+# FIFO and waits for prompts, rather than relying on sleeps and pre-buffered
+# input.
+_restore_tui_start() {
+    local log="$1" fifo="$2" command="$3"
+    mkfifo "$fifo"
+    # Capture stdout directly so the driver can observe prompts while the
+    # child is alive. `script`'s typescript file is flushed only on exit.
+    script -qec "$command" /dev/null <"$fifo" >"$log" 2>&1 &
+    RESTORE_TUI_PID=$!
+    RESTORE_TUI_DRIVER_FAILED=0
+    exec 9>"$fifo"
+}
+
+_restore_tui_wait_for() {
+    local log="$1" needle="$2" i
+    for ((i = 0; i < 200; i++)); do
+        [[ -f "$log" ]] && grep -Fq -- "$needle" "$log" && return 0
+        sleep 0.05
+    done
+    RESTORE_TUI_DRIVER_FAILED=1
+    return 1
+}
+
+_restore_tui_wait_count() {
+    local log="$1" needle="$2" wanted="$3" i count
+    for ((i = 0; i < 200; i++)); do
+        count="$(grep -F -o -- "$needle" "$log" 2>/dev/null | wc -l)"
+        (( count >= wanted )) && return 0
+        sleep 0.05
+    done
+    RESTORE_TUI_DRIVER_FAILED=1
+    return 1
+}
+
+_restore_tui_send() {
+    if ! kill -0 "$RESTORE_TUI_PID" 2>/dev/null; then
+        RESTORE_TUI_DRIVER_FAILED=1
+        return 1
+    fi
+    # A stale PID can still be a zombie between the prompt poll and this
+    # write. Keep a broken FIFO write from delivering SIGPIPE to the spec
+    # shell itself; the caller then records the failed interaction normally.
+    ( printf '%s' "$1" >&9 ) 2>/dev/null || {
+        RESTORE_TUI_DRIVER_FAILED=1
+        return 1
+    }
+}
+
+_restore_tui_finish() {
+    exec 9>&-
+    local i state
+    for ((i = 0; i < 200; i++)); do
+        state="$(ps -o stat= -p "$RESTORE_TUI_PID" 2>/dev/null)"
+        if [[ -z "$state" || "$state" == *Z* ]]; then
+            wait "$RESTORE_TUI_PID"
+            local rc=$?
+            (( RESTORE_TUI_DRIVER_FAILED )) && return 125
+            return "$rc"
+        fi
+        sleep 0.05
+    done
+    kill -TERM "$RESTORE_TUI_PID" 2>/dev/null || true
+    sleep 0.2
+    kill -KILL "$RESTORE_TUI_PID" 2>/dev/null || true
+    wait "$RESTORE_TUI_PID" 2>/dev/null
+    return 124
+}
+
+RTUIH="$(mktemp -d)"
+RTUILOG="$RTUIH/restore-tui.log"
+RTUIFIFO="$RTUIH/input"
+_restore_tui_start "$RTUILOG" "$RTUIFIFO" \
+    "env HOME='$RTUIH/home' OMABACKUP_ROOT='$PWD' OMABACKUP_STATE='$RTUIH/state' \
+         OMABACKUP_DESTINATIONS='$RTUIH/missing.json' XDG_RUNTIME_DIR=/nonexistent \
+         '$OB' restore"
+_restore_tui_wait_for "$RTUILOG" 'Choose [1/2/q]:' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIRC=$?
+RTUIOUT="$(cat -- "$RTUILOG")"
+
+it "restore keeps the terminal open when no valid backup bundles exist"
+[[ "$RTUIRC" -eq 0 ]] && ok || fail "restore exited $RTUIRC before the user chose to quit"
+assert_contains "$RTUIOUT" "No backups found"
+it "restore explains the available no-bundle actions"
+assert_contains "$RTUIOUT" "Try again"
+assert_contains "$RTUIOUT" "Open backup settings"
+assert_contains "$RTUIOUT" "q) Cancel"
+
+RTUIESCLOG="$RTUIH/restore-escape.log"
+RTUIESCFIFO="$RTUIH/restore-escape.input"
+_restore_tui_start "$RTUIESCLOG" "$RTUIESCFIFO" \
+    "env HOME='$RTUIH/escape-home' OMABACKUP_ROOT='$PWD' OMABACKUP_STATE='$RTUIH/escape-state' \
+         OMABACKUP_DESTINATIONS='$RTUIH/missing.json' XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIESCLOG" 'Choose [1/2/q]:' && _restore_tui_send $'\033'
+# The reader briefly waits to distinguish a bare Escape from ESC+[...]. Give
+# that bounded look-ahead time to expire before closing the driver's fd.
+/usr/bin/sleep 0.1
+_restore_tui_finish; RTUIESCRC=$?
+RTUIESCOUT="$(cat -- "$RTUIESCLOG")"
+
+it "Escape cancels the Restore TUI immediately in a real terminal"
+[[ "$RTUIESCRC" -eq 0 ]] && ok || fail "restore did not exit cleanly after the immediate Escape key"
+assert_contains "$RTUIESCOUT" "Restore cancelled"
+
+RTUIARROWLOG="$RTUIH/restore-arrow.log"
+RTUIARROWFIFO="$RTUIH/restore-arrow.input"
+_restore_tui_start "$RTUIARROWLOG" "$RTUIARROWFIFO" \
+    "env HOME='$RTUIH/arrow-home' OMABACKUP_ROOT='$PWD' OMABACKUP_STATE='$RTUIH/arrow-state' \
+         OMABACKUP_DESTINATIONS='$RTUIH/missing.json' XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIARROWLOG" 'Choose [1/2/q]:' && _restore_tui_send $'\033[A'
+/usr/bin/sleep 0.1
+_restore_tui_send $'x\nq\n' || true
+_restore_tui_finish; RTUIARROWRC=$?
+RTUIARROWOUT="$(cat -- "$RTUIARROWLOG")"
+
+it "an arrow key does not cancel the Restore TUI"
+[[ "$RTUIARROWRC" -eq 0 ]] && assert_contains "$RTUIARROWOUT" "Please choose 1, 2 or q." \
+    || fail "Restore treated an arrow-key sequence as Escape"
+
+# Retry must actually re-enter the loop; labels alone are not enough to prove
+# that the action is wired.
+RTUIRETRYLOG="$RTUIH/restore-retry.log"
+RTUIRETRYFIFO="$RTUIH/retry-input"
+_restore_tui_start "$RTUIRETRYLOG" "$RTUIRETRYFIFO" \
+    "env HOME='$RTUIH/retry-home' OMABACKUP_ROOT='$PWD' OMABACKUP_STATE='$RTUIH/retry-state' \
+         OMABACKUP_DESTINATIONS='$RTUIH/missing.json' XDG_RUNTIME_DIR=/nonexistent \
+         '$OB' restore"
+_restore_tui_wait_for "$RTUIRETRYLOG" 'Choose [1/2/q]:' && _restore_tui_send $'1\n'
+_restore_tui_wait_count "$RTUIRETRYLOG" 'No backups found.' 2 && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIRETRYRC=$?
+RTUIRETRYOUT="$(cat -- "$RTUIRETRYLOG")"
+
+it "restore executes Try again before accepting quit"
+[[ "$RTUIRETRYRC" -eq 0 ]] && ok || fail "retry session exited $RTUIRETRYRC"
+it "restore renders the no-bundle screen again after Try again"
+[[ "$(grep -F -o 'No backups found.' "$RTUIRETRYLOG" | wc -l)" -ge 2 ]] \
+    && ok || fail "Try again did not render a second no-bundle screen"
+
+# Settings is a real recovery action too: it enters the config TUI, then
+# returns to the restore recovery menu until the user explicitly quits.
+RTUISETTINGLOG="$RTUIH/restore-settings.log"
+RTUISETTINGFIFO="$RTUIH/settings-input"
+_restore_tui_start "$RTUISETTINGLOG" "$RTUISETTINGFIFO" \
+    "env HOME='$RTUIH/settings-home' OMABACKUP_ROOT='$PWD' OMABACKUP_STATE='$RTUIH/settings-state' \
+         OMABACKUP_DESTINATIONS='$RTUIH/missing.json' OMABACKUP_SYSTEMCTL=/nonexistent \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUISETTINGLOG" 'Choose [1/2/q]:' && _restore_tui_send $'2\n'
+_restore_tui_wait_for "$RTUISETTINGLOG" 'OmaBackup configuration' && _restore_tui_send $'q\n'
+_restore_tui_wait_count "$RTUISETTINGLOG" 'Choose [1/2/q]:' 2 && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUISETTINGRC=$?
+RTUISETTINGOUT="$(cat -- "$RTUISETTINGLOG")"
+
+it "restore opens Settings from the recovery menu and returns"
+[[ "$RTUISETTINGRC" -eq 0 ]] && ok || fail "Settings recovery session exited $RTUISETTINGRC"
+assert_contains "$RTUISETTINGOUT" "OmaBackup configuration"
+it "restore returns to the recovery menu after Settings"
+[[ "$(grep -F -o 'Choose [1/2/q]:' "$RTUISETTINGLOG" | wc -l)" -ge 2 ]] \
+    && ok || fail "Settings did not return to the recovery menu"
+
+# An invalid confirmation is not an explicit cancel. It must leave the user at
+# the same confirmation step, otherwise one typo closes the terminal and
+# discards the restore context.
+RTUIC="$(mktemp -d)"
+RTUICDEST="$RTUIC/destination"; mkdir -p "$RTUICDEST"
+# The artifact cache uses a content hash as its filename. A dir destination
+# contains the published, human-facing bundle name, so use that shape here to
+# exercise the same discovery path as a real push.
+cp -- "$RART" "$RTUICDEST/omabackup-test-20260829-000000.tar.zst"
+printf '{"schemaVersion":1,"destinations":[{"id":"local","type":"dir","path":"%s","keep":5,"enabled":true,"note":null}]}\n' \
+    "$RTUICDEST" >"$RTUIC/destinations.json"
+RTUICLOG="$RTUIC/restore-tui.log"
+RTUICFIFO="$RTUIC/input"
+_restore_tui_start "$RTUICLOG" "$RTUICFIFO" \
+    "env HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/state' OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUICLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUICLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUICLOG" 'Apply this plan to the selected folder?' && _restore_tui_send $'maybe\n'
+_restore_tui_wait_for "$RTUICLOG" 'Please answer y to apply or n to cancel.' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUICRC=$?
+RTUICOUT="$(cat -- "$RTUICLOG")"
+
+it "restore keeps the confirmation step after invalid input"
+[[ "$RTUICRC" -eq 0 ]] && ok || fail "restore exited $RTUICRC after invalid confirmation input"
+assert_contains "$RTUICOUT" "Please answer y to apply or n to cancel."
+it "restore shows the confirmation prompt again after invalid input"
+[[ "$(grep -F -o 'Apply this plan to the selected folder?' "$RTUICLOG" | wc -l)" -ge 2 ]] \
+    && ok || fail "invalid confirmation did not return to the same prompt"
+
+# Choosing a custom path that resolves to HOME must receive the same strong
+# guard as the explicit HOME option. The confirmation policy follows the
+# resolved target, not the menu key the user happened to press.
+RTUIHOMELOG="$RTUIC/restore-home-target.log"
+RTUIHOMEFIFO="$RTUIC/home-input"
+mkdir -p "$RTUIC/home"
+ln -s "$RTUIC/home" "$RTUIC/home-alias"
+_restore_tui_start "$RTUIHOMELOG" "$RTUIHOMEFIFO" \
+    "env HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/home-state' OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIHOMELOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIHOMELOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'3\n'
+_restore_tui_wait_for "$RTUIHOMELOG" 'Absolute target folder:' && _restore_tui_send "$RTUIC/home-alias"$'\n'
+_restore_tui_wait_for "$RTUIHOMELOG" 'Type RESTORE to apply' && _restore_tui_send $'maybe\n'
+_restore_tui_wait_for "$RTUIHOMELOG" 'Please type RESTORE to apply or N to cancel.' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIHOMERC=$?
+RTUIHOMEOUT="$(cat -- "$RTUIHOMELOG")"
+
+it "restore requires the strong confirmation for a HOME alias"
+[[ "$RTUIHOMERC" -eq 0 ]] && ok || fail "restore exited $RTUIHOMERC after the custom HOME target confirmation"
+assert_contains "$RTUIHOMEOUT" "Please type RESTORE to apply or N to cancel."
+
+# The explicit HOME option remains a separate branch and must keep the strong
+# confirmation after the TUI canonicalizes it as --into HOME.
+RTUIEXPLICITLOG="$RTUIC/restore-explicit-home.log"
+RTUIEXPLICITFIFO="$RTUIC/explicit-home-input"
+_restore_tui_start "$RTUIEXPLICITLOG" "$RTUIEXPLICITFIFO" \
+    "env HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/explicit-state' OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIEXPLICITLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIEXPLICITLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'2\n'
+_restore_tui_wait_for "$RTUIEXPLICITLOG" 'Type RESTORE to apply' && _restore_tui_send $'maybe\n'
+_restore_tui_wait_for "$RTUIEXPLICITLOG" 'Please type RESTORE to apply or N to cancel.' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIEXPLICITRC=$?
+RTUIEXPLICITOUT="$(cat -- "$RTUIEXPLICITLOG")"
+
+it "restore keeps the strong confirmation for explicit HOME"
+[[ "$RTUIEXPLICITRC" -eq 0 ]] && ok || fail "explicit HOME session exited $RTUIEXPLICITRC"
+assert_contains "$RTUIEXPLICITOUT" "Please type RESTORE to apply or N to cancel."
+
+# An overlarge decimal must be rejected before Bash arithmetic can wrap it to
+# a valid-looking array index.
+RTUIOVERFLOWLOG="$RTUIC/restore-overflow.log"
+RTUIOVERFLOWFIFO="$RTUIC/overflow-input"
+_restore_tui_start "$RTUIOVERFLOWLOG" "$RTUIOVERFLOWFIFO" \
+    "env HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/overflow-state' OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIOVERFLOWLOG" 'Choose a backup number' && _restore_tui_send $'18446744073709551617\n'
+_restore_tui_wait_for "$RTUIOVERFLOWLOG" 'There is no backup with that number' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIOVERFLOWRC=$?
+RTUIOVERFLOWOUT="$(cat -- "$RTUIOVERFLOWLOG")"
+
+it "restore rejects an overlarge backup number without wrapping"
+[[ "$RTUIOVERFLOWRC" -eq 0 ]] && ok || fail "restore exited $RTUIOVERFLOWRC after an overlarge backup number"
+assert_contains "$RTUIOVERFLOWOUT" "There is no backup with that number"
+
+# The preview can fail after the artifact was listed if the shared folder
+# changes underneath the UI. Prompt synchronization makes the removal happen
+# only after the selection screen has definitely rendered.
+RTUIPREVLOG="$RTUIC/restore-preview-failure.log"
+RTUIPREVFIFO="$RTUIC/preview-input"
+_restore_tui_start "$RTUIPREVLOG" "$RTUIPREVFIFO" \
+    "env HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/preview-state' OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIPREVLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIPREVLOG" 'Choose [1/2/3/q]:' && rm -f -- "$RTUICDEST/omabackup-test-20260829-000000.tar.zst" && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIPREVLOG" 'This backup could not be previewed' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIPREVRC=$?
+RTUIPREVOUT="$(cat -- "$RTUIPREVLOG")"
+
+it "restore keeps its recovery menu when the selected artifact disappears"
+[[ "$RTUIPREVRC" -eq 0 ]] && ok || fail "restore exited $RTUIPREVRC after the preview artifact disappeared"
+assert_contains "$RTUIPREVOUT" "This backup could not be previewed"
+assert_contains "$RTUIPREVOUT" "The source may have changed or become unavailable."
+assert_contains "$RTUIPREVOUT" "q) Cancel"
+assert_not_contains "$RTUIPREVOUT" "?[0;31m"
+
+# The source-copy failure above is distinct from a valid-looking source whose
+# private snapshot is unreadable by restore. Corrupt the snapshot in the head
+# wrapper so the child restore command, rather than the TUI's copy step, owns
+# the preview failure branch.
+cp -- "$RART" "$RTUICDEST/omabackup-test-20260829-000009.tar.zst"
+mkdir -p "$RTUIC/corrupt-snapshot-stub"
+cat >"$RTUIC/corrupt-snapshot-stub/head" <<'STUBEOF'
+#!/bin/bash
+if [[ "${1:-}" == "-c" ]]; then
+    /usr/bin/dd if=/dev/zero bs=1 count="$2" status=none
+else
+    exec /usr/bin/head "$@"
+fi
+STUBEOF
+chmod +x "$RTUIC/corrupt-snapshot-stub/head"
+RTUICORRUPTLOG="$RTUIC/restore-corrupt-snapshot.log"
+RTUICORRUPTFIFO="$RTUIC/corrupt-snapshot-input"
+_restore_tui_start "$RTUICORRUPTLOG" "$RTUICORRUPTFIFO" \
+    "env PATH='$RTUIC/corrupt-snapshot-stub:$PATH' HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/corrupt-snapshot-state' OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUICORRUPTLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUICORRUPTLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUICORRUPTLOG" 'This backup could not be previewed' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUICORRUPTRC=$?
+RTUICORRUPTOUT="$(cat -- "$RTUICORRUPTLOG")"
+
+it "restore keeps its recovery menu when the private snapshot cannot be read"
+[[ "$RTUICORRUPTRC" -eq 0 ]] && ok || fail "corrupt-snapshot session exited $RTUICORRUPTRC"
+assert_contains "$RTUICORRUPTOUT" "This backup could not be previewed."
+assert_contains "$RTUICORRUPTOUT" "q) Cancel"
+
+# /proc is an existing, read-only target: preview can describe the writes,
+# while apply fails at mkdir. That exercises the post-apply recovery path
+# without changing any test or host data.
+cp -- "$RART" "$RTUICDEST/omabackup-test-20260829-000001.tar.zst"
+RTUIAPPLYLOG="$RTUIC/restore-apply-failure.log"
+RTUIAPPLYFIFO="$RTUIC/apply-input"
+_restore_tui_start "$RTUIAPPLYLOG" "$RTUIAPPLYFIFO" \
+    "env HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/apply-state' OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIAPPLYLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIAPPLYLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'3\n'
+_restore_tui_wait_for "$RTUIAPPLYLOG" 'Absolute target folder:' && _restore_tui_send $'/proc\n'
+_restore_tui_wait_for "$RTUIAPPLYLOG" 'Apply this plan to the selected folder?' && _restore_tui_send $'y\n'
+_restore_tui_wait_for "$RTUIAPPLYLOG" 'The restore did not finish successfully' && _restore_tui_send $'maybe\n'
+_restore_tui_wait_for "$RTUIAPPLYLOG" 'Please choose 1, 2 or q.' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIAPPLYRC=$?
+RTUIAPPLYOUT="$(cat -- "$RTUIAPPLYLOG")"
+
+it "restore keeps its recovery menu when apply cannot write the target"
+[[ "$RTUIAPPLYRC" -eq 0 ]] && ok || fail "restore exited $RTUIAPPLYRC after apply failed"
+assert_contains "$RTUIAPPLYOUT" "The restore did not finish successfully"
+assert_contains "$RTUIAPPLYOUT" "Please choose 1, 2 or q."
+
+# Force the path's parent to change between the preview and the apply. The
+# realpath wrapper swaps it on the second exact -m lookup, which is the TUI's
+# revalidation call; no timing race is involved.
+RTUISWAPBASE="$RTUIC/swap"
+mkdir -p "$RTUISWAPBASE"
+mkdir -p "$RTUIC/stub"
+cat >"$RTUIC/stub/realpath" <<'STUBEOF'
+#!/bin/bash
+last="${@: -1}"
+if [[ "$1" == "-m" && "$last" == "$OMABACKUP_TEST_SWAP_BASE/target" ]]; then
+    count_file="$OMABACKUP_TEST_SWAP_BASE/count"
+    count=0
+    [[ -f "$count_file" ]] && count="$(cat "$count_file")"
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$count_file"
+    if [[ "$count" == 2 ]]; then
+        mv -- "$OMABACKUP_TEST_SWAP_BASE" "$OMABACKUP_TEST_SWAP_BASE-real"
+        ln -s -- "$OMABACKUP_TEST_SWAP_HOME" "$OMABACKUP_TEST_SWAP_BASE"
+    fi
+fi
+exec /usr/bin/realpath "$@"
+STUBEOF
+chmod +x "$RTUIC/stub/realpath"
+cp -- "$RART" "$RTUICDEST/omabackup-test-20260829-000002.tar.zst"
+RTUISWAPLOG="$RTUIC/restore-target-changed.log"
+RTUISWAPFIFO="$RTUIC/target-changed-input"
+_restore_tui_start "$RTUISWAPLOG" "$RTUISWAPFIFO" \
+    "env PATH='$RTUIC/stub:$PATH' HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' \
+         OMABACKUP_GROUPS='$RH/g.json' OMABACKUP_TEST_SWAP_BASE='$RTUISWAPBASE' \
+         OMABACKUP_TEST_SWAP_HOME='$RTUIC/home' OMABACKUP_STATE='$RTUIC/swap-state' \
+         OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' XDG_RUNTIME_DIR=/nonexistent \
+         '$OB' restore"
+_restore_tui_wait_for "$RTUISWAPLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUISWAPLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'3\n'
+_restore_tui_wait_for "$RTUISWAPLOG" 'Absolute target folder:' && _restore_tui_send "$RTUISWAPBASE/target"$'\n'
+_restore_tui_wait_for "$RTUISWAPLOG" 'Apply this plan to the selected folder?' && _restore_tui_send $'y\n'
+_restore_tui_wait_for "$RTUISWAPLOG" 'The restore target changed while it was being reviewed.' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUISWAPRC=$?
+RTUISWAPOUT="$(cat -- "$RTUISWAPLOG")"
+
+it "restore refuses a target that changes after preview"
+[[ "$RTUISWAPRC" -eq 0 ]] && ok || fail "restore exited $RTUISWAPRC after the target changed"
+assert_contains "$RTUISWAPOUT" "The restore target changed while it was being reviewed."
+
+# Snapshot the selected bundle before preview. Replacing the shared source
+# after the confirmation prompt must not change what the apply step consumes.
+RTUISNAPSHOTART="$RTUICDEST/omabackup-test-20260829-000008.tar.zst"
+cp -- "$RART" "$RTUISNAPSHOTART"
+RTUISNAPSHOTLOG="$RTUIC/restore-bundle-snapshot.log"
+RTUISNAPSHOTFIFO="$RTUIC/bundle-snapshot-input"
+_restore_tui_start "$RTUISNAPSHOTLOG" "$RTUISNAPSHOTFIFO" \
+    "env HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/snapshot-state' OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUISNAPSHOTLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUISNAPSHOTLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUISNAPSHOTLOG" 'Apply this plan to the selected folder?' && \
+    printf 'not a backup anymore\n' >"$RTUISNAPSHOTART" && _restore_tui_send $'y\n'
+# A successful apply closes restore; there is no second confirmation screen to
+# quit from. The wait is still synchronized to prove the private snapshot was
+# actually consumed before the child exits.
+_restore_tui_wait_for "$RTUISNAPSHOTLOG" 'restored 3 files'
+_restore_tui_finish; RTUISNAPSHOTRC=$?
+RTUISNAPSHOTOUT="$(cat -- "$RTUISNAPSHOTLOG")"
+
+it "restore applies the bundle that was previewed, not a replaced source"
+[[ "$RTUISNAPSHOTRC" -eq 0 ]] && ok || fail "restore exited $RTUISNAPSHOTRC after the source bundle was replaced"
+assert_contains "$RTUISNAPSHOTOUT" "restored 3 files"
+it "restore journal keeps the shared bundle path after applying its snapshot"
+assert_eq "$(jq -r '.artifact' "$RTUIC/snapshot-state/restore-last.json")" "$(realpath "$RTUISNAPSHOTART")"
+
+# The source FD freezes the inode, but a shared writer can still append to
+# that inode after it is opened. The private snapshot must freeze the size as
+# well; otherwise cp follows the moving EOF and the bytes shown in preview
+# are not necessarily the bytes that were copied for the restore.
+RTUIGROWROOT="$RTUIC/grow-fake-root"
+mkdir -p "$RTUIGROWROOT/bin"
+ln -s "$PWD/lib" "$RTUIGROWROOT/lib"
+ln -s "$PWD/groups.default.json" "$RTUIGROWROOT/groups.default.json"
+cat >"$RTUIGROWROOT/bin/omabackup" <<'STUBEOF'
+#!/bin/bash
+if [[ "$1" == restore ]]; then
+    artifact=""
+    for arg in "$@"; do
+        [[ "$arg" == */backup.tar.zst ]] && artifact="$arg"
+    done
+    [[ -n "$artifact" ]] || exit 1
+    stat -c %s "$artifact" >"${OMABACKUP_TEST_SNAPSHOT_SIZE:?}" || exit 1
+    printf 'preview\n'
+fi
+exit 0
+STUBEOF
+chmod +x "$RTUIGROWROOT/bin/omabackup"
+RTUIGROWDIR="$RTUIC/grow-destination"
+mkdir -p "$RTUIGROWDIR"
+RTUIGROWART="$RTUIGROWDIR/omabackup-grow-20260829-000010.tar.zst"
+cp -- "$RART" "$RTUIGROWART"
+RTUIGROWSIZE="$(stat -c %s "$RTUIGROWART")"
+printf '%s\n' "$RTUIGROWSIZE" >"$RTUIC/grow-source-size"
+printf '{"schemaVersion":1,"destinations":[{"id":"grow","type":"dir","path":"%s","keep":5,"enabled":true,"note":null}]}\n' \
+    "$RTUIGROWDIR" >"$RTUIC/grow-destinations.json"
+mkdir -p "$RTUIC/grow-head-stub"
+cat >"$RTUIC/grow-head-stub/head" <<'STUBEOF'
+#!/bin/bash
+if [[ "${1:-}" == "-c" ]]; then
+    /usr/bin/dd if=/dev/zero bs=4096 count=1 >>"${OMABACKUP_TEST_GROW_SOURCE:?}" 2>/dev/null || exit $?
+fi
+exec /usr/bin/head "$@"
+STUBEOF
+chmod +x "$RTUIC/grow-head-stub/head"
+RTUIGROWLOG="$RTUIC/restore-growing-source.log"
+RTUIGROWFIFO="$RTUIC/growing-source-input"
+RTUIGROWSNAPSHOTSIZE="$RTUIC/grow-snapshot-size"
+_restore_tui_start "$RTUIGROWLOG" "$RTUIGROWFIFO" \
+    "env PATH='$RTUIC/grow-head-stub:$PATH' HOME='$RTUIC/grow-home' OMABACKUP_ROOT='$RTUIGROWROOT' \
+         OMABACKUP_GROUPS='$RH/g.json' OMABACKUP_TEST_GROW_SOURCE='$RTUIGROWART' \
+         OMABACKUP_TEST_SNAPSHOT_SIZE='$RTUIGROWSNAPSHOTSIZE' OMABACKUP_STATE='$RTUIC/grow-state' \
+         OMABACKUP_DESTINATIONS='$RTUIC/grow-destinations.json' XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIGROWLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIGROWLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIGROWLOG" 'Apply this plan to the selected folder?' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIGROWRC=$?
+RTUIGROWOUT="$(cat -- "$RTUIGROWLOG")"
+
+it "restore freezes the source size before copying a growing bundle"
+[[ "$RTUIGROWRC" -eq 0 ]] && ok || fail "growing-source session exited $RTUIGROWRC"
+it "the growing-source regression exercised the append"
+[[ "$(stat -c %s "$RTUIGROWART" 2>/dev/null)" -gt "$RTUIGROWSIZE" ]] \
+    && ok || fail "the head stub never ran; the size-freeze path was not exercised"
+it "restore keeps the snapshot at the size frozen before the append"
+assert_eq "$(cat "$RTUIGROWSNAPSHOTSIZE" 2>/dev/null)" "$RTUIGROWSIZE"
+
+# q is an explicit cancel everywhere the TUI asks for a choice, including
+# before a target path has been entered.
+RTUICANCELTARGETLOG="$RTUIC/restore-cancel-target.log"
+RTUICANCELTARGETFIFO="$RTUIC/cancel-target-input"
+_restore_tui_start "$RTUICANCELTARGETLOG" "$RTUICANCELTARGETFIFO" \
+    "env HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/cancel-target-state' OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUICANCELTARGETLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUICANCELTARGETLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUICANCELTARGETRC=$?
+RTUICANCELTARGETOUT="$(cat -- "$RTUICANCELTARGETLOG")"
+
+it "restore accepts q while choosing a target"
+[[ "$RTUICANCELTARGETRC" -eq 0 ]] && ok || fail "target-cancel session exited $RTUICANCELTARGETRC"
+assert_contains "$RTUICANCELTARGETOUT" "Restore cancelled."
+
+RTUICANCELPATHLOG="$RTUIC/restore-cancel-path.log"
+RTUICANCELPATHFIFO="$RTUIC/cancel-path-input"
+_restore_tui_start "$RTUICANCELPATHLOG" "$RTUICANCELPATHFIFO" \
+    "env HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/cancel-path-state' OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUICANCELPATHLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUICANCELPATHLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'3\n'
+_restore_tui_wait_for "$RTUICANCELPATHLOG" 'Absolute target folder:' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUICANCELPATHRC=$?
+RTUICANCELPATHOUT="$(cat -- "$RTUICANCELPATHLOG")"
+
+it "restore accepts q while entering a custom target"
+[[ "$RTUICANCELPATHRC" -eq 0 ]] && ok || fail "path-cancel session exited $RTUICANCELPATHRC"
+assert_contains "$RTUICANCELPATHOUT" "Restore cancelled."
+
+# A target resolver failure is recoverable input/state, not an invisible
+# successful exit that closes the terminal.
+mkdir -p "$RTUIC/realpath-failure-stub"
+cat >"$RTUIC/realpath-failure-stub/realpath" <<'STUBEOF'
+#!/bin/bash
+exit 1
+STUBEOF
+chmod +x "$RTUIC/realpath-failure-stub/realpath"
+cp -- "$RART" "$RTUICDEST/omabackup-test-20260829-000004.tar.zst"
+RTUIREALPATHLOG="$RTUIC/restore-realpath-failure.log"
+RTUIREALPATHFIFO="$RTUIC/realpath-failure-input"
+_restore_tui_start "$RTUIREALPATHLOG" "$RTUIREALPATHFIFO" \
+    "env PATH='$RTUIC/realpath-failure-stub:$PATH' HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' \
+         OMABACKUP_GROUPS='$RH/g.json' OMABACKUP_STATE='$RTUIC/realpath-state' \
+         OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' XDG_RUNTIME_DIR=/nonexistent \
+         '$OB' restore"
+_restore_tui_wait_for "$RTUIREALPATHLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIREALPATHLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIREALPATHLOG" 'We could not resolve the restore target.' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIREALPATHRC=$?
+RTUIREALPATHOUT="$(cat -- "$RTUIREALPATHLOG")"
+
+it "restore keeps a realpath failure recoverable"
+[[ "$RTUIREALPATHRC" -eq 0 ]] && ok || fail "realpath failure session exited $RTUIREALPATHRC"
+assert_contains "$RTUIREALPATHOUT" "We could not resolve the restore target."
+assert_contains "$RTUIREALPATHOUT" "q) Cancel"
+
+# A shared destination can contain a hostile filename. It remains the real
+# filename for selection, but the list must not emit terminal controls.
+RTUIESCDIR="$RTUIC/escape-destination"
+mkdir -p "$RTUIESCDIR"
+RTUIESCNAME=$'omabackup-\033[2J\033[H-20260829-000003.tar.zst'
+cp -- "$RART" "$RTUIESCDIR/$RTUIESCNAME"
+RTUIC1NAME=$'omabackup-\u009b-20260829-000006.tar.zst'
+cp -- "$RART" "$RTUIESCDIR/$RTUIC1NAME"
+cp -- "$RART" "$RTUIESCDIR/omabackup-safe-20260829-000005.tar.zst"
+printf '{"schemaVersion":1,"destinations":[{"id":"escape","type":"dir","path":"%s","keep":5,"enabled":true,"note":null}]}\n' \
+    "$RTUIESCDIR" >"$RTUIC/escape-destinations.json"
+RTUIESCLOG="$RTUIC/restore-escape-name.log"
+RTUIESCFIFO="$RTUIC/escape-name-input"
+_restore_tui_start "$RTUIESCLOG" "$RTUIESCFIFO" \
+    "env HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/escape-state' OMABACKUP_DESTINATIONS='$RTUIC/escape-destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIESCLOG" 'Choose a backup number' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIESCRC=$?
+RTUIESCOUT="$(cat -- "$RTUIESCLOG")"
+
+it "restore omits hostile artifact names from the interactive selector"
+[[ "$RTUIESCRC" -eq 0 ]] && ok || fail "restore escape-name session exited $RTUIESCRC"
+assert_contains "$RTUIESCOUT" "omabackup-safe-20260829-000005.tar.zst"
+assert_contains "$RTUIESCOUT" "2 backup(s) hidden: unsafe file name."
+assert_not_contains "$RTUIESCOUT" "20260829-000006.tar.zst"
+it "restore does not echo the raw hostile artifact name"
+[[ "$RTUIESCOUT" != *"$RTUIESCNAME"* ]] \
+    && ok || fail "restore emitted the raw terminal control from the artifact name"
+
+# Keep a separate all-hidden case so the actionable “No usable backups” path
+# cannot regress while the mixed-list notice stays green.
+RTUIONLYDIR="$RTUIC/escape-only-destination"
+mkdir -p "$RTUIONLYDIR"
+cp -- "$RART" "$RTUIONLYDIR/$RTUIESCNAME"
+printf '{"schemaVersion":1,"destinations":[{"id":"escape-only","type":"dir","path":"%s","keep":5,"enabled":true,"note":null}]}\n' \
+    "$RTUIONLYDIR" >"$RTUIC/escape-only-destinations.json"
+RTUIONLYLOG="$RTUIC/restore-all-hidden.log"
+RTUIONLYFIFO="$RTUIC/all-hidden-input"
+_restore_tui_start "$RTUIONLYLOG" "$RTUIONLYFIFO" \
+    "env HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/all-hidden-state' OMABACKUP_DESTINATIONS='$RTUIC/escape-only-destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIONLYLOG" 'No usable backups found.'
+_restore_tui_wait_for "$RTUIONLYLOG" 'Choose [1/2/q]:' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIONLYRC=$?
+RTUIONLYOUT="$(cat -- "$RTUIONLYLOG")"
+
+it "restore explains when every backup was hidden"
+[[ "$RTUIONLYRC" -eq 0 ]] && ok || fail "all-hidden session exited $RTUIONLYRC"
+assert_contains "$RTUIONLYOUT" "No usable backups found."
+assert_contains "$RTUIONLYOUT" "1 backup file name(s) were hidden"
+assert_contains "$RTUIONLYOUT" "Restore one by path if you trust it."
+
+# The output sanitizer is exercised under the C locale as well as the normal
+# UTF-8 locale. C1 controls can arrive as UTF-8 (C2 80..9F), so byte-oriented
+# replacement must not leave the continuation byte behind when LC_ALL=C is
+# inherited by the terminal launcher.
+RTUISANITIZE_DEF="$(sed -n '/^_restore_tui_sanitize() {/,/^}/p' "$OB")"
+RTUISANITIZE_INPUT=$'before\u009b\033[31mcolour\033[0m\001\n\u00c1rea\u00df'
+RTUISANITIZE_OUTPUT="$(LC_ALL=C bash -c "$RTUISANITIZE_DEF; _restore_tui_sanitize \"\$1\"" _ "$RTUISANITIZE_INPUT")"
+
+it "restore sanitizes C1 and ANSI output under the C locale"
+assert_eq "$RTUISANITIZE_OUTPUT" $'before?colour?\n\u00c1rea\u00df'
+
+# A restore plan can contain one line per file. Keep the sanitizer bounded by
+# a single streaming pass so a normal large plan cannot freeze the TUI while
+# it is waiting to print the preview or apply result.
+RTUISANITIZE_LARGE="$(head -c 20000 /dev/zero | tr '\0' x)"
+if timeout 2s bash -c "$RTUISANITIZE_DEF; _restore_tui_sanitize \"\$1\" >/dev/null" _ "$RTUISANITIZE_LARGE"; then
+    it "restore sanitizes a large plan without quadratic delay"
+    ok
+else
+    it "restore sanitizes a large plan without quadratic delay"
+    fail "sanitizer exceeded the two-second regression bound"
+fi
+
+# Destination metadata is also external input. A path with a UTF-8 C1 code
+# point is valid JSON and can reach the listing even though its human-facing
+# form must never emit the control byte under LC_ALL=C.
+RTUIMETADATADIR="$RTUIC/metadata-"$'\u009b'"-"$'\n'"line"
+mkdir -p "$RTUIMETADATADIR"
+cp -- "$RART" "$RTUIMETADATADIR/omabackup-metadata-20260829-000007.tar.zst"
+jq -n --arg path "$RTUIMETADATADIR" \
+    '{schemaVersion:1,destinations:[{id:"metadata",type:"dir",path:$path,keep:5,enabled:true,note:null}]}' \
+    >"$RTUIC/metadata-destinations.json"
+RTUIMETALOG="$RTUIC/restore-metadata.log"
+RTUIMETAFIFO="$RTUIC/metadata-input"
+_restore_tui_start "$RTUIMETALOG" "$RTUIMETAFIFO" \
+    "env LC_ALL=C HOME='$RTUIC/home' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$RH/g.json' \
+         OMABACKUP_STATE='$RTUIC/metadata-state' OMABACKUP_DESTINATIONS='$RTUIC/metadata-destinations.json' \
+         XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIMETALOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIMETALOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIMETALOG" 'Apply this plan to the selected folder?' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIMETARC=$?
+RTUIMETAOUT="$(cat -- "$RTUIMETALOG")"
+
+it "restore sanitizes destination metadata under the C locale"
+[[ "$RTUIMETARC" -eq 0 ]] && ok || fail "metadata session exited $RTUIMETARC"
+assert_contains "$RTUIMETAOUT" "metadata-?-?line"
+assert_not_contains "$RTUIMETAOUT" "$RTUIMETADATADIR"
+
+# The TUI also sanitizes the child command's preview and apply reports, not
+# only the selector metadata. A tiny CLI double makes the terminal controls
+# deterministic without weakening the real artifact-list path.
+RTUIFAKEROOT="$RTUIC/fake-root"
+mkdir -p "$RTUIFAKEROOT/bin"
+ln -s "$PWD/lib" "$RTUIFAKEROOT/lib"
+ln -s "$PWD/groups.default.json" "$RTUIFAKEROOT/groups.default.json"
+cat >"$RTUIFAKEROOT/bin/omabackup" <<'STUBEOF'
+#!/bin/bash
+if [[ "$1" == restore ]]; then
+    apply=0
+    for arg in "$@"; do [[ "$arg" == --apply ]] && apply=1; done
+    if (( apply )); then
+        printf 'applied \033[31mred\033[0m\n'
+    else
+        printf 'preview \033[31mred\033[0m\n'
+    fi
+    exit 0
+fi
+exit 0
+STUBEOF
+chmod +x "$RTUIFAKEROOT/bin/omabackup"
+RTUIREALOUTLOG="$RTUIC/restore-real-output.log"
+RTUIREALOUTFIFO="$RTUIC/real-output-input"
+_restore_tui_start "$RTUIREALOUTLOG" "$RTUIREALOUTFIFO" \
+    "env HOME='$RTUIC/home' OMABACKUP_ROOT='$RTUIFAKEROOT' OMABACKUP_STATE='$RTUIC/real-output-state' \
+         OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIREALOUTLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIREALOUTLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIREALOUTLOG" 'Apply this plan to the selected folder?' && _restore_tui_send $'y\n'
+_restore_tui_wait_for "$RTUIREALOUTLOG" 'applied red'
+_restore_tui_finish; RTUIREALOUTRC=$?
+RTUIREALOUT="$(cat -- "$RTUIREALOUTLOG")"
+
+it "restore sanitizes real preview and apply output"
+[[ "$RTUIREALOUTRC" -eq 0 ]] && ok || fail "real-output session exited $RTUIREALOUTRC"
+assert_contains "$RTUIREALOUT" "preview red"
+assert_contains "$RTUIREALOUT" "applied red"
+assert_not_contains "$RTUIREALOUT" $'\033[31m'
+
+# Recovery must preserve the child diagnostic on the current screen. A raw
+# transcript still contains bytes from previous screens even when a later
+# clear erased them, so assert against the bytes after the last shared header.
+RTUIFAILPREVROOT="$RTUIC/fake-preview-failure-root"
+mkdir -p "$RTUIFAILPREVROOT/bin"
+ln -s "$PWD/lib" "$RTUIFAILPREVROOT/lib"
+ln -s "$PWD/groups.default.json" "$RTUIFAILPREVROOT/groups.default.json"
+cat >"$RTUIFAILPREVROOT/bin/omabackup" <<'STUBEOF'
+#!/bin/bash
+if [[ "$1" == restore ]]; then
+    printf 'PREVIEW-DIAGNOSTIC\n'
+    exit 1
+fi
+exit 0
+STUBEOF
+chmod +x "$RTUIFAILPREVROOT/bin/omabackup"
+RTUIFAILPREVLOG="$RTUIC/restore-preview-diagnostic.log"
+RTUIFAILPREVFIFO="$RTUIC/preview-diagnostic-input"
+_restore_tui_start "$RTUIFAILPREVLOG" "$RTUIFAILPREVFIFO" \
+    "env HOME='$RTUIC/failure-preview-home' OMABACKUP_ROOT='$RTUIFAILPREVROOT' OMABACKUP_STATE='$RTUIC/failure-preview-state' \
+         OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIFAILPREVLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIFAILPREVLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIFAILPREVLOG" 'This backup could not be previewed' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIFAILPREVRC=$?
+RTUIFAILPREVOUT="$(cat -- "$RTUIFAILPREVLOG")"
+RTUIFAILPREVSCREEN="${RTUIFAILPREVOUT##*$'\033[2J\033[H'}"
+
+it "restore keeps the preview diagnostic on the recovery screen"
+[[ "$RTUIFAILPREVRC" -eq 0 ]] && ok || fail "preview-diagnostic session exited $RTUIFAILPREVRC"
+assert_contains "$RTUIFAILPREVSCREEN" "PREVIEW-DIAGNOSTIC"
+
+RTUIFAILAPPLYROOT="$RTUIC/fake-apply-failure-root"
+mkdir -p "$RTUIFAILAPPLYROOT/bin"
+ln -s "$PWD/lib" "$RTUIFAILAPPLYROOT/lib"
+ln -s "$PWD/groups.default.json" "$RTUIFAILAPPLYROOT/groups.default.json"
+cat >"$RTUIFAILAPPLYROOT/bin/omabackup" <<'STUBEOF'
+#!/bin/bash
+if [[ "$1" == restore ]]; then
+    for arg in "$@"; do
+        if [[ "$arg" == --apply ]]; then
+            printf 'APPLY-DIAGNOSTIC\n'
+            exit 1
+        fi
+    done
+    printf 'PREVIEW-OK\n'
+    exit 0
+fi
+exit 0
+STUBEOF
+chmod +x "$RTUIFAILAPPLYROOT/bin/omabackup"
+RTUIFAILAPPLYLOG="$RTUIC/restore-apply-diagnostic.log"
+RTUIFAILAPPLYFIFO="$RTUIC/apply-diagnostic-input"
+_restore_tui_start "$RTUIFAILAPPLYLOG" "$RTUIFAILAPPLYFIFO" \
+    "env HOME='$RTUIC/failure-apply-home' OMABACKUP_ROOT='$RTUIFAILAPPLYROOT' OMABACKUP_STATE='$RTUIC/failure-apply-state' \
+         OMABACKUP_DESTINATIONS='$RTUIC/destinations.json' XDG_RUNTIME_DIR=/nonexistent '$OB' restore"
+_restore_tui_wait_for "$RTUIFAILAPPLYLOG" 'Choose a backup number' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIFAILAPPLYLOG" 'Choose [1/2/3/q]:' && _restore_tui_send $'1\n'
+_restore_tui_wait_for "$RTUIFAILAPPLYLOG" 'Apply this plan to the selected folder?' && _restore_tui_send $'y\n'
+_restore_tui_wait_for "$RTUIFAILAPPLYLOG" 'The restore did not finish successfully' && _restore_tui_send $'q\n'
+_restore_tui_finish; RTUIFAILAPPLYRC=$?
+RTUIFAILAPPLYOUT="$(cat -- "$RTUIFAILAPPLYLOG")"
+RTUIFAILAPPLYSCREEN="${RTUIFAILAPPLYOUT##*$'\033[2J\033[H'}"
+
+it "restore keeps the apply diagnostic on the recovery screen"
+[[ "$RTUIFAILAPPLYRC" -eq 0 ]] && ok || fail "apply-diagnostic session exited $RTUIFAILAPPLYRC"
+assert_contains "$RTUIFAILAPPLYSCREEN" "APPLY-DIAGNOSTIC"

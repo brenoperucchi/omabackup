@@ -13,18 +13,38 @@ And a second one, which decides whether restoring is safe at all:
 
 ## Status
 
-Stage 1 of 6. Working today: `status`, `collect`, `verify`.
+The CLI, scheduler, restore TUI and QuickShell panel are working today.
 
 ```bash
 ./bin/omabackup status     # Omarchy version, restore range, groups
 ./bin/omabackup collect    # collect the groups into staging
 ./bin/omabackup verify     # check coverage; --json for programmatic use
-./test/run.sh              # 18 specs
+./bin/omabackup config     # guided settings TUI
+./bin/omabackup restore    # guided restore TUI
+./test/run.sh              # complete regression suite
 ```
 
-The QML plugin (`Service.qml`, `BarWidget.qml`, `Panel.qml`) is a placeholder
-until stage 5 — it loads without taking room in the bar and without any way to
-bring the shell down.
+The QuickShell panel is a client of the CLI. Its Settings and Restore actions
+fade the panel out and open the corresponding terminal TUI; the panel never
+writes machine configuration or applies a restore itself.
+
+### Configuration and schedules
+
+`omabackup config` is safe to use over SSH or a recovery terminal. It lists
+backup folders with numbers, generates a destination name when one is not
+provided, explains retention, and offers frequency presets. A script can use
+the same contract directly:
+
+```bash
+./bin/omabackup config set sync-schedule '*/15 * * * *'
+./bin/omabackup config set push-schedule '0 * * * *'
+./bin/omabackup config show --json
+```
+
+Schedules use the familiar five-field crontab form at the interface. The CLI
+validates it and converts it to the systemd `OnCalendar` value behind the
+scenes. The systemd expression is retained only as diagnostic data, not as a
+value the user has to construct.
 
 ## How it works
 

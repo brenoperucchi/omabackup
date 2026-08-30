@@ -8,7 +8,7 @@ Codex, a fresh terminal, another machine) — it is what lets a cold session,
 regardless of which coding agent is reading it, pick up where the last one
 left off. Read this file first, in full, before touching any code.
 
-Last updated: 2026-08-27.
+Last updated: 2026-08-30.
 
 ---
 
@@ -22,7 +22,7 @@ Last updated: 2026-08-27.
 | 3 | T3 — fast syntax/parse check in a disposable container | not started |
 | 4 | `restore` with the version-coupling quarantine (§12.2 of DESIGN.md) | **done** |
 | 5 | QML plugin (`Panel.qml`) — coverage, groups, destinations, schedule | **done**, installed live |
-| 6 | T4 — visual restore check in a VM (QMP screendump) | not started |
+| 6 | T4 — visual restore check in a VM (QMP screendump) | **done**, validated 2026-08-29 |
 
 Stages don't have to land in this order — 5 landed before 2 on purpose, to
 prove the whole pipe works end to end (CLI → JSON → QML → the real bar) before
@@ -510,10 +510,408 @@ subshell -- `exit` alone does not reach past `$(...)`) the moment it fails.
 2. **Removable-drive trigger.** A udev rule calling `omabackup push <id>` when a
    `dir` destination's mount point appears (DESIGN.md §4.4). Not a new
    destination type.
-3. **T3 and T4** (stages 3 and 6) are the verification of what stage 4 now
-   does: a syntax check in a disposable container, and a visual check in a VM.
-   They are worth more now that there is a restore to verify than they were
-   when there was not.
+3. **T3** (stage 3) remains the next independent verification after the
+   configuration surfaces: a syntax check in a disposable container.
+
+### Configuration and the real VM test (design review, 2026-08-29)
+
+Two possible next steps were reviewed after the restore panel was completed:
+an editable Settings surface and a real Omarchy/QEMU restore test. They should
+remain separate concerns.
+
+The proposed configuration boundary is a CLI-owned `omabackup config` command
+with an ANSI/TUI mode for a recovery tty or SSH session. It should validate and
+atomically update the existing machine-owned configuration (`env`,
+`destinations.json`, and the systemd timer settings), while keeping the public
+group manifest and the secret scanner outside the editable settings surface.
+The QuickShell panel can later provide a Settings UI by invoking that command
+through `Quickshell.Io.Process`; it must not edit those files directly. The
+current Config block remains a read-only status summary until that command
+exists.
+
+The proposed T4 harness is a persistent, disposable virtual machine: use the
+host's QEMU/KVM directly (KVM and OVMF are already available here), build or
+refresh one clean golden image, boot a copy-on-write overlay for each run,
+forward SSH from QEMU, copy in a real artifact, run `restore --apply` in the
+guest, then assert the restored files, Omarchy state, and QuickShell/Hyprland
+startup before discarding the overlay. `qcow2` is only the convenient
+copy-on-write disk format for that overlay, not a requirement of the test
+design. Libvirt, containers, and `systemd-nspawn` remain unnecessary for this
+single reproducible graphical-VM workflow; a container can still serve as a
+fast CLI-only test later. Reinstalling Omarchy for every run is not part of the
+restore test; an optional installer-E2E job can test the ISO or provisioning
+path separately. The first manual panel test still happens on the live host,
+using a disposable restore target where possible.
+
+### Execution plan: VM first, then configuration surfaces
+
+The order is intentionally based on risk and dependency, not on visual
+visibility. The restore path is already implemented but has not yet been
+observed end to end on a clean Omarchy. The panel and configuration surfaces
+must not become a second source of truth before that path is exercised.
+
+#### 0. Live smoke test — no code
+
+Use the installed panel and a real artifact to walk through overview →
+artifacts → target → plan → terminal handoff. First use a disposable target;
+record any appearance, scroll, command, or target-selection problem. This is a
+human UX check, not a substitute for the VM.
+
+#### 1. T4/QEMU proof of restore — first implementation
+
+Create `test/vm/` with a documented QEMU/KVM runner, a golden Omarchy image,
+SSH readiness, artifact transfer, restore execution, assertions, timeout and
+cleanup. The normal run boots a copy-on-write overlay and never modifies the
+golden image. Its acceptance checks are:
+
+- the guest boots and accepts the test SSH key;
+- the real artifact is accepted and `restore --apply` completes;
+- expected files and the restore journal exist in the guest;
+- the guest's Omarchy state, QuickShell and Hyprland reach the expected state;
+- logs and a screenshot are preserved on failure, and the overlay is removed
+  after the run.
+
+Creating or refreshing the golden image is a separate, slower operation. An
+ISO/installer automation test is optional and must not be coupled to every
+restore run.
+
+**Completed 2026-08-29:** the runner and its contract probes now exist in
+`test/vm/run.sh`, `test/vm/README.md`, and `test/vm.test.sh`. The runner uses a
+strict pinned SSH host key, one absolute deadline, QMP screenshot evidence,
+durable restore-journal assertions, archive-aware regular-file/symlink checks,
+and live `loginctl`/Wayland/Hyprland checks after SDDM restart. The opt-in
+`test/vm/build-golden.sh` follows Omarchy's unattended `cidata` installer
+contract to create a fresh unencrypted `qcow2` fixture and provision the SSH
+test user. The builder verifies the official ISO checksum, provisions SDDM
+autologin, checks the graphical session, powers the guest off cleanly, then
+boots the same disk in a fresh QEMU process and repeats the SSH/graphical
+checks before accepting it. The contract suite passes its preflight, retry,
+pinned-SSH, deadline, archive, graphical-readiness, and QMP-evidence checks,
+`qemu-img check` reports no errors on the golden, and the real T4 passed with
+the current bundle: 608 files restored,
+the one documented absolute symlink escape refused, journal/hash/type checks
+clean, QuickShell and Hyprland active with an `omarchy-bar` layer, and a
+non-uniform 1280x800 QMP screenshot saved under `~/VMs/omabackup/results/`.
+An earlier golden exposed the installer encryption-default issue and was
+discarded from acceptance; the final golden was rebuilt without the credential
+field that triggered it. The screenshot is retained as human-review evidence;
+the automated visual contract is the live compositor, monitor, and
+`omarchy-bar` checks rather than a claim that pixel diversity proves the right
+desktop. Configuration work can now start.
+
+The builder's cold boot uses a fresh copy of the same OVMF vars template as
+the restore runner, so a transient installer NVRAM entry cannot hide a broken
+golden. Provisioning SSH calls have an absolute deadline, the host-key file is
+swapped only after all builder checks pass, and failed QEMU processes receive a
+TERM/KILL cleanup escalation.
+
+#### 2. Configuration contract — design before interface
+
+Define the schema and invariants for machine-owned settings without changing
+the public group manifest or the secret deny-list. The initial scope is the
+repo path, `dir` destinations, retention, timer intervals, and the enabled
+switch. Keep compatibility with the existing `env`, `destinations.json`, and
+systemd units; do not introduce a second parallel config format merely to draw
+a Settings screen.
+
+The command name is `omabackup config`:
+
+- `omabackup config` opens the interactive ANSI/TUI when attached to a tty;
+- `omabackup config show --json` is the read-only machine-readable view;
+- explicit subcommands may be added for scripts and future QuickShell calls;
+- every mutation validates first, writes atomically, and reports the resulting
+  systemd state.
+
+**Completed 2026-08-29:** the contract is implemented in `lib/config.sh`.
+`config show --json` is read-only; repo and destination mutations preserve
+unrelated environment lines and use atomic mode-600 writes; timer edits accept
+simple five-field crontab schedules, translate them to systemd `OnCalendar`,
+preserve the rest of each unit, and roll back when daemon reload/restart fails.
+The systemd expression is retained only in the diagnostic
+`schedules.calendar` JSON field. Unknown destination fields, types, paths, and
+retention values are rejected.
+
+#### 3. CLI configuration implementation
+
+Implement and regression-test `config` against temporary homes and stubbed
+systemd. It must work over SSH/recovery tty without QuickShell, never source
+user-controlled configuration as shell code, preserve unrelated hand edits,
+and make invalid or incomplete settings impossible to activate silently.
+
+**Completed 2026-08-29:** `bin/omabackup config` provides `show`, `validate`,
+repo/schedule/enabled setters, and destination add/remove. The non-interactive
+path is covered against temporary homes and stubbed systemd; the initial
+non-interactive regression contract had 45 passing assertions, including
+malformed JSON, spaces, atomic preservation, crontab-to-systemd conversion,
+invalid schedules, and timer rollback. The complete Config suite now also
+covers the interactive TUI.
+
+#### 4. ANSI/TUI implementation
+
+Build the interactive interface on top of the CLI contract, not beside it.
+Use plain terminal control/ANSI primitives already available on the base
+system; keep a non-interactive path for automation. Test navigation, cancel,
+validation failures, spaces in paths, no destination, and disabled timers.
+
+**Completed 2026-08-29:** the TUI is a thin ANSI menu over those same CLI
+subcommands, so it shares validation and atomicity instead of duplicating them.
+It offers guided minute/hour/day/week choices, shows the resulting crontab,
+generates a destination name when the user leaves it blank, lets the user
+choose a destination by number or name, and explains retention as “keep the N
+newest bundles”. Restore uses the same terminal-owned TUI style: numbered
+artifacts, a safe preview target by default, an explicit home confirmation, and
+no destination id prompt. It is usable over a recovery tty/SSH session, while
+scripts and QuickShell use the explicit non-interactive commands.
+
+#### 5. QuickShell Settings surface
+
+Follow the existing Omarchy network-settings pattern: the panel's Config block
+stays a compact read-only summary and gets a `Settings…` action in the fixed
+footer. That action opens `omabackup config` in `omarchy-launch-tui`, just as the network panel's
+`Custom` option hands DNS configuration to the Omarchy CLI. When the terminal
+closes, the panel refreshes `status --json` and shows the new state. QML remains
+a client: it does not write config files, run `systemctl`, or reimplement
+validation. A full in-panel form is unnecessary unless real use later shows a
+specific setting that benefits from inline editing.
+
+**Completed 2026-08-29:** `Panel.qml` has a compact read-only `Current settings`
+summary and a `Settings…` action that fades the QuickShell panel before
+launching `omarchy-launch-tui` with `omabackup config`; Restore follows the
+same handoff with `omabackup restore`, so both are the same terminal-owned ANSI
+surface. Machine-action processes have an absolute timeout; the terminal
+handoff remains alive for the whole user TUI session and refreshes on exit. The
+expanded summary scrolls its rows into the capped panel viewport. The panel's
+runtime version comes from the manifest through `status --json`, is shown as
+an explicit `OmaBackup 0.2.1` action, and copies only that version to
+Quickshell's Wayland clipboard when clicked. The fixed footer keeps `Restore…`
+and `Settings…` together, while the body remains ordered as status/actions,
+runtime identity, verification/coverage, destinations, and read-only settings.
+The headless QML probes cover the handoff lifecycle, clipboard assignment and
+layout; the source contract covers the command/app-id wiring, disabled state,
+and timeout path; 15 panel assertions pass.
+
+#### 6. Final verification and delivery
+
+Run the complete shell suite, the QML probes, the VM test, and a live reload
+only after each reviewable unit is complete. Update this plan with observed VM
+results, keep the QEMU harness reproducible, and deploy the panel only after
+the CLI and UI tests pass.
+
+**Completed 2026-08-29:** `./test/run.sh` passed with **779 passed, 0
+failed**; the focused configuration and panel checks passed with 45 and 15
+assertions respectively. The real guest check passed with
+`golden-clean.qcow2`, including restore, Omarchy state, QuickShell, and
+Hyprland, with screenshot evidence at
+`/home/brenoperucchi/VMs/omabackup/results/restore-20260829T220743Z.ppm`.
+Two separate attempts against stale/flaky image state timed out before SSH
+(one `golden-clean` boot and the old `golden-final-v2` fixture); their serial
+evidence is retained by the runner and does not change the successful guest
+run above. The active plugin clone was synchronized from this worktree and
+reloaded with `omarchy-restart-shell`; checksums, `status --json`, and a
+no-op `config` TUI smoke test all passed. The final review closed the timeout,
+disabled-button, Settings-label, fade/refresh, and dead in-panel restore
+findings, including the correction that prevents a long-lived terminal
+session from being mistaken for a timeout and refreshes after a non-zero
+launcher exit; the panel now has no `--apply` path of its own. The full
+Panel visual click-through remains a desktop-only check because its Omarchy
+`qs.Ui` imports are not available to the standalone headless probe; the live
+shell reload loaded the plugin without a QML load error, and the focused
+geometry/protocol probes passed.
+
+### Follow-up UX correction (2026-08-29)
+
+The first configuration surface exposed raw systemd calendar expressions and
+asked for an invented destination id/retention number without explaining the
+terms. The first panel handoff also left Settings and Restore visually over
+the QuickShell card while the terminal opened, and an expanded summary could
+grow below the viewport. This pass moved the user-facing schedule to guided
+crontab choices, made destination ids optional and selectable by number,
+defined retention as the number of newest bundles to keep, routed Restore and
+Settings through the same terminal TUI, delayed the launch until the panel's
+fade completes, kept the long-lived terminal handoff outside the
+CLI-operation timeout, and scrolls the expanded summary to its rows.
+Regression coverage now includes schedule round-tripping,
+destination auto-naming/retention, the capped Settings scroll, handoff wiring,
+and disabled/timeout source contracts.
+
+### UX requirements round — configuration and restore TUI (2026-08-29)
+
+The next work unit is a user-experience correction, not a new configuration
+format. The CLI contract and the QuickShell handoff remain the single source
+of truth; this round changes how the terminal surface explains and recovers
+from states that are currently too easy to misunderstand.
+
+The screenshot exposed these problems in the current configuration TUI:
+
+- an empty `repo:` value gives no indication whether the repository is missing
+  or merely unreadable;
+- normal status shows raw systemd `OnCalendar` syntax instead of a schedule a
+  person can understand;
+- menu labels such as “destination”, “timers” and “previous backups” expose
+  implementation terms without explaining their consequence;
+- an empty or invalid choice produces `Unknown choice:` and then a
+  `Press Enter to continue...` dead end instead of keeping the user in the
+  menu;
+- the same recovery and cancel behavior is not yet consistent across config
+  and restore.
+
+The Restore handoff is also in scope. A reproducible current-state case is:
+`omabackup restore` launched through `omarchy-launch-tui` finds no valid bundle,
+prints `No valid backup bundles were found.` and exits with status 1; the
+terminal launcher then closes its window. The desired behavior is to keep the
+user in an actionable OmaBackup TUI state for recoverable conditions (no
+destination, no bundle, unreachable destination, invalid selection, or a
+failed preview), explaining what happened and offering the next action. The
+terminal may close normally only after an explicit quit/cancel or after an
+unrecoverable launcher failure has been shown to the user.
+
+The requirements to approve before implementation are:
+
+1. **Status first.** Show explicit values or `Not configured`, never a blank
+   field. Use plain labels such as repository, backup folders, backup schedule,
+   send schedule, and automatic backups. Raw systemd calendar values belong in
+   an optional diagnostic/advanced view only.
+   The repository status must also say whether the configured repository has
+   an `origin` remote and therefore whether the implicit GitHub destination is
+   active. GitHub must remain part of the existing repository/remote model,
+   not become a second destination id that can drift from the actual remote.
+2. **One predictable menu.** Group actions by intent: repository, backup
+   folders, backup schedule, send schedule, restore, and automatic backups.
+   `q`/Escape cancel or exit consistently, Enter accepts the documented
+   default, and invalid input returns to the same prompt with the valid range.
+3. **Guided schedules.** Offer every-N-minutes, hourly, daily, and weekly
+   choices with human examples and current-value defaults. Keep custom cron as
+   an explicitly advanced option; the backend continues converting it to
+   systemd without exposing `OnCalendar` in the normal flow.
+4. **Friendly destinations.** Ask for a folder path, generate the internal id
+   automatically unless the user deliberately expands advanced options, list
+   configured folders by number and readable name, and describe retention as
+   “keep the N newest backups”. No user should need to know a destination id
+   to add, remove, or select one.
+5. **Restore as the same interaction model.** Restore must use the same
+   headings, spacing, numbered choices, cancel behavior, error recovery, and
+   confirmation language as Settings. “No backups found” must explain how to
+   configure a folder or return to the menu; it must not flash a terminal and
+   disappear. Target choices must explain preview versus this machine, and the
+   destructive home confirmation remains explicit.
+6. **Panel handoff.** Settings and Restore keep the existing fade-before-launch
+   behavior. When the terminal TUI exits, the panel refreshes status and
+   surfaces any non-zero result without leaving a permanently busy or hidden
+   state.
+7. **Regression contract.** Add permanent tests for empty input, invalid input,
+   no repository, no destination, no bundle, unreachable destination, a failed
+   restore preview, explicit cancel, successful quit, and the exact
+   `omarchy-launch-tui` handoff. Include a GitHub remote-present and
+   GitHub-remote-missing case, asserting that the TUI reports the distinction
+   and that `push` keeps its current implicit-origin behavior. The complete
+   `./test/run.sh` suite and the VM restore check remain required before this
+   work is considered complete.
+
+The current UI language is English; unless the user requests a full
+translation, keep this round in English for consistency with the panel and
+CLI, while making the wording user-oriented.
+
+### Restore TUI gate completed — 2026-08-30
+
+- Recoverable no-bundle, listing, preview, target, and apply failures now keep
+  the terminal open with retry/Settings/quit actions; explicit `q` remains a
+  successful cancel.
+- Restore freezes the resolved target, uses a private descriptor-backed
+  snapshot, bounds the snapshot to the size measured on the opened inode, and
+  keeps the shared artifact path in the journal. Terminal metadata and child
+  output are sanitized before display.
+- The remaining regular-file/FIFO race between Bash's `-f` check and `open` is
+  documented as a residual availability risk of this shell implementation;
+  the integrity contract is the already-open regular inode. The real bug found
+  in arbitration—copying a growing source past the previewed size—is covered
+  by a permanent append regression and fixed with bounded `head -c` copying.
+- Restore gate: `./test/run.sh restore.test.sh` — **244 passed, 0 failed**.
+  Both fixed Herdr reviewers returned `LIMPO` after the final test-label
+  correction; the official arbitration is recorded under
+  `.herdr/ask/omabackup-4/`.
+- Next slice: finish the friendly shared Config/Restore interaction without
+  creating a second destination id or changing push's implicit-origin behavior.
+
+### GitHub/origin visibility gate completed — 2026-08-30
+
+- The old push behavior is preserved: `cmd_push` still derives GitHub from the
+  repository's implicit `origin`, keeps it out of `destinations.json`, includes
+  it in the default push set, and skips it when a named destination is chosen.
+- `config show --json`, `status --json`, the human config view, and the ANSI
+  Settings view now expose the effective origin push URL, distinguish a missing
+  remote, and keep `configured`/`active` independent from timer availability.
+  A common-repository `.git` directory remains the explicit contract; linked
+  worktrees remain outside this slice.
+- Remote credentials are redacted from displayed URLs, failed `git push`
+  details, newly persisted destination errors, and legacy state projected into
+  status JSON. Multiple Git `pushurl` values retain the stable scalar contract:
+  the first target is shown and the UI says that Git may use more.
+- Permanent regressions cover push URL versus fetch URL, exact credential
+  redaction, failed-push stderr/state leakage, legacy state, multi-pushurl
+  setup, default versus named destination selection, missing origin, and
+  configured origin with unavailable timers.
+- Focused gates: `./test/run.sh config.test.sh` — **83 passed, 0 failed**;
+  `./test/run.sh destinations.test.sh` — **61 passed, 0 failed**. Both fixed
+  Herdr reviewers returned `LIMPO` after the final correction round; the
+  review warning was explicitly re-sent and both reread `.herdr/reviewer.md`.
+- The follow-up interaction work is recorded as completed below.
+
+### Friendly Config/Restore interaction gate completed — 2026-08-30
+
+- Config and Restore now share a terminal-owned ANSI interaction model with
+  status-first wording, explicit `Not configured`/unreachable states,
+  recoverable invalid input, `q` cancellation, and no-bundle retry/Settings/
+  quit actions. Restore keeps preview and apply failures visible instead of
+  allowing the terminal launcher to flash and disappear.
+- Folder destinations are shown and removed by ordinal, with readable paths
+  and “keep the N newest backups” retention wording. Internal ids are
+  generated automatically, and the reserved implicit GitHub origin cannot be
+  entered as a duplicate destination.
+- Schedule editing is guided by minutes, hours, days, and weeks, derives the
+  current value as the default, and keeps custom cron as an advanced path.
+  Supported cron forms round-trip through the systemd timers; every-minute and
+  monthly forms are covered, while lossy conversions are rejected.
+- The QuickShell Settings and Restore actions fade the panel before launching
+  the same terminal-owned flow. Completion IPC carries the action, exit code,
+  and generation token; the wrapper owns the heartbeat, signal status, and
+  finite recovery path, so the panel refreshes without getting stuck busy.
+  The displayed manifest version is still a clipboard action, not editable
+  configuration.
+- Human-facing config, destination, schedule, and restore metadata is
+  sanitized before terminal rendering; machine-readable JSON and command
+  arguments remain unchanged. Permanent tests cover control characters,
+  overflow, stale callbacks, signal exits, and launcher failure paths.
+- Focused gates: `config.test.sh` — **135 passed, 0 failed**;
+  `destinations.test.sh` — **75 passed, 0 failed**;
+  `panel.test.sh` — **32 passed, 0 failed**;
+  `vm.test.sh` — **23 passed, 0 failed**;
+  `restore.test.sh` — **251 passed, 0 failed**. Rounds 8–11 found concrete
+  issues; each fix gained a permanent regression that failed before the fix.
+  The final corrections cover destination validation, wrapper cleanup/IPC
+  bounds and signal forwarding, relative golden canonicalization, calendar
+  fallback wording, immediate Escape handling in both TUIs, inherited signal
+  dispositions, termios/trap restoration, and the PGID discovery race.
+- The fixed reviewers completed the final confirmation in round 12: both
+  `omabackup-rev` and `omabackup-rev-2` returned **APPROVE**. The genuine
+  signal-semantics disagreement in round 10 was sent to `herdr-ask`; its
+  findings were implemented and then re-reviewed by the same fixed pair. The
+  operational warning was re-sent in the confirmation request, and both
+  reviewers were instructed to reread `AGENTS.md`'s Reviewer colleagues and
+  `.herdr/reviewer.md`'s Isolamento section.
+- Final verification is complete: `./test/run.sh` — **984 passed, 0 failed**;
+  Bash syntax and `git diff --check` are clean. The real VM gate passed again
+  on 2026-08-30 using the accepted `golden-final-v2.qcow2` fixture with its
+  pinned SSH key: the real artifact restored in the Omarchy guest, the journal
+  and file/type/hash checks passed, QuickShell and Hyprland became active with
+  an `omarchy-bar` layer, and QMP produced screenshot evidence at
+  `/home/brenoperucchi/VMs/omabackup/results/restore-20260830T090504Z.ppm`.
+  The runner used the matching `known_hosts` fixture on port 2223 because the
+  older `known_hosts-final` belongs to a previous image state; SSH remained
+  strict and pinned during the successful run.
+- The parent configuration/restore work is **complete**. Settings and Restore
+  continue to use one terminal-owned ANSI flow, with no second config format
+  and no panel-owned restore path; the QuickShell handoff remains a bounded,
+  refreshable launch around that flow.
 
 ## Open questions for the user, not yet decided
 

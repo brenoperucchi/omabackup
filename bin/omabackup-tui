@@ -1,0 +1,205 @@
+#!/bin/bash
+# Keep the terminal-owned TUI alive independently of omarchy-launch-tui's
+# short-lived launcher process. The panel is notified only after the CLI has
+# really returned, including when the CLI reports an error.
+set -u
+
+cli="${1:-}"
+action="${2:-}"
+token="${3:-}"
+[[ "$cli" == /* ]] || exit 2
+case "$action" in
+    config|restore) ;;
+    *) exit 2 ;;
+esac
+[[ "$token" =~ ^[A-Za-z0-9_-]+$ ]] || exit 2
+
+CLI_PID=""
+CLI_PGID=""
+HEARTBEAT_PID=""
+IPC_PID=""
+IPC_PGID=""
+CLEANED=0
+
+_stop_pid() {
+    local pid="${1:-}" signal="${2:-TERM}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+        wait "$pid" >/dev/null 2>&1 || true
+        return 0
+    fi
+    kill -"$signal" "$pid" >/dev/null 2>&1 || true
+    for _ in {1..20}; do
+        kill -0 "$pid" >/dev/null 2>&1 || {
+            wait "$pid" >/dev/null 2>&1 || true
+            return 0
+        }
+        /usr/bin/sleep 0.05
+    done
+    kill -KILL "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+}
+
+_group_pgid_wait() {
+    local pid="$1" pgid
+    for _ in {1..40}; do
+        kill -0 "$pid" >/dev/null 2>&1 || return 1
+        pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+        if [[ "$pgid" == "$pid" ]]; then
+            printf '%s' "$pgid"
+            return 0
+        fi
+        /usr/bin/sleep 0.01
+    done
+    return 1
+}
+
+_stop_group() {
+    local pid="${1:-}" signal="${2:-TERM}" pgid="${3:-}" own_pgid
+    [[ "$pid" =~ ^[0-9]+$ || "$pgid" =~ ^[0-9]+$ ]] || return 0
+    if [[ ! "$pgid" =~ ^[0-9]+$ ]]; then
+        pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    fi
+    own_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d '[:space:]')"
+    if [[ "$pgid" =~ ^[0-9]+$ && "$pgid" != "$own_pgid" && "$pgid" != 0 ]]; then
+        kill -"$signal" -- "-$pgid" >/dev/null 2>&1 || true
+        for _ in {1..20}; do
+            kill -0 -- "-$pgid" >/dev/null 2>&1 || break
+            /usr/bin/sleep 0.05
+        done
+        kill -KILL -- "-$pgid" >/dev/null 2>&1 || true
+        [[ "$pid" =~ ^[0-9]+$ ]] && wait "$pid" >/dev/null 2>&1 || true
+    else
+        _stop_pid "$pid" "$signal"
+    fi
+}
+
+_ipc_call() {
+    local -a args=("$@")
+    local i
+    command -v omarchy-shell >/dev/null 2>&1 || return 0
+    local grouped=0
+    if command -v setsid >/dev/null 2>&1; then
+        setsid -- omarchy-shell "${args[@]}" >/dev/null 2>&1 &
+        grouped=1
+    else
+        omarchy-shell "${args[@]}" >/dev/null 2>&1 &
+    fi
+    IPC_PID=$!
+    if (( grouped )); then
+        IPC_PGID="$(_group_pgid_wait "$IPC_PID" || true)"
+    else
+        IPC_PGID=""
+    fi
+    # Keep the wrapper independent of GNU timeout. This bounded wait also
+    # gives cleanup a PID to terminate if the IPC client ignores its signal.
+    for i in {1..30}; do
+        if ! kill -0 "$IPC_PID" >/dev/null 2>&1; then
+            wait "$IPC_PID" >/dev/null 2>&1 || true
+            IPC_PID=""
+            IPC_PGID=""
+            return 0
+        fi
+        /usr/bin/sleep 0.1
+    done
+    _stop_group "$IPC_PID" TERM "$IPC_PGID"
+    IPC_PID=""
+    IPC_PGID=""
+}
+
+_notify() {
+    local result="$1"
+    # A terminal can disappear by signal, before the normal command path
+    # reaches its notification. Best-effort IPC is still preferable to
+    # leaving the panel busy forever; the panel has a finite recovery guard
+    # for environments where this command is unavailable. _ipc_call bounds
+    # the client even when it accepts the request but never returns.
+    _ipc_call shell call brenoperucchi.omabackup tuiFinished "$action:$result:$token"
+}
+_heartbeat() {
+    local parent_pid="$$" sleep_pid=""
+    _heartbeat_cleanup() {
+        if [[ -n "$sleep_pid" ]] && kill -0 "$sleep_pid" >/dev/null 2>&1; then
+            kill "$sleep_pid" >/dev/null 2>&1 || true
+            wait "$sleep_pid" >/dev/null 2>&1 || true
+        fi
+        sleep_pid=""
+        _stop_group "${IPC_PID:-}" TERM "${IPC_PGID:-}"
+        IPC_PID=""
+        IPC_PGID=""
+    }
+    trap '_heartbeat_cleanup' EXIT
+    trap '_heartbeat_cleanup; exit 143' TERM
+    trap '_heartbeat_cleanup; exit 129' HUP
+    trap '_heartbeat_cleanup; exit 130' INT
+    while kill -0 "$parent_pid" >/dev/null 2>&1; do
+        sleep 30 &
+        sleep_pid=$!
+        wait "$sleep_pid" || {
+            sleep_pid=""
+            kill -0 "$parent_pid" >/dev/null 2>&1 || return 0
+            continue
+        }
+        sleep_pid=""
+        kill -0 "$parent_pid" >/dev/null 2>&1 || return 0
+        _ipc_call shell call brenoperucchi.omabackup tuiHeartbeat "$token"
+    done
+}
+
+_cleanup() {
+    local signal="${1:-TERM}"
+    (( CLEANED )) && return 0
+    CLEANED=1
+    _stop_group "${CLI_PID:-}" "$signal" "${CLI_PGID:-}"
+    _stop_pid "${HEARTBEAT_PID:-}" TERM
+    _stop_group "${IPC_PID:-}" TERM "${IPC_PGID:-}"
+    CLI_PID=""
+    CLI_PGID=""
+    HEARTBEAT_PID=""
+    IPC_PID=""
+    IPC_PGID=""
+}
+
+_on_exit() {
+    local rc="$1"
+    _cleanup TERM
+    _notify "$rc"
+}
+
+_on_signal() {
+    local signal="$1" rc="$2"
+    _cleanup "$signal"
+    exit "$rc"
+}
+
+trap '_on_exit "$?"' EXIT
+trap '_on_signal HUP 129' HUP
+trap '_on_signal INT 130' INT
+trap '_on_signal TERM 143' TERM
+
+_heartbeat &
+HEARTBEAT_PID=$!
+# Bash gives asynchronous commands /dev/null on stdin when job control is
+# disabled unless it is redirected explicitly. The launcher hands us a PTY;
+# preserve that descriptor or the real CLI will believe it is non-interactive.
+CLI_GROUPED=0
+    if command -v setsid >/dev/null 2>&1; then
+        # Bash marks SIGINT/SIGQUIT ignored for asynchronous jobs. Reset those
+        # dispositions outside the child shell (trap - cannot reset a signal
+        # that was ignored when Bash started) so a terminal Ctrl-C can reach
+        # the CLI's own termios/snapshot cleanup while the wrapper supervises
+        # its group.
+        setsid -- env --default-signal=INT,QUIT /bin/bash -c 'exec "$@"' omabackup-cli \
+            "$cli" "$action" <&0 &
+    CLI_GROUPED=1
+else
+    env --default-signal=INT,QUIT /bin/bash -c 'exec "$@"' omabackup-cli \
+        "$cli" "$action" <&0 &
+fi
+CLI_PID=$!
+if (( CLI_GROUPED )); then
+    CLI_PGID="$(_group_pgid_wait "$CLI_PID" || true)"
+fi
+wait "$CLI_PID"
+rc=$?
+exit "$rc"

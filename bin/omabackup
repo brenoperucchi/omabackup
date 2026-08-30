@@ -46,7 +46,11 @@ _load_env_file() {
         [[ "$line" =~ ^[[:space:]]*[#$] ]] && continue
         [[ "$line" =~ ^[[:space:]]*(OMABACKUP_[A-Z0-9_]+)=(.*)$ ]] || continue
         k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
-        v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"
+        if [[ ${#v} -ge 2 && ${v:0:1} == '"' && ${v: -1} == '"' ]]; then
+            v="${v:1:${#v}-2}"
+        elif [[ ${#v} -ge 2 && ${v:0:1} == "'" && ${v: -1} == "'" ]]; then
+            v="${v:1:${#v}-2}"
+        fi
         [[ " $ENV_FILE_ALLOWED " == *" $k "* ]] || {
             # Plain text, no colours and no _tilde: this runs before either
             # exists, and under `set -u` reaching for them would kill the CLI
@@ -70,6 +74,7 @@ DESTINATIONS_FILE="${OMABACKUP_DESTINATIONS:-$HOME/.config/omabackup/destination
 # Versioned, unlike destinations: secret shapes are generic, and §6 wants the
 # exceptions reviewable by whoever reads the repo next.
 SECRETS_DENY_FILE="${OMABACKUP_SECRETS_DENY:-$OMABACKUP_ROOT/secrets.deny.json}"
+TOOL_MANIFEST="$OMABACKUP_ROOT/manifest.json"
 STAGING="$OMABACKUP_STATE/staging"
 LAST_SYNC_FILE="$OMABACKUP_STATE/last-sync"
 # What each group actually covers, written by collect and read by verify --json
@@ -93,6 +98,15 @@ FINDINGS=()   # level\tgroup\tcode\tmessage\tpath
 die() { printf '%somabackup: %s%s\n' "$RED" "$*" "$NC" >&2; exit 1; }
 
 _tilde() { printf '%s' "${1/#$HOME/\~}"; }
+
+# The manifest is the single source of truth for the installed plugin version.
+# The panel reads it through `status --json`, so the UI never duplicates a
+# version string in QML. A missing or malformed manifest is reported as
+# unknown rather than turning a read-only status check into a false version.
+_tool_version() {
+    jq -er '.version | strings | select(length > 0)' "$TOOL_MANIFEST" 2>/dev/null \
+        || printf 'unknown'
+}
 # A trailing slash on a declared path (an easy typo: "~/.local/bin/" instead
 # of "~/.local/bin") used to ride straight through every consumer of this
 # function's output. It broke restore's forward-move held check
@@ -1307,6 +1321,12 @@ timer_schedule() {
     printf '%s' "$out" | sed -n 's/.*OnCalendar=\([^;]*\).*/\1/p' | sed 's/[[:space:]]*$//'
 }
 
+timer_schedule_cron() {
+    local calendar
+    calendar="$(timer_schedule "$1")" || return 1
+    schedule_calendar_to_cron "$calendar"
+}
+
 scheduler_active() {
     local t
     for t in "${TIMER_UNITS[@]}"; do
@@ -1398,7 +1418,8 @@ cmd_install() {
 # switch, not a reinstall -- and the panel's toggle is the whole reason this
 # verb exists, so it must be reversible from there.
 cmd_enable() {
-    local want="$1"; shift
+    local want="$1" sync_schedule push_schedule
+    shift
     reject_flags "$want" "$@"
     [[ -d "$UNIT_DIR" ]] \
         || die "the timers are not installed yet -- run: omabackup install"
@@ -1406,7 +1427,10 @@ cmd_enable() {
     if [[ "$want" == enable ]]; then
         "$SYSTEMCTL" --user enable --now "${TIMER_UNITS[@]}" >/dev/null 2>&1 \
             || die "could not start the timers"
-        printf '  %s✓%s on %s(sync every 15m, push hourly)%s\n' "$GREEN" "$NC" "$DIM" "$NC"
+        sync_schedule="$(timer_schedule_cron omabackup-sync.timer || printf 'unknown')"
+        push_schedule="$(timer_schedule_cron omabackup-push.timer || printf 'unknown')"
+        printf '  %s✓%s on %s(sync %s, push %s)%s\n' \
+            "$GREEN" "$NC" "$DIM" "$sync_schedule" "$push_schedule" "$NC"
     else
         "$SYSTEMCTL" --user disable --now "${TIMER_UNITS[@]}" >/dev/null 2>&1 \
             || die "could not stop the timers"
@@ -1624,7 +1648,7 @@ cmd_bundle() {
 # a human retrying on purpose should not serve out a penalty.
 cmd_push() {
     require_tools jq git tar zstd
-    local repo="${OMABACKUP_REPO:-}" rc=0 id detail bundle name
+    local repo="${OMABACKUP_REPO:-}" rc=0 id detail safe_detail bundle name
     local -a explicit=()
     while (($#)); do
         case "$1" in
@@ -1634,6 +1658,11 @@ cmd_push() {
     done
     [[ -n "$repo" && -d "$repo/.git" ]] || die "OMABACKUP_REPO must point at a git repo (got: ${repo:-unset})"
     assert_destinations_understood
+    if (( ${#explicit[@]} )); then
+        for id in "${explicit[@]}"; do
+            dest_target_understood "$id" || die "cannot push to that destination: ${id:-unnamed}"
+        done
+    fi
     # Before anything is built or sent, and covering github too: the git push
     # carries the same commit the bundle does, so gating only the bundle would
     # leave the default destination as the one hole (docs/DESIGN.md §6).
@@ -1671,7 +1700,8 @@ cmd_push() {
                 "$([[ "${detail:-0}" -gt 0 ]] 2>/dev/null && echo "sent, pruned ${detail}" || echo "sent")" "$NC"
         else
             _dest_record_failure "$id" "${detail:-unknown error}"
-            printf '  %s✗%s %-11s %s\n' "$RED" "$NC" "$id" "${detail:-unknown error}"
+            safe_detail="$(tui_sanitize "${detail:-unknown error}")"
+            printf '  %s✗%s %-11s %s\n' "$RED" "$NC" "$id" "$safe_detail"
             rc=1
         fi
     done
@@ -1696,12 +1726,368 @@ _into_cleanup() {
 }
 
 # ── restore ──────────────────────────────────────────────────────────────────
+_restore_tui_recovery() {
+    local cli="$1" title="$2" detail="${3:-}" choice
+    tui_header restore
+    printf '\n%s\n' "$title"
+    [[ -n "$detail" ]] && printf '%s\n' "$(_restore_tui_sanitize "$detail")"
+    printf '\nWhat would you like to do?\n'
+    printf '  1) Try again\n  2) Open backup settings\n  q) Cancel\n'
+    while true; do
+        printf 'Choose [1/2/q]: '
+        tui_read_line choice || return 0
+        case "$choice" in
+            1) return 1 ;;
+            2) "$cli" config; return 2 ;;
+            q|Q|$'\033') printf 'Restore cancelled.\n'; return 0 ;;
+            *) printf 'Please choose 1, 2 or q.\n' ;;
+        esac
+    done
+}
+
+_restore_tui_sanitize() {
+    # Keep this streaming: previews and applies can contain one line per
+    # file, and slicing a Bash string one character at a time makes the
+    # sanitizer quadratic. Strip byte-level CSI/C0/DEL first, then let a
+    # stable UTF-8 locale recognize U+0080..U+009F as control code points.
+    # This preserves ordinary UTF-8 continuation bytes even when the caller
+    # inherited LC_ALL=C. LF is intentionally excluded because sed keeps line
+    # breaks outside its pattern space.
+    printf '%s' "$1" |
+        LC_ALL=C sed -E \
+            -e $'s/\x1b\\[[0-9;]*[A-Za-z]//g' \
+            -e $'s/[\x01-\x09\x0b-\x1f\x7f]/?/g' |
+        LC_ALL=C.UTF-8 sed -E 's/[[:cntrl:]]/?/g'
+}
+
+_restore_tui_sanitize_field() {
+    local value
+    value="$(_restore_tui_sanitize "$1")"
+    # Metadata is rendered inline, unlike a child report. Do not let a
+    # malformed destination id/path/date inject a second terminal line.
+    value="${value//$'\n'/?}"
+    printf '%s' "$value"
+}
+
+_restore_tui_cleanup_snapshot() {
+    if [[ -n "${snapshot_dir:-}" ]]; then
+        rm -rf -- "$snapshot_dir"
+    fi
+    snapshot_dir=""
+    snapshot_artifact=""
+}
+
+cmd_restore_tui() {
+    local cli="${OMABACKUP_ROOT}/bin/omabackup" doc rows choice index selected artifact source_artifact journal_source
+    local destination path file created shown_destination shown_path shown_file shown_created shown_target hidden target target_path target_is_home home_path frozen_target current_target_path confirm plan_output apply_output rc recovery source_fd=-1 source_fd_path source_size snapshot_dir="" snapshot_artifact=""
+    local -a target_args=()
+    [[ -t 0 && -t 1 ]] || die "interactive restore needs a terminal; provide an artifact file"
+    # The selected source is shared storage. Keep a private snapshot for the
+    # whole review/apply interaction so a replacement at the original path
+    # cannot make apply act on bytes different from the preview. The RETURN
+    # trap is removed by its own handler, so it cannot leak into later CLI
+    # functions after this TUI exits. Signals use the same cleanup because a
+    # Ctrl-C is a normal way to leave an interactive terminal, not a reason to
+    # strand a complete backup copy in /tmp.
+    trap '_restore_tui_cleanup_snapshot; trap - RETURN INT TERM HUP' RETURN
+    trap '_restore_tui_cleanup_snapshot; exit 130' INT
+    trap '_restore_tui_cleanup_snapshot; exit 143' TERM
+    trap '_restore_tui_cleanup_snapshot; exit 129' HUP
+
+    while true; do
+        if [[ -n "$snapshot_dir" ]]; then
+            rm -rf -- "$snapshot_dir"
+            snapshot_dir=""
+            snapshot_artifact=""
+        fi
+        if ! doc="$(artifacts_json 2>&1)"; then
+            _restore_tui_recovery "$cli" \
+                "We could not read the backup locations." \
+                "$doc"
+            recovery=$?
+            case "$recovery" in
+                0) return 0 ;;
+                1|2) continue ;;
+            esac
+        fi
+        if ! rows="$(jq -c '.destinations[] as $d | $d.artifacts[] |
+            select(.valid == true) |
+            select((.file | test("[\u0000-\u001f\u007f-\u009f]") | not)) |
+            {destination:$d.id,path:$d.path,file:.file,createdAt:(.createdAt // "unknown")}' <<<"$doc")"; then
+            _restore_tui_recovery "$cli" \
+                "We could not read the backup list." \
+                "The destination data is not readable right now."
+            recovery=$?
+            case "$recovery" in
+                0) return 0 ;;
+                1|2) continue ;;
+            esac
+        fi
+        hidden="$(jq -r '[.destinations[].artifacts[]
+            | select(.valid == true)
+            | select(.file | test("[\u0000-\u001f\u007f-\u009f]"))] | length' <<<"$doc" 2>/dev/null || printf '0')"
+        if [[ -z "$rows" ]]; then
+            if (( hidden > 0 )); then
+                _restore_tui_recovery "$cli" \
+                    "No usable backups found." \
+                    "$hidden backup file name(s) were hidden because they contain terminal control characters. Restore one by path if you trust it."
+            else
+                _restore_tui_recovery "$cli" \
+                    "No backups found." \
+                    "Configure a backup folder or run a backup before restoring."
+            fi
+            recovery=$?
+            case "$recovery" in
+                0) return 0 ;;
+                1|2) continue ;;
+            esac
+        fi
+
+        tui_header restore
+        local -a entries=()
+        while IFS= read -r selected; do entries+=("$selected"); done <<<"$rows"
+        for index in "${!entries[@]}"; do
+            destination="$(jq -r '.destination' <<<"${entries[$index]}")"
+            path="$(jq -r '.path' <<<"${entries[$index]}")"
+            file="$(jq -r '.file' <<<"${entries[$index]}")"
+            created="$(jq -r '.createdAt' <<<"${entries[$index]}")"
+            # Destination metadata and artifact names come from shared
+            # storage. Keep their bytes intact for the real argv below, but
+            # replace terminal controls in the human-facing list so a file
+            # cannot clear or forge the restore prompts.
+            shown_destination="$(_restore_tui_sanitize_field "$destination")"
+            shown_path="$(_restore_tui_sanitize_field "$(_tilde "$path")")"
+            shown_file="$(_restore_tui_sanitize_field "$file")"
+            shown_created="$(_restore_tui_sanitize_field "$created")"
+            printf '  %d) [%s] %s\n' "$((index + 1))" "$shown_destination" "$shown_file"
+            printf '     %s  %s\n' "$shown_path" "$shown_created"
+        done
+        (( hidden > 0 )) && printf '\n  %d backup(s) hidden: unsafe file name.\n' "$hidden"
+        while true; do
+            printf '\nChoose a backup number (q to cancel): '
+            tui_read_line choice || return 0
+            case "$choice" in
+                q|Q|$'\033') return 0 ;;
+                ''|*[!0-9]*) printf 'Please choose a listed backup number or q.\n' ;;
+                *)
+                    # Keep the arithmetic expansion bounded. Bash arithmetic
+                    # is signed and silently wraps an overlarge decimal, so
+                    # an input such as 18446744073709551617 could otherwise
+                    # become index 0 and select the first backup.
+                    local numeric_choice="$choice"
+                    while [[ ${#numeric_choice} -gt 1 && ${numeric_choice:0:1} == 0 ]]; do
+                        numeric_choice="${numeric_choice:1}"
+                    done
+                    if (( ${#numeric_choice} > 9 )); then
+                        printf 'There is no backup with that number. Choose 1-%d or q.\n' "${#entries[@]}"
+                        continue
+                    fi
+                    index=$((10#$numeric_choice - 1))
+                    if (( index >= 0 && index < ${#entries[@]} )); then
+                        break
+                    fi
+                    printf 'There is no backup with that number. Choose 1-%d or q.\n' "${#entries[@]}"
+                    ;;
+            esac
+        done
+        selected="${entries[$index]}"
+        path="$(jq -r '.path' <<<"$selected")"
+        file="$(jq -r '.file' <<<"$selected")"
+        artifact="$path/$file"
+        source_artifact="$artifact"
+
+        target_args=()
+        while true; do
+            printf '\nWhere should it go?\n'
+            printf '  1) Preview folder (recommended): %s\n' "$(_tilde "$HOME/.local/state/omabackup/restore-preview")"
+            printf '  2) This machine\x27s home: %s\n' "$(_tilde "$HOME")"
+            printf '  3) Another folder\n'
+            printf 'Choose [1/2/3/q]: '
+            tui_read_line target || return 0
+            case "$target" in
+                q|Q|$'\033') printf 'Restore cancelled.\n'; return 0 ;;
+                1)
+                    target_path="$HOME/.local/state/omabackup/restore-preview"
+                    target_args=(--into "$target_path")
+                    break
+                    ;;
+                2)
+                    target_path="$HOME"
+                    break
+                    ;;
+                3)
+                    printf 'Absolute target folder: (q to cancel) '; tui_read_line target_path || return 0
+                    case "$target_path" in
+                        q|Q|$'\033') printf 'Restore cancelled.\n'; return 0 ;;
+                    esac
+                    if target_path="$(_config_absolute_path "$target_path")"; then
+                        target_args=(--into "$target_path")
+                        break
+                    fi
+                    printf 'The target must be an absolute path without control characters.\n'
+                    ;;
+                *) printf 'Please choose 1, 2, 3 or q.\n' ;;
+            esac
+        done
+
+        # Take the private copy only after the user has chosen the target and
+        # immediately before preview. The source is shared storage: it may
+        # disappear while the target menu is open, and a later replacement
+        # must not change what the confirmation preview describes or what
+        # apply consumes.
+        snapshot_dir="$(mktemp -d)"
+        source_fd_path="/proc/$$/fd"
+        if [[ -z "$snapshot_dir" ]] \
+            || [[ ! -f "$artifact" ]] \
+            || ! exec {source_fd}<"$artifact" 2>/dev/null \
+            || [[ ! -f "$source_fd_path/$source_fd" ]]; then
+            if (( source_fd >= 0 )); then
+                exec {source_fd}<&-
+                source_fd=-1
+            fi
+            _restore_tui_recovery "$cli" \
+                "This backup could not be previewed." \
+                "The source may have changed or become unavailable. The restore was not applied."
+            recovery=$?
+            case "$recovery" in
+                0) return 0 ;;
+                1|2) continue ;;
+            esac
+        fi
+        # Copy through the already-open descriptor. A replacement of the
+        # shared path after this point cannot make the snapshot contain a
+        # different inode from the one whose identity is recorded below. Bash
+        # cannot make the regular-file check and read open atomic; a hostile
+        # writer can still win that microscopic race with a FIFO, but the
+        # integrity guarantee here is the already-open regular inode.
+        source_artifact="$(readlink -f -- "$source_fd_path/$source_fd" 2>/dev/null || printf '%s' "$source_artifact")"
+        journal_source="$(_restore_tui_sanitize_field "$source_artifact")"
+        source_size="$(stat -Lc %s "$source_fd_path/$source_fd" 2>/dev/null)" || source_size=""
+        if [[ ! "$source_size" =~ ^[0-9]+$ ]] \
+            || ! head -c "$source_size" <"$source_fd_path/$source_fd" >"$snapshot_dir/backup.tar.zst" 2>/dev/null \
+            || [[ "$(stat -c %s "$snapshot_dir/backup.tar.zst" 2>/dev/null)" != "$source_size" ]]; then
+            exec {source_fd}<&-
+            source_fd=-1
+            _restore_tui_recovery "$cli" \
+                "This backup could not be previewed." \
+                "The source may have changed or become unavailable. The restore was not applied."
+            recovery=$?
+            case "$recovery" in
+                0) return 0 ;;
+                1|2) continue ;;
+            esac
+        fi
+        exec {source_fd}<&-
+        source_fd=-1
+        snapshot_artifact="$snapshot_dir/backup.tar.zst"
+        artifact="$snapshot_artifact"
+
+        # Freeze the path before the preview and use that same canonical path
+        # for apply. A menu selection is not a security boundary: a symlink
+        # alias can point at HOME, and a mutable parent can otherwise change
+        # between the preview and the write. The restore command rechecks
+        # containment at each write too; this closes the larger TUI window and
+        # makes the confirmation policy follow the resolved destination.
+        target_is_home=0
+        [[ "$target_path" == "$HOME" ]] && target_is_home=1
+        [[ "$target_is_home" == 0 && -e "$target_path" && "$target_path" -ef "$HOME" ]] \
+            && target_is_home=1
+        if ! home_path="$(realpath -m -- "$HOME" 2>/dev/null)" \
+            || ! frozen_target="$(realpath -m -- "$target_path" 2>/dev/null)" \
+            || [[ -z "$home_path" || -z "$frozen_target" ]]; then
+            _restore_tui_recovery "$cli" \
+                "We could not resolve the restore target." \
+                "The restore was not applied. Choose the target again and preview it once more."
+            recovery=$?
+            case "$recovery" in
+                0) return 0 ;;
+                1|2) continue ;;
+            esac
+        fi
+        target_path="$frozen_target"
+        target_args=(--into "$target_path")
+        [[ "$target_path" == "$home_path" ]] && target_is_home=1
+        shown_target="$(_tilde "$target_path")"
+        shown_target="$(_restore_tui_sanitize "$shown_target")"
+        printf '\nChecking the selected backup against %s...\n' "$shown_target"
+        plan_output="$("$cli" restore --journal-artifact "$journal_source" "$artifact" "${target_args[@]}" 2>&1)"; rc=$?
+        if (( rc != 0 )); then
+            _restore_tui_recovery "$cli" \
+                "This backup could not be previewed." \
+                "$(_restore_tui_sanitize "$plan_output")"
+            recovery=$?
+            case "$recovery" in
+                0) return 0 ;;
+                1|2) continue ;;
+            esac
+        fi
+        printf '%s\n' "$(_restore_tui_sanitize "$plan_output")"
+
+        if (( target_is_home )); then
+            printf '\nThis writes into the machine\x27s home and keeps replaced files in the restore journal.\n'
+            while true; do
+                printf 'Type RESTORE to apply, or press Enter to cancel: '
+                tui_read_line confirm || return 0
+                case "$confirm" in
+                    RESTORE) break ;;
+                    ''|n|N|q|Q|$'\033') printf 'Restore cancelled.\n'; return 0 ;;
+                    *) printf 'Please type RESTORE to apply or N to cancel.\n' ;;
+                esac
+            done
+        else
+            while true; do
+                printf '\nApply this plan to the selected folder? [y/N]: '
+                tui_read_line confirm || return 0
+                case "$confirm" in
+                    y|Y|yes|YES) break ;;
+                    ''|n|N|q|Q|$'\033') printf 'Restore cancelled.\n'; return 0 ;;
+                    *) printf 'Please answer y to apply or n to cancel.\n' ;;
+                esac
+            done
+        fi
+        current_target_path="$(realpath -m -- "$target_path" 2>/dev/null)" || current_target_path=""
+        if [[ -z "$current_target_path" || "$current_target_path" != "$target_path" ]]; then
+            _restore_tui_recovery "$cli" \
+                "The restore target changed while it was being reviewed." \
+                "The restore was not applied. Choose the target again and preview it once more."
+            recovery=$?
+            case "$recovery" in
+                0) return 0 ;;
+                1|2) continue ;;
+            esac
+        fi
+        apply_output="$("$cli" restore --journal-artifact "$journal_source" "$artifact" "${target_args[@]}" --apply 2>&1)"
+        rc=$?
+        if (( rc == 0 )); then
+            printf '%s\n' "$(_restore_tui_sanitize "$apply_output")"
+            return 0
+        fi
+        _restore_tui_recovery "$cli" \
+            "The restore did not finish successfully." \
+            "$(_restore_tui_sanitize "$apply_output")"
+        recovery=$?
+        case "$recovery" in
+            0) return 0 ;;
+            1|2) continue ;;
+        esac
+    done
+}
+
 cmd_restore() {
-    local artifact="" apply=0 into=""
+    local artifact="" apply=0 into="" journal_artifact=""
     while (( $# )); do
         case "$1" in
-            --apply)  apply=1; shift ;;
-            --into)   [[ -n "${2:-}" ]] || die "--into needs a directory"; into="$2"; shift 2 ;;
+        --apply)  apply=1; shift ;;
+        --into)   [[ -n "${2:-}" ]] || die "--into needs a directory"; into="$2"; shift 2 ;;
+            # The TUI reviews a private snapshot, but the durable journal must
+            # retain the shared bundle path the user selected. This is an
+            # internal handoff flag; direct CLI restores keep using their own
+            # artifact path automatically.
+            --journal-artifact)
+                      [[ -n "${2:-}" ]] || die "--journal-artifact needs a path"
+                      [[ "$(_restore_tui_sanitize_field "$2")" == "$2" ]] \
+                          || die "--journal-artifact must not contain terminal controls"
+                      journal_artifact="$2"; shift 2 ;;
             # --groups and --json are real flags for this command, but the
             # global parser above already consumed them into $ONLY/$JSON
             # before this loop ever runs -- they cannot appear here. Naming
@@ -1712,12 +2098,24 @@ cmd_restore() {
                       artifact="$1"; shift ;;
         esac
     done
-    [[ -n "$artifact" ]] || die "restore needs an artifact: omabackup restore <file.tar.zst>"
+    if [[ -z "$artifact" && -t 0 && -t 1 && $JSON -eq 0 ]]; then
+        cmd_restore_tui
+        return
+    fi
+    [[ -n "$artifact" ]] || die "restore needs an artifact: omabackup restore <file.tar.zst> (or run it in a terminal for the menu)"
     [[ -f "$artifact" ]] || die "no such artifact: $(_tilde "$artifact")"
-    # Canonicalized once, up front, and reused everywhere this run needs to
-    # name the artifact -- including the earliest journal write below, well
-    # before target/verdict are known.
-    local artifact_abs; artifact_abs="$(realpath -e "$artifact" 2>/dev/null || printf '%s' "$artifact")"
+    # The journal source is either the TUI's already-frozen, terminal-safe
+    # label or the actual artifact path for a direct CLI restore.
+    local journal_artifact_abs
+    if [[ -n "$journal_artifact" ]]; then
+        # The TUI resolved this identity before taking the snapshot. Do not
+        # resolve it again after confirmation: the shared path may have been
+        # replaced by a symlink, and the journal must describe the bundle that
+        # was actually reviewed, not whatever the path points to now.
+        journal_artifact_abs="$journal_artifact"
+    else
+        journal_artifact_abs="$(realpath -e "$artifact" 2>/dev/null || printf '%s' "$artifact")"
+    fi
     local started_at; started_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     # realpath is what _restore_contained refuses on when it is missing --
     # correctly, since a containment check it cannot run is not a check. But
@@ -1798,7 +2196,7 @@ cmd_restore() {
     # start moving overwrites this with the complete picture once it exists.
     if (( apply )); then
         restore_record "$(jq -n \
-            --arg started "$started_at" --arg artifact "$artifact_abs" \
+            --arg started "$started_at" --arg artifact "$journal_artifact_abs" \
             --arg verdict "$verdict" --arg why "$why" \
             '{schemaVersion:1, startedAt:$started, finishedAt:null,
               artifact:$artifact, target:null, verdict:$verdict, why:$why, ok:null}')"
@@ -2134,7 +2532,7 @@ cmd_restore() {
     # Created only here, in the apply branch: a plan run used to make this
     # directory too, so "nothing was written" was said after something already
     # had been.
-    # started_at/artifact_abs are already set, from the top of this
+    # started_at/journal_artifact_abs are already set, from the top of this
     # function -- startedAt names when this restore ATTEMPT began, not when
     # writing began, so an early preflight failure's pending record (below)
     # and this one agree on what "started" meant.
@@ -2160,7 +2558,7 @@ cmd_restore() {
     # ever sees this pending shape (the process died before finishing) now
     # has an honest "incomplete," never a stale "done."
     restore_record "$(jq -n \
-        --arg started "$started_at" --arg artifact "$artifact_abs" \
+        --arg started "$started_at" --arg artifact "$journal_artifact_abs" \
         --arg tmode "$target_mode" --arg tpath "$target_path" \
         --arg verdict "$verdict" --arg why "$why" \
         '{schemaVersion:1, startedAt:$started, finishedAt:null,
@@ -2212,7 +2610,7 @@ cmd_restore() {
     # that looks like a parseable non-answer.
     if journal_doc="$(jq -n \
         --arg started "$started_at" --arg finished "$finished_at" \
-        --arg artifact "$artifact_abs" --arg tmode "$target_mode" --arg tpath "$target_path" \
+        --arg artifact "$journal_artifact_abs" --arg tmode "$target_mode" --arg tpath "$target_path" \
         --arg verdict "$verdict" --arg why "$why" \
         --argjson ok "$ok" --argjson bad "$bad" --argjson qok "$qok" --argjson qbad "$qbad" \
         --argjson held "$nheld" --argjson ambiguous "$na" --argjson escaped "$nesc" \
@@ -2270,7 +2668,9 @@ cmd_restore() {
 }
 
 cmd_status() {
-    local ov oc om; IFS=$'\t' read -r ov oc om <<<"$(omarchy_identity)"
+    local ov oc om tv github_url; IFS=$'\t' read -r ov oc om <<<"$(omarchy_identity)"
+    tv="$(_tool_version)"
+    github_url="$(dest_github_push_url || true)"
     if (( JSON )); then
         # Destinations belong here, never in verify --json. verify's exit code
         # gates the commit (cmd_sync), so folding a stale NAS into it would let
@@ -2287,17 +2687,27 @@ cmd_status() {
               --argjson age "$(last_sync_age || echo null)" \
               --argjson syncsched "$(timer_schedule omabackup-sync.timer | jq -R 'select(length>0)' || echo null)" \
               --argjson pushsched "$(timer_schedule omabackup-push.timer | jq -R 'select(length>0)' || echo null)" \
+              --argjson synccron "$(timer_schedule_cron omabackup-sync.timer | jq -R 'select(length>0)' || echo null)" \
+              --argjson pushcron "$(timer_schedule_cron omabackup-push.timer | jq -R 'select(length>0)' || echo null)" \
+              --arg toolversion "$tv" \
               --arg repo "${OMABACKUP_REPO:-}" \
               --arg destfile "$DESTINATIONS_FILE" \
               --arg denyfile "$SECRETS_DENY_FILE" \
               --arg statedir "$OMABACKUP_STATE" \
+              --arg githubUrl "$github_url" \
+              --argjson githubActive "$( [[ -n "$github_url" ]] && echo true || echo false )" \
               --argjson lastrestore "$(restore_last_json || echo null)" \
-              '{schemaVersion:1, omarchy:{version:$v,channel:$c,migrationWatermark:$m},
+              '{schemaVersion:1, tool:{version:$toolversion},
+                omarchy:{version:$v,channel:$c,migrationWatermark:$m},
                 supportedTargets:$t, staging:$s, destinations:$d,
                 scheduler:{active:$sch, fix:"omabackup install",
-                           sync:$syncsched, push:$pushsched},
+                           sync:$syncsched, push:$pushsched,
+                           syncCron:$synccron, pushCron:$pushcron},
                 config:{repo:$repo, destinationsFile:$destfile,
-                        denyList:$denyfile, state:$statedir},
+                        denyList:$denyfile, state:$statedir,
+                        github:{remote:"origin", configured:$githubActive,
+                                active:$githubActive,
+                                url:(if $githubUrl == "" then null else $githubUrl end)}},
                 stale:$stale, lastSync:$lastsync, lastSyncAgeSec:$age,
                 lastRestore:$lastrestore}'
     else
@@ -2305,6 +2715,19 @@ cmd_status() {
         printf '  restore range: %s\n' "$(jq -r '.supportedTargets|join(", ")' "$GROUPS_FILE")"
         printf '  groups: %s\n' "$(groups_ids | wc -l)"
         printf '  staging: %s\n' "$([ -d "$STAGING" ] && _tilde "$STAGING" || echo 'not collected yet')"
+    fi
+}
+
+# Print the installed plugin version from the same manifest that status and
+# the Omarchy plugin registry use. This is useful over SSH and gives the panel
+# a stable, machine-readable version without adding a second version file.
+cmd_version() {
+    reject_flags version "$@"
+    local tv; tv="$(_tool_version)"
+    if (( JSON )); then
+        jq -n --arg v "$tv" '{schemaVersion:1, version:$v}'
+    else
+        printf 'OmaBackup %s\n' "$tv"
     fi
 }
 
@@ -2379,6 +2802,9 @@ source "$OMABACKUP_ROOT/lib/destinations.sh"
 source "$OMABACKUP_ROOT/lib/secrets.sh"
 source "$OMABACKUP_ROOT/lib/restore.sh"
 source "$OMABACKUP_ROOT/lib/artifacts.sh"
+source "$OMABACKUP_ROOT/lib/schedule.sh"
+source "$OMABACKUP_ROOT/lib/tui.sh"
+source "$OMABACKUP_ROOT/lib/config.sh"
 
 # Two levels: the loop below owns only what every command understands and
 # hands the rest, in order, to the command itself. It used to consume and shift
@@ -2416,6 +2842,7 @@ if [[ "$CMD" != restore ]]; then
 fi
 
 case "$CMD" in
+    version)  cmd_version "${ARGS[@]}" ;;
     verify)  reject_flags verify "${ARGS[@]}"; cmd_verify ;;
     collect) reject_flags collect "${ARGS[@]}"; cmd_collect ;;
     sync)    cmd_sync "${ARGS[@]}" ;;
@@ -2428,10 +2855,12 @@ case "$CMD" in
     status)  reject_flags status "${ARGS[@]}"; cmd_status ;;
     restore) cmd_restore "${ARGS[@]}" ;;
     artifacts) cmd_artifacts "${ARGS[@]}" ;;
+    config)    cmd_config "${ARGS[@]}" ;;
     ""|help)
         cat <<'USAGE'
 omabackup <command> [--json] [--groups a,b]
 
+  version   print the installed OmaBackup version
   status    Omarchy identity, restore range and groups
   reload    update the installed plugin and restart the shell onto it
   enable    start the timers -- the master switch
@@ -2439,7 +2868,8 @@ omabackup <command> [--json] [--groups a,b]
   collect   collect the groups into staging (does not touch the repo)
   verify    check that the backup covers what the system actually reads
   artifacts list what a `dir` destination holds, with each one's own manifest
-  restore   plan a restore from an artifact; --apply to write it
+  restore   plan a restore from an artifact; no file opens a guided TUI
+  config    show or safely edit machine-owned settings; no args opens its TUI
 
 The full cycle is collect -> diff -> verify -> commit. `collect` and `verify`
 are the first two; without them there is no diff for mode:copy groups and

@@ -9,11 +9,12 @@
 # slow, fallible half. A NAS being down must never change whether the commit
 # happened.
 
-OB="$PWD/bin/omabackup"
+OB="$(realpath "$PWD/bin/omabackup")"
+GROUPS_FILE="$(realpath "$PWD/groups.default.json")"
 
 _dest_env() {  # _dest_env <home> <repo> <args...>
     local h="$1" r="$2"; shift 2
-    HOME="$h" OMABACKUP_GROUPS="$PWD/groups.default.json" OMABACKUP_STATE="$h/.state" \
+    HOME="$h" OMABACKUP_GROUPS="$GROUPS_FILE" OMABACKUP_STATE="$h/.state" \
         OMABACKUP_REPO="$r" OMABACKUP_DESTINATIONS="$h/destinations.json" \
         XDG_RUNTIME_DIR=/nonexistent "$OB" "$@" 2>&1
 }
@@ -52,6 +53,69 @@ JSON
 
 it "keep:0 is refused -- retention that keeps nothing is not retention"
 assert_contains "$(_dest_env "$DH" "$DR" push)" "keep"
+
+cat >"$DH/destinations.json" <<'JSON'
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"/tmp/x","keep":18446744073709551617}]}
+JSON
+
+it "an oversized retention is refused before prune arithmetic can wrap"
+assert_contains "$(_dest_env "$DH" "$DR" push)" "supported integer range"
+
+# A hand-edited destinations file must satisfy the same path/id boundary as
+# config. Otherwise a malformed id can create nested state paths, and a
+# relative path makes push write from whichever directory invoked the timer.
+DH_LEGACY="$(mktemp -d)"; DR_LEGACY="$DH_LEGACY/repo"; _dest_repo "$DR_LEGACY"
+cat >"$DH_LEGACY/destinations.json" <<'JSON'
+{"schemaVersion":1,"destinations":[
+ {"id":"legacy/id","type":"dir","path":"relative-target","keep":1}]}
+JSON
+LEGACY_OUT="$(cd "$DH_LEGACY" && _dest_env "$DH_LEGACY" "$DR_LEGACY" push)"
+LEGACY_RC=$?
+
+it "push rejects legacy destination ids and relative paths before writing"
+[[ $LEGACY_RC -ne 0 ]] && ok || fail "push accepted a legacy destination outside config invariants"
+assert_contains "$LEGACY_OUT" "what push cannot honor"
+assert_not_contains "$LEGACY_OUT" "sent"
+
+# Explicit targets are user input too. The state filename must never be a path
+# traversal surface, even when destinations.json itself is valid.
+DH_TRAVERSAL="$(mktemp -d)"; DR_TRAVERSAL="$DH_TRAVERSAL/repo"; _dest_repo "$DR_TRAVERSAL"
+printf '%s\n' '{"schemaVersion":1,"destinations":[]}' >"$DH_TRAVERSAL/destinations.json"
+mkdir -p "$DH_TRAVERSAL/.state/destinations"
+printf '%s\n' 'keep-me' >"$DH_TRAVERSAL/.state/escape.json"
+TRAVERSAL_OUT="$(_dest_env "$DH_TRAVERSAL" "$DR_TRAVERSAL" push ../escape)"
+TRAVERSAL_RC=$?
+
+it "push rejects traversal in an explicit destination before state writes"
+[[ $TRAVERSAL_RC -ne 0 ]] && ok || fail "push accepted a traversal destination"
+assert_eq "$(cat "$DH_TRAVERSAL/.state/escape.json")" "keep-me"
+
+DH_ROOT_FIELD="$(mktemp -d)"; DR_ROOT_FIELD="$DH_ROOT_FIELD/repo"; _dest_repo "$DR_ROOT_FIELD"
+mkdir -p "$DH_ROOT_FIELD/nas"
+cat >"$DH_ROOT_FIELD/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$DH_ROOT_FIELD/nas","keep":1}],"enabled":false}
+JSON
+ROOT_FIELD_OUT="$(_dest_env "$DH_ROOT_FIELD" "$DR_ROOT_FIELD" push nas)"
+ROOT_FIELD_RC=$?
+
+it "push rejects unknown root fields instead of ignoring them"
+[[ $ROOT_FIELD_RC -ne 0 ]] && ok || fail "push accepted an unknown destinations root field"
+assert_contains "$ROOT_FIELD_OUT" "enabled"
+assert_not_contains "$ROOT_FIELD_OUT" "sent"
+[[ -z "$(find "$DH_ROOT_FIELD/nas" -maxdepth 1 -name 'omabackup-*.tar.zst' -print -quit)" ]] \
+    && ok || fail "push wrote a bundle from an invalid destinations document"
+
+DH_GITHUB_DUP="$(mktemp -d)"; DR_GITHUB_DUP="$DH_GITHUB_DUP/repo"; _dest_repo "$DR_GITHUB_DUP"
+GITHUB_DUP_REMOTE="$DH_GITHUB_DUP/remote.git"; git init -q --bare "$GITHUB_DUP_REMOTE"
+git -C "$DR_GITHUB_DUP" remote add origin "$GITHUB_DUP_REMOTE"
+cat >"$DH_GITHUB_DUP/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"github","type":"dir","path":"$DH_GITHUB_DUP/pretend-github","keep":1}]}
+JSON
+GITHUB_DUP_OUT="$(_dest_env "$DH_GITHUB_DUP" "$DR_GITHUB_DUP" push)"
+
+it "rejects a legacy github destination before it can duplicate the implicit origin"
+assert_contains "$GITHUB_DUP_OUT" "implicit"
+assert_eq "$(git -C "$GITHUB_DUP_REMOTE" rev-list --all --count 2>/dev/null)" "0"
 
 # ── a dir destination receives the bundle ────────────────────────────────────
 DH2="$(mktemp -d)"; DR2="$DH2/repo"; _dest_repo "$DR2"
@@ -169,6 +233,98 @@ assert_eq "$(git -C "$DREMOTE" rev-list --all --count 2>/dev/null)" "1"
 
 it "and records the push in its state file"
 [[ -n "$(_state_of "$DH6" '.lastSuccess' github)" ]] && ok || fail "no lastSuccess for github"
+
+# A remote URL may contain a credential, and a failed Git transport commonly
+# repeats that URL in stderr. `_push_github` captures stderr as its destination
+# detail, so this fixture makes sure the captured detail cannot become a
+# persistent lastError or a terminal leak.
+DH6E="$(mktemp -d)"; DR6E="$DH6E/repo"; _dest_repo "$DR6E"
+git -C "$DR6E" remote add origin 'https://breno:ghp_ERROR_TOKEN@github.com/user/dotfiles.git'
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$DH6E/destinations.json"
+GH_FAIL_BIN="$DH6E/fake-bin"; mkdir -p "$GH_FAIL_BIN"
+REAL_GIT="$(command -v git)"
+cat >"$GH_FAIL_BIN/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" push origin HEAD "* ]]; then
+    printf "fatal: unable to access 'https://breno:ghp_ERROR_TOKEN@github.com/user/dotfiles.git/': network down\\n"
+    exit 1
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$GH_FAIL_BIN/git"
+GH_ERROR_OUT="$(PATH="$GH_FAIL_BIN:$PATH" HOME="$DH6E" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$DH6E/.state" OMABACKUP_REPO="$DR6E" \
+    OMABACKUP_DESTINATIONS="$DH6E/destinations.json" XDG_RUNTIME_DIR=/nonexistent \
+    "$OB" push github 2>&1)"
+
+it "redacts credentials from a failed GitHub push before terminal or state output"
+assert_not_contains "$GH_ERROR_OUT" "ghp_ERROR_TOKEN"
+assert_not_contains "$(_state_of "$DH6E" '.lastError.message // ""' github)" "ghp_ERROR_TOKEN"
+
+GH_CONTROL_BIN="$DH6E/fake-control-bin"; mkdir -p "$GH_CONTROL_BIN"
+cat >"$GH_CONTROL_BIN/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" push origin HEAD "* ]]; then
+    printf '\033[2J\033[31mnetwork down\033[0m\n'
+    exit 1
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$GH_CONTROL_BIN/git"
+GH_CONTROL_OUT="$(PATH="$GH_CONTROL_BIN:$PATH" HOME="$DH6E" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$DH6E/.state-control" OMABACKUP_REPO="$DR6E" \
+    OMABACKUP_DESTINATIONS="$DH6E/destinations.json" XDG_RUNTIME_DIR=/nonexistent \
+    "$OB" push github 2>&1)"
+
+it "sanitizes Git transport controls before printing a push failure"
+GH_CONTROL_LINE="$(printf '%s\n' "$GH_CONTROL_OUT" | grep -F 'network down' || true)"
+# The command itself deliberately uses ANSI for its own frame and status
+# marker. Inspect only the transport-detail line, after removing that known
+# marker, so this assertion catches controls coming from Git rather than the
+# TUI's intentional presentation.
+GH_CONTROL_LINE="${GH_CONTROL_LINE//$'\033[0;31m'/}"
+GH_CONTROL_LINE="${GH_CONTROL_LINE//$'\033[0m'/}"
+GH_CONTROL_LINE="${GH_CONTROL_LINE//$'\033[2m'/}"
+assert_not_contains "$GH_CONTROL_LINE" $'\033'
+assert_contains "$GH_CONTROL_LINE" "network down"
+
+mkdir -p "$DH6E/.state/destinations"
+printf '{"schemaVersion":1,"id":"github","lastError":{"at":"now","message":"old https://breno:ghp_ERROR_TOKEN@github.com/user/dotfiles.git error"}}\n' \
+    >"$DH6E/.state/destinations/github.json"
+GH_OLD_STATE="$(_dest_env "$DH6E" "$DR6E" status --json)"
+
+it "redacts credentials already present in a legacy destination state"
+assert_not_contains "$GH_OLD_STATE" "ghp_ERROR_TOKEN"
+
+# The default timer path includes the implicit origin alongside configured
+# destinations. Naming a destination is an intentional narrow retry and must
+# not silently add GitHub back to that operation.
+DH6D="$(mktemp -d)"; DR6D="$DH6D/repo"; _dest_repo "$DR6D"
+DREMOTE6D="$DH6D/remote.git"; git init -q --bare "$DREMOTE6D"
+git -C "$DR6D" remote add origin "$DREMOTE6D"
+DLOCAL6D="$DH6D/local"
+cat >"$DH6D/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"local","type":"dir","path":"$DLOCAL6D","keep":2}]}
+JSON
+_dest_env "$DH6D" "$DR6D" push >/dev/null
+
+it "the default push set includes the implicit GitHub origin"
+assert_eq "$(git -C "$DREMOTE6D" rev-list --all --count 2>/dev/null)" "1"
+assert_eq "$(find "$DLOCAL6D" -maxdepth 1 -name 'omabackup-*.tar.zst' 2>/dev/null | wc -l)" "1"
+
+DH6X="$(mktemp -d)"; DR6X="$DH6X/repo"; _dest_repo "$DR6X"
+DREMOTE6X="$DH6X/remote.git"; git init -q --bare "$DREMOTE6X"
+git -C "$DR6X" remote add origin "$DREMOTE6X"
+DLOCAL6X="$DH6X/local"; mkdir -p "$DLOCAL6X"
+cat >"$DH6X/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"local","type":"dir","path":"$DLOCAL6X","keep":2}]}
+JSON
+_dest_env "$DH6X" "$DR6X" push local >/dev/null
+
+it "an explicitly named local destination skips the implicit GitHub origin"
+assert_eq "$(git -C "$DREMOTE6X" rev-list --all --count 2>/dev/null)" "0"
+assert_eq "$(find "$DLOCAL6X" -maxdepth 1 -name 'omabackup-*.tar.zst' 2>/dev/null | wc -l)" "1"
+
 
 # ── status --json is where the panel reads this, never verify --json ─────────
 # A stale NAS must never be able to fail verify: cmd_sync refuses to commit when

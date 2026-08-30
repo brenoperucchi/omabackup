@@ -76,9 +76,11 @@ Panel {
   // only other way to know is to read four files in three directories.
   readonly property var config: statusDoc && statusDoc.config ? statusDoc.config : null
   readonly property string syncSchedule:
-    statusDoc && statusDoc.scheduler && statusDoc.scheduler.sync ? statusDoc.scheduler.sync : ""
+    statusDoc && statusDoc.scheduler
+      ? (statusDoc.scheduler.syncCron || statusDoc.scheduler.sync || "") : ""
   readonly property string pushSchedule:
-    statusDoc && statusDoc.scheduler && statusDoc.scheduler.push ? statusDoc.scheduler.push : ""
+    statusDoc && statusDoc.scheduler
+      ? (statusDoc.scheduler.pushCron || statusDoc.scheduler.push || "") : ""
 
   // "last backup 8m ago", the way the mockup's header reads it.
   function agoText(sec) {
@@ -112,13 +114,28 @@ Panel {
     var h = Quickshell.env("HOME")
     return (h && p.indexOf(h) === 0) ? "~" + p.substring(h.length) : p
   }
-  // systemd's calendar syntax is precise and unreadable. The panel says what it
-  // means; `systemctl --user list-timers` is there for the exact expression.
+  // The CLI exposes the user-facing five-field crontab form. Keep the calendar
+  // fallback for an older installed CLI, but never make the systemd expression
+  // the normal thing a person has to understand.
   function humanSchedule(c) {
     if (typeof c !== "string" || c === "") return "not scheduled"
-    var m = c.match(/\*:00\/(\d+):00/)
+    if (c === "* * * * *" || c === "*/1 * * * *"
+        || c === "*:*:00" || c === "*-*-* *:*:00") return "every minute"
+    var m = c.match(/^\*\/(\d+) \* \* \* \*$/)
     if (m) return "every " + m[1] + " min"
-    if (c.indexOf("*:00:00") >= 0) return "hourly"
+    if (c === "0 * * * *" || c.indexOf("*:00:00") >= 0) return "hourly"
+    m = c.match(/^(\d+) \* \* \* \*$/)
+    if (m) return "hourly at :" + ("0" + m[1]).slice(-2)
+    m = c.match(/^(\d+) (\d+) \* \* \*$/)
+    if (m) return "daily at " + ("0" + m[2]).slice(-2) + ":" + ("0" + m[1]).slice(-2)
+    m = c.match(/^(\d+) (\d+) \* \* ([0-7])$/)
+    if (m) {
+      var days = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+      return days[Number(m[3]) === 7 ? 0 : Number(m[3])] + " at "
+             + ("0" + m[2]).slice(-2) + ":" + ("0" + m[1]).slice(-2)
+    }
+    m = c.match(/\*:00\/(\d+):00/)
+    if (m) return "every " + m[1] + " min"
     return c
   }
 
@@ -167,6 +184,13 @@ Panel {
     return (Math.round(b / 104857.6) / 10) + " MB"
   }
 
+  function copyToolVersion() {
+    if (root.toolVersion === "?" || root.toolVersion === "") return
+    Quickshell.clipboardText = root.toolVersion
+    root.versionCopied = true
+    versionCopiedTimer.restart()
+  }
+
   // "not collected yet" is not "covers nothing". Zero means collect ran and
   // found nothing there, which is the phantom coverage this tool exists to
   // catch; unknown means it has not looked.
@@ -199,8 +223,12 @@ Panel {
   // warnCount stay in the expression too; both being clean is still
   // required, but it is no longer sufficient on its own.
   readonly property bool covered: report !== null && report.ok === true && failCount === 0 && warnCount === 0
+  readonly property string toolVersion:
+    statusDoc && statusDoc.tool && typeof statusDoc.tool.version === "string"
+      ? statusDoc.tool.version : "?"
   readonly property string omarchyVersion: report && report.omarchy ? (report.omarchy.version || "?") : "?"
   readonly property string watermark: report && report.omarchy ? (report.omarchy.migrationWatermark || "?") : "?"
+  property bool versionCopied: false
 
   // Omarchy's palette has no green on purpose, and neither does this widget:
   // "up to date" is the absence of colour. Colour means there is something to do.
@@ -379,8 +407,15 @@ Panel {
   // being timed against, silently extending how long a hang in either could
   // go unnoticed every time another button was pressed.
   readonly property bool busy:
-    syncing || switching || collectProc.running || verifyProc.running || statusProc.running
+    syncing || switching || configuring || externalBusy || collectProc.running || verifyProc.running || statusProc.running
+  readonly property bool canOpenExternalTui:
+    root.cli !== "" && !root.cliMissing && !root.busy
   property bool switching: false
+  property bool configuring: false
+  property bool externalBusy: false
+  property string externalAction: ""
+  property int externalGeneration: 0
+  property string externalToken: ""
 
   // Config is reference material -- six paths and two schedules, consulted
   // once per install and otherwise just occupying permanent space above
@@ -389,202 +424,16 @@ Panel {
   // itself, matching the affordance a chevron already implies.
   property bool configExpanded: false
 
-  // ── restore ──────────────────────────────────────────────────────────────
-  // The design round settled this decision explicitly, over two rounds of
-  // review (omabackup-rev / omabackup-rev-2 disagreed, the operator decided):
-  // the panel NEVER runs `restore --apply`. It lists artifacts, computes a
-  // plan, and hands the operator an exact command to run in their own
-  // terminal -- which is where stderr, exit code, scrollback and the
-  // ability to retry with different flags all actually exist. Every step
-  // below is read-only against the CLI (Quickshell.Io.Process, same as
-  // every other command this file runs) until the moment a terminal is
-  // opened, and even then this file itself never runs the restore -- it
-  // only launches a terminal that will.
-  //
-  // view is a small state machine, not a route: "overview" is the normal
-  // panel; the other four are the wireframe's own screens, entered and left
-  // in order (artifacts -> target -> plan -> handoff), each one clearing
-  // what came after it when re-entered so a stale plan can never be shown
-  // against a newly chosen artifact or target.
-  property string view: "overview"
-
-  property var artifactsDoc: null
-  property string artifactsError: ""
-
-  property string selectedArtifactPath: ""
-  property string selectedArtifactLabel: ""
-
-  // "into" is the default and the only one offered without an explicit,
-  // separate choice -- the mockup round was explicit that "esta máquina"
-  // must never be a checkbox default that gets left checked by accident.
-  property string targetMode: "into"
-  readonly property string targetPath:
-    targetMode === "home" ? Quickshell.env("HOME")
-                           : Quickshell.env("HOME") + "/.local/state/omabackup/restore-preview"
-
-  property var planDoc: null
-  property string planError: ""
-  property bool planning: false
-
-  // Generation tokens, one per async operation this flow can restart. A
-  // review round reproduced the failure mode directly: select artifact A,
-  // start its plan, go back, select artifact B, start its plan -- the FIRST
-  // plan's onExited can still land after the SECOND one starts, and neither
-  // planProc nor artifactsProc were covered by anything that would notice.
-  // Observed on a real run: artifact-A's plan rendered on the artifact-B
-  // screen, with the handoff button enabled and ready to open a terminal
-  // for B while showing A's verdict. Each Process now carries the token IT
-  // was launched under (planProc.forToken / artifactsProc.forToken); the
-  // token that matters is bumped every time a NEW request begins, and
-  // onExited discards a result whose token has since been superseded --
-  // it cannot tell whether the operator returned to a screen a stale
-  // response would still be capable of describing wrong.
-  property int artifactsToken: 0
-  property int planToken: 0
-
-  function openRestore() {
-    if (root.cli === "" || root.cliMissing || root.busy) return
-    root.artifactsDoc = null
-    root.artifactsError = ""
-    root.selectedArtifactPath = ""
-    root.selectedArtifactLabel = ""
-    root.planDoc = null
-    root.planError = ""
-    root.view = "artifacts"
-    root.artifactsToken++
-    artifactsProc.forToken = root.artifactsToken
-    if (artifactsProc.running) artifactsProc.running = false
-    artifactsProc.buffer = ""
-    artifactsProc.errBuffer = ""
-    artifactsProc.running = true
-    artifactsTimeoutTimer.restart()
+  function toggleSettings() {
+    root.configExpanded = !root.configExpanded
+    if (root.configExpanded) settingsRevealTimer.restart()
   }
 
-  function selectArtifact(path, label) {
-    root.selectedArtifactPath = path
-    root.selectedArtifactLabel = label
-    root.targetMode = "into"
-    root.planDoc = null
-    root.planError = ""
-    // Superseding any plan still in flight for a PREVIOUS artifact: bumping
-    // the token here (not only inside chooseTarget) means even a plan
-    // request that never gets restarted -- the operator picks a different
-    // artifact and never proceeds to target/plan again -- cannot later
-    // apply its result if some future path ever reused it.
-    root.planToken++
-    root.view = "target"
-  }
+  // Restore is intentionally terminal-owned, just like Settings: the CLI
+  // lists artifacts, explains targets, previews the plan, and asks for the
+  // final confirmation in the same ANSI surface used over SSH/recovery TTY.
+  function openRestore() { openExternalTui("restore") }
 
-  function chooseTarget(mode) {
-    root.targetMode = mode
-    root.planDoc = null
-    root.planError = ""
-    root.planning = true
-    root.view = "plan"
-    root.planToken++
-    planProc.forToken = root.planToken
-    if (planProc.running) planProc.running = false
-    planProc.buffer = ""
-    planProc.errBuffer = ""
-    var args = ["restore", "--json", root.selectedArtifactPath]
-    // !== "home", not === "into": a review round found the three places
-    // that read targetMode disagreed on which value means what -- the
-    // DISPLAYED target (targetPath, above) already treats "home" as the
-    // one dangerous case and everything else as the safe preview
-    // directory; this and restoreCommand() below now test the same
-    // polarity, so an unexpected value (not reachable today -- only the
-    // two target buttons ever set this -- but not provably unreachable
-    // forever) can never mean "write to the real home" in the two places
-    // that ACT while meaning "test directory" in the one place the
-    // operator READS.
-    if (root.targetMode !== "home") args = args.concat(["--into", root.targetPath])
-    planProc.command = [root.cli].concat(args)
-    planProc.running = true
-    planTimeoutTimer.restart()
-  }
-
-  function backToOverview() {
-    root.view = "overview"
-  }
-
-  // One screen back, for Escape specifically -- backToOverview() above is
-  // what the explicit "‹ Overview" breadcrumb link means (all the way out),
-  // but a review round pointed out the design round's own words ("back/
-  // escape returns without starting anything") describe stepping back ONE
-  // screen, and Escape was wired to backToOverview() regardless of which
-  // screen it was pressed from -- so there was no way to return from plan
-  // to target to change only the alvo, or from target to artifacts to
-  // change only the choice of backup, without losing the whole flow and
-  // starting over. Never touches selectedArtifactPath/targetMode itself;
-  // only the destination screen decides what it shows for whatever is
-  // already selected.
-  function stepBack() {
-    if (root.view === "plan") root.view = "target"
-    else if (root.view === "target") root.view = "artifacts"
-    else if (root.view === "artifacts") root.backToOverview()
-  }
-
-  // The exact command a terminal would run, kept in ONE place: the preview
-  // shown before handoff and the command actually launched must be the same
-  // string, or the preview is theatre (the restore-panel design round's own
-  // words for exactly this failure mode).
-  function restoreCommand() {
-    var parts = [root.cli, "restore", root.selectedArtifactPath]
-    if (root.targetMode !== "home") parts = parts.concat(["--into", root.targetPath])
-    parts.push("--apply")
-    return parts
-  }
-
-  // POSIX single-quoting: wraps in '...', with each literal ' inside
-  // replaced by '\'' (close the quote, an escaped quote, reopen). Used only
-  // for the plan screen's own DISPLAY text -- restoreCommand()'s array
-  // itself is what actually reaches Process.command as argv, never through
-  // a shell, so this never affects what gets executed either way. It exists
-  // because a review round found the display used a plain .join(" "),
-  // making the shown text lie for exactly the input the real handoff was
-  // built to survive: an artifact path with a space in it (a udisks
-  // automount like ".../My Passport/...") displayed as one thing and, if
-  // pasted into a terminal by hand, split into several -- "the preview and
-  // the command launched must be the same string, or the preview is
-  // theatre," the design round's own words, applied here to the copy-paste
-  // path rather than the launched one.
-  function shellQuote(s) {
-    if (/^[A-Za-z0-9_.\-\/=]+$/.test(s)) return s
-    return "'" + s.replace(/'/g, "'\\''") + "'"
-  }
-  function restoreCommandPreview() {
-    return root.restoreCommand().map(root.shellQuote).join(" ")
-  }
-
-  function openTerminalForRestore() {
-    // blocked is re-checked here, not only by the button's own `enabled:`
-    // binding -- a review round pointed out this is the same principle the
-    // CLI's own _restore_one already lives by ("a function that writes
-    // cannot trust that its only caller got the decision right"), and this
-    // is the one function in this file that launches something able to
-    // write.
-    if (root.cli === "" || root.selectedArtifactPath === "") return
-    if (root.planDoc === null || root.planDoc.blocked === true) return
-    // omarchy-launch-tui, not omarchy-launch-terminal: the latter resolves
-    // its own cwd via `hyprctl activewindow`, which is the panel/bar itself
-    // when launched from here -- the wrong window, every time. omarchy-
-    // launch-tui wraps xdg-terminal-exec + setsid uwsm-app, decoupling the
-    // terminal from this process (so QuickShell reloading -- which the
-    // restore this launches can itself cause, for the shell/plugins groups
-    // -- does not kill it) and giving it an app-id for a Hyprland window
-    // rule. The restore itself runs non-interactive inside `bash -c`
-    // (argv, never string-interpolated -- the artifact path came from the
-    // CLI's own JSON and could contain spaces, quotes, anything); only the
-    // shell AFTER it is interactive, so bashrc never runs ahead of the
-    // restore and the operator gets a live prompt afterward to read
-    // scrollback or retry with different flags.
-    var cmd = root.restoreCommand()
-    var script = '"$@"; rc=$?; printf "\\n[omabackup restore exited %s]\\n" "$rc"; exec "$SHELL" -i'
-    handoffProc.command = ["omarchy-launch-tui", "--app-id=org.omarchy.omabackup-restore",
-                            "bash", "-c", script, "omabackup-restore"].concat(cmd)
-    handoffProc.running = true
-    root.view = "overview"
-  }
   function setEnabled(on) {
     // `cli === ""` is not the same as `cliMissing`: between startup and the
     // resolver answering, neither is true, and the command would have gone out
@@ -594,6 +443,60 @@ Panel {
     switchProc.command = [root.cli, on ? "enable" : "disable"]
     switchProc.running = true
     busyTimeoutTimer.restart()
+  }
+
+  function openExternalTui(action) {
+    if (!root.canOpenExternalTui) return
+    root.externalGeneration += 1
+    // Include wall-clock entropy so a callback from a TUI launched before a
+    // QuickShell reload cannot collide with the first token in the new panel
+    // process. The generation still distinguishes launches in one process.
+    root.externalToken = String(Date.now()) + "-" + String(root.externalGeneration)
+    root.externalAction = action
+    root.externalBusy = true
+    root.configuring = action === "config"
+    // KeyboardPanel owns the fade-out. Waiting for it to finish prevents the
+    // terminal window and the Omarchy panel from occupying the same visual
+    // space for one frame during the handoff.
+    root.close()
+    externalLaunchTimer.restart()
+  }
+
+  function openConfig() { openExternalTui("config") }
+
+  // omarchy-launch-tui only reports that the terminal was launched. The small
+  // wrapper inside that terminal calls this IPC method after the actual CLI
+  // returns, so reopening the panel cannot race the still-running TUI.
+  function finishExternalTui(payload) {
+    var parts = typeof payload === "string" ? payload.split(":") : []
+    var action = parts.length === 3 ? parts[0] : ""
+    var exitText = parts.length === 3 ? parts[1] : ""
+    var token = parts.length === 3 ? parts[2] : ""
+    if (!/^[0-9]+$/.test(exitText) || !/^[0-9]+-[0-9]+$/.test(token)) return "ignored"
+    var exitCode = Number(exitText)
+    if (!isFinite(exitCode) || exitCode < 0 || exitCode > 255 || Math.floor(exitCode) !== exitCode
+        || (action !== "config" && action !== "restore")
+        || root.externalAction !== action || root.externalToken !== token)
+      return "ignored"
+    externalRecoveryTimer.stop()
+    root.externalAction = ""
+    root.externalToken = ""
+    root.externalBusy = false
+    root.configuring = false
+    if (exitCode !== null && exitCode !== 0) {
+      root.lastError = action + ": terminal command exited with status " + exitCode
+      root.refresh(true)
+    } else {
+      root.refresh(false)
+    }
+    return "ok"
+  }
+
+  function heartbeatExternalTui(token) {
+    if (typeof token !== "string" || root.externalAction === "" || root.externalToken !== token)
+      return "ignored"
+    externalRecoveryTimer.restart()
+    return "ok"
   }
 
   property bool syncing: false
@@ -643,107 +546,35 @@ Panel {
     }
   }
 
-  // `omabackup artifacts --json`'s own contract: {schemaVersion:1,
-  // destinations:[{id,path,state,error,artifacts:[...]}]}. Same shape
-  // discipline as applyReport/applyStatus -- schemaVersion checked,
-  // destinations required to be an array (not just object-typed, which an
-  // array itself would also satisfy).
-  //
-  // A review round found this only validated the OUTER document -- not each
-  // destination or each artifact inside it -- and the Repeaters downstream
-  // bind straight into fields like `.id`/`.file` with no guard of their
-  // own. {"schemaVersion":1,"destinations":[null]} passed this check and
-  // then threw a real TypeError ("Cannot read property 'id' of null")
-  // reading it in the UI: a malformed response from a boundary this file is
-  // built to distrust broke the very screen meant to render it, with no
-  // artifactsError ever set to explain why. Every destination and every
-  // artifact inside it is now checked before any of it is accepted.
-  function applyArtifacts(text) {
-    try {
-      var parsed = JSON.parse(text)
-      if (!(parsed && typeof parsed === "object" && !Array.isArray(parsed)
-            && parsed.schemaVersion === 1 && Array.isArray(parsed.destinations))) {
-        root.artifactsError = "unreadable artifact list"
-        return
-      }
-      for (var i = 0; i < parsed.destinations.length; i++) {
-        var d = parsed.destinations[i]
-        if (!d || typeof d !== "object" || Array.isArray(d)
-            || typeof d.id !== "string" || typeof d.state !== "string"
-            || !Array.isArray(d.artifacts)) {
-          root.artifactsError = "unreadable artifact list"
-          return
-        }
-        for (var j = 0; j < d.artifacts.length; j++) {
-          var a = d.artifacts[j]
-          if (!a || typeof a !== "object" || Array.isArray(a)
-              || typeof a.file !== "string" || typeof a.valid !== "boolean") {
-            root.artifactsError = "unreadable artifact list"
-            return
-          }
-        }
-      }
-      root.artifactsDoc = parsed
-    } catch (e) {
-      root.artifactsError = "unreadable artifact list"
-    }
-  }
-
-  // `omabackup restore --json`'s plan document: {schemaVersion:1,
-  // verdict, why, blocked, target, from, counts, groups, rows}.
-  //
-  // A review round found this accepted {"schemaVersion":1,"verdict":"same",
-  // "blocked":false,"counts":[]} -- valid per the checks that existed
-  // (counts only had to be object-typed, which an array also is), yet
-  // missing rows, groups, target and from entirely, with a CTA the button
-  // would still have enabled. target.mode/target.path (what the plan
-  // screen and the handoff button both read to name the destination) and
-  // rows/groups (arrays, even if empty) are now required explicitly, and
-  // counts can no longer be an array either.
-  function applyPlan(text) {
-    try {
-      var parsed = JSON.parse(text)
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)
-          && parsed.schemaVersion === 1
-          && typeof parsed.verdict === "string"
-          && typeof parsed.blocked === "boolean"
-          && parsed.counts && typeof parsed.counts === "object" && !Array.isArray(parsed.counts)
-          && parsed.target && typeof parsed.target === "object" && !Array.isArray(parsed.target)
-          && typeof parsed.target.mode === "string" && typeof parsed.target.path === "string"
-          && Array.isArray(parsed.groups) && Array.isArray(parsed.rows)) {
-        root.planDoc = parsed
-        return
-      }
-      root.planError = "could not calculate restore plan"
-    } catch (e) {
-      root.planError = "could not calculate restore plan"
-    }
-  }
-
   // ── the CLI ──────────────────────────────────────────────────────────────
   // Resolved once: on PATH when installed, otherwise straight out of the plugin
   // directory, so the widget works before anyone runs an install step.
   readonly property string fallbackCli:
     Quickshell.env("HOME") + "/.config/omarchy/plugins/brenoperucchi.omabackup/bin/omabackup"
+  readonly property string tuiCli:
+    Quickshell.env("HOME") + "/.config/omarchy/plugins/brenoperucchi.omabackup/bin/omabackup-tui"
   property string cli: ""
 
-  // A stuck command used to leave `busy` true forever: none of the Processes
-  // below had a timeout, so a CLI that hangs (a stale NAS mount, a lock held
-  // by another instance) left every button dead and the panel silently mute
-  // -- no way for the operator to tell "working" from "broken". One shared
-  // timer, restarted whenever a new operation begins: refresh() and syncNow()
-  // etc never overlap (each refuses to start while `busy`), so a single timer
-  // correctly covers whichever one thing is in flight, and firing while
-  // nothing is running is a harmless no-op. When it fires, every Process
-  // still `running` is presumed dead, told to stop, and the busy flag it owns
-  // is cleared with an explicit timeout message rather than staying silent.
+  // A stuck CLI used to leave `busy` true forever: none of the machine-action
+  // Processes below had a timeout, so a stale NAS mount or held lock left
+  // every button dead and the panel silently mute. One shared timer covers
+  // refresh/sync/collect/enable; the terminal handoff is deliberately not in
+  // that set because omarchy-launch-tui is fire-and-forget. Its Process only
+  // reports that the terminal opened; the detached wrapper reports the real
+  // TUI completion through IPC.
   readonly property int busyTimeoutMs: Math.max(10, root.setting("busyTimeoutSec", 45)) * 1000
+  // IPC is the normal completion path, but a closed terminal or an older
+  // Omarchy without `omarchy-shell` must not deadlock every panel action. This
+  // is deliberately much longer than an ordinary TUI session; it is a safety
+  // valve, not the session timeout used by CLI operations.
+  readonly property int externalRecoveryMs:
+    Math.max(60, root.setting("externalTuiRecoverySec", 900)) * 1000
 
   Timer {
     id: busyTimeoutTimer
     interval: root.busyTimeoutMs
     repeat: false
-    // Each branch sets that Process's own `timedOut` flag before setting
+    // Each branch sets that CLI Process's own `timedOut` flag before setting
     // `running = false`. The protection is the FLAG, checked first thing in
     // onExited -- not the order these two lines are written in. A review
     // round measured (not inferred) the actual delivery order with a real
@@ -981,99 +812,65 @@ Panel {
     }
   }
 
-  // Not covered by busyTimeoutTimer/`busy` -- restore's own screens gate
-  // themselves on `root.planning`/artifactsDoc==null instead, and are the
-  // only thing that can be open while these run (the overview's own buttons
-  // are unrelated actions the operator could still want mid-listing). Each
-  // gets its own one-shot timeout instead (below) rather than joining the
-  // shared one: a review round pointed out that "not covered" had come to
-  // mean "no protection at all," leaving "Listing artifacts…"/"Calculating…"
-  // on screen forever with no error and no way forward.
-  Process {
-    id: artifactsProc
-    property string buffer: ""
-    property string errBuffer: ""
-    property int forToken: 0
-    command: root.cli === "" ? ["true"] : [root.cli, "artifacts", "--json"]
-    stdout: StdioCollector { onStreamFinished: artifactsProc.buffer = text }
-    stderr: StdioCollector { onStreamFinished: artifactsProc.errBuffer = text }
-    // forToken checked first: a review round reproduced a stale artifacts
-    // (or plan, below) response landing after a newer request had already
-    // started -- superseded results are discarded silently rather than
-    // overwriting whatever the current request is about to produce.
-    onExited: function(code) {
-      if (artifactsProc.forToken !== root.artifactsToken) return
-      if (artifactsProc.buffer.trim() !== "" && code === 0) {
-        root.applyArtifacts(artifactsProc.buffer)
-      } else {
-        root.artifactsError = "artifacts: " + (artifactsProc.errBuffer.trim() ||
-          (artifactsProc.buffer.trim() === "" ? ("no output, exit " + code) : ("failed, exit " + code)))
-      }
+  Timer {
+    id: settingsRevealTimer
+    interval: 50
+    repeat: false
+    onTriggered: {
+      if (root.configExpanded && flick.contentHeight > flick.height)
+        flick.contentY = flick.contentHeight - flick.height
     }
   }
 
   Timer {
-    id: artifactsTimeoutTimer
-    interval: root.busyTimeoutMs
+    id: externalLaunchTimer
+    interval: 180
     repeat: false
     onTriggered: {
-      if (artifactsProc.running) {
-        artifactsProc.running = false
-        if (artifactsProc.forToken === root.artifactsToken) {
-          root.artifactsError = "artifacts: timed out after " + Math.round(root.busyTimeoutMs / 1000) + "s"
-        }
-      }
+      if (root.externalAction === "") return
+      externalProc.errBuffer = ""
+      externalProc.command = ["omarchy-launch-tui",
+                              "--app-id=org.omarchy.omabackup-" + root.externalAction,
+                              root.tuiCli, root.cli, root.externalAction, root.externalToken]
+      externalProc.running = true
     }
   }
 
   Process {
-    id: planProc
-    property string buffer: ""
-    property string errBuffer: ""
-    property int forToken: 0
-    command: ["true"]
-    stdout: StdioCollector { onStreamFinished: planProc.buffer = text }
-    stderr: StdioCollector { onStreamFinished: planProc.errBuffer = text }
-    onExited: function(code) {
-      root.planning = false
-      if (planProc.forToken !== root.planToken) return
-      if (planProc.buffer.trim() !== "" && code === 0) {
-        root.applyPlan(planProc.buffer)
-      } else {
-        root.planError = "plan: " + (planProc.errBuffer.trim() ||
-          (planProc.buffer.trim() === "" ? ("no output, exit " + code) : ("failed, exit " + code)))
-      }
-    }
-  }
-
-  Timer {
-    id: planTimeoutTimer
-    interval: root.busyTimeoutMs
-    repeat: false
-    onTriggered: {
-      if (planProc.running) {
-        planProc.running = false
-        if (planProc.forToken === root.planToken) {
-          root.planning = false
-          root.planError = "plan: timed out after " + Math.round(root.busyTimeoutMs / 1000) + "s"
-        }
-      }
-    }
-  }
-
-  // Fire-and-forget: this file's job ends the moment the terminal opens.
-  // What happens in it (the restore itself) is deliberately outside
-  // anything this panel tracks -- the whole point of the handoff is that
-  // the terminal, not this widget, is what stays alive through it.
-  Process {
-    id: handoffProc
+    id: externalProc
     property string errBuffer: ""
     command: ["true"]
-    stderr: StdioCollector { onStreamFinished: handoffProc.errBuffer = text }
+    stderr: StdioCollector { onStreamFinished: externalProc.errBuffer = text }
     onExited: function(code) {
+      var action = root.externalAction
       if (code !== 0) {
-        root.lastError = "could not open a terminal: " + (handoffProc.errBuffer.trim() || ("exit " + code))
+        externalRecoveryTimer.stop()
+        root.externalAction = ""
+        root.externalToken = ""
+        root.externalBusy = false
+        root.configuring = false
+        root.lastError = action + ": " + (externalProc.errBuffer.trim() || ("exit " + code))
+        root.refresh(true)
       }
+      else if (action !== "") {
+        externalRecoveryTimer.restart()
+      }
+    }
+  }
+
+  Timer {
+    id: externalRecoveryTimer
+    interval: root.externalRecoveryMs
+    repeat: false
+    onTriggered: {
+      if (root.externalAction === "") return
+      var action = root.externalAction
+      root.externalAction = ""
+      root.externalToken = ""
+      root.externalBusy = false
+      root.configuring = false
+      root.lastError = action + ": terminal did not report completion; status refreshed"
+      root.refresh(true)
     }
   }
 
@@ -1098,11 +895,20 @@ Panel {
     onTriggered: root.refresh(true)
   }
 
+  Timer {
+    id: versionCopiedTimer
+    interval: 1800
+    repeat: false
+    onTriggered: root.versionCopied = false
+  }
+
   IpcHandler {
     target: "brenoperucchi.omabackup"
     function refresh(): void { root.refresh() }
     function collect(): void { root.collect() }
     function toggle(): void { root.toggle() }
+    function tuiFinished(action: string): string { return root.finishExternalTui(action) }
+    function tuiHeartbeat(token: string): string { return root.heartbeatExternalTui(token) }
     function status(): string {
       return JSON.stringify({ covered: root.covered, fail: root.failCount,
                               warn: root.warnCount, headline: root.headline })
@@ -1159,36 +965,21 @@ Panel {
     // wider here because the group list runs in two columns.
     contentWidth: panel.fittedContentWidth(Style.space(470))
     contentHeight: panel.fittedContentHeight(
-      root.view === "overview" ? (column.implicitHeight + footerBar.height) : restoreColumn.implicitHeight,
+      column.implicitHeight + footerBar.height,
       Style.space(560))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      // Escape steps back one screen inside the restore flow rather than
-      // closing the whole panel outright -- "back/escape returns without
-      // starting anything" is the mockup round's own wording for this, and
-      // a restore-picking flow is exactly the surface where closing by
-      // accident mid-choice is the worse of the two behaviours.
-      onCloseRequested: {
-        if (root.view !== "overview") root.stepBack()
-        else root.close()
-      }
+      onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      // Scoped to the overview: the consolidated mockup round was explicit
-      // that restore must not join this single-letter, no-modifier
-      // namespace -- `c` already writes to staging today, and a restore
-      // screen is exactly the surface where a stray keystroke should never
-      // be read as an action.
       onTextKey: function(t) {
-        if (root.view !== "overview") return
         if (t === "r" || t === "R") root.refresh()
         else if (t === "c" || t === "C") root.collect()
       }
 
       Flickable {
         id: flick
-        visible: root.view === "overview"
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
@@ -1330,13 +1121,34 @@ Panel {
             }
           }
 
-          Text {
+          // Runtime identity is compact and sits between the primary actions
+          // and the detailed sections. The OmaBackup version is a real button
+          // because it is useful when reporting a bug; the copy action writes
+          // only to Quickshell's Wayland clipboard.
+          Row {
             width: parent.width
-            text: "Omarchy " + root.omarchyVersion + "  -  migration " + root.watermark
-            color: Color.muted
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            elide: Text.ElideRight
+            spacing: Style.space(4)
+
+            Button {
+              id: versionButton
+              text: root.versionCopied ? "OmaBackup " + root.toolVersion + "  ✓ copied"
+                                       : "OmaBackup " + root.toolVersion
+              bordered: false
+              focusable: true
+              enabled: root.toolVersion !== "?"
+              foreground: root.versionCopied ? Color.foreground : Color.accent
+              onClicked: root.copyToolVersion()
+            }
+
+            Text {
+              anchors.verticalCenter: versionButton.verticalCenter
+              text: "·  Omarchy " + root.omarchyVersion + "  ·  migration " + root.watermark
+              color: Color.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
+              width: parent.width - versionButton.width - Style.space(4)
+            }
           }
 
           PanelSectionHeader {
@@ -1640,11 +1452,11 @@ Panel {
           // (stale / not-scheduled alerts now live right under the verdict,
           // near the top of the column -- see the reorganised block above)
 
-          // ── config, collapsed by default (click the header to expand) ──────
+          // ── current settings, collapsed by default ───────────────────────
           Item {
             width: parent.width
             implicitHeight: cHdr.implicitHeight + Style.space(5)
-            PanelSectionHeader { id: cHdr; anchors.left: parent.left; text: "Config" }
+            PanelSectionHeader { id: cHdr; anchors.left: parent.left; text: "Current settings" }
             Text {
               anchors.left: cHdr.right
               anchors.leftMargin: Style.space(4)
@@ -1658,7 +1470,7 @@ Panel {
             MouseArea {
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
-              onClicked: root.configExpanded = !root.configExpanded
+              onClicked: root.toggleSettings()
             }
           }
 
@@ -1697,12 +1509,12 @@ Panel {
               }
             }
 
-            CfgRow { k: "sync";     v: root.humanSchedule(root.syncSchedule) }
-            CfgRow { k: "push";     v: root.humanSchedule(root.pushSchedule) }
+            CfgRow { k: "backup";   v: root.humanSchedule(root.syncSchedule) }
+            CfgRow { k: "send";     v: root.humanSchedule(root.pushSchedule) }
             CfgRow { k: "repo";     v: root.config ? root.shortPath(root.config.repo) : "—" }
             CfgRow { k: "state";    v: root.config ? root.shortPath(root.config.state) : "—" }
-            CfgRow { k: "targets";  v: root.config ? root.shortPath(root.config.destinationsFile) : "—" }
-            CfgRow { k: "secrets";  v: root.config ? root.shortPath(root.config.denyList) : "—" }
+            CfgRow { k: "folders";  v: root.config ? root.shortPath(root.config.destinationsFile) : "—" }
+            CfgRow { k: "deny list"; v: root.config ? root.shortPath(root.config.denyList) : "—" }
           }
 
           Text {
@@ -1715,378 +1527,48 @@ Panel {
         }
       }
 
-      // ── the fixed footer: a door, not a button ──────────────────────────
-      // Never scrolls out of view, and never competes visually with "Back
-      // up now": text + chevron, Color.muted, not a bordered Button -- the
-      // mockup round's own distinction between an action (does something)
-      // and a door (navigates, writes nothing). Only present in "overview";
+      // ── the fixed footer: navigation actions ────────────────────────────
+      // Never scrolls out of view and is present only in "overview";
       // the restore screens get their own back-navigation instead.
       Item {
         id: footerBar
-        visible: root.view === "overview"
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        height: restoreEntryRow.implicitHeight + Style.space(12)
+        height: footerActions.implicitHeight + Style.space(12)
 
         PanelSeparator { anchors.top: parent.top; width: parent.width }
 
         Row {
-          id: restoreEntryRow
+          id: footerActions
           anchors.left: parent.left
           anchors.verticalCenter: parent.verticalCenter
-          spacing: Style.space(4)
-          Text {
+          spacing: Style.space(6)
+
+          Button {
+            id: restoreButton
             text: "↻ Restore…"
-            color: (root.cli !== "" && !root.cliMissing && !root.busy) ? Color.muted : Color.muted
-            opacity: (root.cli !== "" && !root.cliMissing && !root.busy) ? 1.0 : 0.4
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-          }
-        }
-        MouseArea {
-          anchors.left: parent.left
-          anchors.verticalCenter: parent.verticalCenter
-          width: restoreEntryRow.implicitWidth
-          height: restoreEntryRow.implicitHeight
-          enabled: root.cli !== "" && !root.cliMissing && !root.busy
-          cursorShape: Qt.PointingHandCursor
-          onClicked: root.openRestore()
-        }
-      }
-
-      // ── the restore flow: artifact -> target -> plan -> handoff ─────────
-      // One Flickable/Column shared by all three screens (Item blocks
-      // toggled by root.view), rather than one pair per screen -- the
-      // wireframes share a nav header and none of them are large enough on
-      // their own to earn a separate scroll container.
-      Flickable {
-        id: restoreFlick
-        visible: root.view !== "overview"
-        anchors.fill: parent
-        contentWidth: width
-        contentHeight: restoreColumn.implicitHeight
-        clip: true
-        boundsBehavior: Flickable.StopAtBounds
-        flickableDirection: Flickable.VerticalFlick
-        interactive: contentHeight > height
-        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
-
-        Column {
-          id: restoreColumn
-          width: restoreFlick.width
-          spacing: Style.space(10)
-
-          Row {
-            width: parent.width
-            spacing: Style.space(8)
-            Text {
-              text: "‹ Overview"
-              color: Color.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              MouseArea { anchors.fill: parent; onClicked: root.backToOverview() }
-            }
-            Text {
-              text: root.view === "artifacts" ? "Restore"
-                  : "Restore · " + root.selectedArtifactLabel
-              color: Color.foreground
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              elide: Text.ElideRight
-            }
+            bordered: false
+            focusable: true
+            foreground: Color.muted
+            opacity: root.canOpenExternalTui ? 1.0 : 0.45
+            enabled: root.canOpenExternalTui
+            onClicked: root.openRestore()
           }
 
-          // ── S1: artifact list ──────────────────────────────────────────
-          Column {
-            visible: root.view === "artifacts"
-            width: parent.width
-            spacing: Style.space(10)
-
-            Text {
-              visible: root.artifactsDoc === null && root.artifactsError === ""
-              width: parent.width
-              text: "Listing artifacts…"
-              color: Color.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-
-            Text {
-              visible: root.artifactsError !== ""
-              width: parent.width
-              text: root.artifactsError
-              color: Color.urgent
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-
-            // A review round found a valid, error-free response with zero
-            // `dir` destinations configured (a real, reachable state -- see
-            // artifacts --json's own contract) left this screen blank once
-            // the loading text disappeared: no message, no next step, just
-            // an empty scroll area under the "Restore" header.
-            Text {
-              visible: root.artifactsDoc !== null && root.artifactsError === ""
-                       && (root.artifactsDoc.destinations || []).length === 0
-              width: parent.width
-              text: "No backup destinations are configured on this machine."
-              color: Color.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-
-            Repeater {
-              model: root.artifactsDoc ? (root.artifactsDoc.destinations || []) : []
-              Column {
-                required property var modelData
-                width: parent.width
-                spacing: Style.space(4)
-
-                PanelSectionHeader { text: (modelData.id || "") + "  ·  " + root.shortPath(modelData.path || "") }
-
-                Text {
-                  visible: modelData.state === "empty"
-                  width: parent.width
-                  text: "No backup artifacts here yet."
-                  color: Color.muted
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                }
-                Text {
-                  visible: modelData.state === "unreachable" || modelData.state === "list-failed"
-                  width: parent.width
-                  text: (modelData.state === "unreachable" ? "Destination unavailable: " : "Could not list: ")
-                        + (modelData.error || "")
-                  color: Color.urgent
-                  font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
-                  wrapMode: Text.WordWrap
-                }
-
-                Repeater {
-                  model: modelData.state === "ok" ? (modelData.artifacts || []) : []
-                  // Item, not Column: a review round found the MouseArea's
-                  // `anchors.fill: parent` invalid where parent was itself a
-                  // Column being positioned by the OUTER Column -- Qt Quick
-                  // explicitly refuses fill/top/bottom/verticalCenter/
-                  // centerIn anchors on a Positioner's own direct children,
-                  // confirmed with a real headless run producing exactly
-                  // this warning and a zero-geometry hit area. Every valid
-                  // artifact was visible and permanently unclickable. An
-                  // Item wrapping an inner Column (positioned normally by
-                  // the Repeater's parent) plus a sibling MouseArea anchored
-                  // to the Item is the idiom Qt Quick actually allows.
-                  Item {
-                    id: artifactRow
-                    required property var modelData
-                    width: parent.width
-                    implicitHeight: artifactCol.implicitHeight
-
-                    Column {
-                      id: artifactCol
-                      width: parent.width
-                      spacing: Style.space(1)
-
-                      Text {
-                        width: parent.width
-                        text: (artifactRow.modelData.valid ? "▪ " : "✗ ") + (artifactRow.modelData.file || "")
-                        color: artifactRow.modelData.valid ? Color.foreground : Color.muted
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.bodySmall
-                        elide: Text.ElideRight
-                      }
-                      Text {
-                        visible: artifactRow.modelData.valid === true
-                        width: parent.width
-                        text: (artifactRow.modelData.host || "?") + "  ·  omarchy "
-                              + (artifactRow.modelData.omarchy ? (artifactRow.modelData.omarchy.version || "?") : "?")
-                              + "  ·  " + root.agoFromIso(artifactRow.modelData.createdAt || "")
-                              + (artifactRow.modelData.verifyOk === false ? "  ·  ✗ verify was failing" : "")
-                        color: artifactRow.modelData.verifyOk === false ? Color.urgent : Color.muted
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
-                        elide: Text.ElideRight
-                      }
-                      Text {
-                        visible: artifactRow.modelData.valid === false
-                        width: parent.width
-                        text: artifactRow.modelData.error || "could not read this artifact"
-                        color: Color.urgent
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
-                        wrapMode: Text.WordWrap
-                      }
-                    }
-
-                    MouseArea {
-                      anchors.fill: parent
-                      enabled: artifactRow.modelData.valid === true
-                      cursorShape: artifactRow.modelData.valid === true ? Qt.PointingHandCursor : Qt.ArrowCursor
-                      onClicked: root.selectArtifact(artifactRow.modelData.path,
-                        (artifactRow.modelData.host || "?") + " · " + root.agoFromIso(artifactRow.modelData.createdAt || ""))
-                    }
-                  }
-                }
-              }
-            }
-          }
-
-          // ── S2: target ──────────────────────────────────────────────────
-          Column {
-            visible: root.view === "target"
-            width: parent.width
-            spacing: Style.space(8)
-
-            Text {
-              width: parent.width
-              text: "Where should this restore go?"
-              color: Color.foreground
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-            }
-
-            Row {
-              width: parent.width
-              spacing: Style.space(6)
-              Button {
-                text: "Test directory"
-                bordered: true
-                focusable: true
-                onClicked: root.chooseTarget("into")
-              }
-              Button {
-                text: "This machine"
-                bordered: true
-                focusable: true
-                onClicked: root.chooseTarget("home")
-              }
-            }
-
-            Text {
-              width: parent.width
-              text: root.targetMode === "home"
-                    ? "This machine: " + root.targetPath
-                    : "Test directory: " + root.targetPath
-              color: root.targetMode === "home" ? Color.urgent : Color.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WrapAnywhere
-            }
-          }
-
-          // ── S3: plan ────────────────────────────────────────────────────
-          Column {
-            visible: root.view === "plan"
-            width: parent.width
-            spacing: Style.space(8)
-
-            Text {
-              visible: root.planning
-              width: parent.width
-              text: "Calculating the restore plan…"
-              color: Color.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-
-            Text {
-              visible: !root.planning && root.planError !== ""
-              width: parent.width
-              text: "Could not calculate restore plan\n" + root.planError
-              color: Color.urgent
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.WordWrap
-            }
-
-            Column {
-              visible: !root.planning && root.planDoc !== null
-              width: parent.width
-              spacing: Style.space(6)
-
-              Text {
-                width: parent.width
-                text: (root.planDoc ? (root.planDoc.verdict || "") : "").toUpperCase()
-                color: !root.planDoc ? Color.muted
-                     : root.planDoc.verdict === "quarantine" ? Color.urgent
-                     : root.planDoc.verdict === "forward" ? Color.accent
-                     : Color.muted
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-              }
-              Text {
-                width: parent.width
-                text: root.planDoc ? (root.planDoc.why || "") : ""
-                color: Color.muted
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-
-              Text {
-                width: parent.width
-                text: {
-                  if (!root.planDoc || !root.planDoc.counts) return ""
-                  var c = root.planDoc.counts
-                  var bits = []
-                  bits.push((c.new || 0) + " new")
-                  bits.push((c.replaced || 0) + " replaced")
-                  if (c.quarantine) bits.push(c.quarantine + " quarantined")
-                  if (c.held) bits.push(c.held + " held")
-                  if (c.ambiguous) bits.push(c.ambiguous + " ambiguous")
-                  if (c.escape) bits.push(c.escape + " refused")
-                  if (c.report) bits.push(c.report + " to read yourself")
-                  return bits.join("  ·  ")
-                }
-                color: Color.foreground
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-
-              Text {
-                visible: root.planDoc && root.planDoc.blocked === true
-                width: parent.width
-                text: "!  Blocked: this plan has ambiguous or refused files. Choose a different artifact or target."
-                color: Color.urgent
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-
-              Text {
-                width: parent.width
-                text: "The panel will not run this. It opens a terminal with the command below."
-                color: Color.muted
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
-              }
-
-              Text {
-                width: parent.width
-                text: root.restoreCommandPreview()
-                color: Color.foreground
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WrapAnywhere
-              }
-
-              Button {
-                text: root.targetMode === "home" ? "Open terminal — this machine"
-                                                  : "Open terminal — test directory"
-                bordered: true
-                focusable: true
-                enabled: root.planDoc !== null && root.planDoc.blocked !== true
-                onClicked: root.openTerminalForRestore()
-              }
-            }
+          Button {
+            id: settingsButton
+            text: root.configuring ? "Settings…" : "⚙ Settings…"
+            bordered: false
+            focusable: true
+            foreground: root.canOpenExternalTui ? Color.accent : Color.muted
+            opacity: root.canOpenExternalTui ? 1.0 : 0.45
+            enabled: root.canOpenExternalTui
+            onClicked: root.openConfig()
           }
         }
       }
+
     }
   }
 }

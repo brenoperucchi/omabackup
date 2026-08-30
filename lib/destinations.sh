@@ -24,13 +24,59 @@ _dest_json() { [[ -f "$DESTINATIONS_FILE" ]] && cat "$DESTINATIONS_FILE" || prin
 
 KNOWN_DEST_FIELDS='["id","type","path","keep","enabled","note"]'
 KNOWN_DEST_TYPES='["dir"]'
+DEST_KEEP_MAX=9223372036854775807
+
+# Keep is a user-controlled decimal that eventually participates in Bash
+# arithmetic while pruning. Normalize it and bound it to the largest signed
+# integer Bash can compare safely before it reaches any arithmetic context.
+_dest_keep_normalize() {
+    local value="$1" normalized
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    normalized="$value"
+    while [[ ${#normalized} -gt 1 && ${normalized:0:1} == 0 ]]; do
+        normalized="${normalized:1}"
+    done
+    (( ${#normalized} <= ${#DEST_KEEP_MAX} )) || return 1
+    if (( ${#normalized} == ${#DEST_KEEP_MAX} )) && [[ "$normalized" > "$DEST_KEEP_MAX" ]]; then
+        return 1
+    fi
+    (( 10#$normalized >= 1 )) || return 1
+    printf '%s' "$normalized"
+}
+
+_dest_keep_valid() {
+    _dest_keep_normalize "$1" >/dev/null
+}
+
+_dest_id_valid() {
+    [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+_destinations_schema_valid() {
+    jq -e '
+      (. | type == "object")
+      and (.schemaVersion == 1)
+      and ((.destinations | type) == "array")
+      and ((if type == "object" then (keys - ["schemaVersion","destinations"] | length == 0) else false end))
+      and all(.destinations[];
+        if type != "object" then false else
+          ((.id? // null) | if type == "string" then test("^[A-Za-z0-9_-]+$") and . != "github" else false end)
+          and ((.type? // null) | . == "dir")
+          and ((.path? // null) | if type == "string" then length > 0 and startswith("/") else false end)
+          and ((.keep? // null) | if type == "number" then floor == . and . >= 1 else false end)
+          and (if has("enabled") then (.enabled | type == "boolean") else true end)
+        end
+      )
+      and (([.destinations[]?.id] | unique | length) == (.destinations | length))
+    ' "$DESTINATIONS_FILE" >/dev/null 2>&1
+}
 
 # Same invariant the group manifest has: a field declared and silently ignored
 # is how staging once went from 1.3MB to 84MB. `github` is not listed here --
 # it is implicit, derived from OMABACKUP_REPO's own remote.
 assert_destinations_understood() {
     [[ -f "$DESTINATIONS_FILE" ]] || return 0
-    local bad line
+    local bad line keep_values keep
     # jq's own status, checked -- a destinations.json this cannot even
     # PARSE (invalid JSON, not just an unknown field) produced the same
     # empty $bad a genuinely clean file does, and `[[ -z "$bad" ]] && return
@@ -42,18 +88,40 @@ assert_destinations_understood() {
     # while a configured GitHub remote (which needs no entry here at all)
     # still gets pushed to, the operator never told the file was unreadable.
     bad="$(jq -r --argjson k "$KNOWN_DEST_FIELDS" --argjson t "$KNOWN_DEST_TYPES" '
-        [ ((.destinations // [])[] | . as $d | (keys[] | select(. as $f | $k | index($f) | not))
+        [ (if type == "object" then
+              ((keys - ["schemaVersion","destinations"])[]
+                | "unknown field \(.) in destinations document")
+            else empty end)
+        , ((.destinations // [])[] | . as $d | (keys[] | select(. as $f | $k | index($f) | not))
             | "unknown field \(.) in destination \($d.id)")
         , ((.destinations // [])[] | select(.type as $x | $t | index($x) | not)
             | "unknown type \(.type) in destination \(.id)")
-        , ((.destinations // [])[] | select((.keep // 0) < 1)
-            | "destination \(.id) needs keep >= 1: retention that keeps nothing is not retention")
+        , ((.destinations // [])[] | select((.keep // 0) | type != "number" or floor != . or . < 1)
+            | "destination \(.id) needs a positive integer keep value")
+        , ((.destinations // [])[] | select((.id // "") == "github")
+            | "destination github is implicit; configure the repository origin remote instead")
         , ((.destinations // [])[] | select((.id // "") == "" or (.path // "") == "")
             | "destination missing id or path")
         ] | .[]' "$DESTINATIONS_FILE" 2>/dev/null)" || {
         printf '%somabackup: destinations.json could not be read as JSON at all%s\n' "$RED" "$NC" >&2
         exit 1
     }
+    keep_values="$(jq -r '.destinations[]? | (.keep // 0)' "$DESTINATIONS_FILE" 2>/dev/null)" || {
+        printf '%somabackup: destinations.json could not be read as JSON at all%s\n' "$RED" "$NC" >&2
+        exit 1
+    }
+    if [[ -n "$keep_values" ]]; then
+        while IFS= read -r keep; do
+            _dest_keep_valid "$keep" || {
+                [[ -n "$bad" ]] && bad+=$'\n'
+                bad+="destination has a keep value outside the supported integer range"
+            }
+        done <<<"$keep_values"
+    fi
+    if ! _destinations_schema_valid; then
+        [[ -n "$bad" ]] && bad+=$'\n'
+        bad+="destination document fails its id, path, schema, or enabled-value invariants"
+    fi
     [[ -z "$bad" ]] && return 0
     printf '%somabackup: destinations.json declares what push cannot honor:%s\n' "$RED" "$NC" >&2
     while IFS= read -r line; do printf '  %s\n' "$line" >&2; done <<<"$bad"
@@ -67,15 +135,44 @@ dest_field() { _dest_json | jq -r --arg i "$1" --arg f "$2" \
 # github needs no entry: the repo already knows its own remote.
 dest_has_github() { git -C "${OMABACKUP_REPO:-/nonexistent}" remote get-url origin >/dev/null 2>&1; }
 
+# Git may repeat a credential-bearing remote URL in a transport error. Keep
+# that detail safe at the boundary shared by the terminal, destination state,
+# and status JSON. This deliberately redacts URL userinfo only; it does not
+# pretend to be a general secret scanner for arbitrary command output.
+dest_redact_output() {
+    sed -E 's#([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@[:space:]]+@#\1#g'
+}
+
+# Return the first effective origin push URL for user-facing status, with
+# credentials removed before it can reach JSON, the panel, or a terminal. Git
+# permits several push URLs and `git push origin HEAD` sends to all of them;
+# the stable scalar `github.url`/`locator` contract intentionally exposes the
+# first one only. The push command itself still receives the real remote from
+# Git; this helper is presentation data only. The ordinary repository contract
+# deliberately matches the command gates elsewhere, which still require
+# `.git` to be a directory.
+dest_github_push_url() {
+    local repo="${OMABACKUP_REPO:-}" url
+    [[ -n "$repo" ]] || return 1
+    [[ -d "$repo/.git" ]] || return 1
+    url="$(git -C "$repo" remote get-url --push origin 2>/dev/null)" || return 1
+    [[ -n "$url" ]] || return 1
+    printf '%s' "$url" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@#\1#'
+}
+
 # ── state ────────────────────────────────────────────────────────────────────
 # One file per destination, not one document: a mount-triggered push and a
 # timer-triggered push can run at once and must not overwrite each other, and a
 # corrupted document would take every destination's history with it.
-dest_state_file() { printf '%s/destinations/%s.json' "$OMABACKUP_STATE" "$1"; }
+dest_state_file() {
+    _dest_id_valid "$1" || return 1
+    printf '%s/destinations/%s.json' "$OMABACKUP_STATE" "$1"
+}
 dest_state() { jq -r "${2}" "$(dest_state_file "$1")" 2>/dev/null || printf ''; }
 
 dest_state_write() {
-    local id="$1" doc="$2" p; p="$(dest_state_file "$id")"
+    local id="$1" doc="$2" p
+    p="$(dest_state_file "$id")" || return 1
     mkdir -p "$(dirname "$p")" || return 1
     # rm -f first: `>` follows a symlink already sitting at "$p.tmp" instead
     # of replacing it -- the exact defect `_publish_file` (lib/publish.sh)
@@ -102,6 +199,7 @@ _dest_record_success() {
 # evaluated after a reboot.
 _dest_record_failure() {
     local id="$1" msg="$2" fails delay
+    msg="$(printf '%s' "$msg" | dest_redact_output)"
     fails="$(dest_state "$id" '.failures // 0')"; [[ "$fails" =~ ^[0-9]+$ ]] || fails=0
     fails=$((fails + 1))
     delay=$((60 * (1 << (fails > 8 ? 8 : fails - 1))))
@@ -111,6 +209,19 @@ _dest_record_failure() {
         --arg prev "$(dest_state "$id" '.lastSuccess // ""')" \
         '{schemaVersion:1, id:$id, lastSuccess:(if $prev=="" then null else $prev end),
           lastError:{at:$at, message:$msg}, failures:$f, nextAttemptAt:$next}')"
+}
+
+# Old state files may have been written before error details were redacted.
+# Sanitize the message while projecting state to status JSON, so a previously
+# persisted credential cannot escape merely because the panel polls status.
+dest_state_public_json() {
+    local file="$1" doc message
+    doc="$(cat "$file" 2>/dev/null || printf '{}')"
+    message="$(jq -r '.lastError.message // empty' <<<"$doc" 2>/dev/null | dest_redact_output)"
+    jq --arg message "$message" '
+        if (.lastError? | type) == "object" then
+            .lastError.message = $message
+        else . end' <<<"$doc" 2>/dev/null || printf '{}'
 }
 
 dest_in_backoff() {
@@ -141,8 +252,12 @@ DEST_STAMP='.omabackup-destination'
 DEST_NAME_TAIL='[0-9]{8}-[0-9]{6}(-[0-9a-f]{12})?\.tar\.zst'
 
 prune_bundles() {  # prune_bundles <dir> <host> <keep> -> prints how many it removed
-    local dir="$1" host="$2" keep="$3" f n=0 removed=0
-    [[ "$keep" =~ ^[0-9]+$ ]] && (( keep >= 1 )) || { printf 'refusing to prune with keep=%s\n' "$keep" >&2; return 1; }
+    local dir="$1" host="$2" keep="$3" f n=0 removed=0 normalized_keep
+    normalized_keep="$(_dest_keep_normalize "$keep")" || {
+        printf 'refusing to prune with keep=%s\n' "$keep" >&2
+        return 1
+    }
+    keep="$normalized_keep"
     [[ -d "$dir" ]] || return 1
     if [[ ! -f "$dir/$DEST_STAMP" ]]; then
         printf 'omabackup: refusing to prune a directory with no %s stamp: %s\n' "$DEST_STAMP" "$dir" >&2
@@ -312,7 +427,10 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
 # have committed locally forever while the panel stayed green.
 _push_github() {
     local out
-    out="$(git -C "$OMABACKUP_REPO" push origin HEAD 2>&1)" || { printf '%s' "${out:-push failed}"; return 1; }
+    out="$(git -C "$OMABACKUP_REPO" push origin HEAD 2>&1)" || {
+        printf '%s' "${out:-push failed}" | dest_redact_output
+        return 1
+    }
     printf '0'
 }
 
@@ -326,25 +444,39 @@ push_destination() {  # push_destination <id> <bundle> <name> -> prints detail, 
     esac
 }
 
+dest_target_understood() {
+    local id="$1" type
+    _dest_id_valid "$id" || {
+        printf 'destination id must contain only letters, numbers, _ or -: %s' "$id"
+        return 1
+    }
+    [[ "$id" == github ]] && return 0
+    type="$(dest_field "$id" type)"
+    [[ -n "$type" ]] || {
+        printf 'unknown destination: %s' "$id"
+        return 1
+    }
+}
+
 # ── the destinations block status --json publishes ───────────────────────────
 # Never verify --json: cmd_sync refuses to commit when verify fails, so a
 # destination folded into verify would let a disconnected NAS block the source
 # of truth -- the exact inverse of "one destination failing does not invalidate
 # the others" (§3).
 destinations_json() {
-    local id
+    local id github_url
     { for id in $(dest_ids); do
         jq -n --arg id "$id" --arg type "$(dest_field "$id" type)" \
               --arg path "$(dest_field "$id" path)" \
               --argjson keep "$(dest_field "$id" keep || true)" \
-              --argjson st "$(cat "$(dest_state_file "$id")" 2>/dev/null || echo '{}')" \
+              --argjson st "$(dest_state_public_json "$(dest_state_file "$id")")" \
               '{id:$id, type:$type, locator:$path, keep:$keep, enabled:true,
                 lastSuccess:($st.lastSuccess // null), lastError:($st.lastError // null),
                 failures:($st.failures // 0), nextAttemptAt:($st.nextAttemptAt // 0)}' 2>/dev/null
       done
-      if dest_has_github; then
-        jq -n --argjson st "$(cat "$(dest_state_file github)" 2>/dev/null || echo '{}')" \
-              --arg url "$(git -C "$OMABACKUP_REPO" remote get-url origin 2>/dev/null)" \
+      if github_url="$(dest_github_push_url)"; then
+        jq -n --argjson st "$(dest_state_public_json "$(dest_state_file github)")" \
+              --arg url "$github_url" \
               '{id:"github", type:"github", locator:$url, keep:null, enabled:true,
                 lastSuccess:($st.lastSuccess // null), lastError:($st.lastError // null),
                 failures:($st.failures // 0), nextAttemptAt:($st.nextAttemptAt // 0)}' 2>/dev/null
