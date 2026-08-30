@@ -898,7 +898,7 @@ CLI, while making the wording user-oriented.
   operational warning was re-sent in the confirmation request, and both
   reviewers were instructed to reread `AGENTS.md`'s Reviewer colleagues and
   `.herdr/reviewer.md`'s Isolamento section.
-- Final verification is complete: `./test/run.sh` — **984 passed, 0 failed**;
+- Final verification is complete: `./test/run.sh` — **985 passed, 0 failed**;
   Bash syntax and `git diff --check` are clean. The real VM gate passed again
   on 2026-08-30 using the accepted `golden-final-v2.qcow2` fixture with its
   pinned SSH key: the real artifact restored in the Omarchy guest, the journal
@@ -912,6 +912,31 @@ CLI, while making the wording user-oriented.
   continue to use one terminal-owned ANSI flow, with no second config format
   and no panel-owned restore path; the QuickShell handoff remains a bounded,
   refreshable launch around that flow.
+
+### Live plugin redeploy — 2026-08-30
+
+- The live symptom had two operational causes, not a missing GitHub code path:
+  the installed clone was still at `81409c9`/`0.2.0`, and the new
+  `bin/omabackup-tui` existed only as an untracked development file. Git-based
+  installation therefore omitted the wrapper that the Panel uses for both
+  Settings and Restore. A permanent Panel regression now requires that the
+  wrapper is tracked and executable; it failed before publication and passes
+  after it.
+- Commit `9e5f0ed` bumps the manifest to `0.2.1`, tracks the wrapper, and was
+  pushed to `origin/main`. The installed clone was safely fast-forwarded after
+  its previous loose changes were preserved in the recoverable stash
+  `pre-omabackup-0.2.1 deployment snapshot`, then reloaded successfully:
+  `9e5f0ed is live`.
+- The machine config had `OMABACKUP_REPO=` even though
+  `~/Devs/omarchy-personal` is the configured private dotfiles repository. The
+  live CLI was set back to that path through `omabackup config set repo`; the
+  resulting status is `tool.version: 0.2.1`, GitHub `configured: true`,
+  `active: true`, and `origin -> https://github.com/brenoperucchi/omarchy-personal.git`.
+- A live PTY smoke through the installed `bin/omabackup-tui` reached the Restore
+  TUI, displayed the actionable `No backups found` recovery screen, accepted
+  `q`, and exited cleanly instead of flashing and closing. The panel was
+  reloaded after the configuration change. Full suite after the packaging
+  regression: **985 passed, 0 failed**.
 
 ## Open questions for the user, not yet decided
 
