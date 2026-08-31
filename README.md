@@ -13,6 +13,8 @@ And a second one, which decides whether restoring is safe at all:
 
 > **Is this machine on a version OmaBackup knows how to restore onto?**
 
+![OmaBackup panel](screenshots/panel.png)
+
 ## Status
 
 The CLI, scheduler, restore TUI and QuickShell panel are working today.
@@ -36,6 +38,8 @@ writes machine configuration or applies a restore itself.
 backup folders with numbers, generates a destination name when one is not
 provided, explains retention, and offers frequency presets. A script can use
 the same contract directly:
+
+![omabackup config](screenshots/config.png)
 
 ```bash
 ./bin/omabackup config set sync-schedule '*/15 * * * *'
