@@ -196,6 +196,36 @@ fi
 [[ $HEARTBEAT_RC -eq 0 && -n "$HEARTBEAT_SLEEP_PID" && $HEARTBEAT_LEFT_BEHIND -eq 0 ]] \
     && ok || fail "the wrapper left a heartbeat child alive after normal exit"
 
+# The handoff/signal tests below pin down _notify()'s IPC argv, but _heartbeat()
+# had the identical "shell call ..." bug and no regression ever exercised it:
+# the fake `sleep` above never returns (`exec tail -f /dev/null`), so the
+# wrapper is torn down before its 30s sleep loop ever reaches the
+# `_ipc_call ... tuiHeartbeat` line. A fake `sleep` that returns immediately
+# lets that line run for real, on the first loop iteration, so this asserts
+# the exact argv omarchy-shell actually receives -- not just that the CLI
+# behaved and the child got reaped.
+HBARGV_HOME="$(mktemp -d)"; mkdir -p "$HBARGV_HOME/bin"
+HBARGV_CALL_LOG="$HBARGV_HOME/hb-call.log"
+HBARGV_CLI="$HBARGV_HOME/cli"
+printf '#!/bin/bash\nexit 0\n' >"$HBARGV_HOME/bin/sleep"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"%s"\n' "$HBARGV_CALL_LOG" >"$HBARGV_HOME/bin/omarchy-shell"
+cat >"$HBARGV_CLI" <<EOF
+#!/bin/bash
+for _ in {1..50}; do
+    [[ -s "$HBARGV_CALL_LOG" ]] && exit 0
+    /usr/bin/sleep 0.01
+done
+exit 1
+EOF
+chmod +x "$HBARGV_HOME/bin/sleep" "$HBARGV_HOME/bin/omarchy-shell" "$HBARGV_CLI"
+HBARGV_RC=0
+PATH="$HBARGV_HOME/bin:$PATH" bin/omabackup-tui "$HBARGV_CLI" config hb-argv-token \
+    >/dev/null 2>&1 || HBARGV_RC=$?
+
+it "the TUI wrapper's heartbeat sends the direct IPC argv, not the broken shell-call prefix"
+assert_eq "$HBARGV_RC" "0"
+assert_eq "$(head -n1 "$HBARGV_CALL_LOG" 2>/dev/null)" "brenoperucchi.omabackup tuiHeartbeat hb-argv-token"
+
 it "bounds a blocked completion IPC instead of hanging the TUI wrapper"
 IPC_HOME="$(mktemp -d)"; mkdir -p "$IPC_HOME/bin"
 IPC_CLI="$IPC_HOME/cli"; IPC_PID_FILE="$IPC_HOME/ipc.pid"
@@ -359,7 +389,18 @@ PATH="$HANDOFF_HOME/bin:$PATH" bin/omabackup-tui "$HANDOFF_CLI" restore 42 >/dev
 it "the TUI handoff preserves the CLI result and sends completion IPC"
 assert_eq "$HANDOFF_RC" "7"
 assert_eq "$(cat "$HANDOFF_CLI_LOG" 2>/dev/null)" "restore"
-assert_contains "$(cat "$HANDOFF_CALL_LOG" 2>/dev/null)" "shell call brenoperucchi.omabackup tuiFinished restore:7:42"
+# Exact match, not assert_contains: `omarchy-shell --help` documents the real
+# contract as `omarchy-shell <target> <method> [args...]` -- there is no
+# working `shell call <id> <method> <arg>` indirection. Confirmed live against
+# the running panel on 2026-08-31: `omarchy-shell shell call
+# brenoperucchi.omabackup status ""` returns the literal string "unknown"
+# while `omarchy-shell brenoperucchi.omabackup status` returns the real
+# payload. A `shell call `-prefixed command is therefore never delivered to
+# Panel.qml's IpcHandler -- externalBusy never clears and Restore/Settings
+# stay disabled until the 900s recovery timer. assert_contains would still
+# pass on the broken prefixed string (it is a superstring of the correct
+# one), so only an exact match actually reproduces the bug.
+assert_eq "$(cat "$HANDOFF_CALL_LOG" 2>/dev/null)" "brenoperucchi.omabackup tuiFinished restore:7:42"
 
 SIGNAL_CLI="$HANDOFF_HOME/signal-cli"
 SIGNAL_CALL_LOG="$HANDOFF_HOME/signal-call.log"
@@ -371,7 +412,8 @@ PATH="$HANDOFF_HOME/bin:$PATH" bin/omabackup-tui "$SIGNAL_CLI" config 42 >/dev/n
 
 it "the TUI wrapper notifies completion when its child terminates by signal"
 assert_eq "$SIGNAL_RC" "129"
-assert_contains "$(cat "$SIGNAL_CALL_LOG" 2>/dev/null)" "tuiFinished config:129:42"
+# See the note above the handoff assertion: exact match on purpose.
+assert_eq "$(cat "$SIGNAL_CALL_LOG" 2>/dev/null)" "brenoperucchi.omabackup tuiFinished config:129:42"
 
 # A terminal launcher gives the wrapper a tty. Bash otherwise replaces stdin
 # with /dev/null for an asynchronous child, which silently sends the real

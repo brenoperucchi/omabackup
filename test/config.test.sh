@@ -238,11 +238,202 @@ assert_not_contains "$GITHUB_TUI" "ghp_EXAMPLE_TOKEN"
 assert_contains "$HUMAN_GITHUB_SHOW" "first push target"
 assert_contains "$HUMAN_GITHUB_SHOW" "Git may use more"
 
+GITINIT_HOME="$(_cfg_home)"
+mkdir -p "$GITINIT_HOME/plain-folder"
+GITINIT_TUI="$(_cfg_tui_home "$GITINIT_HOME" $'1\n'"$GITINIT_HOME/plain-folder"$'\ny\nq\n' "$GITINIT_HOME/repo")"
+
+it "the config TUI offers to git init a plain folder chosen as the backup repository, and inits on yes"
+assert_contains "$GITINIT_TUI" "is not a git repository yet"
+assert_contains "$GITINIT_TUI" "Initialized an empty git repository"
+[[ -d "$GITINIT_HOME/plain-folder/.git" ]] && ok || fail "accepting the offer did not run git init in the chosen folder"
+assert_contains "$(cat "$GITINIT_HOME/.config/omabackup/env" 2>/dev/null)" "OMABACKUP_REPO=$GITINIT_HOME/plain-folder"
+assert_not_contains "$GITINIT_TUI" "will back up nothing"
+
+# A fresh `git init` means an empty index, and a manifest path declared
+# trackedOnly (paths[].trackedRepoPath) uses `git ls-files` as its allow-list
+# (collect_tracked_only, bin/omabackup) -- so it silently backs up nothing
+# until something is committed there. That already surfaces as a `warn`
+# finding on the next sync, but this asserts it is ALSO said right here, at
+# the moment the empty index is created, not discovered as a surprise days
+# later.
+GITINIT_TRACKED_HOME="$(_cfg_home)"
+cat >"$GITINIT_TRACKED_HOME/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"scripts","label":"Personal scripts","mode":"copy","coupled":false,"critical":false,
+  "paths":[{"live":"~/.local/bin","trackedRepoPath":"scripts/local-bin"}]}]}
+JSON
+mkdir -p "$GITINIT_TRACKED_HOME/plain-folder"
+GITINIT_TRACKED_TUI="$(_cfg_tui_home "$GITINIT_TRACKED_HOME" $'1\n'"$GITINIT_TRACKED_HOME/plain-folder"$'\ny\nq\n' "$GITINIT_TRACKED_HOME/repo")"
+
+it "the git-init offer warns up front about trackedOnly groups that will have empty coverage"
+assert_contains "$GITINIT_TRACKED_TUI" "Initialized an empty git repository"
+assert_contains "$GITINIT_TRACKED_TUI" "~/.local/bin"
+# Naming only the live path and saying "commit something there" is not
+# actionable: coverage depends on git ls-files under trackedRepoPath INSIDE
+# the backup repo (collect_tracked_only, bin/omabackup), not on the live path,
+# which is usually not even a git repository of its own. The message must
+# name that real location.
+assert_contains "$GITINIT_TRACKED_TUI" "tracked under scripts/local-bin"
+assert_contains "$GITINIT_TRACKED_TUI" "will back up nothing until this repository tracks files there"
+
+# Every other per-group jq query in this codebase filters
+# select(.enabled != false) (bin/omabackup:285,290,309,311,317) -- a disabled
+# group's declared paths intentionally back up nothing, so warning about them
+# here would be its own false positive.
+GITINIT_DISABLED_HOME="$(_cfg_home)"
+cat >"$GITINIT_DISABLED_HOME/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"scripts","label":"Personal scripts","mode":"copy","coupled":false,"critical":false,"enabled":false,
+  "paths":[{"live":"~/.local/bin","trackedRepoPath":"scripts/local-bin"}]}]}
+JSON
+mkdir -p "$GITINIT_DISABLED_HOME/plain-folder"
+GITINIT_DISABLED_TUI="$(_cfg_tui_home "$GITINIT_DISABLED_HOME" $'1\n'"$GITINIT_DISABLED_HOME/plain-folder"$'\ny\nq\n' "$GITINIT_DISABLED_HOME/repo")"
+
+it "the trackedOnly warning does not fire for a disabled group's paths"
+assert_contains "$GITINIT_DISABLED_TUI" "Initialized an empty git repository"
+assert_not_contains "$GITINIT_DISABLED_TUI" "will back up nothing"
+
+# A bare repository (`git init --bare`) has no `.git` subdirectory at all --
+# the other concrete "no .git subdir" shape besides a linked worktree's
+# .git-as-a-file, and the one omabackup-16's own request specifically named
+# as reproduced-but-uncovered. `git rev-parse --git-dir` still recognizes it.
+GITINIT_BARE_HOME="$(_cfg_home)"
+git init -q --bare "$GITINIT_BARE_HOME/bare.git"
+GITINIT_BARE_TUI="$(_cfg_tui_home "$GITINIT_BARE_HOME" $'1\n'"$GITINIT_BARE_HOME/bare.git"$'\nq\n' "$GITINIT_BARE_HOME/repo")"
+
+it "the config TUI does not offer git init, or reinitialize, a bare repository"
+assert_not_contains "$GITINIT_BARE_TUI" "is not a git repository yet"
+assert_contains "$GITINIT_BARE_TUI" "existing git repository"
+[[ -z "$(find "$GITINIT_BARE_HOME/bare.git" -maxdepth 1 -name '.git')" ]] \
+    && ok || fail "a bare repository unexpectedly grew a nested .git"
+[[ ! -e "$GITINIT_BARE_HOME/.config/omabackup/env" ]] && ok || fail "the repository setting changed for an ineligible bare repository"
+
+# `git rev-parse --git-dir` only checks ancestors, never descendants: it says
+# nothing about a directory that just happens to hold a lot of unrelated
+# content and isn't inside any repo at all -- reproduced live against $HOME
+# itself, which is not inside a repo despite `~/Devs` being full of them.
+# Accepting the offer there would `git init "$HOME"` and let the next sync
+# start publishing backup content directly into it. The offer is scoped to an
+# empty directory -- its actual use case -- rather than guessing at a
+# blocklist of dangerous paths that could never be complete.
+GITINIT_NONEMPTY_HOME="$(_cfg_home)"
+mkdir -p "$GITINIT_NONEMPTY_HOME/not-empty"
+printf 'pre-existing content\n' >"$GITINIT_NONEMPTY_HOME/not-empty/some-file.txt"
+GITINIT_NONEMPTY_TUI="$(_cfg_tui_home "$GITINIT_NONEMPTY_HOME" $'1\n'"$GITINIT_NONEMPTY_HOME/not-empty"$'\nq\n' "$GITINIT_NONEMPTY_HOME/repo")"
+
+it "the config TUI does not offer git init for a non-empty directory that merely isn't inside a repo"
+assert_not_contains "$GITINIT_NONEMPTY_TUI" "is not a git repository yet"
+assert_contains "$GITINIT_NONEMPTY_TUI" "existing git repository"
+[[ ! -d "$GITINIT_NONEMPTY_HOME/not-empty/.git" ]] && ok || fail "git init ran against a non-empty, unrelated directory"
+[[ ! -e "$GITINIT_NONEMPTY_HOME/.config/omabackup/env" ]] && ok || fail "the repository setting changed for a non-empty directory"
+
+# find's default -P policy does not follow a symlink given as its own
+# starting argument, while `-d`, `git -C`, and `git init` all do -- reproduced
+# live against /bin, a symlink to the non-empty /usr/bin on this machine.
+# Without realpath canonicalizing the target once up front, a writable
+# symlink to a non-empty, non-git tree passed the emptiness check as though
+# it were an empty real directory, then `git init` still followed the link
+# and wrote into the real target.
+GITINIT_SYMLINK_HOME="$(_cfg_home)"
+mkdir -p "$GITINIT_SYMLINK_HOME/real-target"
+printf 'pre-existing content\n' >"$GITINIT_SYMLINK_HOME/real-target/some-file.txt"
+ln -s "$GITINIT_SYMLINK_HOME/real-target" "$GITINIT_SYMLINK_HOME/link-to-target"
+GITINIT_SYMLINK_TUI="$(_cfg_tui_home "$GITINIT_SYMLINK_HOME" $'1\n'"$GITINIT_SYMLINK_HOME/link-to-target"$'\nq\n' "$GITINIT_SYMLINK_HOME/repo")"
+
+it "the config TUI does not offer git init through a symlink to a non-empty directory"
+assert_not_contains "$GITINIT_SYMLINK_TUI" "is not a git repository yet"
+assert_contains "$GITINIT_SYMLINK_TUI" "existing git repository"
+[[ ! -d "$GITINIT_SYMLINK_HOME/real-target/.git" ]] && ok || fail "git init ran against the symlink's real, non-empty target"
+[[ ! -e "$GITINIT_SYMLINK_HOME/.config/omabackup/env" ]] && ok || fail "the repository setting changed for a symlink to a non-empty directory"
+
+# find's stderr was discarded and only its stdout emptiness was checked --
+# empty stdout because a directory truly has nothing in it, and empty stdout
+# because find could not even read the directory (no permission), used to
+# look identical. Reproduced live: `find /root -mindepth 1 -maxdepth 1 -print
+# -quit 2>/dev/null` prints nothing and exits 1, for exactly this reason. A
+# 0300 (write+execute, no read) directory owned by the test process
+# reproduces the same shape without needing root: find cannot list it, but
+# git init (which only needs write+execute on the parent to create `.git`)
+# would have succeeded there under the old, exit-status-blind check.
+GITINIT_UNREADABLE_HOME="$(_cfg_home)"
+mkdir -p "$GITINIT_UNREADABLE_HOME/unreadable"
+printf 'secret\n' >"$GITINIT_UNREADABLE_HOME/unreadable/file.txt"
+chmod 0300 "$GITINIT_UNREADABLE_HOME/unreadable"
+GITINIT_UNREADABLE_TUI="$(_cfg_tui_home "$GITINIT_UNREADABLE_HOME" $'1\n'"$GITINIT_UNREADABLE_HOME/unreadable"$'\nq\n' "$GITINIT_UNREADABLE_HOME/repo")"
+chmod 0700 "$GITINIT_UNREADABLE_HOME/unreadable"
+
+it "the config TUI refuses git init on a directory it cannot read, instead of treating the read failure as empty"
+assert_not_contains "$GITINIT_UNREADABLE_TUI" "is not a git repository yet"
+assert_contains "$GITINIT_UNREADABLE_TUI" "existing git repository"
+[[ ! -d "$GITINIT_UNREADABLE_HOME/unreadable/.git" ]] && ok || fail "git init ran against a directory find could not read"
+
+# _config_repo_init_eligible is called twice by the TUI on purpose: once
+# before the prompt, and again immediately before `git init`. The prompt
+# blocks on user input for as long as it takes to answer, an arbitrary window
+# for the target to stop being empty -- this pins the primitive both call
+# sites depend on: eligible while empty, ineligible the moment it is not.
+GITINIT_RACE_DIR="$(mktemp -d)"
+GITINIT_RACE_BEFORE=1
+bash -c 'source lib/config.sh; _config_repo_init_eligible "$1"' _ "$GITINIT_RACE_DIR" >/dev/null 2>&1 \
+    || GITINIT_RACE_BEFORE=0
+printf 'appeared during the prompt\n' >"$GITINIT_RACE_DIR/late-file.txt"
+GITINIT_RACE_AFTER=1
+bash -c 'source lib/config.sh; _config_repo_init_eligible "$1"' _ "$GITINIT_RACE_DIR" >/dev/null 2>&1 \
+    || GITINIT_RACE_AFTER=0
+
+it "_config_repo_init_eligible catches a target that stopped being empty between two calls"
+[[ $GITINIT_RACE_BEFORE -eq 1 && $GITINIT_RACE_AFTER -eq 0 ]] \
+    && ok || fail "the eligibility check did not react to the directory changing between calls (before=$GITINIT_RACE_BEFORE after=$GITINIT_RACE_AFTER)"
+
+GITINIT_DECLINE_HOME="$(_cfg_home)"
+mkdir -p "$GITINIT_DECLINE_HOME/plain-folder"
+GITINIT_DECLINE_TUI="$(_cfg_tui_home "$GITINIT_DECLINE_HOME" $'1\n'"$GITINIT_DECLINE_HOME/plain-folder"$'\nn\nq\n' "$GITINIT_DECLINE_HOME/repo")"
+
+it "declining the git-init offer leaves the folder plain and the configured repository unchanged"
+assert_contains "$GITINIT_DECLINE_TUI" "is not a git repository yet"
+assert_contains "$GITINIT_DECLINE_TUI" "existing git repository"
+[[ ! -d "$GITINIT_DECLINE_HOME/plain-folder/.git" ]] && ok || fail "git init ran even though the offer was declined"
+[[ ! -e "$GITINIT_DECLINE_HOME/.config/omabackup/env" ]] && ok || fail "the repository setting changed despite declining git init"
+
+# `-d "$path/.git"` (the original guard) is wrong in both directions: a linked
+# worktree's `.git` is a FILE, not a directory, so the guard could not tell it
+# apart from a plain folder -- the offer would fire, `git init` would just
+# reinitialize the existing repo and return 0, and the notice would claim
+# "Initialized an empty git repository" right next to config-set-repo's real
+# "must point at an existing git repository" failure. `git rev-parse
+# --git-dir` is what actually answers "is this already a repo".
+GITINIT_WORKTREE_HOME="$(_cfg_home)"
+git -C "$GITINIT_WORKTREE_HOME/repo" commit -q --allow-empty -m init
+git -C "$GITINIT_WORKTREE_HOME/repo" worktree add -q "$GITINIT_WORKTREE_HOME/wt" -b wt-branch
+GITINIT_WORKTREE_TUI="$(_cfg_tui_home "$GITINIT_WORKTREE_HOME" $'1\n'"$GITINIT_WORKTREE_HOME/wt"$'\nq\n' "$GITINIT_WORKTREE_HOME/repo")"
+
+it "the config TUI does not offer git init for a linked worktree, whose .git is a file"
+assert_not_contains "$GITINIT_WORKTREE_TUI" "is not a git repository yet"
+assert_contains "$GITINIT_WORKTREE_TUI" "existing git repository"
+[[ ! -e "$GITINIT_WORKTREE_HOME/.config/omabackup/env" ]] && ok || fail "the repository setting changed for an ineligible worktree"
+
+# The same wrong guard also missed the opposite failure mode: a folder that is
+# merely a SUBdirectory of an existing repository has no `.git` of its own
+# either, so the old guard would offer to init it, `git init` would nest a
+# second repository inside the first, and config-set-repo would then *accept*
+# that nested repo with no error at all -- a silently wrong, origin-less
+# OMABACKUP_REPO instead of the honest failure this asserts.
+GITINIT_NESTED_HOME="$(_cfg_home)"
+git -C "$GITINIT_NESTED_HOME/repo" commit -q --allow-empty -m init
+mkdir -p "$GITINIT_NESTED_HOME/repo/sub"
+GITINIT_NESTED_TUI="$(_cfg_tui_home "$GITINIT_NESTED_HOME" $'1\n'"$GITINIT_NESTED_HOME/repo/sub"$'\nq\n' "$GITINIT_NESTED_HOME/repo")"
+
+it "the config TUI does not offer git init, or nest a repo, inside an existing repository"
+assert_not_contains "$GITINIT_NESTED_TUI" "is not a git repository yet"
+assert_contains "$GITINIT_NESTED_TUI" "existing git repository"
+[[ ! -d "$GITINIT_NESTED_HOME/repo/sub/.git" ]] && ok || fail "git init created a nested repository inside an existing one"
+[[ ! -e "$GITINIT_NESTED_HOME/.config/omabackup/env" ]] && ok || fail "the repository setting silently accepted a nested repo"
+
 NO_REPO_HOME="$(_cfg_home)"
 NO_REPO_TUI="$(_cfg_tui_home "$NO_REPO_HOME" $'q\n' '')"
 
 it "shows explicit friendly values when repository and folders are not configured"
-assert_contains "$NO_REPO_TUI" "Repository: Not configured"
+assert_contains "$NO_REPO_TUI" "Backup repository: Not configured"
 assert_contains "$NO_REPO_TUI" "Backup folders: Not configured"
 assert_contains "$NO_REPO_TUI" "Backup schedule:"
 assert_contains "$NO_REPO_TUI" "Send schedule:"
@@ -670,3 +861,29 @@ _cfg_env "$CH" config set sync-schedule 'hourly' >/dev/null 2>&1 || ROLLBACK_RC=
 it "a failed timer reload restores the previous schedule"
 [[ $ROLLBACK_RC -ne 0 ]] && ok || fail "timer reload failure unexpectedly passed"
 assert_eq "$(cat "$CH/.config/systemd/user/omabackup-sync.timer")" "$BEFORE_TIMER"
+
+# tui_read_line's own accumulator used to be named "value" too, so a caller
+# reading into a variable literally called "value" (options 1 and 6, the only
+# two that did) had its answer silently swallowed by bash's local shadowing:
+# the caller's "value" stayed unset and the next `[[ "$value" == ...]]` died
+# with "unbound variable" the first time either prompt was actually driven
+# interactively. Neither had a regression until now.
+#
+# Absence of "unbound variable" alone is a weak witness here: a broken fix
+# that read the answer but then discarded it would pass that check too. This
+# installs real timer units (cmd_enable's own `[[ -d "$UNIT_DIR" ]]` gate) and
+# a systemctl stub that logs its argv, so the assertion is the actual effect
+# -- systemctl was told to disable --now the real timer units -- not just
+# text that happened to reach the terminal.
+ENABLE_TOGGLE_HOME="$(_cfg_home)"
+mkdir -p "$ENABLE_TOGGLE_HOME/.config/systemd/user"
+ENABLE_TOGGLE_LOG="$ENABLE_TOGGLE_HOME/systemctl-call.log"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"%s"\nexit 0\n' "$ENABLE_TOGGLE_LOG" >"$ENABLE_TOGGLE_HOME/stub/systemctl"
+chmod +x "$ENABLE_TOGGLE_HOME/stub/systemctl"
+ENABLE_TOGGLE_TUI="$(_cfg_tui_home "$ENABLE_TOGGLE_HOME" $'6\noff\nq\n' "$ENABLE_TOGGLE_HOME/repo")"
+
+it "the Automatic backups prompt reads its answer and actually disables the real timer units"
+assert_not_contains "$ENABLE_TOGGLE_TUI" "unbound variable"
+assert_not_contains "$ENABLE_TOGGLE_TUI" "timers are not installed"
+assert_contains "$ENABLE_TOGGLE_TUI" "Automatic backups disabled."
+assert_contains "$(cat "$ENABLE_TOGGLE_LOG" 2>/dev/null)" "--user disable --now omabackup-sync.timer omabackup-push.timer"

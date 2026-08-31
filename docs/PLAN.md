@@ -8,7 +8,7 @@ Codex, a fresh terminal, another machine) — it is what lets a cold session,
 regardless of which coding agent is reading it, pick up where the last one
 left off. Read this file first, in full, before touching any code.
 
-Last updated: 2026-08-30.
+Last updated: 2026-08-31.
 
 ---
 
@@ -937,6 +937,93 @@ CLI, while making the wording user-oriented.
   `q`, and exited cleanly instead of flashing and closing. The panel was
   reloaded after the configuration change. Full suite after the packaging
   regression: **985 passed, 0 failed**.
+
+### Restore/Settings lockup, config naming, and a git-init bootstrap — 2026-08-31
+
+- **The IPC bug the panel redeploy didn't catch.** After the 2026-08-30
+  redeploy, the live symptom recurred in a different shape: opening Restore or
+  Settings from the panel worked, but returning to the panel afterward left
+  both buttons disabled with no way back in short of the 900s recovery timer.
+  Root cause: `bin/omabackup-tui`'s `_notify()`/`_heartbeat()` sent completion
+  IPC as `omarchy-shell shell call brenoperucchi.omabackup tuiFinished ...` —
+  an indirection that does not exist. `omarchy-shell --help` documents the
+  real contract as `omarchy-shell <target> <method> [args...]`; the `shell
+  call ...` form always returns the literal string `unknown` and never
+  reaches `Panel.qml`'s `IpcHandler`, confirmed live against the running
+  panel. `externalBusy` therefore never cleared. Fixed by sending the direct
+  form for both `_notify` and `_heartbeat`. The existing regressions used
+  `assert_contains`, which still passed on the broken, longer string; both
+  were tightened to `assert_eq`, and a real heartbeat-argv regression was
+  added (the old one's fake `sleep` never returned, so that line was never
+  reached by any test).
+- **A second, independent, pre-existing bug found by writing a regression for
+  the first one.** `lib/tui.sh`'s `tui_read_line()` had its own local
+  accumulator named `value`. `cmd_config_tui`'s "Backup repository" and
+  "Automatic backups" prompts both called `tui_read_line value` — the exact
+  name — so bash's local-shadowing silently swallowed the answer: the
+  caller's `value` stayed unset, and the first `set -u` read of it crashed
+  with `value: unbound variable`. Neither prompt had ever been exercised
+  interactively by a test before now. Fixed by renaming the internal
+  accumulator, then hardening `tui_read_line` to explicitly refuse any
+  destination name colliding with its own current locals (`case ... return
+  1`, the same "make bash itself refuse to run" discipline `_verify_extracted`
+  already uses) — review confirmed a bare rename only narrows the collision
+  class, it doesn't close it. New `test/tui.test.sh` covers the primitive
+  directly.
+- **Config menu naming.** `Repository` was confusing because it implied only
+  a git checkout would do, and separately shared no visible relationship with
+  `Backup folders` (the plain, non-git `dir` destinations used for Restore) —
+  two different concepts, similarly named. Renamed to `Backup repository`;
+  `Backup folders — add/remove a folder` (options 2/3) stayed plural, matching
+  the status header and `config show`, after a review round flagged that a
+  singular/plural split put two labels for the same collection on one screen.
+- **git-init bootstrap, and three rounds of hardening it.** The user asked
+  whether `OMABACKUP_REPO` could work without `.git`. Investigation and an
+  `herdr-ask` design round (`omabackup-8`) confirmed git stays required —
+  `sync`'s commit, `bundle_cache_path`'s content addressing, `bundle_name`'s
+  determinism, the secrets scanner's history half, and `dest_has_github` all
+  depend on it — but landed on both reviewers independently recommending the
+  same low-risk alternative: offer to `git init` a chosen folder that isn't a
+  repo yet, instead of just failing. Implemented in `cmd_config_tui`'s
+  "Backup repository" prompt, then hardened over three review rounds
+  (`omabackup-15/16/17`, the last one user-authorized past the normal 2-round
+  cap):
+  - The initial guard (`! -d "$path/.git"`) was wrong in both directions: a
+    linked worktree or bare repo has no `.git` *directory* (file, or absent
+    entirely), so the offer fired and `git init` just reinitialized the
+    existing repo, printing a false "Initialized..." beside the real
+    rejection; and a subdirectory of an existing repo has no `.git` of its
+    own either, so `git init` could nest a second repo that `config set repo`
+    then silently accepted. Fixed with `git rev-parse --git-dir`, which
+    resolves upward the way git itself does.
+  - `rev-parse --git-dir` only checks ancestors, not descendants, so it said
+    nothing about a broad, unrelated, non-empty directory that merely isn't
+    inside any repo — reproduced live against `$HOME` itself. Fixed by also
+    requiring the target be empty, closing the class without guessing at a
+    blocklist of dangerous paths.
+  - The trackedOnly-coverage warning that fires after a successful init
+    originally named only the live path ("`~/.local/bin` ... commit something
+    there") — not actionable, since `collect_tracked_only` reads `git
+    ls-files` under `trackedRepoPath` **inside the backup repo**, which the
+    live path usually isn't a git repository of at all. Fixed to name both.
+    Also added the `select(.enabled != false)` filter every other per-group
+    query in this codebase already has.
+  - The empty-directory check itself had two more holes, both reproduced live
+    and found independently by both reviewers in round 3: `find`'s default
+    `-P` policy doesn't follow a symlink given as its own starting argument,
+    so a writable symlink to a non-empty tree read as empty while `-d`,
+    `git -C`, and `git init` all followed it; and `find`'s stderr was
+    discarded with only stdout checked, so a directory `find` could not even
+    read (permission denied, or `find` missing from `PATH`) also read as
+    "empty" instead of "unknown". Fixed by canonicalizing the target once
+    with `realpath -e` and reusing that same resolved path for every check
+    and for `git init` itself, and by checking `find`'s exit status alongside
+    its output. A third finding (the prompt blocks on input indefinitely,
+    with nothing re-checked immediately before the actual `git init`) was
+    closed by extracting the three-part check into
+    `_config_repo_init_eligible` and calling it again right before the
+    mutating step.
+  - Full suite after all of the above: **1033 passed, 0 failed**.
 
 ## Open questions for the user, not yet decided
 

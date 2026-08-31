@@ -48,16 +48,44 @@ _tui_restore_saved_traps() {
 # backspace are handled here so every Config/Restore prompt shares the same
 # semantics.
 tui_read_line() {
-    local variable="$1" value="" char tty_state next tail_char
+    # The accumulator below is deliberately not named "value": a caller
+    # passing that exact string as $1 (a very natural choice, and the one
+    # `cmd_config_tui`'s own repository/enabled prompts used) would have its
+    # `local variable="$1"` shadow this function's own local of the same
+    # name. `printf -v "$variable"` would then write to THIS function's
+    # local instead of the caller's, so the caller's variable would stay
+    # unset -- and any `set -u` read of it afterward dies with "unbound
+    # variable" instead of getting the typed line. Found live: both of
+    # lib/config.sh's `tui_read_line value` call sites crashed exactly this
+    # way the first time they were actually exercised interactively.
+    #
+    # Renaming the accumulator only narrows the collision class, it does not
+    # close it: any of THIS function's own local names -- "input_buf" itself
+    # included, along with "variable", "char", "tty_state", and the rest
+    # declared below -- reproduces the identical silent failure if a future
+    # caller happens to choose one. Refuse those explicitly instead, the same
+    # way `_verify_extracted` (lib/bundle.sh) uses `${2?...}` to make bash
+    # itself refuse to run rather than trust every future call site to dodge
+    # a name it cannot see.
+    local variable="$1"
+    case "$variable" in
+        variable|input_buf|char|tty_state|next|tail_char| \
+        previous_exit|previous_hup|previous_int|previous_term| \
+        tty_restored|tui_signal)
+            printf 'tui_read_line: unsupported destination variable name: %q\n' "$variable" >&2
+            return 1
+            ;;
+    esac
+    local input_buf="" char tty_state next tail_char
     if [[ ! -t 0 || ! -t 1 ]]; then
-        IFS= read -r value || return 1
-        printf -v "$variable" '%s' "$value"
+        IFS= read -r input_buf || return 1
+        printf -v "$variable" '%s' "$input_buf"
         return 0
     fi
 
     tty_state="$(stty -g 2>/dev/null)" || {
-        IFS= read -r value || return 1
-        printf -v "$variable" '%s' "$value"
+        IFS= read -r input_buf || return 1
+        printf -v "$variable" '%s' "$input_buf"
         return 0
     }
     local previous_exit previous_hup previous_int previous_term
@@ -112,17 +140,17 @@ tui_read_line() {
                 tty_restored=1
                 _tui_restore_saved_traps "$previous_exit" "$previous_hup" "$previous_int" "$previous_term"
                 printf '\n'
-                printf -v "$variable" '%s' "$value"
+                printf -v "$variable" '%s' "$input_buf"
                 return 0
                 ;;
             $'\177'|$'\b')
-                if [[ -n "$value" ]]; then
-                    value="${value%?}"
+                if [[ -n "$input_buf" ]]; then
+                    input_buf="${input_buf%?}"
                     printf '\b \b'
                 fi
                 ;;
             *)
-                value+="$char"
+                input_buf+="$char"
                 printf '%s' "$char"
                 ;;
         esac
@@ -130,7 +158,7 @@ tui_read_line() {
     stty "$tty_state" >/dev/null 2>&1 || true
     tty_restored=1
     _tui_restore_saved_traps "$previous_exit" "$previous_hup" "$previous_int" "$previous_term"
-    printf -v "$variable" '%s' "$value"
+    printf -v "$variable" '%s' "$input_buf"
     case "$tui_signal" in
         HUP) kill -HUP "$$" >/dev/null 2>&1 || true ;;
         INT) kill -INT "$$" >/dev/null 2>&1 || true ;;

@@ -114,7 +114,14 @@ _notify() {
     # leaving the panel busy forever; the panel has a finite recovery guard
     # for environments where this command is unavailable. _ipc_call bounds
     # the client even when it accepts the request but never returns.
-    _ipc_call shell call brenoperucchi.omabackup tuiFinished "$action:$result:$token"
+    #
+    # `omarchy-shell <target> <method> [args...]` is the real contract
+    # (confirmed via `omarchy-shell --help`) -- there is no `shell call <id>
+    # <method> <arg>` indirection. That form used to be sent here and always
+    # returned the literal string "unknown" without reaching Panel.qml's
+    # IpcHandler, so externalBusy never cleared and Restore/Settings stayed
+    # disabled until the panel's own 900s recovery timer.
+    _ipc_call brenoperucchi.omabackup tuiFinished "$action:$result:$token"
 }
 _heartbeat() {
     local parent_pid="$$" sleep_pid=""
@@ -142,7 +149,7 @@ _heartbeat() {
         }
         sleep_pid=""
         kill -0 "$parent_pid" >/dev/null 2>&1 || return 0
-        _ipc_call shell call brenoperucchi.omabackup tuiHeartbeat "$token"
+        _ipc_call brenoperucchi.omabackup tuiHeartbeat "$token"
     done
 }
 
