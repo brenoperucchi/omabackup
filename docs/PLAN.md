@@ -1025,6 +1025,33 @@ CLI, while making the wording user-oriented.
     mutating step.
   - Full suite after all of the above: **1033 passed, 0 failed**.
 
+### Small follow-up: Restore button color, a coverage gap, manifest 0.2.2 — 2026-08-31
+
+- The footer's Restore button was hardcoded to `Color.muted` regardless of
+  state, a leftover from a pre-Button-component `color: cond ? Color.muted :
+  Color.muted` no-op that predates this repo's history and was never actually
+  distinguishing enabled from disabled by color -- unlike Settings right next
+  to it, which already switched to `Color.accent` when enabled. A fully
+  enabled Restore read as permanently faded. Fixed to match Settings' own
+  pattern; new source-string regression scoped to just `restoreButton`'s
+  block (a looser, file-wide check would have passed even on the old code,
+  since `settingsButton` already had the correct string elsewhere).
+- Auditing test coverage per config-menu option surfaced one real gap: option
+  5 ("Send schedule") shares its entire code path with option 4 (`4|5) ...
+  choice==4 ? sync : push ...` in `cmd_config_tui`), but only option 4 had
+  ever been driven interactively -- option 5's own branch (`push-schedule`,
+  "Send schedule saved.", `omabackup-push.timer`) was only ever reached
+  through the non-interactive `config set push-schedule` CLI form. Same
+  asymmetric-coverage shape as the `tui_read_line` and git-init bugs above.
+  New interactive regression closes it, in its own fixture rather than the
+  shared `$CH` used by nearby specs (driving option 5 there would have
+  overwritten `omabackup-push.timer` out from under a later spec that depends
+  on its value).
+- Manifest bumped `0.2.1` -> `0.2.2`. This batch (cosmetic fix + test-only
+  changes + version bump) was not sent through a blind review round given its
+  low risk, unlike the substantive logic changes above.
+- Full suite: **1036 passed, 0 failed**.
+
 ## Open questions for the user, not yet decided
 
 - What path should the first `dir` destination actually point at?

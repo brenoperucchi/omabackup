@@ -77,6 +77,14 @@ else
     fail "Settings/Restore do not close with a fade, launch their TUIs, and refresh afterward"
 fi
 
+it "Restore gets the same accent-when-enabled color as Settings, not a permanent muted one"
+RESTORE_BUTTON_BLOCK="$(awk '/id: restoreButton/{p=1} p{print} p && /^          \}/{exit}' Panel.qml)"
+if [[ "$RESTORE_BUTTON_BLOCK" == *'foreground: root.canOpenExternalTui ? Color.accent : Color.muted'* ]]; then
+    ok
+else
+    fail "restoreButton's foreground is hardcoded instead of switching to Color.accent when enabled"
+fi
+
 it "the fade closes the panel before the external TUI launch is scheduled"
 OPEN_EXTERNAL_BLOCK="$(sed -n '/function openExternalTui/,/^  }/p' Panel.qml)"
 OPEN_CLOSE_LINE="$(awk '/function openExternalTui/{inside=1} inside && /root\.close\(\)/{print NR; exit}' Panel.qml)"

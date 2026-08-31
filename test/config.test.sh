@@ -741,6 +741,30 @@ it "uses the current interval as the guided schedule default"
 assert_contains "$(cat "$CH/.config/systemd/user/omabackup-sync.timer")" "OnCalendar=*:0/20"
 assert_contains "$DEFAULT_SCHEDULE_TUI" "Every 20 minutes"
 
+# Options 4 and 5 share one code path in cmd_config_tui (`4|5) ... choice==4
+# ? sync : push ...`), but only option 4 had ever been driven interactively;
+# option 5's own branch (push-schedule, "Send schedule saved.",
+# omabackup-push.timer) was only ever reached through the non-interactive
+# `config set push-schedule` CLI form. Same asymmetric-coverage shape as the
+# tui_read_line and git-init bugs this file's other regressions close.
+#
+# A dedicated home, not $CH: every test around this one builds on $CH's
+# cumulative schedule state (see the crontab/rollback specs further down),
+# and driving option 5 interactively here would overwrite
+# omabackup-push.timer out from under them.
+SEND_SCHEDULE_HOME="$(_cfg_home)"
+mkdir -p "$SEND_SCHEDULE_HOME/.config/systemd/user"
+# `config set push-schedule` gates on both timer *files* existing
+# (lib/config.sh:821 -- "timers are not installed yet" otherwise), not just
+# the directory.
+printf '[Timer]\nOnCalendar=*:0/15\nPersistent=true\n' >"$SEND_SCHEDULE_HOME/.config/systemd/user/omabackup-sync.timer"
+printf '[Timer]\nOnCalendar=hourly\nPersistent=true\n' >"$SEND_SCHEDULE_HOME/.config/systemd/user/omabackup-push.timer"
+SEND_SCHEDULE_TUI="$(_cfg_tui_home "$SEND_SCHEDULE_HOME" $'5\n1\n20\n\nq\n' "$SEND_SCHEDULE_HOME/repo")"
+
+it "the Send schedule option (5) actually drives the push timer, not just sync"
+assert_contains "$SEND_SCHEDULE_TUI" "Send schedule saved."
+assert_contains "$(cat "$SEND_SCHEDULE_HOME/.config/systemd/user/omabackup-push.timer")" "OnCalendar=*:0/20"
+
 {
     printf '#!/bin/bash\n'
     printf 'if [[ "$*" == *TimersCalendar* && "$*" == *sync* ]]; then echo "{ OnCalendar=*:*:00 ; next_elapse=... }"; exit 0; fi\n'

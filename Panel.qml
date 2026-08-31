@@ -1550,7 +1550,13 @@ Panel {
             text: "↻ Restore…"
             bordered: false
             focusable: true
-            foreground: Color.muted
+            // Was hardcoded to Color.muted regardless of state -- a leftover
+            // from a pre-Button-component `color: cond ? Color.muted :
+            // Color.muted` no-op (9e5f0ed and its predecessor), never
+            // actually distinguishing enabled from disabled by color the way
+            // settingsButton below always has. Opacity alone made a fully
+            // enabled Restore read as faded next to Settings.
+            foreground: root.canOpenExternalTui ? Color.accent : Color.muted
             opacity: root.canOpenExternalTui ? 1.0 : 0.45
             enabled: root.canOpenExternalTui
             onClicked: root.openRestore()
