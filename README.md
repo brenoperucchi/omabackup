@@ -15,6 +15,49 @@ And a second one, which decides whether restoring is safe at all:
 
 ![OmaBackup panel](screenshots/panel.png)
 
+## Install
+
+```bash
+omarchy plugin add https://github.com/brenoperucchi/omabackup --enable
+```
+
+That clones the plugin and turns the panel widget on. It does not touch your
+backup schedule yet — point it at a git repository and switch the timers on,
+either through the panel (**Settings…** → **Backup repository**, which offers
+to `git init` an empty folder for you) or directly:
+
+```bash
+OMABACKUP_REPO=~/path/to/your/dotfiles ~/.config/omarchy/plugins/brenoperucchi.omabackup/bin/omabackup install
+```
+
+`install` writes the systemd timers (sync every 15 minutes, push hourly) and
+enables them. Nothing runs unattended before this step.
+
+## Uninstall
+
+```bash
+omarchy plugin remove brenoperucchi.omabackup
+```
+
+That removes the panel widget and leaves your schedule, configuration, and
+backup repository alone — a widget going away should not take your backups
+with it. To also stop everything and remove the local state, do this first,
+**before** removing the plugin (it deletes the checkout `omabackup disable`
+runs from):
+
+```bash
+~/.config/omarchy/plugins/brenoperucchi.omabackup/bin/omabackup disable
+systemctl --user disable --now omabackup-{sync,push}.{service,timer}
+rm -f ~/.config/systemd/user/omabackup-{sync,push}.{service,timer}
+systemctl --user daemon-reload
+
+rm -rf ~/.config/omabackup      # OMABACKUP_REPO and other settings
+rm -rf ~/.local/state/omabackup # staging and sync bookkeeping
+```
+
+None of this touches the backup repository itself or any `dir` destination.
+They stay exactly where they are.
+
 ## Status
 
 The CLI, scheduler, restore TUI and QuickShell panel are working today.
