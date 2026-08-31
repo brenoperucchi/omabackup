@@ -1,5 +1,7 @@
 # OmaBackup
 
+**We Can Backup Everything of Omarchy.**
+
 Dotfile backup for Omarchy 4 that answers a different question than usual.
 Not *"is the backup intact?"* — the `hyprland.conf` from August 2026 was
 intact, valid and complete, and useless for exactly that reason once Hyprland
@@ -96,6 +98,25 @@ next, what a fresh session needs to know. [`docs/DESIGN.md`](docs/DESIGN.md) is
 the architecture and the review that reshaped it twice. [`docs/CONTEXT.md`](docs/CONTEXT.md)
 is the incident that started it all.
 
+## Ideas for later
+
+Not committed to, not scheduled — things worth doing if the need shows up in
+practice, gathered from comparing notes with other Omarchy backup plugins
+(currently [omarchy-time-machine](https://github.com/jankeesvw/omarchy-time-machine)).
+
+- [ ] GFS-style retention for `dir` destinations (daily/weekly/monthly/yearly
+      tiers), instead of just "keep the N newest".
+- [ ] A `pre_command` hook that runs before a destination's backup/push, for a
+      drive or NAS mount that needs waking up first.
+- [ ] Evaluate whole-backup encryption at rest. Today only the `secrets` group
+      is encrypted (`age`, explicit allow-list); everything else — dotfiles,
+      scripts, git history — is not. Deliberately out of scope until a real
+      destination shows up that isn't already under the user's physical or
+      account control.
+
+**Suggestions for OmaBackup are welcome.** If you use it, or you looked at
+this and thought of something it should do, open an issue.
+
 ## License
 
-MIT
+[MIT](LICENSE)
