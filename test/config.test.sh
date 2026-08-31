@@ -215,13 +215,27 @@ _cfg_tui() {
 }
 
 _cfg_tui_home() {
-    local h="$1" input="$2" repo
+    local h="$1" input="$2" repo out rc=0
     if (($# >= 3)); then repo="$3"; else repo="$h/repo"; fi
-    printf '%b' "$input" | script -qec \
+    # `script -qec` feeds the TUI a fixed keystroke script over a real PTY;
+    # `tui_read_line` correctly blocks waiting for more input once the bytes
+    # run out (lib/tui.sh). If a caller's keystroke count ever falls out of
+    # phase with how many prompts the TUI actually shows -- exactly the kind
+    # of thing a guard-condition regression changes -- this used to hang
+    # indefinitely instead of failing: measured live, one run stuck for 3h34
+    # until a `kill -9` on the wedged child freed it. `timeout --foreground`
+    # (matching the pattern test/vm.test.sh's own runner already uses)
+    # converts that into a fast, legible failure instead.
+    out="$(timeout --foreground --kill-after=5s 15s bash -c \
+        'printf "%b" "$1" | script -qec "$2" /dev/null 2>&1' _ "$input" \
         "env HOME='$h' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$h/g.json' \
          OMABACKUP_STATE='$h/.state' OMABACKUP_REPO='$repo' \
          OMABACKUP_DESTINATIONS='$h/dest.json' OMABACKUP_SYSTEMCTL='$h/stub/systemctl' \
-         XDG_RUNTIME_DIR=/nonexistent '$OB' config" /dev/null 2>&1
+         XDG_RUNTIME_DIR=/nonexistent '$OB' config")" || rc=$?
+    if (( rc == 124 || rc == 137 )); then
+        out+=$'\n[_cfg_tui_home: timed out -- the keystroke script fell out of phase with the TUI prompts]'
+    fi
+    printf '%s' "$out"
 }
 
 HUMAN_GITHUB_SHOW="$(_cfg_env "$CH" config show)"
@@ -759,11 +773,23 @@ mkdir -p "$SEND_SCHEDULE_HOME/.config/systemd/user"
 # the directory.
 printf '[Timer]\nOnCalendar=*:0/15\nPersistent=true\n' >"$SEND_SCHEDULE_HOME/.config/systemd/user/omabackup-sync.timer"
 printf '[Timer]\nOnCalendar=hourly\nPersistent=true\n' >"$SEND_SCHEDULE_HOME/.config/systemd/user/omabackup-push.timer"
-SEND_SCHEDULE_TUI="$(_cfg_tui_home "$SEND_SCHEDULE_HOME" $'5\n1\n20\n\nq\n' "$SEND_SCHEDULE_HOME/repo")"
+# No trailing blank line: entering "20" sets CONFIG_TUI_SCHEDULE and returns
+# straight to the main menu (lib/config.sh's case-1 branch `break`s out with
+# nothing left to confirm), so an extra "\n" here is consumed as an invalid
+# main-menu choice and prints a spurious "Please choose 1-6 or q." -- harmless,
+# but it means the keystroke count was never actually traced against what the
+# TUI shows, the same imprecision that lets _cfg_tui_home's script -qec drift
+# out of phase (see its own comment).
+SEND_SCHEDULE_TUI="$(_cfg_tui_home "$SEND_SCHEDULE_HOME" $'5\n1\n20\nq\n' "$SEND_SCHEDULE_HOME/repo")"
 
 it "the Send schedule option (5) actually drives the push timer, not just sync"
 assert_contains "$SEND_SCHEDULE_TUI" "Send schedule saved."
 assert_contains "$(cat "$SEND_SCHEDULE_HOME/.config/systemd/user/omabackup-push.timer")" "OnCalendar=*:0/20"
+# The whole point of naming this "not just sync": a code path shared with
+# option 4 (`4|5) ... choice==4 ? sync : push ...`) could plausibly write to
+# the wrong unit, e.g. a mistake in the sync/push branch selection. Without
+# this, a regression that wrote to BOTH timers would still pass.
+assert_contains "$(cat "$SEND_SCHEDULE_HOME/.config/systemd/user/omabackup-sync.timer")" "OnCalendar=*:0/15"
 
 {
     printf '#!/bin/bash\n'

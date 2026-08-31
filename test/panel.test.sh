@@ -78,7 +78,13 @@ else
 fi
 
 it "Restore gets the same accent-when-enabled color as Settings, not a permanent muted one"
-RESTORE_BUTTON_BLOCK="$(awk '/id: restoreButton/{p=1} p{print} p && /^          \}/{exit}' Panel.qml)"
+# Match the closing brace at ANY indentation, not a literal ten spaces: a
+# reindent (a footer wrapper, a QML reformat) would otherwise make the
+# terminator stop matching, run the extraction to EOF, and pull settingsButton
+# in too -- which already has the string this spec checks for, so the
+# assertion would pass silently even with restoreButton regressed. That is
+# exactly the false positive this scoped extraction exists to avoid.
+RESTORE_BUTTON_BLOCK="$(awk '/id: restoreButton/{p=1} p{print} p && /^[[:space:]]*\}/{exit}' Panel.qml)"
 if [[ "$RESTORE_BUTTON_BLOCK" == *'foreground: root.canOpenExternalTui ? Color.accent : Color.muted'* ]]; then
     ok
 else

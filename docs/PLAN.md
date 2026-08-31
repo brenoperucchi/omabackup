@@ -1048,9 +1048,32 @@ CLI, while making the wording user-oriented.
   overwritten `omabackup-push.timer` out from under a later spec that depends
   on its value).
 - Manifest bumped `0.2.1` -> `0.2.2`. This batch (cosmetic fix + test-only
-  changes + version bump) was not sent through a blind review round given its
-  low risk, unlike the substantive logic changes above.
-- Full suite: **1036 passed, 0 failed**.
+  changes + version bump) was committed and pushed without a blind review
+  round first, given its apparent low risk. The user asked for one
+  afterward anyway (`omabackup-18`, reviewing the pushed commit directly)
+  and it was worth it:
+  - Both reviewers independently converged on the same finding
+    `omabackup-rev-2` had already raised for `omabackup-17`:
+    `_cfg_tui_home` feeds the TUI a fixed keystroke script over a PTY via
+    `script -qec` with no timeout. A keystroke count that falls out of phase
+    with what the TUI actually shows hangs indefinitely instead of failing
+    -- measured live at 3h34 stuck, freed only by `kill -9` on the wedged
+    child. Fixed by wrapping it in `timeout --foreground --kill-after=5s
+    15s`, the same pattern `test/vm.test.sh`'s own runner already uses.
+  - The new Restore-button regression's `awk` block-extraction matched the
+    closing brace at one literal indentation depth; a reindent would have
+    made it run to EOF and silently pull `settingsButton` in too (which
+    already had the string being checked for), passing even with
+    `restoreButton` regressed back to broken. Fixed to match at any
+    indentation.
+  - The new "Send schedule (5)" regression was named "not just sync" but
+    never asserted sync stayed untouched -- a regression that wrote to
+    both timers would have passed. Added the missing assertion, and
+    trimmed a stray blank keystroke that was being silently absorbed by
+    the main menu as an invalid choice.
+  - Fixed in a follow-up commit, not an amend.
+- Full suite: **1036 passed, 0 failed** before the `omabackup-18` follow-up,
+  **1037 passed, 0 failed** after it.
 
 ## Open questions for the user, not yet decided
 
