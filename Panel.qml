@@ -965,7 +965,11 @@ Panel {
     active: root.failCount > 0
     opacity: root.covered ? 0.75 : 1.0
     slotSize: Style.bar.statusSlot
-    fontSize: Style.font.caption
+    // Style.font.caption (10px) inside a 21px statusSlot, on a 26px bar --
+    // most of the available space was going unused, compounding the
+    // legibility problem opacity alone did not explain. iconLarge (18px)
+    // still leaves headroom under both the slot and the bar height.
+    fontSize: Style.font.iconLarge
     tooltipText: "OmaBackup - " + root.headline
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.refresh()
