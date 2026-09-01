@@ -935,9 +935,14 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // fa-exclamation-triangle when something needs doing, fa-save otherwise.
-    // Both are BMP codepoints, like the first-party widgets use.
-    text: root.failCount > 0 ? "\uf071" : "\uf0c7"
+    // fa-exclamation-triangle when something needs doing, fa-layer-group
+    // otherwise -- stacked snapshots over time, not the generic fa-save
+    // floppy disk this used to be. Chosen deliberately distinct from the
+    // other Omarchy backup plugins' own marks: Time Machine (restic) uses
+    // fa-history (a clock with a rewind arrow), OmaVault uses a Nerd Font
+    // "safe" glyph. Both are BMP codepoints, like the first-party widgets
+    // use.
+    text: root.failCount > 0 ? "\uf071" : "\uf5fd"
     // WidgetButton colours through `foreground`, and `active` swaps in
     // `activeColor` (the theme's urgent). No green anywhere: a healthy backup
     // is dimmed, not celebrated.
