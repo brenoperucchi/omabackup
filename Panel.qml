@@ -935,14 +935,23 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // fa-exclamation-triangle when something needs doing, fa-layer-group
-    // otherwise -- stacked snapshots over time, not the generic fa-save
-    // floppy disk this used to be. Chosen deliberately distinct from the
-    // other Omarchy backup plugins' own marks: Time Machine (restic) uses
-    // fa-history (a clock with a rewind arrow), OmaVault uses a Nerd Font
-    // "safe" glyph. Both are BMP codepoints, like the first-party widgets
-    // use.
-    text: root.failCount > 0 ? "\uf071" : "\uf5fd"
+    // fa-exclamation-triangle when something needs doing, fa-code-branch
+    // otherwise -- not the generic fa-save floppy disk this used to be, and
+    // deliberately distinct from the other Omarchy backup plugins' own
+    // marks: Time Machine (restic) uses fa-history, OmaVault uses a Nerd
+    // Font "safe" glyph. A git branch fork says what actually sets this
+    // tool apart: real git history, not a proprietary snapshot format.
+    //
+    // fa-layer-group (U+F5FD) was tried first and rendered as a blank box:
+    // the bar's font resolves through Qt's "monospace" alias to whichever
+    // Nerd Font is installed system-wide (JetBrainsMono Nerd Font on this
+    // machine, confirmed via `fc-match monospace`), and that build only
+    // carries the classic Font Awesome block (roughly U+F000-F2FF) -- newer
+    // FA5+ solid icons like layer-group, code-commit, and shield-halved
+    // (U+F3xx and up) are simply absent. Checked with fontTools'
+    // getBestCmap() against the actual installed .ttf, not assumed:
+    // everything picked here is confirmed present.
+    text: root.failCount > 0 ? "\uf071" : "\uf126"
     // WidgetButton colours through `foreground`, and `active` swaps in
     // `activeColor` (the theme's urgent). No green anywhere: a healthy backup
     // is dimmed, not celebrated.
