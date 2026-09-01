@@ -48,6 +48,16 @@ Panel {
   property var statusDoc: null
 
   readonly property var destinations: cleanDestinations(statusDoc)
+  // github is always the implicit destination derived from OMABACKUP_REPO's
+  // own `origin` remote (DESIGN.md §3) -- it gets its own button up top,
+  // next to the other primary actions, instead of sitting in the generic
+  // Destinations list below with whatever `dir` destinations exist.
+  readonly property var githubDestination: {
+    for (var i = 0; i < destinations.length; i++)
+      if (destinations[i].id === "github") return destinations[i]
+    return null
+  }
+  readonly property var otherDestinations: destinations.filter(function(d) { return d.id !== "github" })
   // Absent scheduler key means an older CLI, not an unscheduled machine: do not
   // invent an alarm out of a missing field.
   // §4: the badge does not clear itself. "nothing is scheduled" was already
@@ -463,6 +473,17 @@ Panel {
   }
 
   function openConfig() { openExternalTui("config") }
+
+  // The GitHub button opens the LOCAL backup repository (OMABACKUP_REPO) in
+  // the file manager -- "where the files were saved" before `push` sends
+  // them on. Not github.com: that would start a network trip from what is
+  // otherwise a read-only status button, and the panel never does that on a
+  // click it did not ask to confirm. Util.execArgv (qs.Commons) is the
+  // shared, injection-safe way first-party plugins already launch xdg-open.
+  function openRepoInFileManager() {
+    if (!root.config || !root.config.repo) return
+    Util.execArgv(["xdg-open", root.config.repo])
+  }
 
   // omarchy-launch-tui only reports that the terminal was launched. The small
   // wrapper inside that terminal calls this IPC method after the actual CLI
@@ -936,22 +957,22 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     // fa-exclamation-triangle when something needs doing, Material Design
-    // Icons' md-folder_sync otherwise -- a folder with sync arrows, for the
-    // actual cycle this tool runs (collect -> publish -> verify -> commit),
-    // not the generic fa-save floppy disk this used to be. Picked from a
-    // different icon family than either other Omarchy backup plugin: Time
-    // Machine (restic) uses Font Awesome's fa-history, OmaVault uses
-    // Material Design's own md-safe. Codepoints for candidate glyphs
-    // (fa-layer-group, fa-code-commit, fa-shield-halved -- all FA5+ solid
-    // icons above roughly U+F2FF) were checked with fontTools'
+    // Icons' md-sync otherwise -- two circling arrows for the actual cycle
+    // this tool runs (collect -> publish -> verify -> commit), not the
+    // generic fa-save floppy disk this used to be. Picked from a different
+    // icon family than either other Omarchy backup plugin: Time Machine
+    // (restic) uses Font Awesome's fa-history, OmaVault uses Material
+    // Design's own md-safe. Codepoints for candidate glyphs (fa-layer-group,
+    // fa-code-commit, fa-shield-halved -- all FA5+ solid icons above
+    // roughly U+F2FF) were checked with fontTools'
     // getBestCmap()/getGlyphOrder() against the actual installed
     // JetBrainsMono Nerd Font .ttf (resolved via `fc-match monospace`, which
     // is what the bar's font actually renders through) before settling
     // here, after fa-layer-group (U+F5FD) rendered as a blank box -- that
-    // build only carries the classic Font Awesome block. md-folder_sync is
-    // U+F0D0B, above the Basic Multilingual Plane, so it needs the
-    // `\u{...}` code point escape rather than `\uXXXX`.
-    text: root.failCount > 0 ? "\uf071" : "\u{F0D0B}"
+    // build only carries the classic Font Awesome block. md-sync is
+    // U+F04E6, above the Basic Multilingual Plane, so it needs the `\u{...}`
+    // code point escape rather than `\uXXXX`.
+    text: root.failCount > 0 ? "\uf071" : "\u{F04E6}"
     // WidgetButton colours through `foreground`, and `active` swaps in
     // `activeColor` (the theme's urgent). No green anywhere: a healthy backup
     // is dimmed, not celebrated -- but `dimmed: true` alone hands the exact
@@ -1126,23 +1147,57 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
-          Row {
+          Item {
             width: parent.width
-            spacing: Style.space(6)
+            implicitHeight: primaryActions.implicitHeight
 
-            Button {
-              text: root.syncing ? "backing up…" : "Back up now"
-              bordered: true
-              focusable: true
-              enabled: root.cli !== "" && !root.cliMissing && !root.busy
-              onClicked: root.syncNow()
+            Row {
+              id: primaryActions
+              anchors.left: parent.left
+              spacing: Style.space(6)
+
+              Button {
+                text: root.syncing ? "backing up…" : "Back up now"
+                bordered: true
+                focusable: true
+                enabled: root.cli !== "" && !root.cliMissing && !root.busy
+                onClicked: root.syncNow()
+              }
+              Button {
+                text: "Check again"
+                bordered: true
+                focusable: true
+                enabled: root.cli !== "" && !root.cliMissing && !root.checking && !root.busy
+                onClicked: root.refresh()
+              }
             }
+
+            // github is the implicit destination derived from OMABACKUP_REPO's
+            // own `origin` remote (DESIGN.md §3), so it earns a spot next to
+            // the primary actions instead of the generic Destinations chips
+            // below, which are now only about `dir` destinations. Clicking it
+            // opens the local repository it pushes from -- "where the files
+            // were saved" -- not github.com itself, since that is a network
+            // trip a quiet status button should not silently start.
             Button {
-              text: "Check again"
+              visible: root.githubDestination !== null
+              anchors.right: parent.right
+              text: "GitHub"
               bordered: true
               focusable: true
-              enabled: root.cli !== "" && !root.cliMissing && !root.checking && !root.busy
-              onClicked: root.refresh()
+              selected: root.githubDestination
+                        ? (root.githubDestination.lastSuccess !== "" && !root.githubDestination.failed)
+                        : false
+              foreground: root.githubDestination && root.githubDestination.failed ? Color.urgent
+                        : root.githubDestination && root.githubDestination.lastSuccess !== "" ? Color.foreground
+                        : Color.accent
+              enabled: root.config && root.config.repo
+              tooltipText: root.githubDestination
+                  ? (root.githubDestination.failed ? root.githubDestination.errorMessage
+                     : root.githubDestination.lastSuccess !== ""
+                       ? "sent " + root.agoFromIso(root.githubDestination.lastSuccess) : "never sent")
+                  : ""
+              onClicked: root.openRepoInFileManager()
             }
           }
 
@@ -1399,7 +1454,11 @@ Panel {
           // (statusDoc === null), so an unknown state gets its own header
           // rather than the whole section quietly not existing.
           Item {
-            visible: root.destinations.length > 0 || root.statusDoc === null
+            // github moved to its own button in the top action row (below);
+            // this section is now only about `dir` destinations, so it hides
+            // once there is nothing else -- an unknown state still gets its
+            // own header rather than quietly not existing.
+            visible: root.otherDestinations.length > 0 || root.statusDoc === null
             width: parent.width
             implicitHeight: dHdr.implicitHeight + Style.space(5)
             PanelSectionHeader { id: dHdr; anchors.left: parent.left; text: "Destinations" }
@@ -1414,7 +1473,7 @@ Panel {
             spacing: Style.space(6)
 
             Repeater {
-              model: root.destinations
+              model: root.otherDestinations
               Row {
                 id: destRow
                 required property var modelData
