@@ -1,7 +1,15 @@
 /staging/
 *.tmp
 
-# herdr review-cycle: estado efemero (rodadas de review/ask, handoffs) -
-# reviewer.md fica versionado
+# Agent-instruction files for this repo's own dev workflow (herdr-review
+# protocol, coding-agent guidance) -- untracked, not gitignored-away
+# entirely: `omarchy plugin add` does a plain `git clone` of this repo with
+# no manifest-driven file selection, so anything tracked here ends up
+# installed onto an end user's machine at ~/.config/omarchy/plugins/.
+# Shipping cross-tool agent instructions to every installer is a real
+# instruction-injection surface unrelated to the plugin's runtime -- see
+# https://github.com/omacom/omarchy-plugin-marketplace/issues/3968. Kept on
+# disk for this and any other dev checkout to use locally; just not
+# distributed.
+AGENTS.md
 .herdr/*
-!.herdr/reviewer.md
