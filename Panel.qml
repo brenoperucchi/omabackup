@@ -936,22 +936,22 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     // fa-exclamation-triangle when something needs doing, Material Design
-    // Icons' md-sync otherwise -- two circling arrows for the actual cycle
-    // this tool runs (collect -> publish -> verify -> commit), not the
-    // generic fa-save floppy disk this used to be. Picked from a different
-    // icon family than either other Omarchy backup plugin: Time Machine
-    // (restic) uses Font Awesome's fa-history, OmaVault uses Material
-    // Design's own md-safe. Codepoints for candidate glyphs (fa-layer-group,
-    // fa-code-commit, fa-shield-halved -- all FA5+ solid icons above
-    // roughly U+F2FF) were checked with fontTools'
+    // Icons' md-database_sync otherwise -- a database with sync arrows, for
+    // the actual cycle this tool runs (collect -> publish -> verify ->
+    // commit), not the generic fa-save floppy disk this used to be. Picked
+    // from a different icon family than either other Omarchy backup plugin:
+    // Time Machine (restic) uses Font Awesome's fa-history, OmaVault uses
+    // Material Design's own md-safe. Codepoints for candidate glyphs
+    // (fa-layer-group, fa-code-commit, fa-shield-halved -- all FA5+ solid
+    // icons above roughly U+F2FF) were checked with fontTools'
     // getBestCmap()/getGlyphOrder() against the actual installed
     // JetBrainsMono Nerd Font .ttf (resolved via `fc-match monospace`, which
     // is what the bar's font actually renders through) before settling
     // here, after fa-layer-group (U+F5FD) rendered as a blank box -- that
-    // build only carries the classic Font Awesome block. md-sync is
-    // U+F04E6, above the Basic Multilingual Plane, so it needs the `\u{...}`
-    // code point escape rather than `\uXXXX`.
-    text: root.failCount > 0 ? "\uf071" : "\u{F04E6}"
+    // build only carries the classic Font Awesome block. md-database_sync
+    // is U+F0CFF, above the Basic Multilingual Plane, so it needs the
+    // `\u{...}` code point escape rather than `\uXXXX`.
+    text: root.failCount > 0 ? "\uf071" : "\u{F0CFF}"
     // WidgetButton colours through `foreground`, and `active` swaps in
     // `activeColor` (the theme's urgent). No green anywhere: a healthy backup
     // is dimmed, not celebrated -- but `dimmed: true` alone hands the exact
