@@ -988,10 +988,12 @@ Panel {
     slotSize: Style.bar.statusSlot
     // Style.font.caption (10px) inside a 21px statusSlot, on a 26px bar --
     // most of the available space was going unused, compounding the
-    // legibility problem opacity alone did not explain. A literal 16 (not
-    // the iconLarge token, 18px) still leaves headroom under both the slot
-    // and the bar height.
-    fontSize: 16
+    // legibility problem opacity alone did not explain. Style.font.heading
+    // (not the iconLarge token, 18px) defaults to the same 16px but scales
+    // with the shell's own fontBaseSize -- a literal 16 would stay fixed
+    // while Style.bar.statusSlot grows under it, recreating the exact
+    // too-small-for-its-slot problem this line exists to fix.
+    fontSize: Style.font.heading
     tooltipText: "OmaBackup - " + root.headline
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.refresh()
@@ -1199,6 +1201,25 @@ Panel {
                   : ""
               onClicked: root.openRepoInFileManager()
             }
+          }
+
+          // The button's tooltip alone is not enough: qs.Ui.Button only shows
+          // it on `mouseArea.containsMouse`, never on keyboard focus, so a
+          // keyboard-only user would have no way to read the error or the
+          // last-sent age at all -- the chip this replaced showed it as
+          // plain, always-visible text. This restores that, redundantly with
+          // the tooltip rather than instead of it.
+          Text {
+            visible: root.githubDestination !== null
+            width: parent.width
+            horizontalAlignment: Text.AlignRight
+            text: "GitHub " + (root.githubDestination && root.githubDestination.failed
+                    ? root.githubDestination.errorMessage
+                    : root.githubDestination && root.githubDestination.lastSuccess !== ""
+                      ? "sent " + root.agoFromIso(root.githubDestination.lastSuccess) : "never sent")
+            color: root.githubDestination && root.githubDestination.failed ? Color.urgent : Color.muted
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
           }
 
           // Runtime identity is compact and sits between the primary actions

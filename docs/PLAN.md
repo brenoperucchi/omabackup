@@ -1075,6 +1075,68 @@ CLI, while making the wording user-oriented.
 - Full suite: **1036 passed, 0 failed** before the `omabackup-18` follow-up,
   **1037 passed, 0 failed** after it.
 
+### Bar icon iteration, a GitHub button, and a timeout fix that didn't (`omabackup-19`) — 2026-09-01
+
+- The bar icon changed several times live, at the user's direction, comparing
+  each candidate against the actual installed font: `fa-save` (generic) ->
+  `fa-layer-group` (rendered as a blank box -- the installed JetBrainsMono
+  Nerd Font only carries the classic Font Awesome block, confirmed via
+  fontTools) -> `fa-code-branch` -> Material Design's `md-sync` /
+  `md-sync_circle` / `md-database_sync` / `md-folder_sync` -> back to
+  `md-sync`, the final choice. `dimmed: root.covered` (a fixed 0.45 opacity
+  from the shared `WidgetButton`) was replaced with a direct
+  `opacity: root.covered ? 0.75 : 1.0` -- confirmed live as nearly invisible
+  against the user's transparent bar. `fontSize` went from `Style.font.caption`
+  (10px, in a 21px slot) to a literal 16, later corrected to `Style.font.heading`
+  (see below).
+- The `github` destination (implicit via `OMABACKUP_REPO`'s `origin`, DESIGN.md
+  §3) moved from a non-clickable chip in the Destinations list to its own
+  button in the top action row, right-justified next to "Back up
+  now"/"Check again". Clicking it opens the **local** repository in the file
+  manager (`Util.execArgv(["xdg-open", root.config.repo])`, the shared
+  injection-safe launcher first-party plugins already use) -- deliberately
+  not github.com, since that would start a network trip from a read-only
+  status button with no confirmation. The Destinations section below is now
+  only about `dir` destinations (`root.otherDestinations`) and hides once
+  none exist.
+- Also: Hyprland's `decoration:rounding` was changed from 12 to 0 in
+  `~/.config/hypr/looknfeel.lua`, at the user's request, to make every panel
+  square -- this is a system-wide setting read live by the shared
+  `Style.cornerRadius` token, not something a single plugin can override
+  (`KeyboardPanel`'s own `BorderSurface` hardcodes `radius: Style.cornerRadius`
+  with no exposed override property). Confirmed both Time Machine and OmaVault
+  read the identical token; OmaVault's square-looking demo gif reflects its
+  author's own (low/zero) rounding setting, not anything the plugin did
+  differently.
+- Review round `omabackup-19` (15-commit batch since `omabackup-18`) found one
+  real regression the two rounds before it had both praised as fixed:
+  `_cfg_tui_home`'s `timeout --foreground` (`fee0888`) does not actually bound
+  anything. `--foreground` stops `timeout` from creating its own process
+  group, so it can only signal its direct child (the wrapping `bash -c`) --
+  `script` and the TUI inside it are grandchildren, survive as orphans still
+  holding the pipe open, and the command substitution hangs exactly as
+  before. `omabackup-rev-2` reproduced this live (stuck >2 minutes with the
+  "fixed" code) and proved dropping `--foreground` closes it (rc=124 at
+  ~17s). Fixed for real this time, plus a permanent regression that pins the
+  actual elapsed time, not just the marker text, since asserting the text
+  alone is exactly what let the broken version look fixed for two review
+  rounds. Also fixed: the GitHub button's status (error / last-sent age) had
+  moved from always-visible chip text to a tooltip that `qs.Ui.Button` only
+  shows on mouse hover, never on keyboard focus -- restored as visible text
+  alongside the tooltip, not instead of it.
+- **Known gap, not fixed this round:** the 35-assertion `panel.test.sh` gate
+  never actually instantiates `Panel.qml` itself -- `_qml_probe` only loads
+  standalone probe files, and `Panel.qml` is otherwise just grepped as a
+  string. A broken `Util.execArgv` call, a `dir` destination lost or
+  duplicated by the `otherDestinations`/`githubDestination` split, or a
+  straight syntax error in any of this round's new lines could in principle
+  pass 35 green checks undetected. Live reloads on the real installed plugin
+  and the user's own screenshots are the only evidence any of this actually
+  works today. Building a harness that instantiates the real `Panel.qml`
+  with synthetic `dir`/`github` destinations and intercepts the click argv is
+  real, separate work -- flagged, not attempted here.
+- Full suite: **1039 passed, 0 failed**.
+
 ## Open questions for the user, not yet decided
 
 - What path should the first `dir` destination actually point at?

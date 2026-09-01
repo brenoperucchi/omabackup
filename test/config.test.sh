@@ -223,10 +223,20 @@ _cfg_tui_home() {
     # phase with how many prompts the TUI actually shows -- exactly the kind
     # of thing a guard-condition regression changes -- this used to hang
     # indefinitely instead of failing: measured live, one run stuck for 3h34
-    # until a `kill -9` on the wedged child freed it. `timeout --foreground`
-    # (matching the pattern test/vm.test.sh's own runner already uses)
-    # converts that into a fast, legible failure instead.
-    out="$(timeout --foreground --kill-after=5s 15s bash -c \
+    # until a `kill -9` on the wedged child freed it.
+    #
+    # `timeout --foreground` (matching test/vm.test.sh's own runner) was tried
+    # first and does NOT close this: `--foreground` tells `timeout` not to
+    # start its own process group, so it can only signal its direct child --
+    # the `bash -c` here. `script` (and the TUI inside it) are grandchildren;
+    # killing the shell orphans them alive, still holding the write end of
+    # this command substitution's pipe, so `out="$(...)"` never returns even
+    # though `timeout` itself already fired and exited. Reproduced live, twice
+    # (>2 minutes stuck with `--foreground`; the orphaned `script`/`omabackup`
+    # pair still running at t+25s). Without `--foreground`, `timeout` owns its
+    # own process group and signals all of it, `script` included -- confirmed
+    # live: rc=124 at ~17s (the 15s limit plus the kill-after escalation).
+    out="$(timeout --kill-after=5s 15s bash -c \
         'printf "%b" "$1" | script -qec "$2" /dev/null 2>&1' _ "$input" \
         "env HOME='$h' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$h/g.json' \
          OMABACKUP_STATE='$h/.state' OMABACKUP_REPO='$repo' \
@@ -237,6 +247,25 @@ _cfg_tui_home() {
     fi
     printf '%s' "$out"
 }
+
+# _cfg_tui_home's own timeout mechanism, pinned directly: a keystroke script
+# that runs out mid-prompt (enters option 1, then nothing -- stdin ends right
+# where the TUI is still waiting for the repository path) used to hang the
+# whole suite for as long as 3h34 before this was found. This must fail fast
+# instead, not just in theory -- so it asserts the actual elapsed time, not
+# only the marker text. Slower than the rest of the suite (~17s: the 15s
+# limit plus the kill-after escalation) on purpose; that cost buys proof the
+# mechanism this file's other regressions all depend on actually bounds the
+# wait, not just that it looks like it should on paper.
+TIMEOUT_PROBE_HOME="$(_cfg_home)"
+TIMEOUT_PROBE_START=$(date +%s)
+TIMEOUT_PROBE_TUI="$(_cfg_tui_home "$TIMEOUT_PROBE_HOME" $'1\n' "$TIMEOUT_PROBE_HOME/repo")"
+TIMEOUT_PROBE_ELAPSED=$(( $(date +%s) - TIMEOUT_PROBE_START ))
+
+it "_cfg_tui_home fails fast, not hangs, when the keystroke script runs out mid-prompt"
+assert_contains "$TIMEOUT_PROBE_TUI" "_cfg_tui_home: timed out"
+[[ $TIMEOUT_PROBE_ELAPSED -lt 30 ]] \
+    && ok || fail "took ${TIMEOUT_PROBE_ELAPSED}s -- the timeout did not actually bound the wait (expected ~17s)"
 
 HUMAN_GITHUB_SHOW="$(_cfg_env "$CH" config show)"
 GITHUB_TUI="$(_cfg_tui $'q\n')"
