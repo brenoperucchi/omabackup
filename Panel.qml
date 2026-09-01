@@ -936,22 +936,22 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     // fa-exclamation-triangle when something needs doing, Material Design
-    // Icons' md-sync_circle otherwise -- sync arrows inside a ring, for the
-    // actual cycle this tool runs (collect -> publish -> verify -> commit),
-    // not the generic fa-save floppy disk this used to be. Picked from a
-    // different icon family than either other Omarchy backup plugin: Time
-    // Machine (restic) uses Font Awesome's fa-history, OmaVault uses
-    // Material Design's own md-safe. Codepoints for candidate glyphs
-    // (fa-layer-group, fa-code-commit, fa-shield-halved -- all FA5+ solid
-    // icons above roughly U+F2FF) were checked with fontTools'
+    // Icons' md-sync otherwise -- two circling arrows for the actual cycle
+    // this tool runs (collect -> publish -> verify -> commit), not the
+    // generic fa-save floppy disk this used to be. Picked from a different
+    // icon family than either other Omarchy backup plugin: Time Machine
+    // (restic) uses Font Awesome's fa-history, OmaVault uses Material
+    // Design's own md-safe. Codepoints for candidate glyphs (fa-layer-group,
+    // fa-code-commit, fa-shield-halved -- all FA5+ solid icons above
+    // roughly U+F2FF) were checked with fontTools'
     // getBestCmap()/getGlyphOrder() against the actual installed
     // JetBrainsMono Nerd Font .ttf (resolved via `fc-match monospace`, which
     // is what the bar's font actually renders through) before settling
     // here, after fa-layer-group (U+F5FD) rendered as a blank box -- that
-    // build only carries the classic Font Awesome block. md-sync_circle is
-    // U+F1378, above the Basic Multilingual Plane, so it needs the `\u{...}`
+    // build only carries the classic Font Awesome block. md-sync is
+    // U+F04E6, above the Basic Multilingual Plane, so it needs the `\u{...}`
     // code point escape rather than `\uXXXX`.
-    text: root.failCount > 0 ? "\uf071" : "\u{F1378}"
+    text: root.failCount > 0 ? "\uf071" : "\u{F04E6}"
     // WidgetButton colours through `foreground`, and `active` swaps in
     // `activeColor` (the theme's urgent). No green anywhere: a healthy backup
     // is dimmed, not celebrated -- but `dimmed: true` alone hands the exact
@@ -967,9 +967,10 @@ Panel {
     slotSize: Style.bar.statusSlot
     // Style.font.caption (10px) inside a 21px statusSlot, on a 26px bar --
     // most of the available space was going unused, compounding the
-    // legibility problem opacity alone did not explain. iconLarge (18px)
-    // still leaves headroom under both the slot and the bar height.
-    fontSize: Style.font.iconLarge
+    // legibility problem opacity alone did not explain. A literal 16 (not
+    // the iconLarge token, 18px) still leaves headroom under both the slot
+    // and the bar height.
+    fontSize: 16
     tooltipText: "OmaBackup - " + root.headline
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) root.refresh()
