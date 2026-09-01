@@ -215,8 +215,13 @@ _cfg_tui() {
 }
 
 _cfg_tui_home() {
-    local h="$1" input="$2" repo out rc=0
+    local h="$1" input="$2" repo gh path_prefix path_arg="" out rc=0
     if (($# >= 3)); then repo="$3"; else repo="$h/repo"; fi
+    if (($# >= 4)); then gh="$4"; else gh="$h/stub/gh-unavailable"; fi
+    if (($# >= 5)) && [[ -n "$5" ]]; then
+        path_prefix="$5"
+        path_arg="PATH='$path_prefix:$PATH' "
+    fi
     # `script -qec` feeds the TUI a fixed keystroke script over a real PTY;
     # `tui_read_line` correctly blocks waiting for more input once the bytes
     # run out (lib/tui.sh). If a caller's keystroke count ever falls out of
@@ -236,16 +241,45 @@ _cfg_tui_home() {
     # pair still running at t+25s). Without `--foreground`, `timeout` owns its
     # own process group and signals all of it, `script` included -- confirmed
     # live: rc=124 at ~17s (the 15s limit plus the kill-after escalation).
+    # OMABACKUP_GH defaults to a path nothing creates: _config_gh_available's
+    # `command -v` fails closed on it, so the GitHub-remote offer stays
+    # silent and every keystroke script written before that offer existed
+    # keeps working unchanged. A 4th argument points this at a real stub for
+    # tests that exercise the offer itself. A 5th argument prepends a
+    # directory to PATH -- for a test that needs to shadow an ordinary
+    # command like `mkdir` itself (lib/config.sh has no override variable
+    # for it, unlike systemctl/gh); the concrete PATH value is captured from
+    # this test runner's own environment at call time, not re-expanded by
+    # the inner shell, so it does not depend on what `script`'s child
+    # inherits.
     out="$(timeout --kill-after=5s 15s bash -c \
         'printf "%b" "$1" | script -qec "$2" /dev/null 2>&1' _ "$input" \
         "env HOME='$h' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$h/g.json' \
          OMABACKUP_STATE='$h/.state' OMABACKUP_REPO='$repo' \
          OMABACKUP_DESTINATIONS='$h/dest.json' OMABACKUP_SYSTEMCTL='$h/stub/systemctl' \
+         OMABACKUP_GH='$gh' ${path_arg}\
          XDG_RUNTIME_DIR=/nonexistent '$OB' config")" || rc=$?
     if (( rc == 124 || rc == 137 )); then
         out+=$'\n[_cfg_tui_home: timed out -- the keystroke script fell out of phase with the TUI prompts]'
     fi
     printf '%s' "$out"
+}
+
+# cmd_config_tui's loop opens every iteration with tui_header, which starts
+# by writing ESC[2J (clear screen) -- found by review that a regression
+# merely asserting some diagnostic text appears ANYWHERE in _cfg_tui_home's
+# raw PTY transcript proves nothing about whether a real user would ever see
+# it: `script` records every byte written, including text printed just
+# before a later clear wipes it from the actual terminal. A transcript from
+# the pre-fix code that printed a diagnostic and then immediately lost it to
+# the next redraw satisfies a plain assert_contains identically to the fixed
+# code that keeps it in the durable `notice` line. This does not need a full
+# ANSI/VT100 interpreter to tell those apart: bash's own greedy `##` prefix
+# removal, matched against the literal three-byte clear sequence, isolates
+# everything printed after the LAST clear -- which is exactly the durable
+# content a person reading the real terminal would still see.
+_cfg_tui_last_frame() {
+    printf '%s' "${1##*$'\033[2J'}"
 }
 
 # _cfg_tui_home's own timeout mechanism, pinned directly: a keystroke script
@@ -966,3 +1000,331 @@ assert_not_contains "$ENABLE_TOGGLE_TUI" "unbound variable"
 assert_not_contains "$ENABLE_TOGGLE_TUI" "timers are not installed"
 assert_contains "$ENABLE_TOGGLE_TUI" "Automatic backups disabled."
 assert_contains "$(cat "$ENABLE_TOGGLE_LOG" 2>/dev/null)" "--user disable --now omabackup-sync.timer omabackup-push.timer"
+
+# Options 4/5/6 (schedule, enabled) all die the exact same way on a fresh
+# machine that has a repo configured but never ran `omabackup install`
+# ("timers are not installed yet -- run: omabackup install", lib/config.sh
+# and cmd_enable) -- and, before this, that die message was the end of the
+# road inside the TUI: there is no menu option to run `install`, so a new
+# user working through the guided flow in the obvious order (1 -> 4/5/6) hit
+# a wall they could only clear by finding a shell. `omabackup install` only
+# needs OMABACKUP_REPO, which is already on disk by then (option 1 writes it,
+# and bin/omabackup loads it at startup), so the fix offers to run it right
+# there, like the git-init offer above does for a fresh repository.
+INSTALL_OFFER_HOME="$(_cfg_home)"
+INSTALL_OFFER_LOG="$INSTALL_OFFER_HOME/systemctl-call.log"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"%s"\nexit 0\n' "$INSTALL_OFFER_LOG" >"$INSTALL_OFFER_HOME/stub/systemctl"
+chmod +x "$INSTALL_OFFER_HOME/stub/systemctl"
+INSTALL_OFFER_TUI="$(_cfg_tui_home "$INSTALL_OFFER_HOME" $'4\n1\n5\ny\nq\n' "$INSTALL_OFFER_HOME/repo")"
+
+it "the Backup schedule option offers to install the timers instead of dead-ending on 'not installed yet'"
+assert_contains "$INSTALL_OFFER_TUI" "timers are not installed yet. Install them now?"
+assert_contains "$INSTALL_OFFER_TUI" "installed and scheduled"
+assert_contains "$INSTALL_OFFER_TUI" "Backup schedule saved."
+[[ -f "$INSTALL_OFFER_HOME/.config/systemd/user/omabackup-sync.timer" ]] \
+    && ok || fail "accepting the install offer did not actually install the timer units"
+assert_contains "$(cat "$INSTALL_OFFER_HOME/.config/systemd/user/omabackup-sync.timer")" "OnCalendar=*:0/5"
+assert_contains "$(cat "$INSTALL_OFFER_LOG")" "enable --now omabackup-sync.timer omabackup-push.timer"
+
+INSTALL_OFFER_ENABLE_HOME="$(_cfg_home)"
+INSTALL_OFFER_ENABLE_LOG="$INSTALL_OFFER_ENABLE_HOME/systemctl-call.log"
+printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"%s"\nexit 0\n' "$INSTALL_OFFER_ENABLE_LOG" >"$INSTALL_OFFER_ENABLE_HOME/stub/systemctl"
+chmod +x "$INSTALL_OFFER_ENABLE_HOME/stub/systemctl"
+INSTALL_OFFER_ENABLE_TUI="$(_cfg_tui_home "$INSTALL_OFFER_ENABLE_HOME" $'6\non\ny\nq\n' "$INSTALL_OFFER_ENABLE_HOME/repo")"
+
+it "the Automatic backups option offers to install the timers instead of dead-ending"
+assert_contains "$INSTALL_OFFER_ENABLE_TUI" "timers are not installed yet. Install them now?"
+assert_contains "$INSTALL_OFFER_ENABLE_TUI" "installed and scheduled"
+assert_contains "$INSTALL_OFFER_ENABLE_TUI" "Automatic backups enabled."
+assert_contains "$(cat "$INSTALL_OFFER_ENABLE_LOG")" "enable --now omabackup-sync.timer omabackup-push.timer"
+
+INSTALL_DECLINE_HOME="$(_cfg_home)"
+printf '#!/bin/bash\nexit 0\n' >"$INSTALL_DECLINE_HOME/stub/systemctl"
+chmod +x "$INSTALL_DECLINE_HOME/stub/systemctl"
+INSTALL_DECLINE_TUI="$(_cfg_tui_home "$INSTALL_DECLINE_HOME" $'4\n1\n5\nn\nq\n' "$INSTALL_DECLINE_HOME/repo")"
+
+it "declining the install offer leaves the original error and installs nothing"
+assert_contains "$INSTALL_DECLINE_TUI" "timers are not installed yet. Install them now?"
+assert_not_contains "$INSTALL_DECLINE_TUI" "installed and scheduled"
+assert_contains "$INSTALL_DECLINE_TUI" "timers are not installed yet -- run: omabackup install"
+[[ ! -d "$INSTALL_DECLINE_HOME/.config/systemd/user" ]] \
+    && ok || fail "declining the install offer still created timer units"
+
+# A failed install (e.g. systemd refuses to enable the units) must be
+# reported, not swallowed into a false "saved" -- the retry only happens when
+# the offer actually succeeded.
+INSTALL_OFFER_FAIL_HOME="$(_cfg_home)"
+{
+    printf '#!/bin/bash\n'
+    printf 'if [[ "$*" == *"enable --now"* ]]; then exit 1; fi\n'
+    printf 'exit 0\n'
+} >"$INSTALL_OFFER_FAIL_HOME/stub/systemctl"
+chmod +x "$INSTALL_OFFER_FAIL_HOME/stub/systemctl"
+INSTALL_OFFER_FAIL_TUI="$(_cfg_tui_home "$INSTALL_OFFER_FAIL_HOME" $'4\n1\n5\ny\nq\n' "$INSTALL_OFFER_FAIL_HOME/repo")"
+
+it "a failed install after accepting the offer is reported, not silently treated as success"
+assert_contains "$INSTALL_OFFER_FAIL_TUI" "timers are not installed yet. Install them now?"
+# The final FRAME, not just the raw transcript: found by review that the
+# pre-fix code also printed this text (transiently, wiped by the next
+# redraw) and would have satisfied a plain assert_contains identically.
+assert_contains "$(_cfg_tui_last_frame "$INSTALL_OFFER_FAIL_TUI")" "could not enable the timers"
+assert_not_contains "$INSTALL_OFFER_FAIL_TUI" "Backup schedule saved."
+
+# The other half of the originating request: "Backup repository" only ever
+# offered `git init` for a directory that already exists. A path that does
+# not exist at all (the exact case reported: a fresh machine, a repo path
+# never created) fell straight through to _config_require_repo's raw
+# "must point at an existing git repository" with no offered fix. None of the
+# existing-directory hazards (already a repo, nested repo, $HOME-sized
+# directory) apply to a path with nothing at it yet, so this offer only needs
+# to guard `mkdir -p` itself failing.
+MKDIR_HOME="$(_cfg_home)"
+MKDIR_TUI="$(_cfg_tui_home "$MKDIR_HOME" $'1\n'"$MKDIR_HOME/fresh-repo"$'\ny\nq\n' "$MKDIR_HOME/repo")"
+
+it "the config TUI offers to create and git init a backup repository path that does not exist yet"
+assert_contains "$MKDIR_TUI" "does not exist yet. Create it and initialize a git repository there?"
+assert_contains "$MKDIR_TUI" "and initialized an empty git repository there."
+[[ -d "$MKDIR_HOME/fresh-repo/.git" ]] && ok || fail "accepting the offer did not create and init the directory"
+assert_contains "$(cat "$MKDIR_HOME/.config/omabackup/env" 2>/dev/null)" "OMABACKUP_REPO=$MKDIR_HOME/fresh-repo"
+
+MKDIR_DECLINE_HOME="$(_cfg_home)"
+MKDIR_DECLINE_TUI="$(_cfg_tui_home "$MKDIR_DECLINE_HOME" $'1\n'"$MKDIR_DECLINE_HOME/fresh-repo"$'\nn\nq\n' "$MKDIR_DECLINE_HOME/repo")"
+
+it "declining the create-and-init offer leaves the directory absent and the repo unchanged"
+assert_contains "$MKDIR_DECLINE_TUI" "does not exist yet. Create it and initialize a git repository there?"
+[[ ! -e "$MKDIR_DECLINE_HOME/fresh-repo" ]] && ok || fail "declining the offer still created the directory"
+[[ ! -e "$MKDIR_DECLINE_HOME/.config/omabackup/env" ]] && ok || fail "the repository setting changed despite declining"
+
+# 0500 (read+execute, no write) on the parent: mkdir -p can look inside it
+# (execute) and see "new-repo" is absent, but cannot create anything there --
+# the same "exists vs. cannot confirm" split the git-init eligibility check
+# already has to handle, on the create side instead of the read side.
+MKDIR_FAIL_HOME="$(_cfg_home)"
+mkdir -p "$MKDIR_FAIL_HOME/locked-parent"
+chmod 0500 "$MKDIR_FAIL_HOME/locked-parent"
+MKDIR_FAIL_TUI="$(_cfg_tui_home "$MKDIR_FAIL_HOME" $'1\n'"$MKDIR_FAIL_HOME/locked-parent/new-repo"$'\ny\nq\n' "$MKDIR_FAIL_HOME/repo")"
+chmod 0700 "$MKDIR_FAIL_HOME/locked-parent"
+
+it "a directory that cannot be created is reported, not silently treated as success"
+assert_contains "$MKDIR_FAIL_TUI" "does not exist yet. Create it and initialize a git repository there?"
+assert_contains "$MKDIR_FAIL_TUI" "Could not create"
+[[ ! -e "$MKDIR_FAIL_HOME/locked-parent/new-repo" ]] \
+    && ok || fail "mkdir somehow succeeded against a read-only parent"
+
+# The last piece of the originating request: after a fresh `git init`, offer
+# to also create a GitHub repository via `gh`, gated on it being installed
+# and authenticated (checked with `gh auth token` -- a local credential-store
+# read, not a network round trip, per _config_gh_available's own comment).
+# Every git-init test above ran with OMABACKUP_GH pointed at a path nothing
+# creates, so this offer never fired for them -- these tests point it at a
+# real stub instead, to drive the offer itself.
+GITHUB_OFFER_HOME="$(_cfg_home)"
+mkdir -p "$GITHUB_OFFER_HOME/plain-folder"
+GITHUB_OFFER_LOG="$GITHUB_OFFER_HOME/gh-call.log"
+{
+    printf '#!/bin/bash\n'
+    printf 'if [[ "$1 $2" == "auth token" ]]; then printf "gho_faketoken\\n"; exit 0; fi\n'
+    printf 'if [[ "$1 $2" == "repo create" ]]; then printf "%%s\\n" "$*" >>"%s"; printf "https://github.com/user/plain-folder\\n"; exit 0; fi\n' "$GITHUB_OFFER_LOG"
+    printf 'exit 1\n'
+} >"$GITHUB_OFFER_HOME/stub/gh"
+chmod +x "$GITHUB_OFFER_HOME/stub/gh"
+GITHUB_OFFER_TUI="$(_cfg_tui_home "$GITHUB_OFFER_HOME" $'1\n'"$GITHUB_OFFER_HOME/plain-folder"$'\ny\ny\nq\n' "$GITHUB_OFFER_HOME/repo" "$GITHUB_OFFER_HOME/stub/gh")"
+
+it "after a fresh git init, the config TUI offers to also create a GitHub repository when gh is available"
+assert_contains "$GITHUB_OFFER_TUI" "Also create a private GitHub repository for it and set it as origin?"
+assert_contains "$GITHUB_OFFER_TUI" "Created a private GitHub repository and set it as origin."
+assert_contains "$(cat "$GITHUB_OFFER_LOG")" "repo create --private --source=$GITHUB_OFFER_HOME/plain-folder --remote=origin -- plain-folder"
+
+GITHUB_DECLINE_HOME="$(_cfg_home)"
+mkdir -p "$GITHUB_DECLINE_HOME/plain-folder"
+GITHUB_DECLINE_LOG="$GITHUB_DECLINE_HOME/gh-call.log"
+{
+    printf '#!/bin/bash\n'
+    printf 'if [[ "$1 $2" == "auth token" ]]; then printf "gho_faketoken\\n"; exit 0; fi\n'
+    printf 'if [[ "$1 $2" == "repo create" ]]; then printf "%%s\\n" "$*" >>"%s"; exit 0; fi\n' "$GITHUB_DECLINE_LOG"
+    printf 'exit 1\n'
+} >"$GITHUB_DECLINE_HOME/stub/gh"
+chmod +x "$GITHUB_DECLINE_HOME/stub/gh"
+GITHUB_DECLINE_TUI="$(_cfg_tui_home "$GITHUB_DECLINE_HOME" $'1\n'"$GITHUB_DECLINE_HOME/plain-folder"$'\ny\nn\nq\n' "$GITHUB_DECLINE_HOME/repo" "$GITHUB_DECLINE_HOME/stub/gh")"
+
+it "declining the GitHub offer still saves the local repository, without calling gh repo create"
+assert_contains "$GITHUB_DECLINE_TUI" "Also create a private GitHub repository for it and set it as origin?"
+assert_contains "$GITHUB_DECLINE_TUI" "Backup repository saved."
+assert_not_contains "$GITHUB_DECLINE_TUI" "Created a private GitHub repository"
+[[ ! -s "$GITHUB_DECLINE_LOG" ]] && ok || fail "gh repo create ran despite declining the offer"
+assert_contains "$(cat "$GITHUB_DECLINE_HOME/.config/omabackup/env" 2>/dev/null)" "OMABACKUP_REPO=$GITHUB_DECLINE_HOME/plain-folder"
+
+GITHUB_FAIL_HOME="$(_cfg_home)"
+mkdir -p "$GITHUB_FAIL_HOME/plain-folder"
+{
+    printf '#!/bin/bash\n'
+    printf 'if [[ "$1 $2" == "auth token" ]]; then printf "gho_faketoken\\n"; exit 0; fi\n'
+    printf 'if [[ "$1 $2" == "repo create" ]]; then printf "GraphQL: Name already exists on this account (createRepository)\\n" >&2; exit 1; fi\n'
+    printf 'exit 1\n'
+} >"$GITHUB_FAIL_HOME/stub/gh"
+chmod +x "$GITHUB_FAIL_HOME/stub/gh"
+GITHUB_FAIL_TUI="$(_cfg_tui_home "$GITHUB_FAIL_HOME" $'1\n'"$GITHUB_FAIL_HOME/plain-folder"$'\ny\ny\nq\n' "$GITHUB_FAIL_HOME/repo" "$GITHUB_FAIL_HOME/stub/gh")"
+
+it "a failed GitHub repository creation is reported but still saves the local repository"
+GITHUB_FAIL_LAST_FRAME="$(_cfg_tui_last_frame "$GITHUB_FAIL_TUI")"
+assert_contains "$GITHUB_FAIL_LAST_FRAME" "Name already exists on this account"
+assert_contains "$GITHUB_FAIL_LAST_FRAME" "Could not create a GitHub repository for it."
+assert_contains "$GITHUB_FAIL_LAST_FRAME" "Backup repository saved."
+[[ -d "$GITHUB_FAIL_HOME/plain-folder/.git" ]] && ok || fail "the local repository was not created despite the GitHub failure"
+
+GITHUB_UNAVAILABLE_HOME="$(_cfg_home)"
+mkdir -p "$GITHUB_UNAVAILABLE_HOME/plain-folder"
+GITHUB_UNAVAILABLE_TUI="$(_cfg_tui_home "$GITHUB_UNAVAILABLE_HOME" $'1\n'"$GITHUB_UNAVAILABLE_HOME/plain-folder"$'\ny\nq\n' "$GITHUB_UNAVAILABLE_HOME/repo")"
+
+it "the GitHub offer stays silent when gh is not available, instead of adding an unexpected prompt"
+assert_not_contains "$GITHUB_UNAVAILABLE_TUI" "Also create a private GitHub repository"
+assert_contains "$GITHUB_UNAVAILABLE_TUI" "Backup repository saved."
+
+GITHUB_UNAUTH_HOME="$(_cfg_home)"
+mkdir -p "$GITHUB_UNAUTH_HOME/plain-folder"
+printf '#!/bin/bash\nexit 1\n' >"$GITHUB_UNAUTH_HOME/stub/gh"
+chmod +x "$GITHUB_UNAUTH_HOME/stub/gh"
+GITHUB_UNAUTH_TUI="$(_cfg_tui_home "$GITHUB_UNAUTH_HOME" $'1\n'"$GITHUB_UNAUTH_HOME/plain-folder"$'\ny\nq\n' "$GITHUB_UNAUTH_HOME/repo" "$GITHUB_UNAUTH_HOME/stub/gh")"
+
+it "the GitHub offer stays silent when gh is installed but not authenticated"
+assert_not_contains "$GITHUB_UNAUTH_TUI" "Also create a private GitHub repository"
+assert_contains "$GITHUB_UNAUTH_TUI" "Backup repository saved."
+
+MKDIR_GITHUB_HOME="$(_cfg_home)"
+MKDIR_GITHUB_LOG="$MKDIR_GITHUB_HOME/gh-call.log"
+{
+    printf '#!/bin/bash\n'
+    printf 'if [[ "$1 $2" == "auth token" ]]; then printf "gho_faketoken\\n"; exit 0; fi\n'
+    printf 'if [[ "$1 $2" == "repo create" ]]; then printf "%%s\\n" "$*" >>"%s"; exit 0; fi\n' "$MKDIR_GITHUB_LOG"
+    printf 'exit 1\n'
+} >"$MKDIR_GITHUB_HOME/stub/gh"
+chmod +x "$MKDIR_GITHUB_HOME/stub/gh"
+MKDIR_GITHUB_TUI="$(_cfg_tui_home "$MKDIR_GITHUB_HOME" $'1\n'"$MKDIR_GITHUB_HOME/fresh-repo"$'\ny\ny\nq\n' "$MKDIR_GITHUB_HOME/repo" "$MKDIR_GITHUB_HOME/stub/gh")"
+
+it "creating a brand-new repository directory also offers to create a GitHub repository for it"
+assert_contains "$MKDIR_GITHUB_TUI" "Also create a private GitHub repository for it and set it as origin?"
+assert_contains "$MKDIR_GITHUB_TUI" "Created a private GitHub repository and set it as origin."
+assert_contains "$(cat "$MKDIR_GITHUB_LOG")" "repo create --private --source=$MKDIR_GITHUB_HOME/fresh-repo --remote=origin -- fresh-repo"
+
+# Round omabackup-20 review, P1 (omabackup-rev): a path whose leaf does not
+# exist but whose PARENT is already a git repository used to pass the
+# "doesn't exist yet" branch's plain `[[ ! -e ]]` check unchanged -- so
+# accepting the offer would `mkdir -p` a subdirectory inside the existing
+# repository and `git init` there, nesting a second repository inside the
+# first. Exactly the hazard rounds 15-17 closed for a target that already
+# exists (see the git-init-eligible tests above), reproduced here for one
+# that does not yet. _config_repo_create_eligible closes it by walking up to
+# the nearest EXISTING ancestor and checking THAT, since `git rev-parse
+# --git-dir` cannot be asked about a path that is not there yet.
+NESTED_CREATE_HOME="$(_cfg_home)"
+mkdir -p "$NESTED_CREATE_HOME/existing-repo"
+git init -q "$NESTED_CREATE_HOME/existing-repo"
+NESTED_CREATE_TUI="$(_cfg_tui_home "$NESTED_CREATE_HOME" $'1\n'"$NESTED_CREATE_HOME/existing-repo/new-subdir"$'\nq\n' "$NESTED_CREATE_HOME/repo")"
+
+it "the config TUI does not offer to create a directory inside an existing repository, nesting a second one"
+assert_not_contains "$NESTED_CREATE_TUI" "does not exist yet. Create it and initialize a git repository there?"
+[[ ! -e "$NESTED_CREATE_HOME/existing-repo/new-subdir" ]] \
+    && ok || fail "the subdirectory was created even though the offer did not fire"
+[[ ! -d "$NESTED_CREATE_HOME/existing-repo/new-subdir/.git" ]] \
+    && ok || fail "a nested git repository was created inside the existing one"
+
+# Round omabackup-20 review, P2 (both reviewers, independently): the local
+# repository used to be persisted as OMABACKUP_REPO only AFTER the optional,
+# blocking GitHub offer (a prompt, then a real `gh` invocation) had already
+# run -- so an interruption during either step left a valid, just-initialized
+# local repository (and, if `gh repo create` had already succeeded, a real
+# private GitHub repository) with OMABACKUP_REPO never saved, and no way to
+# recover: a second attempt at the same path no longer offers to init it,
+# since it is already a repository by then. `config set repo` now runs
+# immediately after `git init` succeeds, before the GitHub offer. Proven here
+# by having the gh stub check, at the moment `_config_gh_available` makes its
+# very first call (the offer's own gate, before its prompt is even shown),
+# whether OMABACKUP_REPO has already been persisted -- the earliest possible
+# observation point inside the offer.
+ORDER_HOME="$(_cfg_home)"
+mkdir -p "$ORDER_HOME/plain-folder"
+ORDER_MARKER="$ORDER_HOME/order-violation.marker"
+{
+    printf '#!/bin/bash\n'
+    printf 'if [[ "$1 $2" == "auth token" ]]; then\n'
+    printf '  grep -q "OMABACKUP_REPO=%s/plain-folder" "%s/.config/omabackup/env" 2>/dev/null || touch "%s"\n' \
+        "$ORDER_HOME" "$ORDER_HOME" "$ORDER_MARKER"
+    printf '  printf "gho_faketoken\\n"; exit 0\n'
+    printf 'fi\n'
+    printf 'if [[ "$1 $2" == "repo create" ]]; then exit 0; fi\n'
+    printf 'exit 1\n'
+} >"$ORDER_HOME/stub/gh"
+chmod +x "$ORDER_HOME/stub/gh"
+ORDER_TUI="$(_cfg_tui_home "$ORDER_HOME" $'1\n'"$ORDER_HOME/plain-folder"$'\ny\nn\nq\n' "$ORDER_HOME/repo" "$ORDER_HOME/stub/gh")"
+
+it "the local repository is persisted as OMABACKUP_REPO before the GitHub offer even checks gh's availability"
+assert_contains "$ORDER_TUI" "Also create a private GitHub repository for it and set it as origin?"
+[[ ! -e "$ORDER_MARKER" ]] \
+    && ok || fail "OMABACKUP_REPO was not yet saved when the GitHub offer's own availability check ran"
+
+# Round omabackup-21 review, P2 (omabackup-rev): an earlier version put the
+# repository name FIRST and unterminated -- `gh repo create <name> --private
+# --source=... --remote=origin`. A directory whose basename starts with `-`
+# (reproduced live with one literally named "--help") is then read by gh as
+# an OPTION instead of the positional name: `gh repo create --help --private
+# --source=... --remote=origin` just prints gh's own help and exits 0
+# without creating or validating anything, and the helper reported that exit
+# code as success. The fix puts every flag first and terminates option
+# parsing with `--` before the name, so nothing after it can be misread
+# regardless of what the directory is named -- driven here through a real
+# directory literally named "--help", the same repro the review used.
+HYPHEN_HOME="$(_cfg_home)"
+mkdir -p -- "$HYPHEN_HOME/--help"
+HYPHEN_LOG="$HYPHEN_HOME/gh-call.log"
+{
+    printf '#!/bin/bash\n'
+    printf 'if [[ "$1 $2" == "auth token" ]]; then printf "gho_faketoken\\n"; exit 0; fi\n'
+    printf 'if [[ "$1 $2" == "repo create" ]]; then printf "%%s\\n" "$*" >>"%s"; exit 0; fi\n' "$HYPHEN_LOG"
+    printf 'exit 1\n'
+} >"$HYPHEN_HOME/stub/gh"
+chmod +x "$HYPHEN_HOME/stub/gh"
+HYPHEN_TUI="$(_cfg_tui_home "$HYPHEN_HOME" $'1\n'"$HYPHEN_HOME/--help"$'\ny\ny\nq\n' "$HYPHEN_HOME/repo" "$HYPHEN_HOME/stub/gh")"
+
+it "gh repo create puts every flag before the repository name, behind --, so a leading-hyphen basename cannot be read as an option"
+assert_contains "$HYPHEN_TUI" "Created a private GitHub repository and set it as origin."
+assert_contains "$(cat "$HYPHEN_LOG")" "repo create --private --source=$HYPHEN_HOME/--help --remote=origin -- --help"
+
+# Round omabackup-21 review, P3 (omabackup-rev): the previous nested-repo
+# regression only covered _config_repo_create_eligible's own ancestor check,
+# not the SECOND half of that fix -- the _config_repo_init_eligible gate
+# that runs on what `mkdir -p` actually produced, right before `git init`.
+# `mkdir -p` treats an already-existing directory as success rather than
+# failure, so a race between the eligibility re-check and the `mkdir -p`
+# call itself could hand back a path something else populated in the
+# meantime; without this second gate, a fresh `git init` would run against
+# whatever was actually there instead of the empty directory this code path
+# assumes it just created.
+#
+# `mkdir` has no override variable of its own in bin/omabackup (unlike
+# systemctl/gh), so this shadows it directly on PATH -- via _cfg_tui_home's
+# 5th argument -- with a stub that behaves exactly like the real `mkdir -p
+# -- <path>` for every call except the one whose target matches this test's
+# own race marker, where it also drops a file into the directory it just
+# created before returning success: simulating something else populating
+# the target inside the same window the real code re-checks.
+MKDIR_RACE_HOME="$(_cfg_home)"
+mkdir -p "$MKDIR_RACE_HOME/stub"
+{
+    printf '#!/bin/bash\n'
+    printf 'if [[ "$3" == *"race-target"* ]]; then\n'
+    printf '  /usr/bin/mkdir -p -- "$3"\n'
+    printf '  printf "raced content\\n" >"$3/unexpected-file.txt"\n'
+    printf '  exit 0\n'
+    printf 'fi\n'
+    printf 'exec /usr/bin/mkdir "$@"\n'
+} >"$MKDIR_RACE_HOME/stub/mkdir"
+chmod +x "$MKDIR_RACE_HOME/stub/mkdir"
+MKDIR_RACE_TUI="$(_cfg_tui_home "$MKDIR_RACE_HOME" $'1\n'"$MKDIR_RACE_HOME/race-target"$'\ny\nq\n' "$MKDIR_RACE_HOME/repo" "" "$MKDIR_RACE_HOME/stub")"
+
+it "a directory populated during its own creation is rejected right before git init, not silently accepted"
+assert_contains "$MKDIR_RACE_TUI" "changed while it was being created -- not initializing it."
+[[ -f "$MKDIR_RACE_HOME/race-target/unexpected-file.txt" ]] \
+    && ok || fail "the race stub did not actually populate the directory as this test assumes"
+[[ ! -d "$MKDIR_RACE_HOME/race-target/.git" ]] \
+    && ok || fail "git init ran despite the directory being populated during its own creation"
+assert_not_contains "$MKDIR_RACE_TUI" "Backup repository saved."

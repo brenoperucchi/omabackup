@@ -1310,6 +1310,7 @@ cmd_sync() {
 SYSTEMCTL="${OMABACKUP_SYSTEMCTL:-systemctl}"
 UNIT_DIR="$HOME/.config/systemd/user"
 TIMER_UNITS=(omabackup-sync.timer omabackup-push.timer)
+GH="${OMABACKUP_GH:-gh}"
 
 # The interval systemd is actually running, asked of systemd. Repeating it in
 # QML or in a constant here would be the same fact in two places, which is how

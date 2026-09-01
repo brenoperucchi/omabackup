@@ -190,6 +190,77 @@ _config_repo_init_eligible() {
     (( rc == 0 )) && [[ -z "$listing" ]]
 }
 
+# Whether `path` -- syntactically absolute, NOT required to exist -- is safe
+# to offer the mkdir+git-init bootstrap for. `path` itself not existing is
+# not enough on its own: found by review, a path whose leaf is absent but
+# whose parent is already inside a git repository (a typo landing one level
+# inside an existing backup repo, e.g. "~/dotfiles/subdir" when "~/dotfiles"
+# is already `git init`-ed) would otherwise pass straight through, and
+# `git init` nests a second repository inside the first -- the exact hazard
+# `_config_repo_init_eligible` above exists to prevent for a path that
+# already exists, reproduced here for one that does not yet.
+#
+# `git rev-parse --git-dir` only resolves from a real, existing directory, so
+# this walks up from `path` to the nearest ancestor that actually exists
+# (there is always at least one: `/`) and asks IT, not `path`. `rev-parse`
+# itself then resolves upward through that ancestor's own parents the same
+# way git always does, so an ancestor that is merely a subdirectory of an
+# existing repo is still caught, not just a repo root exactly at that spot.
+_config_repo_create_eligible() {
+    local path="$1" existing_ancestor
+    [[ -n "$path" && ! -e "$path" ]] || return 1
+    existing_ancestor="$path"
+    while [[ "$existing_ancestor" != / && ! -e "$existing_ancestor" ]]; do
+        existing_ancestor="$(dirname -- "$existing_ancestor")"
+    done
+    [[ -d "$existing_ancestor" ]] || return 1
+    git -C "$existing_ancestor" rev-parse --git-dir >/dev/null 2>&1 && return 1
+    return 0
+}
+
+# A fresh `git init` -- whether into an existing empty directory or one just
+# created by the offer below -- means an empty index. Any group path declared
+# trackedOnly (paths[].trackedRepoPath in the manifest, e.g. "Personal
+# scripts") uses `git ls-files` as its allow-list (collect_tracked_only,
+# bin/omabackup), so it silently backs up nothing until something is
+# committed there. That already surfaces as a `warn` finding on the next
+# sync, but only there -- printed here too, right when the empty index is
+# created, so it is not a surprise discovered days later.
+#
+# Naming only `.live` and saying "commit something there" was wrong:
+# coverage does not depend on the live path at all -- collect_tracked_only
+# (bin/omabackup) reads `git ls-files` under `.trackedRepoPath` INSIDE THE
+# BACKUP REPO, which a normal live path (e.g. ~/.local/bin) usually is not
+# even a git repository of its own. The actionable fact is the
+# trackedRepoPath, so both are named. `select(.enabled != false)` matches
+# every other per-group query in this codebase (bin/omabackup:285,290,309,
+# 311,317) -- a disabled group's declared paths intentionally back up
+# nothing, and a false warning about them would be its own bug. `@tsv`
+# escapes any embedded tab/newline in the manifest value itself;
+# `tui_sanitize_field` below is the belt matching this codebase's actual
+# display contract for inline metadata.
+_config_repo_tracked_only_note() {
+    local tracked list live sub
+    tracked="$(jq -r \
+        '.groups[]? | select(.enabled != false) | (.paths // [])[]
+         | select(type=="object" and has("trackedRepoPath"))
+         | [.live, .trackedRepoPath] | @tsv' \
+        "$GROUPS_FILE" 2>/dev/null)" || return 0
+    [[ -n "$tracked" ]] || return 0
+    list=""
+    while IFS=$'\t' read -r live sub; do
+        [[ -n "$live" ]] || continue
+        list+="$(tui_sanitize_field "$live") (tracked under $(tui_sanitize_field "$sub")), "
+    done <<<"$tracked"
+    list="${list%, }"
+    # Explicit, not left to the printf's own exit status: a caller
+    # concatenating this into a prefix string never checks $?, but leaving
+    # it unset means the function returns 1 whenever there is nothing to
+    # say, which would become a real bug the day this script grows `set -e`.
+    [[ -n "$list" ]] && printf 'Note: %s will back up nothing until this repository tracks files there. ' "$list"
+    return 0
+}
+
 _config_show_json() {
     local destinations='{"schemaVersion":1,"destinations":[]}' sync_calendar push_calendar sync_cron push_cron sync_label push_label github_url repo_status
     [[ -f "$DESTINATIONS_FILE" ]] && destinations="$(cat -- "$DESTINATIONS_FILE")"
@@ -459,11 +530,111 @@ _config_tui_schedule() {
     }
 }
 
+# A schedule/enabled change that fails only because the systemd timers were
+# never installed is not a dead end -- `omabackup install` only needs
+# OMABACKUP_REPO, which is already on disk by the time a user reaches these
+# menu options (option 1 writes it via _config_env_set, and bin/omabackup
+# sources that same file at startup). Offering to run it here, instead of
+# just surfacing "-- run: omabackup install" and leaving the user to find a
+# shell, closes the same class of gap the git-init offer above closes for a
+# fresh repository. Return codes: 0 installed (caller should retry the
+# original config-set), 1 declined/cancelled, 2 install ran but failed, 3
+# the terminal went away (caller must exit the whole TUI, not just this menu
+# choice).
+#
+# Sets CONFIG_TUI_INSTALL_OUTPUT rather than printing `install`'s own output
+# directly (as an earlier version of this did): `cmd_config_tui`'s loop opens
+# every iteration with `tui_header`, which clears the whole screen before the
+# next prompt is drawn, so anything printed here and not folded into the
+# caller's own persisted `notice` is gone before a real user could read it --
+# found by review. The caller decides whether and how to surface it.
+_config_tui_offer_install() {
+    local cli="$1" answer install_rc
+    CONFIG_TUI_INSTALL_OUTPUT=""
+    printf 'Automatic backup timers are not installed yet. Install them now? [y/N] (q to cancel): '
+    tui_read_line answer || return 3
+    case "$answer" in
+        y|Y|yes|Yes|YES) ;;
+        *) return 1 ;;
+    esac
+    CONFIG_TUI_INSTALL_OUTPUT="$("$cli" install 2>&1)"; install_rc=$?
+    (( install_rc == 0 )) && return 0
+    return 2
+}
+
+# `gh auth token` reads the local credential store; it makes no network call,
+# matching this file's existing posture of never probing the network just to
+# decide whether to show a prompt (the destination/repo/git-init checks above
+# are all judged from local state alone). `gh auth status` was the other
+# candidate but does more validation, including a round trip -- not needed
+# just to gate an offer that gh itself will re-validate for real if accepted.
+_config_gh_available() {
+    local gh="$1"
+    command -v "$gh" >/dev/null 2>&1 || return 1
+    "$gh" auth token >/dev/null 2>&1
+}
+
+# Offered right after a successful `git init` and after that repository has
+# already been persisted as OMABACKUP_REPO (see the caller): a fresh local
+# repository is exactly the moment "should this also live on GitHub" is
+# relevant, and gh already has everything it needs (an authenticated
+# session, a local repo to point --source at). No prompt at all when gh is
+# missing or not authenticated -- unlike the install offer, there is no dead
+# end here to rescue the user from; this is a convenience on top of an
+# already-complete local repository, so silence is the right default when it
+# does not apply. `--private` with no visibility prompt: a dotfiles backup
+# repository defaulting private is the safe call, and it can be reopened from
+# GitHub itself later if the user wants otherwise. No `--push`: the repo is
+# empty immediately after `git init` anyway, and the next sync/push cycle is
+# what actually sends content -- this only has to wire the remote up.
+#
+# The repository NAME is passed explicitly, as gh's own `--help` documents:
+# "To create a remote repository non-interactively, supply the repository
+# name and one of --public/--private/--internal" -- found by review that the
+# prior version omitted it, relying only on `--source` defaulting the name.
+# Confirmed (on the failure path only, to avoid creating a real repository
+# just to probe this) that gh validates `--source` before anything else and
+# exits non-interactively either way, but there is no reason to run a form
+# gh's own documentation does not call non-interactive when the documented
+# one is just as short -- especially with a real TUI prompt sharing the same
+# stdin one call away.
+#
+# The name goes LAST, after every flag, behind its own `--`: an earlier
+# version put it first and unterminated -- found by review that a directory
+# whose basename starts with `-` (e.g. one literally named `--help`) is then
+# read by gh as an option instead of the positional name, so `gh repo create
+# --help --private --source=... --remote=origin` just prints gh's own help
+# and exits 0 without creating or validating anything, and this helper would
+# have reported that as success. `--` stops option parsing the same way it
+# does for every other command in this file (`git init -q -- "$path"`, `rm
+# -f -- "$tmp"`), so nothing after it can be misread as a flag regardless of
+# what the directory happens to be named.
+#
+# Sets CONFIG_TUI_GITHUB_OUTPUT rather than printing `gh`'s own output
+# directly, for the same reason _config_tui_offer_install does: the caller's
+# next `tui_header` clears the screen before a real user could read it.
+# Return codes mirror _config_tui_offer_install: 0 created, 1 declined or gh
+# is not available/authenticated (both silent-fallthrough cases for the
+# caller), 2 gh ran but failed, 3 the terminal went away.
+_config_tui_offer_github() {
+    local gh="$1" path="$2" answer create_rc
+    CONFIG_TUI_GITHUB_OUTPUT=""
+    _config_gh_available "$gh" || return 1
+    printf 'Also create a private GitHub repository for it and set it as origin? [y/N] (q to skip): '
+    tui_read_line answer || return 3
+    case "$answer" in
+        y|Y|yes|Yes|YES) ;;
+        *) return 1 ;;
+    esac
+    CONFIG_TUI_GITHUB_OUTPUT="$("$gh" repo create --private --source="$path" --remote=origin -- "$(basename -- "$path")" 2>&1)"; create_rc=$?
+    (( create_rc == 0 )) && return 0
+    return 2
+}
+
 cmd_config_tui() {
     local cli="${OMABACKUP_ROOT}/bin/omabackup" choice value id path keep output rc dest_choice doc notice="" schedule_rc \
-        repo_init_abs repo_init_prefix repo_init_answer \
-        repo_init_tracked_only repo_init_tracked_only_list \
-        repo_init_tracked_only_live repo_init_tracked_only_sub
+        repo_init_abs repo_init_canon repo_init_prefix repo_init_answer \
+        install_offer_rc github_offer_rc install_note
     [[ -t 0 && -t 1 ]] || die "interactive config needs a terminal; use config show --json or config set"
     while true; do
         tui_header configuration
@@ -499,13 +670,19 @@ cmd_config_tui() {
                 fi
                 # git stays required (sync/push/restore all depend on it --
                 # see docs/PLAN.md's design-review note), but a folder that
-                # merely has not been `git init`-ed yet is the common case, not
-                # an error: offer to init it right here instead of just dying.
-                # Only for an existing directory -- a path that does not exist
-                # at all still falls straight through to config set repo's own
-                # message, since silently creating directories from a typed
-                # path is a bigger action than initializing git in one that is
-                # already there.
+                # merely has not been `git init`-ed yet -- or does not exist
+                # yet at all -- is the common case, not an error: offer to
+                # create/init it right here instead of just dying. The two
+                # cases get separate prompts below (mkdir+init vs. init-only)
+                # since a directory that does not exist yet is missing the
+                # "already a repo" / "$HOME-sized" hazards the
+                # existing-directory offer has to guard against -- but NOT the
+                # nested-repo one: a path whose leaf is absent but whose
+                # parent already IS a repository (a typo landing one level
+                # inside an existing backup repo) is caught by
+                # `_config_repo_create_eligible`, the mkdir-branch's own
+                # analogue of the check below, walking up to the nearest
+                # existing ancestor instead of checking the target directly.
                 #
                 # The guard is `git rev-parse --git-dir`, not `-d "$path/.git"`.
                 # The latter is wrong in both directions, confirmed by review:
@@ -552,11 +729,13 @@ cmd_config_tui() {
                 # symlink to a non-empty, non-git tree used to pass every
                 # check below as though it were an empty real directory.
                 repo_init_abs="$(_config_absolute_path "$value" 2>/dev/null)" || repo_init_abs=""
-                [[ -n "$repo_init_abs" ]] && repo_init_abs="$(realpath -e "$repo_init_abs" 2>/dev/null)"
+                repo_init_canon=""
+                [[ -n "$repo_init_abs" && -e "$repo_init_abs" ]] \
+                    && repo_init_canon="$(realpath -e "$repo_init_abs" 2>/dev/null)"
                 repo_init_prefix=""
-                if _config_repo_init_eligible "$repo_init_abs"; then
+                if [[ -n "$repo_init_canon" ]] && _config_repo_init_eligible "$repo_init_canon"; then
                     printf '%s is not a git repository yet. Initialize one there now? [y/N] (q to cancel): ' \
-                        "$(tui_sanitize_field "$repo_init_abs")"
+                        "$(tui_sanitize_field "$repo_init_canon")"
                     tui_read_line repo_init_answer || return 0
                     case "$repo_init_answer" in
                         q|Q|$'\033') notice="Backup repository change cancelled."; continue ;;
@@ -565,71 +744,102 @@ cmd_config_tui() {
                             # blocked on user input for an arbitrary amount of
                             # time, which is a window for the target to stop
                             # being empty, stop existing, or become a repo.
-                            if ! _config_repo_init_eligible "$repo_init_abs"; then
-                                notice="$(tui_sanitize_field "$repo_init_abs") changed while waiting for an answer -- not initializing it."
+                            if ! _config_repo_init_eligible "$repo_init_canon"; then
+                                notice="$(tui_sanitize_field "$repo_init_canon") changed while waiting for an answer -- not initializing it."
                                 continue
                             fi
-                            if git init -q -- "$repo_init_abs" >/dev/null 2>&1; then
-                                repo_init_prefix="Initialized an empty git repository in $(tui_sanitize_field "$repo_init_abs"). "
-                                # A fresh `git init` means an empty index. Any
-                                # group path declared trackedOnly (paths[].
-                                # trackedRepoPath in the manifest -- e.g.
-                                # "Personal scripts") uses `git ls-files` as
-                                # its allow-list (collect_tracked_only,
-                                # bin/omabackup), so it silently backs up
-                                # nothing until something is committed there.
-                                # That already surfaces as a `warn` finding on
-                                # the next sync, but only there -- said here,
-                                # right when the empty index is created, so it
-                                # is not a surprise discovered days later.
-                                #
-                                # Naming only `.live` and saying "commit
-                                # something there" was wrong: coverage does
-                                # not depend on the live path at all --
-                                # collect_tracked_only (bin/omabackup) reads
-                                # `git ls-files` under `.trackedRepoPath`
-                                # INSIDE THE BACKUP REPO, which a normal live
-                                # path (e.g. ~/.local/bin) usually is not even
-                                # a git repository of its own. The actionable
-                                # fact is the trackedRepoPath, so both are
-                                # named. `select(.enabled != false)` matches
-                                # every other per-group query in this codebase
-                                # (bin/omabackup:285,290,309,311,317) -- a
-                                # disabled group's declared paths intentionally
-                                # back up nothing, and a false warning about
-                                # them would be its own bug. `@tsv` escapes
-                                # any embedded tab/newline in the manifest
-                                # value itself; `tui_sanitize_field` below is
-                                # the belt matching this codebase's actual
-                                # display contract for inline metadata.
-                                repo_init_tracked_only="$(jq -r \
-                                    '.groups[]? | select(.enabled != false) | (.paths // [])[]
-                                     | select(type=="object" and has("trackedRepoPath"))
-                                     | [.live, .trackedRepoPath] | @tsv' \
-                                    "$GROUPS_FILE" 2>/dev/null)" || repo_init_tracked_only=""
-                                if [[ -n "$repo_init_tracked_only" ]]; then
-                                    repo_init_tracked_only_list=""
-                                    while IFS=$'\t' read -r repo_init_tracked_only_live repo_init_tracked_only_sub; do
-                                        [[ -n "$repo_init_tracked_only_live" ]] || continue
-                                        repo_init_tracked_only_list+="$(tui_sanitize_field "$repo_init_tracked_only_live") (tracked under $(tui_sanitize_field "$repo_init_tracked_only_sub")), "
-                                    done <<<"$repo_init_tracked_only"
-                                    repo_init_tracked_only_list="${repo_init_tracked_only_list%, }"
-                                    repo_init_prefix+="Note: ${repo_init_tracked_only_list} will back up nothing until this repository tracks files there. "
-                                fi
-                            else
-                                notice="Could not initialize a git repository in $(tui_sanitize_field "$repo_init_abs")."
+                            if ! git init -q -- "$repo_init_canon" >/dev/null 2>&1; then
+                                notice="Could not initialize a git repository in $(tui_sanitize_field "$repo_init_canon")."
                                 continue
                             fi
+                            repo_init_prefix="Initialized an empty git repository in $(tui_sanitize_field "$repo_init_canon"). "
+                            repo_init_prefix+="$(_config_repo_tracked_only_note)"
+                            ;;
+                        *) ;;
+                    esac
+                elif _config_repo_create_eligible "$repo_init_abs"; then
+                    # The only new risk beyond _config_repo_create_eligible's
+                    # own guards is `mkdir -p` itself failing (permissions, a
+                    # non-directory blocking an ancestor component), handled
+                    # the same way the `git init` failure already is: report
+                    # it and leave the repo setting unchanged.
+                    printf '%s does not exist yet. Create it and initialize a git repository there? [y/N] (q to cancel): ' \
+                        "$(tui_sanitize_field "$repo_init_abs")"
+                    tui_read_line repo_init_answer || return 0
+                    case "$repo_init_answer" in
+                        q|Q|$'\033') notice="Backup repository change cancelled."; continue ;;
+                        y|Y|yes|Yes|YES)
+                            # Re-checked for the same TOCTOU reason as above:
+                            # the prompt just blocked on arbitrary answer
+                            # time, during which the target could have
+                            # appeared, or a repository could now cover one
+                            # of its ancestors.
+                            if ! _config_repo_create_eligible "$repo_init_abs"; then
+                                notice="$(tui_sanitize_field "$repo_init_abs") changed while waiting for an answer -- not creating it."
+                                continue
+                            fi
+                            if ! mkdir -p -- "$repo_init_abs" 2>/dev/null; then
+                                notice="Could not create $(tui_sanitize_field "$repo_init_abs")."
+                                continue
+                            fi
+                            repo_init_canon="$(realpath -e "$repo_init_abs" 2>/dev/null)" || repo_init_canon="$repo_init_abs"
+                            # A last gate on the directory `mkdir -p` actually
+                            # produced, right before `git init`: `mkdir -p`
+                            # treats an already-existing directory as success
+                            # rather than failure, so a race between the
+                            # re-check above and this call could still hand
+                            # back a path something else populated or
+                            # replaced in the meantime. This is the same
+                            # "empty, not already a repo" check the
+                            # existing-directory branch relies on, applied to
+                            # what was just created instead of assumed from
+                            # having just created it.
+                            if ! _config_repo_init_eligible "$repo_init_canon"; then
+                                notice="$(tui_sanitize_field "$repo_init_canon") changed while it was being created -- not initializing it."
+                                continue
+                            fi
+                            if ! git init -q -- "$repo_init_canon" >/dev/null 2>&1; then
+                                notice="Created $(tui_sanitize_field "$repo_init_canon") but could not initialize a git repository there."
+                                continue
+                            fi
+                            repo_init_prefix="Created $(tui_sanitize_field "$repo_init_canon") and initialized an empty git repository there. "
+                            repo_init_prefix+="$(_config_repo_tracked_only_note)"
                             ;;
                         *) ;;
                     esac
                 fi
+                # Persisted right after a fresh `git init` succeeds, before
+                # the optional GitHub offer below: that offer blocks on user
+                # input and shells out to `gh`, and an interruption during
+                # either must not leave a valid, just-initialized local
+                # repository unregistered as OMABACKUP_REPO -- especially
+                # since a second attempt at this same path would no longer
+                # offer to init it (it is already a repo by then), silently
+                # losing the recovery path along with the state.
                 output="$($cli config set repo "$value" 2>&1)"; rc=$?
-                if (( rc == 0 )); then
-                    notice="${repo_init_prefix}Backup repository saved."
-                else
+                if (( rc != 0 )); then
                     notice="${repo_init_prefix}${output:-Backup repository setting was not changed.}"
+                    continue
                 fi
+                # repo_init_prefix is empty exactly when this iteration typed
+                # an already-valid repository path and neither branch above
+                # ran -- the GitHub offer only makes sense right after this
+                # turn's own fresh `git init`, not every time someone points
+                # the setting at a repo that already existed.
+                if [[ -n "$repo_init_prefix" ]]; then
+                    _config_tui_offer_github "$GH" "$repo_init_canon"
+                    github_offer_rc=$?
+                    (( github_offer_rc == 3 )) && return 0
+                    if (( github_offer_rc == 0 )); then
+                        repo_init_prefix+="Created a private GitHub repository and set it as origin. "
+                    elif (( github_offer_rc == 2 )); then
+                        repo_init_prefix+="Could not create a GitHub repository for it."
+                        [[ -n "$CONFIG_TUI_GITHUB_OUTPUT" ]] \
+                            && repo_init_prefix+=" $(tui_sanitize "$CONFIG_TUI_GITHUB_OUTPUT")"
+                        repo_init_prefix+=" "
+                    fi
+                fi
+                notice="${repo_init_prefix}Backup repository saved."
                 ;;
             2)
                 printf 'Backup folder path (absolute; q to cancel): '
@@ -705,11 +915,37 @@ cmd_config_tui() {
                   else
                     output="$($cli config set push-schedule "$value" 2>&1)"; rc=$?
                   fi
+                  install_note=""
+                  if (( rc != 0 )) && [[ "$output" == *"timers are not installed yet"* ]]; then
+                    _config_tui_offer_install "$cli"
+                    install_offer_rc=$?
+                    (( install_offer_rc == 3 )) && return 0
+                    if (( install_offer_rc == 0 )); then
+                        [[ -n "$CONFIG_TUI_INSTALL_OUTPUT" ]] \
+                            && install_note="$(tui_sanitize "$CONFIG_TUI_INSTALL_OUTPUT") "
+                        if [[ "$choice" == 4 ]]; then
+                            output="$($cli config set sync-schedule "$value" 2>&1)"; rc=$?
+                        else
+                            output="$($cli config set push-schedule "$value" 2>&1)"; rc=$?
+                        fi
+                    elif (( install_offer_rc == 2 )); then
+                        # The stale "timers are not installed yet" text in
+                        # $output would otherwise survive into the notice
+                        # below unchanged, telling the user to run the exact
+                        # command that was just tried and just failed --
+                        # found by review. CONFIG_TUI_INSTALL_OUTPUT carries
+                        # the real reason.
+                        notice="Could not install the timers automatically."
+                        [[ -n "$CONFIG_TUI_INSTALL_OUTPUT" ]] \
+                            && notice+=" $(tui_sanitize "$CONFIG_TUI_INSTALL_OUTPUT")"
+                        continue
+                    fi
+                  fi
                   if (( rc == 0 )); then
                     if [[ "$choice" == 4 ]]; then
-                        notice="Backup schedule saved."
+                        notice="${install_note}Backup schedule saved."
                     else
-                        notice="Send schedule saved."
+                        notice="${install_note}Send schedule saved."
                     fi
                   else
                     notice="${output:-Schedule was not changed.}"
@@ -724,10 +960,26 @@ cmd_config_tui() {
                     continue
                 fi
                 output="$($cli config set enabled "$value" 2>&1)"; rc=$?
+                install_note=""
+                if (( rc != 0 )) && [[ "$output" == *"timers are not installed yet"* ]]; then
+                    _config_tui_offer_install "$cli"
+                    install_offer_rc=$?
+                    (( install_offer_rc == 3 )) && return 0
+                    if (( install_offer_rc == 0 )); then
+                        [[ -n "$CONFIG_TUI_INSTALL_OUTPUT" ]] \
+                            && install_note="$(tui_sanitize "$CONFIG_TUI_INSTALL_OUTPUT") "
+                        output="$($cli config set enabled "$value" 2>&1)"; rc=$?
+                    elif (( install_offer_rc == 2 )); then
+                        notice="Could not install the timers automatically."
+                        [[ -n "$CONFIG_TUI_INSTALL_OUTPUT" ]] \
+                            && notice+=" $(tui_sanitize "$CONFIG_TUI_INSTALL_OUTPUT")"
+                        continue
+                    fi
+                fi
                 if (( rc == 0 )); then
                     case "$value" in
-                        on|true|yes|1) notice="Automatic backups enabled." ;;
-                        *) notice="Automatic backups disabled." ;;
+                        on|true|yes|1) notice="${install_note}Automatic backups enabled." ;;
+                        *) notice="${install_note}Automatic backups disabled." ;;
                     esac
                 else
                     notice="${output:-Automatic backup setting was not changed.}"

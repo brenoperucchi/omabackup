@@ -1137,6 +1137,186 @@ CLI, while making the wording user-oriented.
   real, separate work -- flagged, not attempted here.
 - Full suite: **1039 passed, 0 failed**.
 
+### Settings TUI: closing the "dead end" gaps in options 1/4/5/6 — 2026-09-01
+
+The user reported setting "Backup repository" to a directory that did not
+exist yet and hitting a raw `repo must point at an existing git repository`
+with no way forward from inside the TUI. That widened into an explicit
+request: audit both the Settings and Restore TUIs for every point where the
+flow just fails instead of offering a path to success, before fixing broadly.
+
+The audit found Restore already at the target standard --
+`_restore_tui_recovery` wraps every failure in "Try again / Open backup
+settings / Cancel", so nothing there needed to change. The Settings TUI's
+main loop was equally robust at the mechanical level (never crashes, always
+returns to the menu), but three concrete points repeated a non-interactive
+CLI's raw `die` text and stopped, with no menu path to the fix:
+
+- **Options 4/5/6 (Backup schedule, Send schedule, Automatic backups)** all
+  die the same way on a repo-configured machine that never ran `omabackup
+  install`: `"timers are not installed yet -- run: omabackup install"` --
+  and there was no "install" option anywhere in the 1-6 menu, so a new user
+  working through the obvious order (1 -> 4/5/6) hit a wall only a shell
+  could clear. Fixed with `_config_tui_offer_install` (lib/config.sh): on
+  that specific message, offer to run `omabackup install` right there and
+  retry the original schedule/enabled change. Viable because `cmd_install`
+  only needs `OMABACKUP_REPO`, already on disk by the time option 1 has run
+  (bin/omabackup loads `~/.config/omabackup/env` at startup; an
+  already-set variable always wins over it).
+- **Option 1, a repository path that does not exist at all** -- the
+  originating report. The existing git-init offer only fired for a directory
+  that already exists; a path with nothing at it fell straight through.
+  None of the existing-directory hazards (already a repo, nested repo,
+  `$HOME`-sized directory) apply to a path with nothing there yet, so the new
+  branch only has to guard `mkdir -p` itself failing. The trackedOnly-groups
+  coverage note that used to live inline in the git-init branch was pulled
+  out into `_config_repo_tracked_only_note` so both branches share it instead
+  of duplicating ~25 lines of jq.
+- **Option 1, after either successful `git init`** -- the second half of the
+  originating request: offer to also create a private GitHub repository via
+  `gh repo create --private --source=<path> --remote=origin` (no `--push`;
+  the repo is empty right after init anyway, and the next sync/push cycle
+  sends real content). Gated on `gh` being installed and authenticated,
+  checked with `gh auth token` -- a local credential-store read, not a
+  network round trip, matching this file's existing "never probe the network
+  just to decide whether to show a prompt" posture. Silent (no prompt at all)
+  when gh is missing or unauthenticated: unlike the install offer, there is
+  no dead end to rescue here, just a convenience on top of an already-usable
+  local repository. `$GH` (`bin/omabackup`, next to `$SYSTEMCTL`) is
+  overridable via `OMABACKUP_GH`, the same stub-injection pattern the
+  systemd-timer tests already use.
+- 28 new regressions in `test/config.test.sh`, each confirmed to fail against
+  the pre-fix code (`git stash` the two source files, rerun, restore) before
+  being counted as done: accept/decline/fail for the install offer (both
+  schedule and enabled), accept/decline/fail/unavailable/unauthenticated for
+  the GitHub offer (both the existing-directory and newly-created-directory
+  branches), and accept/decline/mkdir-failure for the create-directory offer
+  itself. `_cfg_tui_home` gained a 4th optional argument for a `gh` stub path
+  and defaults `OMABACKUP_GH` to a path nothing creates, so every git-init
+  keystroke script written before the GitHub offer existed keeps working
+  unchanged -- the same "keystroke count falls out of phase" failure mode
+  `_cfg_tui_home`'s own timeout bug (above) was about, avoided here by
+  keeping the new prompt opt-in per test rather than always-on.
+- Full suite: **1085 passed, 0 failed**.
+
+#### Review round `omabackup-20`: a nested-repo hole, a lost-write race, and a non-standard `gh` invocation
+
+Both reviewers found real, independent problems in the round above, converging
+from different angles on the same underlying ordering defect:
+
+- **`omabackup-rev`, CONFIRMADO** -- the "doesn't exist yet" branch's `[[ ! -e
+  ]]` check says nothing about the path's ANCESTORS. A target like
+  `~/existing-repo/new-subdir` (the leaf absent, the parent already a git
+  repository) passed straight through, and accepting the offer would nest a
+  second repository inside the first -- exactly the hazard rounds 15-17 closed
+  for a target that already exists, unguarded here for one that does not yet.
+  Fixed with `_config_repo_create_eligible` (lib/config.sh): walks up from the
+  target to the nearest EXISTING ancestor (there is always at least one, `/`)
+  and asks `git rev-parse --git-dir` about that instead, since git itself
+  cannot be asked about a path that is not there. Also closes the race
+  `omabackup-rev` flagged in the same finding -- `mkdir -p` treats an
+  already-existing directory as success rather than failure, so a second
+  `_config_repo_init_eligible` gate now runs on what `mkdir -p` actually
+  produced, right before `git init`, instead of trusting the pre-mkdir check.
+- **CONFIRMADO from both reviewers, independently** -- `git init` succeeded,
+  then the flow blocked on the optional GitHub offer (a prompt, then a real
+  `gh` shell-out), and only after that returned did `config set repo` persist
+  OMABACKUP_REPO. An interruption during either step left a valid, freshly
+  initialized local repository -- and possibly a real private GitHub
+  repository with origin already wired -- with OMABACKUP_REPO never saved, and
+  no way back in: a second attempt at the same path no longer offers to init
+  it, since it is already a repository by then. Fixed by moving `config set
+  repo` to run immediately after `git init` succeeds, before the GitHub offer
+  -- the offer is now strictly additive on top of an already-consistent,
+  already-persisted state. Proven with a new regression that has the `gh`
+  stub check, at the exact moment its own `auth token` availability call
+  runs (before its prompt is even shown), whether OMABACKUP_REPO is already
+  on disk.
+- **`omabackup-rev-2`, well-evidenced, treated as valid** -- `gh repo create
+  --private --source=<path> --remote=origin` omitted the repository name.
+  `gh repo create --help` (gh 2.98.0, this machine) documents the
+  non-interactive form as requiring name + one of `--public/--private
+  /--internal`; without it, in the exact window identified above, the door
+  was open for `gh` to read from the same stdin the TUI itself was using.
+  Confirmed non-interactive on the failure path only (deliberately not
+  probed on the success path, to avoid creating a real repository just to
+  check). Fixed by passing `"$(basename -- "$path")"` as the name --
+  literally gh's own documented example.
+- **Fixed, not from a specific numbered finding but the same root cause** --
+  `_config_tui_offer_install`/`_config_tui_offer_github` printed their
+  underlying command's output directly, but `cmd_config_tui`'s loop clears
+  the whole screen (`tui_header`'s `ESC[2J`) before the next prompt draws, so
+  on failure that diagnostic was gone before a real user could read it --
+  and, specifically for install, the `notice` that survived the redraw was
+  the ORIGINAL "timers are not installed yet -- run: omabackup install",
+  telling the user to run the exact command that had just failed, with less
+  information than before the offer existed. Both helpers now set a
+  `CONFIG_TUI_INSTALL_OUTPUT`/`CONFIG_TUI_GITHUB_OUTPUT` global (the same
+  convention `CONFIG_TUI_SCHEDULE` already uses) instead of printing, and
+  both call sites fold it into a durable `notice`/prefix on both success and
+  failure.
+- Also fixed, cheap and low-risk: the two `_config_tui_offer_github` call
+  sites now honor its documented `rc==3` ("terminal went away") the same way
+  its install sibling already does, instead of silently falling through as
+  if declined; and `_config_repo_tracked_only_note` now `return 0`s
+  explicitly instead of relying on its last conditional's own exit status,
+  which happened to be 1 whenever there was nothing to report -- harmless
+  today (no `set -e`, no caller checks `$?`), flagged as a latent trap for
+  whenever either changes.
+- 5 new regressions (2 for the nested-repo/ordering fixes above, 3 covering
+  the argv and notice-content changes the other fixes needed); the existing
+  batch's `gh repo create` argv assertions and the two "installed and
+  scheduled" assertions were updated to match the corrected invocation and
+  the now-durable success notice.
+- Full suite: **1090 passed, 0 failed**.
+
+#### Review round `omabackup-21` (correction round 2 of 2): a real argv bug, and two testing-rigor gaps
+
+`omabackup-rev-2` re-verified every round-20 fix independently (ran
+`_config_repo_create_eligible` by hand against 8 constructed paths, traced
+the reordering through every branch it could have broken) and approved with
+no new findings. `omabackup-rev` found three real gaps in round 20's own
+fixes:
+
+- **P2, a real bug** -- the just-fixed `gh repo create` call still put the
+  repository name FIRST, unterminated: `gh repo create <name> --private
+  --source=... --remote=origin`. A directory whose basename starts with `-`
+  (reproduced live with one literally named `--help`) is then read by `gh`
+  as an OPTION instead of the positional name -- `gh repo create --help
+  --private --source=... --remote=origin` just prints `gh`'s own help and
+  exits 0 without creating or validating anything, and the helper reported
+  that exit code as success. Fixed by moving every flag before the name and
+  terminating option parsing with `--`, the same pattern this file already
+  uses everywhere else a value could start with `-` (`git init -q --
+  "$path"`, `rm -f -- "$tmp"`). New regression drives this through a real
+  directory named `--help` and asserts the resulting argv.
+- **P3, testing rigor** -- the round-20 regressions proving diagnostic output
+  survives to the user (the install/GitHub failure notices) only checked
+  substring presence anywhere in `_cfg_tui_home`'s raw PTY transcript. The
+  PRE-fix code also printed that same text, transiently, right before the
+  next `tui_header` cleared it -- so those assertions would have passed
+  identically against the broken version; they proved nothing about
+  survival past the clear. Fixed by adding `_cfg_tui_last_frame` (bash's own
+  greedy `##` prefix removal against the literal `ESC[2J` byte sequence,
+  isolating everything printed after the LAST clear) and pointing the two
+  affected assertions at it instead of the raw transcript.
+- **P3, testing rigor** -- the round-20 nested-repo regression only covered
+  `_config_repo_create_eligible`'s ancestor check, not the second half of
+  that same fix: the `_config_repo_init_eligible` gate that runs on what
+  `mkdir -p` actually produced, right before `git init`, closing the race
+  where `mkdir -p` treats an already-existing (and possibly since-populated)
+  directory as success rather than failure. New regression shadows `mkdir`
+  itself on `PATH` (it has no override variable of its own, unlike
+  systemctl/gh) via a 5th argument added to `_cfg_tui_home`, with a stub
+  that behaves exactly like the real `mkdir -p -- <path>` except for one
+  specific race-marker target, where it also drops a file into the
+  directory before returning success -- proving the second gate actually
+  fires, not just that the underlying primitive works in isolation.
+- 4 new regressions; both reviewers agreed this is the natural stopping
+  point (`omabackup-rev-2`: "Não vejo nada que justifique uma terceira"),
+  matching the review protocol's 2-correction-round budget.
+- Full suite: **1096 passed, 0 failed**.
+
 ## Open questions for the user, not yet decided
 
 - What path should the first `dir` destination actually point at?
