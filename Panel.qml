@@ -935,23 +935,23 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // fa-exclamation-triangle when something needs doing, fa-code-branch
-    // otherwise -- not the generic fa-save floppy disk this used to be, and
-    // deliberately distinct from the other Omarchy backup plugins' own
-    // marks: Time Machine (restic) uses fa-history, OmaVault uses a Nerd
-    // Font "safe" glyph. A git branch fork says what actually sets this
-    // tool apart: real git history, not a proprietary snapshot format.
-    //
-    // fa-layer-group (U+F5FD) was tried first and rendered as a blank box:
-    // the bar's font resolves through Qt's "monospace" alias to whichever
-    // Nerd Font is installed system-wide (JetBrainsMono Nerd Font on this
-    // machine, confirmed via `fc-match monospace`), and that build only
-    // carries the classic Font Awesome block (roughly U+F000-F2FF) -- newer
-    // FA5+ solid icons like layer-group, code-commit, and shield-halved
-    // (U+F3xx and up) are simply absent. Checked with fontTools'
-    // getBestCmap() against the actual installed .ttf, not assumed:
-    // everything picked here is confirmed present.
-    text: root.failCount > 0 ? "\uf071" : "\uf126"
+    // fa-exclamation-triangle when something needs doing, Material Design
+    // Icons' md-sync otherwise -- two circling arrows for the actual cycle
+    // this tool runs (collect -> publish -> verify -> commit), not the
+    // generic fa-save floppy disk this used to be. Picked from a different
+    // icon family than either other Omarchy backup plugin: Time Machine
+    // (restic) uses Font Awesome's fa-history, OmaVault uses Material
+    // Design's own md-safe. Codepoints for candidate glyphs (fa-layer-group,
+    // fa-code-commit, fa-shield-halved -- all FA5+ solid icons above
+    // roughly U+F2FF) were checked with fontTools'
+    // getBestCmap()/getGlyphOrder() against the actual installed
+    // JetBrainsMono Nerd Font .ttf (resolved via `fc-match monospace`, which
+    // is what the bar's font actually renders through) before settling
+    // here, after fa-layer-group (U+F5FD) rendered as a blank box -- that
+    // build only carries the classic Font Awesome block. md-sync is
+    // U+F04E6, above the Basic Multilingual Plane, so it needs the `\u{...}`
+    // code point escape rather than `\uXXXX`.
+    text: root.failCount > 0 ? "\uf071" : "\u{F04E6}"
     // WidgetButton colours through `foreground`, and `active` swaps in
     // `activeColor` (the theme's urgent). No green anywhere: a healthy backup
     // is dimmed, not celebrated.
