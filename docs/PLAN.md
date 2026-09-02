@@ -2440,6 +2440,326 @@ already-reviewed round-28 layer resurfaced.
 
 Full suite after this round's fix: **1251 passed, 0 failed**.
 
+### Two logging gaps found against a real incident, closed after design consultation
+
+The user hit the exact scenario the persistent-log feature (above) was
+supposed to explain: the panel showed `check failed` /
+`config: terminal did not report completion; status refreshed`, and
+today's log file had no `config` line anywhere. Investigation (Plan Mode)
+found two independent gaps:
+
+1. This machine's installed systemd units were stale -- the repo's own
+   templates already carry `Environment=OMABACKUP_LOG_SKIP=1`, and
+   `cmd_reload` already refreshes installed units from them on every run,
+   but this machine had not run `reload` since that fix shipped, so
+   `sync`/`push` timer runs were duplicating into the file log
+   (~20 routine lines/day, confirmed directly). Operational, not a code
+   fix -- addressed by actually running `reload`.
+2. Two places in `Panel.qml` detect a real problem without ever hearing
+   from a live `bin/omabackup-tui` wrapper, so neither could log anything:
+   `externalRecoveryTimer.onTriggered` (no heartbeat for
+   `externalRecoveryMs`, default 900s = 30x the wrapper's own 30s
+   heartbeat -- **this is exactly the user's incident**), and
+   `externalProc.onExited`'s `code !== 0` branch (the terminal launch
+   itself failed, so there was never a wrapper process at all).
+
+Design-consulted before writing any code (`herdr-ask`, round
+omabackup-12) -- same precedent as the original logging feature itself.
+Both reviewers independently converged on `Util.execArgv` (`qs.Commons`)
+over `killGroup`'s disposable-`Process`-plus-backstop pattern, for a
+reason the initial draft plan didn't have: `killGroup`'s `Process`
+requires the *panel itself* to survive long enough to observe `exited`
+and call `destroy()`, which cannot be assumed at either site (900s of
+already-degraded state at one; a leaked `Qt.createQmlObject` if never
+destroyed). `execDetached`'s child is independent of the panel's own
+lifecycle. Both reviewers also converged on keeping a `timeout` bound on
+the dispatch (since `execDetached` gives no way to observe a hang), with
+one reviewer (`omabackup-rev-2`) finding, by reading `lib/log.sh`
+directly, that `_log_write` appends its line *before* it ever reaches its
+own `flock -x -w 5` -- meaning the initially-proposed matching `5s`
+external timeout was only safe by an unwritten internal ordering; raised
+to `10s`, with a comment explaining why, to stop depending on that
+coincidence.
+
+Also settled by consultation: the outcome field must read `failed
+(no heartbeat)` / `failed (launch)`, not free text -- the log's existing
+outcomes are `ok`/`failed (exit N)`/`failed (signal X)`/`still failing
+(exit N)`, and a human `grep failed`-ing the file after an incident
+(confirmed to be the actual use case -- this whole investigation started
+because that grep came up empty) needs to catch these two new lines the
+same way. And a possible "duplicate" -- the wrapper eventually completing
+and logging its own real outcome shortly after the panel already gave up
+-- is kept deliberately, not deduplicated: two different true facts
+("the panel stopped waiting" vs. "the wrapper finished, and how")
+together reveal a slow-not-dead wrapper a single line couldn't
+distinguish, linked by a shared `token` in both detail strings.
+
+One review-caught bug fixed before it ever shipped: the launch-failure
+site's own guard (`root.cli !== ""`) did not also check `action !== ""`,
+unlike the recovery-timer site, which already had that guard structurally
+via an early return. Without the fix, a launch failure with an already-
+cleared `externalAction` would have logged a line with a blank action
+field -- reopening the exact shape of bug already fixed once elsewhere
+(round omabackup-23). `errBuffer` (an unbounded `StdioCollector`) is now
+truncated to 2000 chars with a marker and stripped of embedded NULs
+before becoming an argv element, and the exit code is preserved in the
+detail even when stderr is also present (the original draft's
+`errBuffer || ("exit " + code)` shape silently dropped the code whenever
+stderr was non-empty).
+
+Two new headless QuickShell probes (`test/qml/panel-logs-recovery-timeout.qml`,
+`test/qml/panel-logs-launch-failure.qml`), following this suite's own
+"hand-maintained mirror" convention -- driving the real handler logic
+against a stub `omabackup` CLI that records its own invocation argv to a
+file (`Util.execArgv`/`execDetached` gives no completion signal to wait
+on, so the probes poll for the file instead of asserting immediately).
+Both fail-before/pass-after verified directly: the launch-failure probe's
+second scenario (empty `externalAction`) was run against a scratch copy
+with the `action !== ""` guard removed and correctly caught the
+regression (a second log line with a blank action field appeared) before
+being counted as a real regression test. One structural substring check
+added alongside them for the one fact a behavioral probe cannot easily
+prove without shelling out to `ps` mid-run: that `timeout` really is the
+literal prefix `Util.execArgv` is given at both sites, not just present
+somewhere in the file.
+
+Full suite: **1254 passed, 0 failed**.
+
+### Round omabackup-30 review of the implementation: a real race and a real architectural bug, both closed
+
+`herdr-review` dispatched on the implementation above. `omabackup-rev`
+found two P2s and a P3; `omabackup-rev-2` found one P2 -- the same
+underlying fact `omabackup-rev` also flagged from a different angle
+(CONFIRMADO), plus independently verified everything else in the diff was
+correct.
+
+- **P2 (`omabackup-rev`) -- `externalProc.onExited` re-read mutable root
+  state instead of its own launch's captured identity.** The handler read
+  `root.externalAction`/`root.externalToken` at CALLBACK time, not the
+  values that were actually active when THIS launch started. A late,
+  stale exit from session A arriving after root's own state had moved on
+  to session B would stop B's recovery, clear B's busy/token, overwrite
+  B's `lastError`, and log a failure under B's token that actually
+  belonged to A. `canOpenExternalTui`'s own `!busy` gate makes this
+  unreachable by any caller in the codebase today, but the fix -- capture
+  `launchAction`/`launchToken` on `externalProc` itself when the launch is
+  armed, and refuse to act at all in `onExited` unless they still match
+  the currently active session -- removes the dependency on that gate
+  holding forever, rather than trusting it implicitly. Verified with a
+  genuine, deterministic race in the new test probe: session A's
+  `externalProc` launched with a real 0.4s delay before its own non-zero
+  exit, root's session identity switched to session B 100ms in (while A
+  is still running), and the probe confirms A's late exit changes nothing
+  about B's state and logs nothing under A's stale identity.
+- **P3 (`omabackup-rev`) -- the `timeout` bound did not actually bound
+  what it was supposed to.** `Util.execArgv`'s own implementation is
+  `Quickshell.execDetached(["bash", "-lc", 'exec "$@"', "bash"].concat(argv))`
+  -- passing `timeout` as part of that `argv` (the first draft's own
+  shape) puts it INSIDE the login shell, so `timeout`'s own clock starts
+  only after `bash -lc` has already finished sourcing the user's profile.
+  A hung profile was therefore never bounded at all, despite the
+  comment's own claim that it was. Fixed with a small shared
+  `logEventDetached(argv)` helper that calls `Quickshell.execDetached`
+  directly, with `timeout` as the true outermost element wrapping the
+  whole login-shell invocation -- still injection-safe (every value stays
+  a literal argv element through `"$@"`, the `bash -lc` string itself
+  unchanged and constant).
+- **P2 (both reviewers independently, converging on the same fact) -- a
+  permanent comment asserted a correlation mechanism that did not exist.**
+  The comment justifying the decision not to deduplicate the panel's two
+  log lines per session claimed the wrapper's own `_on_exit` log-event
+  calls already carried the session token -- they did not.
+  `bin/omabackup-tui:190,192` fixed to include `(token $token)` in both
+  calls, closing the gap the comment had assumed was already closed.
+- **P2 (`omabackup-rev`) -- the two new QML probes did not actually
+  exercise the properties they claimed to.** The original probes'
+  launch-failure scenario used short ASCII stderr and only tested the
+  empty-action case, never actually exercising truncation, NUL-stripping,
+  or the (then-nonexistent) stale-identity guard. Rewritten into five
+  sequenced scenarios: normal failure, the real stale-substitution race
+  above, empty-action, NUL-stripping in isolation (a short
+  `"BEFORE\0MORE"` blob -- proving the two halves survive JOINED, which a
+  Qt/QProcess-level truncation-at-NUL upstream of this code could not
+  produce), and truncation in isolation (2500 pure-ASCII characters, no
+  NUL at all -- proving the >2000-char cut on its own, not conflated with
+  NUL-handling in the same oversized blob the way the first draft's single
+  combined scenario had been, which could not actually distinguish the two
+  properties from each other). A new bash-level regression
+  (`test/panel.test.sh`) captures `bin/omabackup-tui`'s own real invocation
+  argv and confirms the token fix above. Structural substring checks
+  (`test/panel.test.sh`) extended to anchor on `logEventDetached` itself
+  and the launch-identity guard's own field names, not just the `timeout`
+  prefix as before -- per `omabackup-rev-2`'s own suggestion, turning "a
+  mirror that can silently drift" into "a mirror that breaks the suite
+  when it drifts."
+- **P3 (`omabackup-rev`) -- both probes leaked a `/tmp` directory per run,
+  outside `test/run.sh`'s own `TMPDIR` scoping.** Fixed with
+  `Quickshell.env("TMPDIR")` (the same access pattern this shell's own
+  `shell.qml`/`Color.qml` already use for `HOME`), falling back to `/tmp`
+  only if unset.
+
+One self-inflicted bug found and fixed before it ever reached review: an
+intended `\x00` escape sequence in one of the two probe files was
+transcribed as an actual, literal NUL byte during authoring -- caught by
+directly inspecting the file's raw bytes (`python3 -c "...count(b'\x00')..."`)
+after `grep`/the Edit tool's own string-matching started failing
+inexplicably against text that LOOKED identical when read back. Fixed by
+rewriting the byte in place with Python, not by retyping the surrounding
+QML by hand a second time.
+
+Full suite after this round's fixes: **1257 passed, 0 failed**.
+
+### Round omabackup-31: a follow-up review of round-30's own fixes, and it earned its keep
+
+`herdr-review` dispatched narrowly on round-30's own fix set (the four
+items above). `omabackup-rev` found one real P2 and two P3s;
+`omabackup-rev-2` independently verified the four fixes were each correct
+on their own merits (including measuring the `timeout` fix's real effect
+with a fabricated slow login profile: without it, `rc=0` after the full
+3s a hung profile took; with it, `rc=124` at the configured 1s bound) and
+found two P3s of its own, one of which converges with `omabackup-rev`'s
+own P3 on the exact same underlying gap.
+
+- **P2 (`omabackup-rev`) -- the two new QML probes' assertions about
+  sanitization, truncation, and guard-ordering only proved their own
+  private mirror copies of the logic were correct, never that the REAL
+  `Panel.qml` matched.** Reproduced directly: removing the NUL-strip or
+  the 2000-char truncation from `Panel.qml`, or moving the stale-callback
+  guard to run AFTER the state mutations it exists to prevent, would leave
+  every existing check green. This is the same "hand-maintained mirror,
+  not import" tradeoff this whole test suite already accepts elsewhere
+  (documented in `killGroup`'s own comment) -- not something to solve with
+  a full module-extraction refactor in this round, but the SPECIFIC gap
+  (nothing anchored these exact expressions, or their order, against the
+  real source) is closeable cheaply. Three new structural substring checks
+  added in `test/panel.test.sh`, anchored directly on `Panel.qml`'s own
+  text: the NUL-strip and 2000-char truncation literals, and an
+  ORDER-sensitive pattern (`*guardText*'root.externalAction = ""'*`,
+  bash's `*A*B*` glob requiring A before B) proving the guard's own text
+  appears before the first state mutation it's supposed to gate.
+- **P3 (both reviewers, converging on the same gap from different
+  angles) -- the timeout structural check itself would have passed a
+  reordered, still-broken version of the fix.** Two independent `&&`-ed
+  substring clauses impose no order between them --
+  `omabackup-rev-2` constructed the exact regression
+  (`["bash", "-lc", 'exec "$@"', "bash", "timeout", ...]` -- `timeout`
+  moved back inside the login shell, just written by hand instead of
+  through `Util.execArgv`) and confirmed the OLD two-clause check passed
+  it. Fixed with a single ordered pattern instead of two independent
+  ones, the same `*A*B*` technique as the guard-ordering fix above --
+  named by `omabackup-rev-2` as the same family of defect this project
+  already took seriously in rounds 15 and 18 (an assertion that stops
+  discriminating in silence).
+- **P3 (`omabackup-rev`) -- the token-correlation regression only covered
+  the wrapper's normal-exit path, never its signal path.**
+  `bin/omabackup-tui`'s `_on_exit` has two nearly-identical `log-event`
+  calls (`"exit=$rc"` and `"signal=$TUI_SIGNAL"`); the earlier fix's own
+  test only drove the first. A same-shaped bug in the second could have
+  hidden indefinitely. The existing HUP-signal fixture (already present
+  for an unrelated regression) now also records its own `log-event` argv
+  and asserts the token there too.
+- **P3 (`omabackup-rev-2`) -- phase 3's "nothing was logged" assertion in
+  the launch-failure probe used a fixed ~800ms window, not a real
+  completion signal, and could pass for the wrong reason (the write just
+  hadn't landed yet) rather than because it was genuinely suppressed --
+  precisely the same login-shell-profile latency the round's own `timeout`
+  fix exists to bound, not eliminate.** Fixed using the standard technique
+  for proving a negative in an async system: after the suppressed
+  attempt's own process has actually exited (`!externalProc.running`, a
+  real signal, not a guess), dispatch a second, KNOWN-VALID sentinel
+  `log-event` call and wait for IT to land with the same retry loop
+  phase 1 already uses; only the content BEFORE the sentinel in the
+  record file is what the suppressed attempt could possibly have
+  contributed. The same "wait for the real signal, not a guessed window"
+  fix was applied to phase 2's own completion check for the same reason
+  (`omabackup-rev`'s related point that a fixed tick count there could
+  also check before the exit was actually delivered), and phase 2's own
+  artificial delay was widened (0.4s -> 0.8s) for a wider safety margin
+  against a starved event loop -- `omabackup-rev-2`'s own assessment that
+  a flake there fails in the safe direction (a spurious red, not a false
+  green) made this a lower-priority hardening, not a required fix, but
+  cheap enough to do anyway.
+
+Full suite after this round's fixes: **1259 passed, 0 failed**.
+
+### Round omabackup-32: the second correction-round's own verification, and where this stopped
+
+`herdr-review` dispatched on round-31's own fixes -- the second and, per
+this project's own "max 2 correction rounds" discipline, LAST
+self-directed correction-verification round before any remaining finding
+goes to the user instead of being fixed unilaterally. This round produced
+a genuine, and instructive, split: `omabackup-rev` reported two more P2s
+and three P3s; `omabackup-rev-2` explicitly **APPROVE**d, stating plainly
+that no unresolved P1 or P2 remained, and characterized the overlapping
+concern as low-priority residue for "a future round, or never."
+
+Three of `omabackup-rev`'s findings were precise, cheap, and clearly
+worth fixing regardless of the disagreement -- applied immediately, not
+treated as requiring a fresh round:
+
+- The `launchAction`/`launchToken` guard-ordering anchor only ordered
+  `launchAction`'s own comparison against the mutation, leaving
+  `launchToken`'s comparison free to move after `root.externalAction = ""`
+  without breaking the check -- a real, narrower regression shape than
+  "the whole guard moved" (which `omabackup-rev-2`'s own testing HAD
+  caught). Fixed by anchoring both comparisons as one unit, ending at the
+  guard's own `) return`.
+- The truncation anchor only required `errText.length > 2000` to appear,
+  not the assignment `errText = errText.slice(0, 2000)` -- a no-op body
+  would have still passed. Fixed by anchoring the full `if (...) errText =
+  ...` line as one literal.
+- The `timeout`-wrapping anchor's ordered `*A*B*` pattern still accepted
+  `Util.execArgv(["timeout", ...])` -- "timeout text before bash -lc text"
+  is also true for that construction, which puts `Util`'s own internal
+  login shell back outside `timeout`'s reach (the exact round-30 defect,
+  surviving through the ordered check that was supposed to close it).
+  Fixed by anchoring the literal call shape
+  `Quickshell.execDetached(["timeout"` instead.
+
+All three fixes verified fail-before/pass-after against the exact
+regressions described, applied to a scratch copy of `Panel.qml` (not the
+real file) via Python string replacement, confirming each check now
+rejects what it previously accepted.
+
+Two comment corrections from `omabackup-rev-2`, also applied: a stale
+"0.4s" reference in `panel-logs-launch-failure.qml` left over from
+widening phase 2's delay to 0.8s; and, more substantively, the
+phase-3 sentinel's own comment was rewritten after `omabackup-rev-2`
+pointed out it attributed the proof of absence to the wrong clause --
+`beforeSentinel` is a readability aid, not what actually closes the case;
+`lines.length === 11` is, since it catches a leak wherever in the file it
+lands, not only before the sentinel. `omabackup-rev-2` flagged the
+mis-attribution as more urgent than the underlying gap itself, since a
+future reader could "simplify" the check down to just the misleadingly
+central-looking `beforeSentinel` clause and silently remove the part that
+actually works.
+
+**What was NOT fixed, and why this is where self-directed correction
+stops:** `omabackup-rev`'s remaining findings -- that the phase-3 sentinel
+does not FORMALLY fence the suppressed attempt's own write (both are
+independent `execDetached` chains with no ordering guarantee, so a
+sufficiently delayed leak could in principle land after the sentinel and
+still pass), and that phases 2/4/5 still read their target state after a
+real-but-not-fully-synchronized signal rather than a true blocking
+handshake -- are real, and `omabackup-rev-2` independently confirmed the
+same underlying facts. The two reviewers diverge only on severity:
+`omabackup-rev` weighs the sentinel gap as P2 and recommends a
+synchronous in-memory dispatch log or an explicit join before proving
+absence; `omabackup-rev-2`, having derived that the check's REAL
+soundness rests on `lines.length` catching a leak anywhere in the file
+(not on the sentinel ordering the way its comment used to imply), assesses
+the residual window as narrow enough (it requires a reintroduced bug's own
+leaked write to lose a race against another near-identical, independently
+dispatched write) to defer indefinitely without blocking. This is a
+genuine severity disagreement over the same underlying facts, arriving
+exactly at the point this project's own review discipline says to stop
+iterating and hand the state to the user rather than picking a side
+unilaterally.
+
+Full suite after this round's fixes: **1259 passed, 0 failed**. Both
+`herdr-review` rounds' full test-suite runs (`omabackup-rev-2`,
+independently) matched.
+
 ## Open questions for the user, not yet decided
 
 - What path should the first `dir` destination actually point at?

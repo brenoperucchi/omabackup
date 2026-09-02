@@ -186,10 +186,19 @@ _on_exit() {
     # actually implement `log-event` (as this file's own test fixtures
     # legitimately substitute, to drive the wrapper in isolation) hangs this
     # exit path indefinitely instead of ever reaching `_notify`.
+    # (token $token): found missing here in review (round omabackup-30,
+    # both omabackup-rev and omabackup-rev-2 independently) -- Panel.qml's
+    # own panel-detected log-event calls (externalRecoveryTimer,
+    # externalProc's launch-failure branch) already include this same
+    # token, and the design decision to keep two separate log lines per
+    # session instead of deduplicating them depends on a reader being able
+    # to connect them. Without the token on THIS side too, that connection
+    # does not exist: two "config (interactive)" lines on a day with more
+    # than one config session are not distinguishable from each other.
     if [[ -n "$TUI_SIGNAL" ]]; then
-        timeout --kill-after=2s 5s "$cli" log-event "$action (interactive)" "signal=$TUI_SIGNAL" "after ${elapsed}s" >/dev/null 2>&1
+        timeout --kill-after=2s 5s "$cli" log-event "$action (interactive)" "signal=$TUI_SIGNAL" "after ${elapsed}s (token $token)" >/dev/null 2>&1
     else
-        timeout --kill-after=2s 5s "$cli" log-event "$action (interactive)" "exit=$rc" "after ${elapsed}s" >/dev/null 2>&1
+        timeout --kill-after=2s 5s "$cli" log-event "$action (interactive)" "exit=$rc" "after ${elapsed}s (token $token)" >/dev/null 2>&1
     fi
     _notify "$rc"
 }

@@ -1124,6 +1124,19 @@ Panel {
     onTriggered: {
       if (root.externalAction === "") return
       externalProc.errBuffer = ""
+      // Captured here, not re-read from root.externalAction/externalToken
+      // inside onExited below -- found in review (round omabackup-30,
+      // `omabackup-rev`): those two root properties are the CURRENT
+      // session's mutable state, not this specific launch's own identity.
+      // canOpenExternalTui already refuses a second openExternalTui() while
+      // externalBusy is set, so no caller can reach this today with a
+      // different session already active -- but a callback that reads
+      // mutable shared state instead of its own captured identity is a
+      // latent bug waiting for the NEXT caller who doesn't realize that
+      // gating is load-bearing here. Capturing at launch time removes the
+      // dependency on that invariant entirely.
+      externalProc.launchAction = root.externalAction
+      externalProc.launchToken = root.externalToken
       externalProc.command = ["omarchy-launch-tui",
                               "--app-id=org.omarchy.omabackup-" + root.externalAction,
                               root.tuiCli, root.cli, root.externalAction, root.externalToken]
@@ -1131,13 +1144,48 @@ Panel {
     }
   }
 
+  // Prefixes `timeout` OUTSIDE Util.execArgv's own login shell, not inside
+  // it -- Util.execArgv's real implementation is
+  // `Quickshell.execDetached(["bash", "-lc", 'exec "$@"', "bash"].concat(argv))`
+  // (`/usr/share/omarchy/shell/Commons/Util.qml`, confirmed by direct
+  // read): whatever `argv` is only starts running AFTER `bash -lc` has
+  // already sourced the user's login profile. Passing `timeout` as part of
+  // that `argv` (this file's first attempt, found wrong in review, round
+  // omabackup-30, `omabackup-rev`) bounds only the exec after the profile
+  // finishes -- a hung profile itself is never bounded at all. Building the
+  // full argv here and driving `Quickshell.execDetached` directly, with
+  // `timeout` as the true outermost element, bounds the profile-sourcing
+  // too. Still injection-safe: every value stays a literal argv element
+  // through `"$@"`, never interpolated into the `bash -lc` string itself
+  // (that string is the fixed constant `'exec "$@"'`, unchanged from
+  // Util.execArgv's own).
+  function logEventDetached(argv) {
+    Quickshell.execDetached(["timeout", "--kill-after=2s", "10s",
+                              "bash", "-lc", 'exec "$@"', "bash"].concat(argv))
+  }
+
   Process {
     id: externalProc
     property string errBuffer: ""
+    property string launchAction: ""
+    property string launchToken: ""
     command: ["true"]
     stderr: StdioCollector { onStreamFinished: externalProc.errBuffer = text }
     onExited: function(code) {
-      var action = root.externalAction
+      // Stale-callback guard, ahead of everything else in this handler --
+      // found in review (round omabackup-30, `omabackup-rev`): the launch
+      // and token this specific exit belongs to are `launchAction`/
+      // `launchToken`, captured once at launch time, NOT whatever
+      // root.externalAction/root.externalToken currently hold. If they no
+      // longer match the session this Process object is CURRENTLY tracking,
+      // this callback is for a launch attempt the panel has already moved
+      // on from -- clearing state, setting lastError, or logging on its
+      // behalf would attribute this outcome to whatever session root's
+      // fields now describe instead.
+      if (externalProc.launchAction === "" || externalProc.launchAction !== root.externalAction
+          || externalProc.launchToken !== root.externalToken) return
+      var action = externalProc.launchAction
+      var token = externalProc.launchToken
       if (code !== 0) {
         externalRecoveryTimer.stop()
         root.externalAction = ""
@@ -1146,6 +1194,41 @@ Panel {
         root.configuring = false
         root.lastError = action + ": " + (externalProc.errBuffer.trim() || ("exit " + code))
         root.refresh(true)
+        // The wrapper never started -- there is no bin/omabackup-tui process
+        // to log this session's outcome for itself, so the panel is the only
+        // thing that ever will. Best-effort, fire-and-forget: recover the UI
+        // first (above), dispatch the log line second, so a synchronous
+        // throw from execArgv can never leave the panel stuck. `action`
+        // guarded separately from `root.cli`, not folded into one check --
+        // found in design consultation (herdr-ask, round omabackup-12) that
+        // this branch, unlike externalRecoveryTimer's own onTriggered, has
+        // no existing empty-action guard, which would reopen the blank-
+        // action log line already fixed elsewhere (round omabackup-23).
+        // `action` cannot be empty here regardless (the stale-callback
+        // guard above already refused an empty launchAction), kept anyway
+        // as a direct, self-contained condition rather than relying on
+        // that guard's own reasoning holding forever.
+        if (root.cli !== "" && action !== "") {
+          // errBuffer is an unbounded StdioCollector (see its own
+          // declaration above) -- truncate before it becomes an argv
+          // element and strip embedded NULs, so an oversized or NUL-
+          // containing stderr blob cannot silently fail the very call
+          // meant to explain the failure (E2BIG or a truncated C string).
+          // NUL-stripped BEFORE truncating, so the 2000-char budget counts
+          // surviving characters, not ones about to be discarded anyway.
+          var errText = externalProc.errBuffer.trim().replace(/\x00/g, "")
+          if (errText.length > 2000) errText = errText.slice(0, 2000) + " …(truncated)"
+          // The exit code must survive even when stderr is present -- keep
+          // both, not the `errBuffer || ("exit " + code)` shape used for
+          // lastError above, which silently drops the code whenever stderr
+          // is non-empty.
+          try {
+            root.logEventDetached([root.cli, "log-event",
+                            action + " (interactive)", "failed (launch)",
+                            "exit " + code + (errText ? "; stderr=" + errText : "") +
+                            " (token " + token + ")"])
+          } catch (e) {}
+        }
       }
       else if (action !== "") {
         externalRecoveryTimer.restart()
@@ -1160,12 +1243,49 @@ Panel {
     onTriggered: {
       if (root.externalAction === "") return
       var action = root.externalAction
+      var token = root.externalToken
       root.externalAction = ""
       root.externalToken = ""
       root.externalBusy = false
       root.configuring = false
       root.lastError = action + ": terminal did not report completion; status refreshed"
       root.refresh(true)
+      // Same reasoning as externalProc's own log-event call above: the
+      // wrapper may still be alive but unreachable, so this is the only
+      // record of the panel giving up. Deliberately NOT deduplicated
+      // against a possible later, real log-event call from the wrapper
+      // itself (if it eventually recovers and exits normally) -- design
+      // consultation (herdr-ask, round omabackup-12) settled this as two
+      // different true facts worth keeping, not a duplicate to suppress:
+      // "the panel stopped waiting" and "the wrapper finished, and how"
+      // together reveal a slow-not-dead wrapper that a single line
+      // couldn't distinguish. The shared token (also in the wrapper's own
+      // _on_exit log-event calls, bin/omabackup-tui:190,192) is what lets
+      // a reader connect the two lines for the same session -- both
+      // reviewers independently found this comment's claim was false on
+      // the wrapper's side at the time it was written (round omabackup-30);
+      // bin/omabackup-tui's own two log-event calls now include the token
+      // too, so this correlation is real, not aspirational.
+      //
+      // `token` read directly from root.externalToken (not captured at an
+      // earlier point the way externalProc's launchAction/launchToken are)
+      // -- safe here because this Timer's own onTriggered firing IS this
+      // specific session's own event: openExternalTui assigns
+      // externalToken before externalAction, so a non-empty action (the
+      // guard above) already implies a non-empty token, and every path
+      // that resolves a session before this timer fires also calls this
+      // timer's own .stop() (finishExternalTui, externalProc's
+      // launch-failure branch) -- unlike a spawned OS process's onExited,
+      // which cannot be un-fired once the process has already exited, so
+      // externalProc needs its own captured-identity guard and this timer
+      // does not.
+      if (root.cli !== "")
+        try {
+          root.logEventDetached([root.cli, "log-event",
+                          action + " (interactive)", "failed (no heartbeat)",
+                          "gave up after " + Math.round(root.externalRecoveryMs / 1000) +
+                          "s with no heartbeat or completion callback (token " + token + ")"])
+        } catch (e) {}
     }
   }
 

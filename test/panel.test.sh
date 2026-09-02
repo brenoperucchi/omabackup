@@ -180,6 +180,109 @@ else
     fail "a closed terminal or missing IPC can leave the panel busy forever"
 fi
 
+# The two probes below prove the actual dispatched log-event content and
+# guards behaviorally; these are plain structural checks for facts a
+# behavioral probe cannot easily prove without shelling out to `ps` mid-run
+# -- that a real `timeout` bound wraps the WHOLE dispatch (including the
+# login shell's own profile-sourcing, not just the exec after it -- round
+# omabackup-30's own P3 finding against the first draft), and that the
+# stale-callback guard (round omabackup-30's P2 finding) is really there,
+# not just present somewhere in the file. Added after a real incident
+# (panel showed "config: terminal did not report completion; status
+# refreshed" with nothing in the log to explain it), design consultation
+# (herdr-ask, round omabackup-12), and code review (round omabackup-30).
+RECOVERY_BLOCK="$(sed -n '/id: externalRecoveryTimer/,/^  }/p' Panel.qml)"
+LOGDISPATCH_BLOCK="$(sed -n '/function logEventDetached/,/^  }/p' Panel.qml)"
+
+# The several `*A*B*` ordered-glob checks below (bash requires A's text to
+# appear before B's) prove "an A exists before a B", not "no B exists
+# before A" -- verified in review (round omabackup-32, `omabackup-rev-2`)
+# to not be an exploitable gap TODAY only because each anchor text is
+# unique within its own captured block. If a second, earlier occurrence of
+# one of these exact anchor strings is ever added to Panel.qml, these
+# checks would stop discriminating silently -- worth knowing before
+# reusing this technique elsewhere in this file.
+#
+# Anchored on the literal call shape `Quickshell.execDetached(["timeout"`,
+# not just "timeout text before bash -lc text" -- found by review (round
+# omabackup-31, `omabackup-rev-2`, then round omabackup-32, `omabackup-rev`,
+# on a second gap in the same check): an ordered `*A*B*` pattern alone still
+# accepts `Util.execArgv(["timeout", ..., "bash", "-lc", ...])`, which
+# satisfies "timeout before bash -lc" just as well while putting Util's OWN
+# internal login shell back outside timeout's reach -- the exact round-30
+# defect, reproduced through the ordered check instead of the two-clause
+# one. Requiring `Quickshell.execDetached(["timeout"` as one literal
+# refuses any construction that routes through Util.execArgv at all.
+it "the panel's shared log-event dispatcher wraps timeout around the WHOLE call, including the login shell"
+if [[ "$LOGDISPATCH_BLOCK" == *'Quickshell.execDetached(["timeout", "--kill-after=2s", "10s",'* ]]; then
+    ok
+else
+    fail "logEventDetached no longer bounds the whole dispatch with timeout, or timeout moved inside the login shell again"
+fi
+
+it "both panel-detected sites dispatch through the shared, timeout-bounded helper"
+if [[ "$EXTERNAL_BLOCK" == *'root.logEventDetached([root.cli, "log-event"'* \
+      && "$EXTERNAL_BLOCK" == *'root.cli !== "" && action !== ""'* \
+      && "$RECOVERY_BLOCK" == *'root.logEventDetached([root.cli, "log-event"'* ]]; then
+    ok
+else
+    fail "a panel-dispatched log-event call bypassed the shared helper, or is missing its action guard"
+fi
+
+# Ordered pattern again (guard text before the first state mutation) -- the
+# two new QML probes are hand-maintained mirrors, not imports of Panel.qml
+# itself (this suite's existing, documented convention -- see killGroup's
+# own comment), so nothing forces them to notice if the REAL guard were
+# removed, reordered to run after state was already mutated, or if the real
+# NUL-strip/truncation were deleted -- found by review (round omabackup-31,
+# `omabackup-rev`, reproduced: removing either from Panel.qml, or moving the
+# guard after the mutations, leaves the probes' own private copies of that
+# logic untouched and every existing check still green). These structural
+# anchors on the real source close that specific gap without a full
+# module-extraction refactor of the mirror convention itself.
+# Both conditions anchored in ONE ordered pattern, not two independent
+# clauses -- found by review (round omabackup-32, `omabackup-rev`): the
+# previous version only ordered launchAction's own comparison against the
+# mutation, leaving launchToken's comparison free to be moved after
+# `root.externalAction = ""` (a real, narrower regression than "the whole
+# guard moved") without breaking this check. Anchoring
+# "...launchToken !== root.externalToken) return" as one unit -- the
+# guard's own closing token -- proves BOTH comparisons are still inside
+# the same `if (...) return` and that the whole thing still precedes the
+# mutation.
+it "externalProc.onExited refuses a callback whose launch identity no longer matches the active session"
+if [[ "$EXTERNAL_BLOCK" == *'property string launchAction: ""'* \
+      && "$EXTERNAL_BLOCK" == *'property string launchToken: ""'* \
+      && "$EXTERNAL_BLOCK" == *'externalProc.launchAction !== root.externalAction'*'externalProc.launchToken !== root.externalToken) return'*'root.externalAction = ""'* \
+      && "$LAUNCH_BLOCK" == *'externalProc.launchAction = root.externalAction'* \
+      && "$LAUNCH_BLOCK" == *'externalProc.launchToken = root.externalToken'* ]]; then
+    ok
+else
+    fail "externalProc's launch identity is no longer captured at launch time, or is no longer compared (both action AND token) BEFORE any state mutation in onExited"
+fi
+
+# The condition and its own assignment anchored as ONE literal substring,
+# not two independent clauses -- found by review (round omabackup-32,
+# `omabackup-rev`): checking `errText.length > 2000` alone does not prove
+# the body actually truncates; a no-op body (or one that clears errText
+# entirely) would still satisfy that clause on its own.
+it "the launch-failure detail sanitizes and bounds stderr before it becomes an argv element"
+if [[ "$EXTERNAL_BLOCK" == *'.replace(/\x00/g, "")'* \
+      && "$EXTERNAL_BLOCK" == *'if (errText.length > 2000) errText = errText.slice(0, 2000)'* \
+      && "$EXTERNAL_BLOCK" == *'.replace(/\x00/g, "")'*'if (errText.length > 2000) errText = errText.slice(0, 2000)'* ]]; then
+    ok
+else
+    fail "the real NUL-stripping or 2000-char truncation is missing, or NUL-stripping no longer runs before truncation"
+fi
+
+it "the panel itself logs when the wrapper goes silent (recovery timeout)"
+_qml_probe test/qml/panel-logs-recovery-timeout.qml \
+    && ok || fail "externalRecoveryTimer firing did not dispatch the expected log-event call"
+
+it "the panel itself logs a failed terminal launch, and never with a blank action"
+_qml_probe test/qml/panel-logs-launch-failure.qml \
+    && ok || fail "externalProc's launch-failure branch did not dispatch log-event correctly, or logged with an empty action"
+
 it "the heartbeat is owned by the wrapper process"
 if grep -Fq 'local parent_pid="$$"' bin/omabackup-tui \
     && grep -Fq 'while kill -0 "$parent_pid"' bin/omabackup-tui \
@@ -638,18 +741,49 @@ assert_eq "$(cat "$HANDOFF_CLI_LOG" 2>/dev/null)" "restore"
 # one), so only an exact match actually reproduces the bug.
 assert_eq "$(cat "$HANDOFF_CALL_LOG" 2>/dev/null)" "brenoperucchi.omabackup tuiFinished restore:7:42"
 
+# The design decision to keep the panel's OWN two log-event lines
+# undeduplicated (externalRecoveryTimer, externalProc's launch-failure
+# branch) depends on a reader being able to connect a late wrapper
+# completion back to the panel's earlier "gave up" line via a shared
+# token. Found missing here in review (round omabackup-30, both
+# reviewers independently): the wrapper's own log-event calls did not
+# carry the token at all. This captures the wrapper's REAL invocation
+# argv (not a source-text substring check) and confirms it now does.
+LOGTOKEN_HOME="$(mktemp -d)"
+mkdir -p "$LOGTOKEN_HOME/bin"
+LOGTOKEN_CLI="$LOGTOKEN_HOME/fake-cli"
+LOGTOKEN_LOG="$LOGTOKEN_HOME/log-event.log"
+printf '#!/bin/bash\nif [[ "$1" == log-event ]]; then printf "%%s\\n" "$*" >"%s"; exit 0; fi\nexit 0\n' "$LOGTOKEN_LOG" >"$LOGTOKEN_CLI"
+printf '#!/bin/bash\nexit 0\n' >"$LOGTOKEN_HOME/bin/omarchy-shell"
+chmod +x "$LOGTOKEN_CLI" "$LOGTOKEN_HOME/bin/omarchy-shell"
+PATH="$LOGTOKEN_HOME/bin:$PATH" bin/omabackup-tui "$LOGTOKEN_CLI" config 1788124236-1 >/dev/null 2>&1
+
+it "the wrapper's own log-event call carries the same token the panel uses to correlate lines"
+assert_contains "$(cat "$LOGTOKEN_LOG" 2>/dev/null)" "(token 1788124236-1)"
+
 SIGNAL_CLI="$HANDOFF_HOME/signal-cli"
 SIGNAL_CALL_LOG="$HANDOFF_HOME/signal-call.log"
-printf '#!/bin/bash\n[[ "$1" == log-event ]] && exit 0\nkill -HUP "$$"\n' >"$SIGNAL_CLI"
+# Records its own log-event argv (instead of just accepting and discarding
+# it) -- found by review (round omabackup-31, `omabackup-rev`): the earlier
+# token regression only drove the CLI-exited-normally path through
+# bin/omabackup-tui's own `_on_exit` (its `"exit=$rc"` branch); the
+# SIGNAL path (its `"signal=$TUI_SIGNAL"` branch, exercised by this exact
+# fixture) was never checked for the same `(token ...)` fix, and a
+# same-shaped bug could have hidden there undetected.
+SIGNAL_LOGEVENT_LOG="$HANDOFF_HOME/signal-logevent.log"
+printf '#!/bin/bash\nif [[ "$1" == log-event ]]; then printf "%%s\\n" "$*" >"%s"; exit 0; fi\nkill -HUP "$$"\n' "$SIGNAL_LOGEVENT_LOG" >"$SIGNAL_CLI"
 printf '#!/bin/bash\nprintf "%%s\\n" "$*" >"%s"\n' "$SIGNAL_CALL_LOG" >"$HANDOFF_HOME/bin/omarchy-shell"
 chmod +x "$SIGNAL_CLI" "$HANDOFF_HOME/bin/omarchy-shell"
 SIGNAL_RC=0
-PATH="$HANDOFF_HOME/bin:$PATH" bin/omabackup-tui "$SIGNAL_CLI" config 42 >/dev/null 2>&1 || SIGNAL_RC=$?
+PATH="$HANDOFF_HOME/bin:$PATH" bin/omabackup-tui "$SIGNAL_CLI" config 1788124236-8 >/dev/null 2>&1 || SIGNAL_RC=$?
 
 it "the TUI wrapper notifies completion when its child terminates by signal"
 assert_eq "$SIGNAL_RC" "129"
 # See the note above the handoff assertion: exact match on purpose.
-assert_eq "$(cat "$SIGNAL_CALL_LOG" 2>/dev/null)" "brenoperucchi.omabackup tuiFinished config:129:42"
+assert_eq "$(cat "$SIGNAL_CALL_LOG" 2>/dev/null)" "brenoperucchi.omabackup tuiFinished config:129:1788124236-8"
+
+it "the wrapper's log-event call on the SIGNAL path also carries the token, not just the normal-exit path"
+assert_contains "$(cat "$SIGNAL_LOGEVENT_LOG" 2>/dev/null)" "(token 1788124236-8)"
 
 # A terminal launcher gives the wrapper a tty. Bash otherwise replaces stdin
 # with /dev/null for an asynchronous child, which silently sends the real

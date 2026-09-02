@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "brenoperucchi.omabackup",
   "name": "OmaBackup",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "author": "brenoperucchi",
   "license": "MIT",
   "description": "Dotfile backup that tells you when it stopped covering what the system reads, and refuses to restore onto versions it does not know.",

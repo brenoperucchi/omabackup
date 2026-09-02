@@ -2842,6 +2842,13 @@ cmd_version() {
 # implementation instead of two racing processes.
 cmd_log_event() {
     (($# == 2 || $# == 3)) || die "usage: omabackup log-event ACTION OUTCOME [DETAIL]"
+    # Calls _log_write directly, not _log_run_on_failure -- every caller of
+    # this subcommand (bin/omabackup-tui's own _on_exit, and Panel.qml's
+    # two panel-detected-failure sites) already decided its own outcome and
+    # is rare by construction (one interactive session, or 900s of silence),
+    # so the coalescing state machine (`.last-*` files, "only log a
+    # transition") that verify/status need for constant polling does not
+    # apply here and would only add unneeded state.
     _log_write "$1" "$2" "${3:-}"
 }
 
