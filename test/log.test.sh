@@ -323,6 +323,232 @@ it "the Settings TUI's Log retention option rejects non-numeric input without ch
 assert_not_contains "$OPT7_BAD_TUI" "Log retention saved."
 assert_eq "$(jq -r '.retentionDays' "$OPT7_HOME/.config/omabackup/log.json" 2>/dev/null)" "14"
 
+# The TUI's own header now shows the log directory -- shared by both config
+# and restore (lib/tui.sh's tui_header, not cmd_config_tui specifically), so
+# a user hunting for "what actually happened" (the motivating case for the
+# whole log feature) does not need to already know the path exists.
+it "the Settings TUI's own header shows where the log lives"
+assert_contains "$OPT7_TUI" "Log: "
+
+# Found by review (round omabackup-33, `omabackup-rev`): LOG_DIR is
+# derived from user-settable OMABACKUP_LOG_DIR/OMABACKUP_STATE, and
+# _tilde alone does no sanitization -- a value containing a CSI sequence
+# could clear the screen or move the cursor, and an embedded newline could
+# forge an extra banner line. Set OMABACKUP_LOG_DIR directly (bypassing
+# OMABACKUP_STATE's own derivation) to a value carrying both, and confirm
+# neither survives into the captured output.
+HDRSANITIZE_HOME="$(_log_home)"
+HDRSANITIZE_EVIL_LOGDIR=$'/tmp/evil\x1b[2Jinjected\nFAKE LINE'
+HDRSANITIZE_CMD="env HOME='$HDRSANITIZE_HOME' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$HDRSANITIZE_HOME/g.json' \
+     OMABACKUP_STATE='$HDRSANITIZE_HOME/.state' OMABACKUP_REPO='$HDRSANITIZE_HOME/repo' \
+     OMABACKUP_DESTINATIONS='$HDRSANITIZE_HOME/dest.json' OMABACKUP_SYSTEMCTL='$HDRSANITIZE_HOME/stub/systemctl' \
+     OMABACKUP_LOG_DIR=$(printf '%q' "$HDRSANITIZE_EVIL_LOGDIR") \
+     XDG_RUNTIME_DIR=/nonexistent '$OB' config"
+HDRSANITIZE_TUI="$(timeout --kill-after=5s 15s bash -c \
+    'printf "%b" "$1" | script -qec "$2" /dev/null 2>&1' _ $'q\n' "$HDRSANITIZE_CMD")"
+
+it "the TUI header sanitizes the log path before displaying it"
+# tui_sanitize_field neutralizes an embedded newline to "?" rather than
+# dropping the text after it -- so "FAKE LINE" is still expected to appear,
+# but joined onto the SAME "Log: " line, never as an independent line of
+# its own (which would mean the injected newline forged a real extra line
+# in the banner).
+assert_not_contains "$HDRSANITIZE_TUI" $'\nFAKE LINE'
+# The CSI sequence itself must be gone (tui_sanitize strips it entirely,
+# not just escapes it) -- checked on the "Log:" line specifically, since
+# tui_header's OWN legitimate screen-clear also emits a real CSI earlier in
+# the same output.
+HDRSANITIZE_LOGLINE="$(printf '%s' "$HDRSANITIZE_TUI" | command grep -a -- '^Log: ')"
+assert_not_contains "$HDRSANITIZE_LOGLINE" $'\x1b'
+assert_contains "$HDRSANITIZE_LOGLINE" "evilinjected"
+assert_contains "$HDRSANITIZE_LOGLINE" "FAKE LINE"
+
+# Settings TUI option 8: view the last N log lines, printed directly (not
+# via `notice`, which tui_header's own screen-clear would erase before it
+# could be read) and gated behind an explicit "Press Enter to continue".
+OPT8_HOME="$(_log_home)"
+mkdir -p "$OPT8_HOME/.state/log"
+printf '2026-09-01T10:00:00-03:00  sync  ok  5s\n2026-09-01T10:15:00-03:00  push  ok  3s\n' \
+    >"$OPT8_HOME/.state/log/omabackup-2026-09-01.log"
+OPT8_TUI="$(timeout --kill-after=5s 15s bash -c \
+    'printf "%b" "$1" | script -qec "$2" /dev/null 2>&1' _ $'8\n\n\nq\n' \
+    "env HOME='$OPT8_HOME' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$OPT8_HOME/g.json' \
+     OMABACKUP_STATE='$OPT8_HOME/.state' OMABACKUP_REPO='$OPT8_HOME/repo' \
+     OMABACKUP_DESTINATIONS='$OPT8_HOME/dest.json' OMABACKUP_SYSTEMCTL='$OPT8_HOME/stub/systemctl' \
+     XDG_RUNTIME_DIR=/nonexistent '$OB' config")"
+
+it "the Settings TUI's View log option prompts, defaults to 20, and prints the real log content"
+assert_contains "$OPT8_TUI" "How many lines? [20]"
+assert_contains "$OPT8_TUI" "sync  ok  5s"
+assert_contains "$OPT8_TUI" "push  ok  3s"
+assert_contains "$OPT8_TUI" "Press Enter to continue"
+
+# The test above sends all keystrokes upfront -- it proves the prompt text
+# and log content both appear somewhere in the captured output, but not
+# that "Press Enter to continue" actually BLOCKED the next redraw. Found by
+# review (round omabackup-33, `omabackup-rev`): if `tui_read_line` on that
+# line were removed entirely, the trailing Enter in the keystroke script
+# would just become an extra invalid main-menu choice, and the same
+# substrings would still all appear somewhere in the output -- this test
+# would keep passing against a broken gate.
+#
+# Proof technique, redesigned in review (round omabackup-34, `omabackup-
+# rev`) to remove EVERY timing guess: instead of sending a bare Enter and
+# then trying to prove NOTHING happened within some window (the same
+# "absence relative to a guessed delay" fragility already fixed once for
+# the launch-failure QML probe's phase 3, round omabackup-31), send "q\n"
+# itself as the continuing keystroke. `tui_read_line` accepts any line, so
+# with a WORKING gate "q" is consumed as "press enter to continue" and the
+# process loops back to a live, redrawn main menu -- a SECOND "q" is then
+# needed to actually exit. With a BROKEN (missing) gate, that same "q"
+# falls straight through to the OUTER menu's own `q|Q) ... return 0`
+# branch and the whole process exits immediately, needing only the one
+# "q". The observable is "is the process still alive", not a timing
+# window -- no sleep, no false-green possible from CI slowness.
+#
+# Driver matches restore.test.sh's own established shape
+# (`_restore_tui_start`/`_wait_for`/`_send`/`_finish`, test/restore.test.sh
+# lines ~2460-2525): a `driver_failed` flag so a stalled wait actually
+# fails the test instead of silently sampling nonsense, writes isolated
+# from SIGPIPE, and a bounded wait with a TERM/KILL fallback so a
+# regression that leaves the child alive or out of phase cannot hang the
+# whole suite.
+OPT8SYNC_HOME="$(_log_home)"
+mkdir -p "$OPT8SYNC_HOME/.state/log"
+# Keep this fixture line free of the literal text "Choose an option" --
+# noted in review (round omabackup-36, `omabackup-rev-2`): the draw
+# counter below is a plain substring count over the whole PTY transcript,
+# which includes this printed log content. A "realistic" fixture that
+# happened to contain the menu's own text would silently break the count.
+printf '2026-09-01T10:00:00-03:00  sync  ok  5s\n' >"$OPT8SYNC_HOME/.state/log/omabackup-2026-09-01.log"
+OPT8SYNC_LOG="$OPT8SYNC_HOME/tui.log"
+OPT8SYNC_FIFO="$OPT8SYNC_HOME/input"
+mkfifo "$OPT8SYNC_FIFO"
+script -qec "env HOME='$OPT8SYNC_HOME' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$OPT8SYNC_HOME/g.json' \
+     OMABACKUP_STATE='$OPT8SYNC_HOME/.state' OMABACKUP_REPO='$OPT8SYNC_HOME/repo' \
+     OMABACKUP_DESTINATIONS='$OPT8SYNC_HOME/dest.json' OMABACKUP_SYSTEMCTL='$OPT8SYNC_HOME/stub/systemctl' \
+     XDG_RUNTIME_DIR=/nonexistent '$OB' config" /dev/null <"$OPT8SYNC_FIFO" >"$OPT8SYNC_LOG" 2>&1 &
+OPT8SYNC_PID=$!
+OPT8SYNC_DRIVER_FAILED=0
+exec 9>"$OPT8SYNC_FIFO"
+
+_opt8sync_wait_for() {  # _opt8sync_wait_for <needle>
+    local i
+    for ((i = 0; i < 200; i++)); do
+        command grep -Fq -- "$1" "$OPT8SYNC_LOG" 2>/dev/null && return 0
+        sleep 0.05
+    done
+    OPT8SYNC_DRIVER_FAILED=1
+    return 1
+}
+_opt8sync_count() {  # _opt8sync_count <needle> -> occurrences so far
+    command grep -F -o -- "$1" "$OPT8SYNC_LOG" 2>/dev/null | wc -l
+}
+# `_opt8sync_wait_for` alone is only an EXISTENCE check -- waiting for
+# "Choose an option" to reappear with it would return instantly, since the
+# string already exists from the very first menu draw, not from the redraw
+# this test actually needs to wait for. Confirmed live: without this
+# count-based wait, "after" was captured before the real second redraw had
+# necessarily finished, intermittently reading 1 instead of 2 depending on
+# scheduling. Same shape as restore.test.sh's own `_restore_tui_wait_count`.
+_opt8sync_wait_count() {  # _opt8sync_wait_count <needle> <n>
+    local i
+    for ((i = 0; i < 200; i++)); do
+        (( $(_opt8sync_count "$1") >= $2 )) && return 0
+        sleep 0.05
+    done
+    OPT8SYNC_DRIVER_FAILED=1
+    return 1
+}
+_opt8sync_send() {  # _opt8sync_send <text>
+    if ! kill -0 "$OPT8SYNC_PID" 2>/dev/null; then
+        OPT8SYNC_DRIVER_FAILED=1
+        return 1
+    fi
+    ( printf '%s' "$1" >&9 ) 2>/dev/null || { OPT8SYNC_DRIVER_FAILED=1; return 1; }
+}
+
+_opt8sync_wait_for "Choose an option" && _opt8sync_send $'8\n'
+_opt8sync_wait_for "How many lines?" && _opt8sync_send $'\n'
+_opt8sync_wait_for "sync  ok  5s"
+# "x\nq\n", not just "q\n" -- redesigned in review (round omabackup-35,
+# `omabackup-rev`, disputing the previous single-"q" version's own
+# soundness): sampling "is the process still alive right after the second
+# menu-draw text appears" has a genuine narrow window -- a BROKEN gate's
+# own redraw is printed, then blocks on the menu's OWN read, and a sample
+# landing in between (redraw visible, `q` not yet consumed) would
+# misclassify a broken gate as working. `omabackup-rev-2` independently
+# verified the underlying mechanism has no such window in the FIFO/EOF
+# sense, but did not address this specific sampling race -- treated here
+# as the more conservative reviewer's concern being real enough to design
+# around rather than adjudicate.
+#
+# Queuing "x" first removes the ambiguity entirely, by making the two
+# outcomes differ in a COUNT observed only once the process has fully
+# and unambiguously exited, not in a liveness sample mid-flight: with a
+# WORKING gate, "x" is consumed as the continuing keystroke (any input is
+# accepted there, no value inspected) and "q" becomes the FIRST real menu
+# choice after just one redraw -- 2 "Choose an option" draws total. With a
+# BROKEN gate, the log-view branch falls straight through to the menu,
+# "x" lands there as an INVALID choice (not 1-8/q), forcing one more
+# redraw with a "Please choose 1-8 or q." notice before "q" is finally
+# read as the exit choice -- 3 draws total. The two keystrokes are queued
+# together up front; blocking reads consume them in order regardless of
+# how many redraws happen in between, so there is nothing to time here.
+_opt8sync_wait_for "Press Enter to continue" && _opt8sync_send $'x\nq\n'
+exec 9>&-
+
+# Wait for the process to fully and unambiguously exit -- not a liveness
+# sample mid-flight -- before ever counting redraws. Bounded poll before
+# the blocking `wait`, matching restore.test.sh's own `_restore_tui_finish`
+# shape, so a regression that leaves this child alive or out of phase
+# fails this ONE test instead of hanging the whole suite (found in review,
+# round omabackup-34, `omabackup-rev`, against an earlier unbounded
+# `wait`).
+OPT8SYNC_RC=124
+for ((i = 0; i < 200; i++)); do
+    OPT8SYNC_STAT="$(ps -o stat= -p "$OPT8SYNC_PID" 2>/dev/null)"
+    if [[ -z "$OPT8SYNC_STAT" || "$OPT8SYNC_STAT" == *Z* ]]; then
+        wait "$OPT8SYNC_PID" 2>/dev/null
+        OPT8SYNC_RC=$?
+        break
+    fi
+    sleep 0.05
+done
+if [[ "$OPT8SYNC_RC" == 124 ]]; then
+    kill -TERM "$OPT8SYNC_PID" 2>/dev/null || true
+    sleep 0.2
+    kill -KILL "$OPT8SYNC_PID" 2>/dev/null || true
+    wait "$OPT8SYNC_PID" 2>/dev/null || true
+    OPT8SYNC_DRIVER_FAILED=1
+fi
+OPT8SYNC_DRAWS="$(_opt8sync_count "Choose an option")"
+
+it "the Settings TUI's View log option really blocks the redraw until Enter, not just shows the prompt text somewhere"
+(( OPT8SYNC_DRIVER_FAILED == 0 )) && [[ "$OPT8SYNC_RC" == 0 && "$OPT8SYNC_DRAWS" == 2 ]] \
+    && ok || fail "expected the gate to consume 'x' as continue (exactly 2 menu draws total) and a clean exit, got driver_failed=$OPT8SYNC_DRIVER_FAILED rc=$OPT8SYNC_RC draws=$OPT8SYNC_DRAWS"
+
+OPT8_BAD_TUI="$(timeout --kill-after=5s 15s bash -c \
+    'printf "%b" "$1" | script -qec "$2" /dev/null 2>&1' _ $'8\nnotanumber\nq\n' \
+    "env HOME='$OPT8_HOME' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$OPT8_HOME/g.json' \
+     OMABACKUP_STATE='$OPT8_HOME/.state' OMABACKUP_REPO='$OPT8_HOME/repo' \
+     OMABACKUP_DESTINATIONS='$OPT8_HOME/dest.json' OMABACKUP_SYSTEMCTL='$OPT8_HOME/stub/systemctl' \
+     XDG_RUNTIME_DIR=/nonexistent '$OB' config")"
+
+it "the Settings TUI's View log option rejects non-numeric input without crashing the menu loop"
+assert_contains "$OPT8_BAD_TUI" "Enter a positive number of lines."
+
+OPT8_EMPTY_HOME="$(_log_home)"
+OPT8_EMPTY_TUI="$(timeout --kill-after=5s 15s bash -c \
+    'printf "%b" "$1" | script -qec "$2" /dev/null 2>&1' _ $'8\n\n\nq\n' \
+    "env HOME='$OPT8_EMPTY_HOME' OMABACKUP_ROOT='$PWD' OMABACKUP_GROUPS='$OPT8_EMPTY_HOME/g.json' \
+     OMABACKUP_STATE='$OPT8_EMPTY_HOME/.state' OMABACKUP_REPO='$OPT8_EMPTY_HOME/repo' \
+     OMABACKUP_DESTINATIONS='$OPT8_EMPTY_HOME/dest.json' OMABACKUP_SYSTEMCTL='$OPT8_EMPTY_HOME/stub/systemctl' \
+     XDG_RUNTIME_DIR=/nonexistent '$OB' config")"
+
+it "the Settings TUI's View log option says so plainly when nothing has been logged yet"
+assert_contains "$OPT8_EMPTY_TUI" "Nothing logged yet."
+
 # Round omabackup-22 review: a die() reached before the EXIT trap used to
 # exist -- `--groups` with no value dies inside the argument-parsing loop,
 # which ran before the trap was installed at all.
@@ -724,3 +950,329 @@ OMABACKUP_TUI_SUPERVISED=1 bash "$RECOVERYENV_HOME/harness.sh" >/dev/null 2>&1
 
 it "opening Settings from Restore's own recovery menu gets its own log record, not the outer session's inherited suppression"
 assert_contains "$(cat "$RECOVERYENV_HOME/marker" 2>/dev/null)" "SUPERVISED=unset"
+
+# ── _log_tail: the read side this file never had until now ─────────────────
+# Everything above only ever writes. These are direct unit tests of the
+# function itself (source lib/log.sh, no CLI round-trip) -- fast and precise
+# about the one property that actually matters here: reading across
+# multiple day-files in the right order, pulling only as many lines as
+# still needed from each.
+TAIL_HOME="$(mktemp -d)"
+TAIL_STATE="$TAIL_HOME/.state"
+mkdir -p "$TAIL_STATE/log"
+printf 'a1\na2\na3\n' >"$TAIL_STATE/log/omabackup-2026-08-30.log"
+printf 'b1\nb2\n' >"$TAIL_STATE/log/omabackup-2026-08-31.log"
+printf 'c1\nc2\nc3\n' >"$TAIL_STATE/log/omabackup-2026-09-01.log"
+
+it "_log_tail returns fewer lines than requested from a single file without padding or erroring"
+TAIL_OUT="$(OMABACKUP_STATE="$TAIL_STATE" bash -c 'source lib/log.sh; _log_tail 100' 2>&1)"
+assert_eq "$TAIL_OUT" "$(printf 'a1\na2\na3\nb1\nb2\nc1\nc2\nc3')"
+
+it "_log_tail spanning two day-files puts the OLDER file's lines first, not just concatenated in read order"
+TAIL_OUT2="$(OMABACKUP_STATE="$TAIL_STATE" bash -c 'source lib/log.sh; _log_tail 4' 2>&1)"
+assert_eq "$TAIL_OUT2" "$(printf 'b2\nc1\nc2\nc3')"
+
+it "_log_tail asking for exactly what exists in the newest file alone does not reach into older ones"
+TAIL_OUT3="$(OMABACKUP_STATE="$TAIL_STATE" bash -c 'source lib/log.sh; _log_tail 3' 2>&1)"
+assert_eq "$TAIL_OUT3" "$(printf 'c1\nc2\nc3')"
+
+it "_log_tail rejects a non-canonical N instead of silently coercing it"
+for TAIL_BAD in 0 -1 "" abc "+5"; do
+    TAIL_RC=0
+    OMABACKUP_STATE="$TAIL_STATE" bash -c 'source lib/log.sh; _log_tail "$1"' _ "$TAIL_BAD" >/dev/null 2>&1 || TAIL_RC=$?
+    (( TAIL_RC == 1 )) || fail "expected _log_tail to reject N=[$TAIL_BAD] with rc=1, got rc=$TAIL_RC"
+done
+ok
+
+# A real bug caught in review (round omabackup-33, `omabackup-rev`,
+# reproduced live): a decimal too large for bash's signed 64-bit `((
+# ))` (e.g. one above INT64_MAX) satisfied the plain `^[1-9][0-9]*$`
+# regex, then wrapped to a large NEGATIVE number once it reached
+# arithmetic context -- making `remaining <= 0` true immediately and
+# returning SUCCESS with zero lines, not a rejection. Rejected outright now,
+# the same length-then-range check _log_retention_normalize already uses.
+it "_log_tail rejects N too large for bash arithmetic instead of silently returning nothing"
+TAIL_HUGE_RC=0
+OMABACKUP_STATE="$TAIL_STATE" bash -c 'source lib/log.sh; _log_tail 9223372036854775808' >/dev/null 2>&1 || TAIL_HUGE_RC=$?
+assert_eq "$TAIL_HUGE_RC" "1"
+
+# Permanent regression for the nullglob save/restore fix itself -- found
+# missing in review (round omabackup-35, `omabackup-rev`): the earlier
+# manual verification that `_log_tail` no longer forces nullglob off for
+# its caller was real, but was never captured as a test the suite actually
+# runs -- every existing _log_tail test calls it with nullglob at its
+# bash default (off), which the ORIGINAL, buggy `shopt -u` unconditional
+# version also left off, so none of them would have caught the original
+# bug either. Covers both starting states, and the return-1 (error) path
+# too, not just the success path.
+it "_log_tail restores the caller's own nullglob state exactly, whichever it was, on success or failure"
+TAIL_NULLGLOB_ON="$(bash -c '
+    shopt -s nullglob
+    source lib/log.sh
+    OMABACKUP_STATE='"'"'/does/not/exist'"'"'
+    _log_tail 5 >/dev/null 2>&1
+    shopt -p nullglob
+')"
+assert_eq "$TAIL_NULLGLOB_ON" "shopt -s nullglob"
+
+TAIL_NULLGLOB_OFF="$(bash -c '
+    shopt -u nullglob
+    OMABACKUP_STATE="'"$TAIL_STATE"'"
+    source lib/log.sh
+    _log_tail 100 >/dev/null 2>&1   # a real, successful read this time
+    shopt -p nullglob
+')"
+assert_eq "$TAIL_NULLGLOB_OFF" "shopt -u nullglob"
+
+TAIL_UNREADABLE_NG_STATE="$(mktemp -d)"
+mkdir -p "$TAIL_UNREADABLE_NG_STATE/log"
+printf 'x\n' >"$TAIL_UNREADABLE_NG_STATE/log/omabackup-2026-09-01.log"
+chmod 000 "$TAIL_UNREADABLE_NG_STATE/log/omabackup-2026-09-01.log"
+TAIL_NULLGLOB_ON_ERR="$(bash -c '
+    shopt -s nullglob
+    OMABACKUP_STATE="'"$TAIL_UNREADABLE_NG_STATE"'"
+    source lib/log.sh
+    _log_tail 5 >/dev/null 2>&1   # this one fails (return 1) -- state must still restore
+    shopt -p nullglob
+')"
+chmod 644 "$TAIL_UNREADABLE_NG_STATE/log/omabackup-2026-09-01.log"
+assert_eq "$TAIL_NULLGLOB_ON_ERR" "shopt -s nullglob"
+
+it "omabackup log-tail rejects the same too-large N with a clear message"
+LOGTAIL_HUGE_HOME="$(_log_home)"
+LOGTAIL_HUGE_OUT="$(_log_env "$LOGTAIL_HUGE_HOME" log-tail 9223372036854775808)"; LOGTAIL_HUGE_RC=$?
+(( LOGTAIL_HUGE_RC != 0 )) && assert_contains "$LOGTAIL_HUGE_OUT" "too large" \
+    || fail "expected a non-zero exit and a clear message for an oversized log-tail N"
+
+# Found by review (round omabackup-33, `omabackup-rev`, reproduced live):
+# `for f in $(command ls "$LOG_DIR"/omabackup-*.log | sort -r)` word-splits
+# the ls output, so a LOG_DIR containing a space (OMABACKUP_LOG_DIR/
+# OMABACKUP_STATE are both user-settable) broke every filename into
+# fragments that never matched `[[ -f "$f" ]]`, and _log_tail silently
+# returned nothing despite real log files existing. Fixed with a native
+# bash glob into an array instead of parsing `ls` output.
+it "_log_tail works correctly when LOG_DIR itself contains a space"
+TAIL_SPACE_STATE="$(mktemp -d)/state with space"
+mkdir -p "$TAIL_SPACE_STATE/log"
+printf 's1\ns2\ns3\n' >"$TAIL_SPACE_STATE/log/omabackup-2026-09-01.log"
+TAIL_SPACE_OUT="$(OMABACKUP_STATE="$TAIL_SPACE_STATE" bash -c 'source lib/log.sh; _log_tail 2' 2>&1)"
+assert_eq "$TAIL_SPACE_OUT" "$(printf 's2\ns3')"
+
+# The array-glob fix above closed spaces, but the newline-delimited
+# `printf '%s\n' | sort` immediately after it would still have split ONE
+# path into two lines for a LOG_DIR containing an embedded newline -- found
+# by review (round omabackup-34, `omabackup-rev`; independently confirmed
+# by `omabackup-rev-2` as a PRE-EXISTING limitation the `ls`-based version
+# already had too, not a regression this round introduced). Fixed with a
+# NUL-delimited sort (`sort -z`, `mapfile -d ''`).
+it "_log_tail works correctly when LOG_DIR itself contains a newline"
+TAIL_NEWLINE_STATE="$(mktemp -d)/state"$'\n'"weird"
+mkdir -p "$TAIL_NEWLINE_STATE/log"
+printf 'n1\nn2\nn3\n' >"$TAIL_NEWLINE_STATE/log/omabackup-2026-09-01.log"
+TAIL_NEWLINE_OUT="$(OMABACKUP_STATE="$TAIL_NEWLINE_STATE" bash -c 'source lib/log.sh; _log_tail 2' 2>&1)"
+assert_eq "$TAIL_NEWLINE_OUT" "$(printf 'n2\nn3')"
+
+# Found by review (round omabackup-34, `omabackup-rev`): a day-file that
+# exists but cannot be read (wrong permissions, or any other real I/O
+# failure) used to be silently treated the same as a legitimately empty
+# one -- `log-tail`/`recentLog` would report "nothing logged" for a log
+# that genuinely could not be read, the same "failure read as absence"
+# shape this project already takes seriously elsewhere.
+it "_log_tail fails loudly on an unreadable day-file instead of reporting it as empty"
+TAIL_UNREADABLE_STATE="$(mktemp -d)"
+mkdir -p "$TAIL_UNREADABLE_STATE/log"
+printf 'secret\n' >"$TAIL_UNREADABLE_STATE/log/omabackup-2026-09-01.log"
+chmod 000 "$TAIL_UNREADABLE_STATE/log/omabackup-2026-09-01.log"
+TAIL_UNREADABLE_RC=0
+TAIL_UNREADABLE_OUT="$(OMABACKUP_STATE="$TAIL_UNREADABLE_STATE" bash -c 'source lib/log.sh; _log_tail 5' 2>&1)" || TAIL_UNREADABLE_RC=$?
+chmod 644 "$TAIL_UNREADABLE_STATE/log/omabackup-2026-09-01.log"
+assert_eq "$TAIL_UNREADABLE_RC" "1"
+assert_eq "$TAIL_UNREADABLE_OUT" ""
+
+# Found by review (round omabackup-35, `omabackup-rev`): `sort`'s own exit
+# status was not checked at all (it originally ran inside a process
+# substitution feeding `mapfile`, whose own status is what `$?` would have
+# reflected, not `sort`'s), so a failing/missing `sort` left `sorted`
+# short and `_log_tail` still returned success. A stub `sort` on PATH that
+# always fails immediately (emitting nothing) proves the fix.
+it "_log_tail fails, not silently returns partial results, when sort fails immediately"
+TAIL_SORTFAIL_STATE="$(mktemp -d)"
+mkdir -p "$TAIL_SORTFAIL_STATE/log" "$TAIL_SORTFAIL_STATE/stubbin"
+printf 'x1\nx2\n' >"$TAIL_SORTFAIL_STATE/log/omabackup-2026-09-01.log"
+printf '#!/bin/bash\nexit 1\n' >"$TAIL_SORTFAIL_STATE/stubbin/sort"
+chmod +x "$TAIL_SORTFAIL_STATE/stubbin/sort"
+TAIL_SORTFAIL_RC=0
+TAIL_SORTFAIL_OUT="$(OMABACKUP_STATE="$TAIL_SORTFAIL_STATE" PATH="$TAIL_SORTFAIL_STATE/stubbin:$PATH" \
+    bash -c 'source lib/log.sh; _log_tail 5' 2>&1)" || TAIL_SORTFAIL_RC=$?
+assert_eq "$TAIL_SORTFAIL_RC" "1"
+assert_eq "$TAIL_SORTFAIL_OUT" ""
+
+# A NARROWER, more adversarial case of the same bug -- found by review
+# (round omabackup-36, `omabackup-rev`): the FIRST fix (round 35) compared
+# `${#sorted[@]}` against `${#files[@]}` after reading through a process
+# substitution, reasoning "sort only reorders, never adds or drops an
+# element" -- true, but a `sort` that passes through every record
+# UNCHANGED and only THEN exits non-zero produces an array of the exact
+# expected LENGTH, so that check alone would have let this exact case
+# through undetected. This stub does exactly that (`cat` before `exit 1`)
+# -- proving the round-36 fix (checking sort's own real exit status via a
+# temp file, not an after-the-fact count) actually closes this, not just
+# the simpler immediate-failure case above.
+it "_log_tail fails even when sort passes through all input correctly before failing"
+TAIL_SORTPASSFAIL_STATE="$(mktemp -d)"
+mkdir -p "$TAIL_SORTPASSFAIL_STATE/log" "$TAIL_SORTPASSFAIL_STATE/stubbin"
+printf 'x1\nx2\n' >"$TAIL_SORTPASSFAIL_STATE/log/omabackup-2026-09-01.log"
+printf '#!/bin/bash\ncat\nexit 1\n' >"$TAIL_SORTPASSFAIL_STATE/stubbin/sort"
+chmod +x "$TAIL_SORTPASSFAIL_STATE/stubbin/sort"
+TAIL_SORTPASSFAIL_RC=0
+TAIL_SORTPASSFAIL_OUT="$(OMABACKUP_STATE="$TAIL_SORTPASSFAIL_STATE" PATH="$TAIL_SORTPASSFAIL_STATE/stubbin:$PATH" \
+    bash -c 'source lib/log.sh; _log_tail 5' 2>&1)" || TAIL_SORTPASSFAIL_RC=$?
+assert_eq "$TAIL_SORTPASSFAIL_RC" "1"
+assert_eq "$TAIL_SORTPASSFAIL_OUT" ""
+
+# Same shape, for `wc -l`: its failure used to leave `lines_in_chunk` an
+# empty string, which bash arithmetic silently reads as 0, so `remaining`
+# would never decrease and one day-file could contribute far more than its
+# fair share of the budget instead of the whole call failing outright.
+it "_log_tail fails, not silently miscounts, when wc itself fails"
+TAIL_WCFAIL_STATE="$(mktemp -d)"
+mkdir -p "$TAIL_WCFAIL_STATE/log" "$TAIL_WCFAIL_STATE/stubbin"
+printf 'x1\nx2\nx3\n' >"$TAIL_WCFAIL_STATE/log/omabackup-2026-09-01.log"
+printf '#!/bin/bash\nexit 1\n' >"$TAIL_WCFAIL_STATE/stubbin/wc"
+chmod +x "$TAIL_WCFAIL_STATE/stubbin/wc"
+TAIL_WCFAIL_RC=0
+TAIL_WCFAIL_OUT="$(OMABACKUP_STATE="$TAIL_WCFAIL_STATE" PATH="$TAIL_WCFAIL_STATE/stubbin:$PATH" \
+    bash -c 'source lib/log.sh; _log_tail 5' 2>&1)" || TAIL_WCFAIL_RC=$?
+assert_eq "$TAIL_WCFAIL_RC" "1"
+assert_eq "$TAIL_WCFAIL_OUT" ""
+
+it "omabackup log-tail reports the same unreadable-log case with a clear, actionable message"
+TAIL_UNREADABLE_CLI_HOME="$(_log_home)"
+mkdir -p "$TAIL_UNREADABLE_CLI_HOME/.state/log"
+printf 'secret\n' >"$TAIL_UNREADABLE_CLI_HOME/.state/log/omabackup-2026-09-01.log"
+chmod 000 "$TAIL_UNREADABLE_CLI_HOME/.state/log/omabackup-2026-09-01.log"
+TAIL_UNREADABLE_CLI_OUT="$(_log_env "$TAIL_UNREADABLE_CLI_HOME" log-tail 5)"; TAIL_UNREADABLE_CLI_RC=$?
+chmod 644 "$TAIL_UNREADABLE_CLI_HOME/.state/log/omabackup-2026-09-01.log"
+(( TAIL_UNREADABLE_CLI_RC != 0 )) && assert_contains "$TAIL_UNREADABLE_CLI_OUT" "could not read" \
+    || fail "expected a non-zero exit and a clear message for an unreadable log file"
+
+it "_log_tail against an empty or missing log directory returns nothing, not an error"
+TAIL_EMPTY="$(mktemp -d)"
+TAIL_RC=0
+# Captured under TAIL_EMPTY's own mktemp -d, not a predictable shared
+# /tmp/tail_empty_out path -- found by review (round omabackup-33,
+# `omabackup-rev`): two concurrent suite runs would collide on that fixed
+# name, and one could truncate/remove a file another process still had
+# open.
+OMABACKUP_STATE="$TAIL_EMPTY/.state" bash -c 'source lib/log.sh; _log_tail 5' >"$TAIL_EMPTY/out" 2>&1 || TAIL_RC=$?
+assert_eq "$TAIL_RC" "0"
+assert_eq "$(cat "$TAIL_EMPTY/out")" ""
+
+# ── cmd_log_tail / `omabackup log-tail`: the CLI-level surface ─────────────
+LOGTAIL_HOME="$(_log_home)"
+mkdir -p "$LOGTAIL_HOME/.state/log"
+printf 'x1\nx2\nx3\n' >"$LOGTAIL_HOME/.state/log/omabackup-2026-09-01.log"
+
+it "omabackup log-tail with no argument defaults to the last 20 lines"
+LOGTAIL_DEFAULT="$(_log_env "$LOGTAIL_HOME" log-tail)"
+assert_eq "$LOGTAIL_DEFAULT" "$(printf 'x1\nx2\nx3')"
+
+it "omabackup log-tail N prints exactly N lines"
+LOGTAIL_N="$(_log_env "$LOGTAIL_HOME" log-tail 2)"
+assert_eq "$LOGTAIL_N" "$(printf 'x2\nx3')"
+
+it "omabackup log-tail rejects a non-numeric N with a clear message, not a bash error"
+LOGTAIL_BAD="$(_log_env "$LOGTAIL_HOME" log-tail abc)"; LOGTAIL_BAD_RC=$?
+(( LOGTAIL_BAD_RC != 0 )) && assert_contains "$LOGTAIL_BAD" "N must be a positive integer" \
+    || fail "expected a non-zero exit and a clear message for log-tail abc"
+
+# Found by review (round omabackup-33, `omabackup-rev`): the central gate
+# refusing every command without a group manifest present (bin/omabackup,
+# right before the main dispatch case) only exempted log-event and
+# kill-group, not log-tail -- so exactly a broken install (a missing/moved
+# groups manifest) could not use the one command meant to help explain it.
+it "omabackup log-tail works even with a missing group manifest, same as log-event/kill-group"
+NOMANIFEST_HOME="$(_log_home)"
+mkdir -p "$NOMANIFEST_HOME/.state/log"
+printf 'nm1\nnm2\n' >"$NOMANIFEST_HOME/.state/log/omabackup-2026-09-01.log"
+rm -f "$NOMANIFEST_HOME/g.json"
+NOMANIFEST_OUT="$(_log_env "$NOMANIFEST_HOME" log-tail 2)"
+assert_eq "$NOMANIFEST_OUT" "$(printf 'nm1\nnm2')"
+
+# Found by review (round omabackup-34, `omabackup-rev`): the dispatcher
+# hands cmd_log_tail the whole ARGS array, but only $1 was ever read, so
+# `log-tail 2 typo` silently succeeded printing 2 lines instead of
+# refusing the extra argument -- unlike every other real subcommand's own
+# reject_flags/exact-count discipline.
+it "omabackup log-tail rejects extra positional arguments instead of silently ignoring them"
+EXCESSARGS_OUT="$(_log_env "$NOMANIFEST_HOME" log-tail 2 typo)"; EXCESSARGS_RC=$?
+(( EXCESSARGS_RC != 0 )) && assert_contains "$EXCESSARGS_OUT" "usage: omabackup log-tail" \
+    || fail "expected a non-zero exit and a usage message for a trailing extra argument"
+
+# A real bug caught while implementing this: log-tail fell through
+# _log_policy_for_cmd's default `failure` policy (nothing in that case
+# statement named it explicitly), so running it successfully wrote its OWN
+# "log-tail ok" transition line into the very log it was just asked to
+# read -- a read that mutates what it reads, and one that would keep
+# compounding across repeated fresh-state runs. Fixed by adding log-tail to
+# the same `never` bucket as log-event/kill-group/version/artifacts/help.
+it "log-tail itself never writes to the log it reads -- running it repeatedly does not add its own lines"
+LOGTAIL_SELF_HOME="$(_log_home)"
+mkdir -p "$LOGTAIL_SELF_HOME/.state/log"
+printf 'seed1\nseed2\n' >"$LOGTAIL_SELF_HOME/.state/log/omabackup-2026-09-01.log"
+_log_env "$LOGTAIL_SELF_HOME" log-tail 10 >/dev/null 2>&1
+_log_env "$LOGTAIL_SELF_HOME" log-tail 10 >/dev/null 2>&1
+LOGTAIL_SELF_OUT="$(_log_env "$LOGTAIL_SELF_HOME" log-tail 10)"
+assert_eq "$LOGTAIL_SELF_OUT" "$(printf 'seed1\nseed2')"
+
+# ── cmd_status --json's recentLog field ─────────────────────────────────────
+STATUSLOG_HOME="$(_log_home)"
+
+it "status --json's recentLog reflects real log-event calls, capped at 5 lines"
+# Six distinct events, not three -- found by review (round omabackup-33,
+# `omabackup-rev`): three events fits entirely under the 5-line cap, so
+# the old version of this test would still pass against a version of
+# _log_tail that used a LARGER cap, or one that returned the lines in the
+# wrong order (it only checked substring containment, not an exact,
+# ordered array). Six events forces action1 to actually be dropped, and
+# comparing the exact ordered array (not just substring containment)
+# proves both the cap and the order in one assertion.
+for STATUSLOG_ACTION in action1 action2 action3 action4 action5 action6; do
+    _log_env "$STATUSLOG_HOME" log-event "$STATUSLOG_ACTION" ok "" >/dev/null 2>&1
+done
+STATUSLOG_JSON="$(_log_env "$STATUSLOG_HOME" status --json)"
+STATUSLOG_RECENT="$(printf '%s' "$STATUSLOG_JSON" | jq -c '[.recentLog[] | capture("  (?<a>action[0-9]+)  ") | .a]')"
+assert_eq "$STATUSLOG_RECENT" '["action2","action3","action4","action5","action6"]'
+
+it "status --json's recentLog is an empty array, not null or missing, when nothing has been logged yet"
+STATUSLOG_EMPTY_HOME="$(_log_home)"
+STATUSLOG_EMPTY_JSON="$(_log_env "$STATUSLOG_EMPTY_HOME" status --json)"
+assert_eq "$(printf '%s' "$STATUSLOG_EMPTY_JSON" | jq -c '.recentLog')" "[]"
+
+it "status --json's recentLogError is false for both the populated and the empty case above"
+assert_eq "$(printf '%s' "$STATUSLOG_JSON" | jq -c '.recentLogError')" "false"
+assert_eq "$(printf '%s' "$STATUSLOG_EMPTY_JSON" | jq -c '.recentLogError')" "false"
+
+# The permanent CLI-level regression this feature was missing -- found by
+# review (round omabackup-36, `omabackup-rev`): round 35 added
+# recentLogError and a QML probe phase that manually injects
+# `{ recentLog: [], recentLogError: true }` into a fixture statusDoc, which
+# proves only that the PANEL renders the flag correctly, never that
+# `cmd_status --json` itself actually SETS it for a real read failure --
+# the one path this feature exists to close. A genuine chmod-000 day-file
+# drives the real CLI end to end.
+it "status --json reports recentLogError:true (and keeps recentLog:[]) for a real unreadable day-file"
+STATUSLOG_ERR_HOME="$(_log_home)"
+mkdir -p "$STATUSLOG_ERR_HOME/.state/log"
+printf 'secret\n' >"$STATUSLOG_ERR_HOME/.state/log/omabackup-2026-09-01.log"
+chmod 000 "$STATUSLOG_ERR_HOME/.state/log/omabackup-2026-09-01.log"
+STATUSLOG_ERR_JSON="$(_log_env "$STATUSLOG_ERR_HOME" status --json)"
+chmod 644 "$STATUSLOG_ERR_HOME/.state/log/omabackup-2026-09-01.log"
+assert_eq "$(printf '%s' "$STATUSLOG_ERR_JSON" | jq -c '.recentLog')" "[]"
+assert_eq "$(printf '%s' "$STATUSLOG_ERR_JSON" | jq -c '.recentLogError')" "true"
+# The rest of the document must still be well-formed and unaffected --
+# recentLog/recentLogError's own settled principle (round 33/34/35): a
+# read failure in this one field must never break the whole status
+# document.
+assert_eq "$(printf '%s' "$STATUSLOG_ERR_JSON" | jq -c '.schemaVersion')" "1"
+assert_eq "$(printf '%s' "$STATUSLOG_ERR_JSON" | jq -c '.destinations | type')" '"array"'

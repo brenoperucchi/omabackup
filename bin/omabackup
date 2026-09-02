@@ -1773,7 +1773,19 @@ cmd_push() {
 # call actually created, into directories that existed before and merely
 # happened to be empty at this moment -- not this cleanup's to remove.
 _into_cleanup() {
-    local into="$1" boundary="$2" d="$into"
+    local into="$1" boundary="$2"
+    # A separate `local` statement, not `local into="$1" ... d="$into"` on
+    # one line -- found by review (round omabackup-33, `omabackup-rev-2`,
+    # scanning the whole repo after the same pitfall was found and fixed in
+    # `_log_tail`): bash does not see a variable just assigned earlier in
+    # the SAME `local` statement when expanding a later one on that line,
+    # so `d` was silently empty on every call. With `d=""`, the `while`
+    # loop's own `-n "$d"` was false on its first check, so this function
+    # has been a complete no-op across all 17 call sites in cmd_restore's
+    # error paths -- confirmed live: a 4-level directory created by a
+    # restore attempt, then aborted, left all 4 levels behind instead of
+    # being cleaned back up to `boundary`.
+    local d="$into"
     [[ -n "$into" ]] || return 0
     while [[ "$d" != "$boundary" && -n "$d" && "$d" != "/" ]]; do
         rmdir "$d" 2>/dev/null || return 0
@@ -2776,7 +2788,36 @@ cmd_status() {
         # "one destination failing does not invalidate the others". This
         # document reports recorded state and never probes the network, so the
         # panel can poll it as often as it likes.
+        #
+        # recentLog: fixed at 5 lines, not a caller-supplied count -- this is
+        # the panel's own "Recent activity" glance, refreshed for free on
+        # every status poll it already makes; a real viewer with a
+        # user-chosen line count is `omabackup log-tail N` / the Settings
+        # TUI's own "View log" item, not this document.
+        #
+        # `_log_tail`'s own exit status is captured explicitly right after
+        # the assignment, not left to fall through unchecked -- found by
+        # review (round omabackup-35, `omabackup-rev`): `set -o pipefail`
+        # (this script's own line 9) DOES make the pipe's `$?` reflect a
+        # failing `_log_tail` even though `jq` afterward succeeds, but
+        # nothing previously READ that `$?` before this local assignment
+        # was used as-is -- so a genuinely unreadable day-file (the exact
+        # case `_log_tail` was hardened, round omabackup-34, to report as
+        # a real failure rather than silent emptiness) still reached this
+        # document as a plain `recentLog:[]`, indistinguishable from
+        # nothing having been logged at all. `recentLog` itself STAYS `[]`
+        # on failure -- round omabackup-33/34's own settled principle
+        # holds: this field must never be able to break the rest of the
+        # status document -- but `recentLogError` now says so explicitly,
+        # so a consumer (the panel) CAN show the two states differently
+        # instead of that distinction being silently unrecoverable here.
+        local recentlog_json recentlog_rc=0
+        recentlog_json="$(_log_tail 5 | jq -R -s 'rtrimstr("\n") | if length == 0 then [] else split("\n") end')" \
+            || recentlog_rc=$?
+        (( recentlog_rc != 0 )) && recentlog_json='[]'
         jq -n --arg v "$ov" --arg c "$oc" --arg m "$om" --arg s "$STAGING" \
+              --argjson recentLog "$recentlog_json" \
+              --argjson recentLogError "$( (( recentlog_rc != 0 )) && echo true || echo false )" \
               --argjson t "$(jq '.supportedTargets' "$GROUPS_FILE")" \
               --argjson d "$(destinations_json 2>/dev/null || echo '[]')" \
               --argjson sch "$(scheduler_active && echo true || echo false)" \
@@ -2807,7 +2848,7 @@ cmd_status() {
                                 active:$githubActive,
                                 url:(if $githubUrl == "" then null else $githubUrl end)}},
                 stale:$stale, lastSync:$lastsync, lastSyncAgeSec:$age,
-                lastRestore:$lastrestore}'
+                lastRestore:$lastrestore, recentLog:$recentLog, recentLogError:$recentLogError}'
     else
         printf '  Omarchy %s (%s) - migration watermark %s\n' "$ov" "$oc" "$om"
         printf '  restore range: %s\n' "$(jq -r '.supportedTargets|join(", ")' "$GROUPS_FILE")"
@@ -2850,6 +2891,44 @@ cmd_log_event() {
     # transition") that verify/status need for constant polling does not
     # apply here and would only add unneeded state.
     _log_write "$1" "$2" "${3:-}"
+}
+
+# The read side of the persistent log, for direct use (unlike log-event/
+# kill-group, this one is meant to be run by a person, not just the
+# wrapper/panel -- documented in the usage text below). Validation
+# mirrors the four OMABACKUP_RESTORE_* overrides in lib/bundle.sh: a
+# non-canonical value is refused outright rather than silently coerced.
+# N's own format/length/range checks below are DELIBERATELY duplicated
+# inside `_log_tail` itself (lib/log.sh) -- noted in review (round
+# omabackup-35, `omabackup-rev-2`) as worth a comment rather than
+# "simplifying" one of the two away: `_log_tail` is also called
+# internally by `cmd_status` with a fixed literal, but it is still a
+# general-purpose function that must defend its own contract regardless
+# of caller, the same reasoning `_log_retention_normalize` and
+# `_dest_keep_normalize` already apply to their own callers.
+cmd_log_tail() {
+    # Excess positional arguments rejected outright -- found by review
+    # (round omabackup-34, `omabackup-rev`): the dispatcher hands this
+    # function the whole ARGS array, but only $1 was ever read, so
+    # `log-tail 2 typo` silently succeeded printing 2 lines instead of
+    # refusing the extra argument, unlike every other real subcommand's
+    # own `reject_flags`/exact-count discipline.
+    (($# <= 1)) || die "usage: omabackup log-tail [N]"
+    local n="${1:-20}"
+    [[ "$n" =~ ^[1-9][0-9]*$ ]] || die "log-tail: N must be a positive integer"
+    (( ${#n} <= ${#LOG_TAIL_MAX_LINES} )) && (( 10#$n <= LOG_TAIL_MAX_LINES )) \
+        || die "log-tail: N is too large (max $LOG_TAIL_MAX_LINES)"
+    # A non-zero return here is now a genuine read failure (an unreadable
+    # day-file), not a rejected N -- both already-checked above -- so it
+    # gets its own actionable message instead of exiting silently with no
+    # output at all. tui_sanitize_field wraps the displayed path -- found
+    # by review (round omabackup-35, `omabackup-rev`): the header's own
+    # "Log: <path>" line was sanitized (round omabackup-33), but this
+    # direct CLI error path interpolated the same user-settable LOG_DIR
+    # raw, reopening the identical CSI/newline injection this project
+    # already closed once for the header.
+    _log_tail "$n" \
+        || die "log-tail: could not read one or more log files under $(tui_sanitize_field "$(_tilde "$LOG_DIR")")"
 }
 
 # Internal only -- not printed in the usage text below. Panel.qml's
@@ -3064,7 +3143,7 @@ _log_policy_for_cmd() {
     case "$1" in
         sync|push|collect|install|enable|disable|bundle|reload) printf always ;;
         verify|status|restore|config) printf failure ;;
-        version|artifacts|help|log-event|kill-group|"") printf never ;;
+        version|artifacts|help|log-event|kill-group|log-tail|"") printf never ;;
         # Anything else reaches the final `die "unknown command"` below --
         # still a real failure worth logging under whatever the user typed.
         *) printf failure ;;
@@ -3209,8 +3288,14 @@ esac
 # of "group" from the process kind this command actually kills), and is
 # spawned by the panel specifically to recover from something already
 # going wrong -- it must not itself refuse over a manifest problem that
-# has nothing to do with the process it was asked to stop.
-if [[ "$CMD" != log-event && "$CMD" != kill-group ]]; then
+# has nothing to do with the process it was asked to stop. `log-tail` joins
+# them for the same reason as log-event -- found by review (round
+# omabackup-33, `omabackup-rev`): it has nothing to do with backup groups
+# either, and a missing/broken manifest is exactly the kind of broken
+# install a person would reach for `log-tail` to explain -- refusing here
+# would mean the one command meant to explain a broken install cannot run
+# on one.
+if [[ "$CMD" != log-event && "$CMD" != kill-group && "$CMD" != log-tail ]]; then
     [[ -f "$GROUPS_FILE" ]] || die "group manifest not found: $GROUPS_FILE"
     # restore validates --groups against the ARTIFACT's manifest, not this
     # machine's -- a group name valid for one is not necessarily valid for
@@ -3238,6 +3323,7 @@ case "$CMD" in
     restore) cmd_restore "${ARGS[@]}" ;;
     artifacts) cmd_artifacts "${ARGS[@]}" ;;
     config)    cmd_config "${ARGS[@]}" ;;
+    log-tail)  cmd_log_tail "${ARGS[@]}" ;;
     log-event) cmd_log_event "${ARGS[@]}" ;;
     kill-group) cmd_kill_group "${ARGS[@]}" ;;
     ""|help)
@@ -3254,6 +3340,7 @@ omabackup <command> [--json] [--groups a,b]
   artifacts list what a `dir` destination holds, with each one's own manifest
   restore   plan a restore from an artifact; no file opens a guided TUI
   config    show or safely edit machine-owned settings; no args opens its TUI
+  log-tail  print the last N log lines (default 20)
 
 The full cycle is collect -> diff -> verify -> commit. `collect` and `verify`
 are the first two; without them there is no diff for mode:copy groups and

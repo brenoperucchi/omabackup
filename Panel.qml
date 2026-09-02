@@ -554,11 +554,36 @@ Panel {
     // the machine's state is -- requiring both present in their real shape
     // is still cheap and now actually distinguishes a genuine (if minimal)
     // v1 document from a truncated one.
+    //
+    // recentLog is NOT required the same way -- found in review (round
+    // omabackup-33, both reviewers independently): unlike destinations/
+    // scheduler, which the panel cannot render around at all,
+    // destinations/scheduler are structurally essential while recentLog is
+    // a 5-line cosmetic preview whose absence already has a defined
+    // meaning ("[] = nothing logged yet"). resolveProc prefers any
+    // `omabackup` already on PATH over this checkout's own binary -- an
+    // updated panel talking to an older CLI still on PATH would emit a v1
+    // document with no recentLog key at all, and requiring it here would
+    // reject the WHOLE document (destinations, scheduler, config, all of
+    // it) over one decorative field, turning an additive change into a
+    // breaking one for that skew. A field that is PRESENT but the wrong
+    // shape still means something is actually wrong, so that case is still
+    // rejected -- only "absent" is treated as "not logged yet" rather than
+    // "corrupt." recentLogError (added round omabackup-35, alongside
+    // making the underlying read failure it reports on a real, checked
+    // condition in cmd_status rather than a silently-swallowed one) is
+    // optional for the exact same skew reason and defaults to false --
+    // "no error reported" is the right reading of an older CLI that does
+    // not know this field exists yet, not "an error, unreported."
     try {
       var parsed = JSON.parse(text)
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && parsed.schemaVersion === 1
           && Array.isArray(parsed.destinations)
-          && parsed.scheduler && typeof parsed.scheduler === "object" && !Array.isArray(parsed.scheduler)) {
+          && parsed.scheduler && typeof parsed.scheduler === "object" && !Array.isArray(parsed.scheduler)
+          && (parsed.recentLog === undefined || Array.isArray(parsed.recentLog))
+          && (parsed.recentLogError === undefined || typeof parsed.recentLogError === "boolean")) {
+        if (!Array.isArray(parsed.recentLog)) parsed.recentLog = []
+        if (typeof parsed.recentLogError !== "boolean") parsed.recentLogError = false
         root.statusDoc = parsed
         return
       }
@@ -615,6 +640,16 @@ Panel {
   function toggleSettings() {
     root.configExpanded = !root.configExpanded
     if (root.configExpanded) settingsRevealTimer.restart()
+  }
+
+  // Same reasoning and collapsed-by-default default as configExpanded
+  // above -- a glance at recent log activity, not something occupying
+  // permanent space over Groups/Destinations.
+  property bool activityExpanded: false
+
+  function toggleActivity() {
+    root.activityExpanded = !root.activityExpanded
+    if (root.activityExpanded) settingsRevealTimer.restart()
   }
 
   // Restore is intentionally terminal-owned, just like Settings: the CLI
@@ -2014,6 +2049,93 @@ Panel {
             CfgRow { k: "state";    v: root.config ? root.shortPath(root.config.state) : "—" }
             CfgRow { k: "folders";  v: root.config ? root.shortPath(root.config.destinationsFile) : "—" }
             CfgRow { k: "deny list"; v: root.config ? root.shortPath(root.config.denyList) : "—" }
+          }
+
+          // ── recent activity, collapsed by default ─────────────────────────
+          // Mirrors "Current settings" above exactly (same Item + header +
+          // "+"/"-" Text + full-Item MouseArea shape; no Behavior on height
+          // anywhere in this file, so this section does not invent that
+          // pattern only for itself -- the enclosing Flickable's own
+          // relayout is what makes expansion visible). Content is a flat
+          // list of lines (the Verification alerts Repeater's own shape,
+          // Panel.qml's alerts block), not a 2-column Grid -- log lines are
+          // not key/value pairs. Fed by statusDoc.recentLog, already
+          // fetched on every status poll this panel already makes -- no
+          // second Process/onExited block needed for this section alone.
+          Item {
+            width: parent.width
+            implicitHeight: aHdr.implicitHeight + Style.space(5)
+            PanelSectionHeader { id: aHdr; anchors.left: parent.left; text: "Recent activity" }
+            Text {
+              anchors.left: aHdr.right
+              anchors.leftMargin: Style.space(4)
+              anchors.verticalCenter: aHdr.verticalCenter
+              text: root.activityExpanded ? "-" : "+"
+              color: Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+            PanelSeparator { anchors.bottom: parent.bottom; width: parent.width }
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.toggleActivity()
+            }
+          }
+
+          Column {
+            id: activityList
+            visible: root.activityExpanded
+            width: column.width
+            spacing: Style.space(2)
+
+            // Model gated on activityExpanded too, not just this Column's
+            // own visibility -- an empty-when-collapsed model keeps the
+            // Repeater from instantiating delegates for content nobody can
+            // see, the same "invisible still occupies nothing" reasoning
+            // this file's own collapsed-Grid test already established for
+            // cfgGrid above.
+            Repeater {
+              model: root.activityExpanded && root.statusDoc && Array.isArray(root.statusDoc.recentLog)
+                ? root.statusDoc.recentLog : []
+              Text {
+                required property var modelData
+                width: activityList.width
+                text: modelData
+                color: Color.foreground
+                opacity: 0.7
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
+
+            // Distinguished from "nothing logged yet" -- added round
+            // omabackup-35, alongside making the underlying day-file read
+            // failure a real, reported condition in cmd_status
+            // (recentLogError) instead of one silently indistinguishable
+            // from an empty log. Checked ahead of the plain-empty message
+            // below, since an unreadable log is never ALSO genuinely
+            // empty in a way worth saying so about.
+            Text {
+              visible: root.activityExpanded && root.statusDoc && root.statusDoc.recentLogError === true
+              width: activityList.width
+              text: "Could not read the log."
+              color: Color.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            Text {
+              visible: root.activityExpanded &&
+                !(root.statusDoc && root.statusDoc.recentLogError === true) &&
+                !(root.statusDoc && Array.isArray(root.statusDoc.recentLog) && root.statusDoc.recentLog.length > 0)
+              width: activityList.width
+              text: "Nothing logged yet."
+              color: Color.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
           }
 
           Text {

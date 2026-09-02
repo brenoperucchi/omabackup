@@ -64,6 +64,10 @@ it "expanding Settings scrolls its values into the visible panel area"
 _qml_probe test/qml/settings-expands-and-scrolls.qml \
     && ok || fail "Settings expanded below the capped panel viewport without scrolling into view"
 
+it "Recent activity collapses to zero height, shows a placeholder when empty, and renders real log lines in order"
+_qml_probe test/qml/activity-section-collapses-and-shows-lines.qml \
+    && ok || fail "the Recent activity section's collapse/placeholder/content states are not all correct"
+
 it "a group row's custom-styled tooltip does not break the Row's own layout"
 _qml_probe test/qml/group-row-tooltip-is-safe-in-row.qml \
     && ok || fail "adding a HoverHandler/ToolTip child broke the Row's geometry"
@@ -73,6 +77,39 @@ _qml_probe test/qml/config-action-refresh.qml \
     && ok || fail "the Config handoff did not refresh after the panel was reopened"
 
 PANEL_SOURCE="$(<Panel.qml)"
+
+# The QML probe above is a hand-maintained mirror, not an import of
+# Panel.qml itself (this suite's established convention) -- these structural
+# anchors on the real source close the gap a mirror alone leaves: nothing
+# would otherwise notice if the real applyStatus() stopped validating
+# recentLog's shape, or if the real Repeater's model stopped being gated on
+# activityExpanded (an ungated model would instantiate delegates for content
+# nobody can see while collapsed, the same "invisible still occupies
+# nothing" performance property cfgGrid already established).
+it "Recent activity's own state, guard, and model binding are all present in the real source"
+if [[ "$PANEL_SOURCE" == *'property bool activityExpanded: false'* \
+      && "$PANEL_SOURCE" == *'function toggleActivity() {'* \
+      && "$PANEL_SOURCE" == *'(parsed.recentLog === undefined || Array.isArray(parsed.recentLog))'* \
+      && "$PANEL_SOURCE" == *'if (!Array.isArray(parsed.recentLog)) parsed.recentLog = []'* \
+      && "$PANEL_SOURCE" == *'model: root.activityExpanded && root.statusDoc && Array.isArray(root.statusDoc.recentLog)'* ]]; then
+    ok
+else
+    fail "Recent activity's state property, toggle function, status-shape guard, or model gating is missing from Panel.qml"
+fi
+
+# recentLogError -- added round omabackup-35 alongside making the
+# underlying day-file read failure a real, checked condition in
+# cmd_status instead of one silently masked as an empty recentLog.
+it "recentLogError is validated the same optional-but-typed way as recentLog, and drives a distinct message"
+if [[ "$PANEL_SOURCE" == *'(parsed.recentLogError === undefined || typeof parsed.recentLogError === "boolean")'* \
+      && "$PANEL_SOURCE" == *'if (typeof parsed.recentLogError !== "boolean") parsed.recentLogError = false'* \
+      && "$PANEL_SOURCE" == *'root.statusDoc.recentLogError === true'* \
+      && "$PANEL_SOURCE" == *'"Could not read the log."'* ]]; then
+    ok
+else
+    fail "recentLogError's shape guard, default, or its distinct UI message is missing from Panel.qml"
+fi
+
 it "the Settings link delegates to the CLI-owned ANSI configuration"
 if [[ "$PANEL_SOURCE" == *'text: root.configuring ? "Settings…" : "⚙ Settings…"'* \
       && "$PANEL_SOURCE" == *'function openConfig() { openExternalTui("config") }'* \

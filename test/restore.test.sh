@@ -3184,3 +3184,63 @@ RTUIFAILAPPLYSCREEN="${RTUIFAILAPPLYOUT##*$'\033[2J\033[H'}"
 it "restore keeps the apply diagnostic on the recovery screen"
 [[ "$RTUIFAILAPPLYRC" -eq 0 ]] && ok || fail "apply-diagnostic session exited $RTUIFAILAPPLYRC"
 assert_contains "$RTUIFAILAPPLYSCREEN" "APPLY-DIAGNOSTIC"
+
+# _into_cleanup: found by review (round omabackup-33, `omabackup-rev-2`,
+# scanning the whole repo for the same bash `local`-chaining pitfall
+# fixed in lib/log.sh's _log_tail) to have been a complete no-op since it
+# was written -- `local into="$1" boundary="$2" d="$into"` in one
+# statement leaves `d` empty (bash does not see a variable just assigned
+# earlier in the SAME `local` statement when expanding a later one on that
+# line), so the cleanup loop's own `-n "$d"` was false on its very first
+# check and nothing was ever removed, across all 17 call sites in
+# cmd_restore's error paths. Extracted directly from bin/omabackup, not a
+# hand-copy, so this test tracks the real function.
+INTOCLEANUP_HOME="$(mktemp -d)"
+mkdir -p "$INTOCLEANUP_HOME/base/x/y/z"
+bash -c "
+$(sed -n '/^_into_cleanup() {/,/^}/p' bin/omabackup)
+_into_cleanup '$INTOCLEANUP_HOME/base/x/y/z' '$INTOCLEANUP_HOME/base'
+"
+INTOCLEANUP_REMAINING="$(find "$INTOCLEANUP_HOME/base" -mindepth 1 -type d)"
+
+it "_into_cleanup actually removes newly-empty ancestor directories up to the boundary"
+assert_eq "$INTOCLEANUP_REMAINING" ""
+[[ -d "$INTOCLEANUP_HOME/base" ]] && ok || fail "the boundary directory itself should survive, but was removed too"
+
+# A directory that is NOT empty (something else created a file inside one
+# of the ancestors) must stop the climb right there, not remove it anyway
+# -- rmdir's own real failure is what _into_cleanup relies on to know
+# when to stop.
+INTOCLEANUP_NONEMPTY_HOME="$(mktemp -d)"
+mkdir -p "$INTOCLEANUP_NONEMPTY_HOME/base/x/y/z"
+printf 'keep me\n' >"$INTOCLEANUP_NONEMPTY_HOME/base/x/marker.txt"
+bash -c "
+$(sed -n '/^_into_cleanup() {/,/^}/p' bin/omabackup)
+_into_cleanup '$INTOCLEANUP_NONEMPTY_HOME/base/x/y/z' '$INTOCLEANUP_NONEMPTY_HOME/base'
+"
+
+it "_into_cleanup stops climbing at the first non-empty ancestor instead of forcing past it"
+[[ ! -d "$INTOCLEANUP_NONEMPTY_HOME/base/x/y" && -d "$INTOCLEANUP_NONEMPTY_HOME/base/x" \
+   && -f "$INTOCLEANUP_NONEMPTY_HOME/base/x/marker.txt" ]] \
+    && ok || fail "expected y/z removed, x (containing marker.txt) kept"
+
+# The third, most common-in-practice case for the same matrix (noted in
+# review, round omabackup-34, `omabackup-rev-2`, as not a defect but worth
+# covering explicitly): `--into` pointing at a directory that already
+# existed before the restore started. `into == boundary` here, so the
+# loop's own `"$d" != "$boundary"` is false on the very first check and
+# nothing is removed -- exactly the behavior the function's own comment
+# already documents ("or <into> itself, when <into> already existed: the
+# loop below then does nothing"), and the most likely real call shape
+# since restoring into an existing directory is the common case.
+INTOCLEANUP_SAME_HOME="$(mktemp -d)"
+mkdir -p "$INTOCLEANUP_SAME_HOME/base"
+printf 'already here\n' >"$INTOCLEANUP_SAME_HOME/base/existing.txt"
+bash -c "
+$(sed -n '/^_into_cleanup() {/,/^}/p' bin/omabackup)
+_into_cleanup '$INTOCLEANUP_SAME_HOME/base' '$INTOCLEANUP_SAME_HOME/base'
+"
+
+it "_into_cleanup does nothing when --into pointed at a directory that already existed (into == boundary)"
+[[ -d "$INTOCLEANUP_SAME_HOME/base" && -f "$INTOCLEANUP_SAME_HOME/base/existing.txt" ]] \
+    && ok || fail "an already-existing --into directory (or its contents) should never be touched"

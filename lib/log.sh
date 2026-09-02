@@ -233,3 +233,149 @@ _log_run_on_failure() {
     } 2>/dev/null
     return 0
 }
+
+# The read side this file never had until now -- everything above only
+# ever writes. Walks day-files NEWEST first (same glob shape the pruning
+# loop above already uses), pulling only as many lines as still needed
+# from each via `tail`, until `n` is satisfied or files run out -- so a
+# request for the last 5 lines never reads an entire month of history
+# just to throw most of it away. Each file's own chunk is prepended to the
+# accumulator (not appended), since files are visited newest-first but the
+# final output must read oldest-to-newest, the same direction the log
+# itself is written in.
+#
+# No locking: an append under O_APPEND is already atomic below PIPE_BUF
+# (this file's own header comment on `_log_write` already establishes
+# this), so a read racing a write can only ever see a complete line or
+# none of it -- never a torn one. Lines are already sanitized at write
+# time (`tui_sanitize_field`, inside `_log_write`), so nothing further is
+# needed before they reach a terminal or become a JSON array element.
+LOG_TAIL_MAX_LINES=100000
+
+_log_tail() {  # _log_tail <n> -> up to <n> most recent log lines, oldest first
+    local n="$1" f chunk lines_in_chunk out=""
+    # A separate `local` statement, not `local n="$1" remaining="$n"` on one
+    # line -- confirmed live that bash does NOT see a variable just assigned
+    # earlier in the SAME `local` statement when expanding a later one on
+    # that same line (`local a=1 b=$a` in one statement leaves `b` empty;
+    # splitting into two statements works). A real, easy-to-miss pitfall,
+    # not a stylistic choice -- found by review (round omabackup-33,
+    # `omabackup-rev-2`) to ALSO be the reason `_into_cleanup`
+    # (bin/omabackup) had silently never removed anything, in already-
+    # shipped code discovered by a repo-wide scan for the same shape.
+    #
+    # Length-bounded against LOG_TAIL_MAX_LINES before ANY arithmetic
+    # context, same reasoning and shape as _log_retention_normalize just
+    # above (and _dest_keep_normalize, lib/destinations.sh) -- found by
+    # review (round omabackup-33, `omabackup-rev`, reproduced live):
+    # `^[1-9][0-9]*$` alone accepts a decimal so large it overflows bash's
+    # signed 64-bit `(( ))` (e.g. 9223372036854775808 wraps to a large
+    # NEGATIVE number), making `remaining <= 0` true immediately and
+    # returning success with zero lines -- silently wrong, not just
+    # rejected.
+    [[ "$n" =~ ^[1-9][0-9]*$ ]] || return 1
+    (( ${#n} <= ${#LOG_TAIL_MAX_LINES} )) || return 1
+    (( 10#$n <= LOG_TAIL_MAX_LINES )) || return 1
+    local remaining="$n"
+    # Bash's own glob into an array, not `for f in $(command ls ... | sort
+    # -r)` -- found by review (round omabackup-33, `omabackup-rev`): piping
+    # through an unquoted command substitution word-splits the result,
+    # which breaks on a LOG_DIR containing a space (a real, if unusual,
+    # possible value -- OMABACKUP_LOG_DIR/OMABACKUP_STATE are user-
+    # settable). `nullglob` avoids a literal, unmatched glob pattern
+    # becoming its own single "file" when no logs exist yet.
+    #
+    # nullglob's prior state is saved and restored via `shopt -p`/`eval`,
+    # the exact idiom lib/tui.sh already uses for trap save/restore
+    # (`trap -p` / `_tui_restore_saved_traps`) -- NOT `local -`, which a
+    # round-34 review suggestion proposed and this project verified live
+    # does NOT do what it sounds like it should: `local -` only scopes
+    # `set -o` options (the ones in `$-`), never `shopt`-managed ones like
+    # `nullglob` -- confirmed directly (`local -; shopt -s nullglob`
+    # inside a function still leaks nullglob=on to the caller after
+    # return). Nothing in this project currently enables nullglob before
+    # calling this function, so the leak was latent, not live -- still
+    # worth closing properly rather than with a fix that only looks right.
+    local nullglob_was
+    nullglob_was="$(shopt -p nullglob)"
+    shopt -s nullglob
+    local -a files=()
+    files=( "$LOG_DIR"/omabackup-*.log )
+    eval "$nullglob_was"
+    local -a sorted=()
+    if (( ${#files[@]} > 0 )); then
+        # NUL-delimited, not newline-delimited -- found by review (round
+        # omabackup-34, `omabackup-rev`; independently confirmed by
+        # `omabackup-rev-2` as a pre-existing limitation the `ls`-based
+        # version already had, not a regression this round introduced): a
+        # LOG_DIR containing an embedded newline would otherwise split
+        # ONE path into two lines here, and `mapfile` would reconstruct
+        # two broken fragments instead of one real path. `sort -z` and
+        # `mapfile -d ''` handle the NUL-separated form directly.
+        #
+        # `sort`'s own exit status, actually checked -- not just an
+        # array-length comparison after the fact. Found by review (round
+        # omabackup-36, `omabackup-rev`): this function's own PREVIOUS
+        # round-35 fix compared `${#sorted[@]}` against `${#files[@]}`
+        # after reading through a process substitution, reasoning that
+        # "sort can only reorder, never add or drop an element" -- true,
+        # but incomplete: a `sort` that emits all N records and THEN
+        # exits non-zero (or one that emits N records with content
+        # corrupted -- e.g. one path duplicated, another dropped, still N
+        # total) satisfies the count check while still being a real
+        # failure, and the array-length approach cannot detect either.
+        # Fixed by not using a process substitution at all: `sort`'s
+        # output is written to a real temp file, whose write DIRECTLY
+        # checks `sort`'s own exit status (as the last stage of a real
+        # pipe redirected to a file, its status is `$?` regardless of
+        # `pipefail`), and `mapfile` then reads that already-verified file
+        # via plain redirection -- no subshell involved, so the earlier
+        # concern (`mapfile` as the last stage of a literal pipe loses its
+        # own variable) does not apply here either.
+        local sort_tmp
+        sort_tmp="$(mktemp)" || return 1
+        if ! printf '%s\0' "${files[@]}" | LC_ALL=C sort -z -r >"$sort_tmp"; then
+            rm -f "$sort_tmp"
+            return 1
+        fi
+        mapfile -d '' -t sorted <"$sort_tmp"
+        rm -f "$sort_tmp"
+    fi
+    for f in "${sorted[@]}"; do
+        (( remaining <= 0 )) && break
+        [[ -f "$f" ]] || continue
+        # tail's own exit status is now checked -- found by review (round
+        # omabackup-34, `omabackup-rev`): the previous `[[ -z "$chunk" ]]
+        # && continue` treated an unreadable-but-existing file (wrong
+        # permissions, or any other real read failure) identically to a
+        # legitimately empty one, so `log-tail`/`recentLog` reported
+        # "nothing logged" for a log that genuinely could not be read --
+        # the same "failure silently read as absence" shape this
+        # project's own PLAN.md already treats as a real class of bug
+        # elsewhere. A read failure now aborts the whole call, EXCEPT the
+        # one case that must stay benign: the file raced away between the
+        # `[[ -f ]]` check above and this `tail` call (this project's own
+        # pruning, under its own lock, could remove a day-file exactly
+        # this old between the two) -- re-checked with a second `[[ -f ]]`
+        # so that specific, narrow race keeps behaving like "this file had
+        # nothing," not a hard error.
+        if ! chunk="$(tail -n "$remaining" -- "$f" 2>/dev/null)"; then
+            [[ -f "$f" ]] || continue
+            return 1
+        fi
+        [[ -z "$chunk" ]] && continue
+        # `wc`'s own exit status checked too -- found by review (round
+        # omabackup-35, `omabackup-rev`): if `wc` failed, the previous code
+        # let `lines_in_chunk` become an empty string, which bash
+        # arithmetic silently treats as 0 -- `remaining` would then never
+        # decrease, and one day-file could contribute far more than its
+        # fair share of the N-line budget instead of this call failing
+        # outright the way a genuine tool failure should.
+        lines_in_chunk="$(printf '%s\n' "$chunk" | wc -l)" || return 1
+        [[ "$lines_in_chunk" =~ ^[0-9]+$ ]] || return 1
+        if [[ -n "$out" ]]; then out="$chunk"$'\n'"$out"; else out="$chunk"; fi
+        remaining=$(( remaining - lines_in_chunk ))
+    done
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    return 0
+}

@@ -6,7 +6,23 @@
 tui_header() {
     local title="$1"
     printf '\033[2J\033[H'
-    printf 'OmaBackup %s\n\n' "$title"
+    printf 'OmaBackup %s\n' "$title"
+    # LOG_DIR (lib/log.sh) and _tilde (bin/omabackup) are both already
+    # defined by the time any TUI screen actually runs -- shared by both
+    # config (lib/config.sh) and restore (bin/omabackup), so a user hunting
+    # for "what actually happened" (the case the log feature itself exists
+    # for) does not need to already know this path to find it.
+    #
+    # Piped through tui_sanitize_field, not printed raw -- found by review
+    # (round omabackup-33, `omabackup-rev`): LOG_DIR is derived from
+    # OMABACKUP_LOG_DIR/OMABACKUP_STATE, both user-settable environment
+    # values, and `_tilde` only does a HOME-prefix string substitution --
+    # nothing about it strips a CSI/C0/C1 sequence or an embedded newline
+    # that a crafted value could use to clear the screen or forge an extra
+    # line in this banner. This is the same function `_log_write` already
+    # trusts to make a log LINE safe to display; using it here too closes
+    # the same class of risk for this new display path.
+    printf 'Log: %s\n\n' "$(tui_sanitize_field "$(_tilde "$LOG_DIR")")"
 }
 
 tui_sanitize() {

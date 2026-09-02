@@ -671,14 +671,15 @@ cmd_config_tui() {
         printf '  5) Send schedule\n'
         printf '  6) Automatic backups\n'
         printf '  7) Log retention\n'
+        printf '  8) View log\n'
         printf '  q) Cancel\n\n'
-        printf 'Choose an option [1-7/q]: '
+        printf 'Choose an option [1-8/q]: '
         tui_read_line choice || return 0
         rc=0
         case "$choice" in
             q|Q|$'\033') printf '\nConfiguration cancelled.\n'; return 0 ;;
             ''|*[!0-9]*)
-                notice="Please choose 1-7 or q."
+                notice="Please choose 1-8 or q."
                 continue
                 ;;
             1)
@@ -1020,8 +1021,38 @@ cmd_config_tui() {
                     notice="${output:-Log retention was not changed.}"
                 fi
                 ;;
+            8)
+                printf 'How many lines? [20] (q to cancel): '
+                tui_read_line value || return 0
+                if [[ "$value" == q || "$value" == Q || "$value" == $'\033' ]]; then
+                    notice="View log cancelled."
+                    continue
+                fi
+                value="${value:-20}"
+                if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+                    notice="Enter a positive number of lines."
+                    continue
+                fi
+                # Printed directly, not via `notice` -- a notice is a single
+                # line shown once before the NEXT tui_header clears the
+                # screen; log content can be many lines, and tui_header's own
+                # \033[2J\033[H at the top of the next loop iteration would
+                # erase it before it could be read. So this branch prints now
+                # and waits for an explicit keypress itself, instead of
+                # setting notice and letting the loop's own redraw happen
+                # immediately.
+                printf '\n'
+                output="$($cli log-tail "$value" 2>&1)"
+                if [[ -n "$output" ]]; then
+                    printf '%s\n' "$(tui_sanitize "$output")"
+                else
+                    printf 'Nothing logged yet.\n'
+                fi
+                printf '\nPress Enter to continue...'
+                tui_read_line value
+                ;;
             *)
-                notice="Please choose 1-7 or q."
+                notice="Please choose 1-8 or q."
                 continue
                 ;;
         esac

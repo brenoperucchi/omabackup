@@ -2760,8 +2760,441 @@ Full suite after this round's fixes: **1259 passed, 0 failed**. Both
 `herdr-review` rounds' full test-suite runs (`omabackup-rev-2`,
 independently) matched.
 
+### Reading the log back: a Settings TUI item, and a panel section
+
+The persistent log (above) only ever had a write side. The user asked for
+two consumers of the same log files, in the same message that also
+reported two live bugs handled separately (a one-off dimmed-but-clickable
+Settings button, not reproduced; the enable/disable toggle not responding
+on one 34" ultrawide monitor specifically, not the other two -- a
+hardware/compositor question still being triaged, not a code change).
+Before building the panel side, the user picked a design from three ASCII
+mockups (an inline status-line caption, an expandable footer section, and
+a hover-tooltip indicator) -- the expandable section, matching "Current
+settings" exactly.
+
+One shared read primitive, `_log_tail(n)` (`lib/log.sh`), walks day-files
+newest-first and pulls only as many lines from each as still needed --
+found and fixed a real bash pitfall while writing it: `local n="$1"
+remaining="$n"` in ONE statement leaves `remaining` empty, since bash does
+not see a variable just assigned earlier in the same `local` line when
+expanding a later one on that line (confirmed live in isolation); splitting
+into two `local` statements fixed it.
+
+Two consumers:
+- `omabackup log-tail [N]` (default 20) -- a new, documented (unlike
+  `log-event`/`kill-group`) CLI subcommand, used by the Settings TUI's new
+  option 8 ("View log"): prompts for a line count, prints the real content
+  directly (not via the one-line `notice` mechanism, since `tui_header`'s
+  own screen-clear at the top of the next loop iteration would erase
+  multi-line output before it could be read), and waits for an explicit
+  keypress before returning to the menu. `tui_header` itself (shared by
+  both `config` and `restore`) now also prints the log's own directory,
+  tilde-shortened -- the user's second, smaller ask in the same message.
+- `cmd_status --json` gains a `recentLog` field (fixed at 5 lines, not
+  configurable -- a glance, not a viewer), reusing the exact round-trip the
+  panel already makes on every refresh instead of a second Process/onExited
+  block. `Panel.qml`'s "Recent activity" section mirrors "Current
+  settings" exactly (same collapsed-by-default Item+header+"+"/"-"+
+  MouseArea shape, same `settingsRevealTimer` reused rather than
+  duplicated), with a flat `Repeater` over `statusDoc.recentLog` (the
+  Verification alerts list's own shape, not "Current settings"'s 2-column
+  Grid -- log lines are not key/value pairs) instead. `applyStatus`'s
+  existing document-shape validation gained one more required field
+  (`Array.isArray(parsed.recentLog)`), matching how `destinations`/
+  `scheduler` are already required, so a malformed or missing field cannot
+  reach the Repeater and throw at render time.
+
+A real, self-inflicted bug caught before it shipped: `log-tail` fell
+through `_log_policy_for_cmd`'s default `failure` policy (nothing in that
+case statement named it), so running it successfully wrote its OWN
+"log-tail ok" line into the very log it was just asked to display -- a
+read that mutates what it reads. Fixed by adding it to the same `never`
+bucket as `log-event`/`kill-group`/`version`/`artifacts`/`help`. Caught by
+a regression that runs it twice and asserts the log is unchanged, not by
+inspection.
+
+Adding an 8th Settings TUI option broke three existing tests that had
+baked in the *previous* boundary of the menu: two asserted the exact
+`"Please choose 1-7 or q."` text (now `1-8`), and one used `8` itself as
+an example of an out-of-range choice -- which stopped being true the
+moment 8 became a real option, and was changed to `9`. Caught by the full
+suite, not anticipated in advance.
+
+Full suite: **1280 passed, 0 failed**.
+
+### Round omabackup-33 review: five real bugs, one of them already shipped and never caught
+
+`herdr-review` dispatched on the log-viewing feature above. `omabackup-rev`
+found five P2s and three P3s; `omabackup-rev-2` independently found one P2
+of its own (the most consequential finding of the round) and confirmed
+everything else in the diff.
+
+- **P2 (`omabackup-rev-2`) -- the SAME bash `local`-chaining pitfall
+  `_log_tail` had, already shipped and never caught, in `_into_cleanup`
+  (`bin/omabackup`).** A repo-wide scan (38 shell files) for `local a=1
+  b=$a`-shaped statements found one real occurrence outside this diff:
+  `local into="$1" boundary="$2" d="$into"` left `d` empty, so the
+  cleanup loop's own `-n "$d"` was false immediately and the function has
+  been a complete no-op since it was written -- across all 17 call sites
+  in `cmd_restore`'s error paths, with zero prior test coverage. Fixed
+  with the same two-`local`-statement split, and two new tests (a real
+  no-op-if-broken directory tree that actually gets cleaned up to the
+  boundary, and a non-empty ancestor correctly stopping the climb) --
+  extracting the real function from `bin/omabackup`, not a hand-copy.
+- **P2 (`omabackup-rev`) -- `_log_tail` broke on a `LOG_DIR` containing a
+  space.** `for f in $(command ls ... | sort -r)` word-splits the
+  result; `OMABACKUP_LOG_DIR`/`OMABACKUP_STATE` are both user-settable,
+  so this was reachable. Fixed with a native bash glob into an array
+  instead of parsing `ls` output.
+- **P2 (`omabackup-rev`) -- `log-tail` still required the group
+  manifest.** The central gate (right before the main dispatch case)
+  only exempted `log-event`/`kill-group`; `log-tail` fell through it, so
+  exactly a broken install (a missing/moved manifest) could not use the
+  one command meant to help explain it. Added to the same exemption.
+- **P2 (`omabackup-rev`) -- N validation accepted a decimal too large for
+  bash's signed 64-bit arithmetic.** `^[1-9][0-9]*$` alone let a value
+  above `INT64_MAX` through, which then wrapped to a large NEGATIVE
+  number inside `(( remaining <= 0 ))`, returning SUCCESS with zero
+  lines -- silently wrong, not rejected. Fixed with the same
+  length-then-range check `_log_retention_normalize` already established,
+  against a new `LOG_TAIL_MAX_LINES=100000` ceiling.
+- **P2 (`omabackup-rev`) -- `tui_header`'s new log-path line was not
+  sanitized.** `LOG_DIR` is derived from user-settable environment
+  values, and `_tilde` is a plain string substitution -- a crafted value
+  with a CSI sequence or an embedded newline could clear the screen or
+  forge an extra banner line. Piped through `tui_sanitize_field`, the
+  same function `_log_write` already trusts to make a log LINE safe.
+- **P2 (both reviewers, converging) -- making `recentLog` a REQUIRED
+  field in `applyStatus` turned an additive change into a breaking one.**
+  `resolveProc` prefers any `omabackup` already on PATH over this
+  checkout's own binary; an updated panel talking to an older CLI still
+  on PATH would emit a v1 document with no `recentLog` key, and requiring
+  it rejected the WHOLE document -- destinations, scheduler, config, all
+  of it -- over one 5-line cosmetic field. Fixed per both reviewers'
+  identical suggested fix: absence now means `[]` (already its documented
+  meaning), and only a PRESENT-but-wrong-shape value is still rejected.
+- **P3s (`omabackup-rev`), all test-quality, all fixed:** the "capped at
+  5" test used only 3 events and substring containment, which would have
+  passed against a wrong cap OR wrong order -- rewritten with 6 distinct
+  events and an exact ordered-array comparison. The "Press Enter to
+  continue" PTY test sent all keystrokes upfront and only checked the
+  prompt text appeared somewhere -- rewritten with a synchronized,
+  wait-then-send FIFO driver that proves the redraw is blocked until the
+  continuing keystroke (and, while building it, caught a real bug in the
+  new driver itself: waiting for "Choose an option" to reappear returned
+  instantly, since that string already existed from the first menu draw
+  -- fixed with an occurrence-counting wait, the same shape
+  `restore.test.sh`'s own `_restore_tui_wait_count` already uses). A test
+  used a predictable shared `/tmp/tail_empty_out` path, risking collision
+  with a concurrent suite run -- moved under its own `mktemp -d`.
+
+Every fix verified fail-before/pass-after against the exact regression
+described, several by temporarily swapping in a mutated copy of the real
+file and restoring it afterward (confirmed via `git diff` showing no
+stray changes each time).
+
+Full suite: **1292 passed, 0 failed**.
+
+### Round omabackup-34: a measured second review, and a wrong suggested fix caught before it shipped
+
+`herdr-review` dispatched on round-33's own fixes. `omabackup-rev` found
+five more P2s and three P3s; `omabackup-rev-2`'s tone shifted noticeably
+from round 33 -- confirming six of the fixes by direct measurement,
+finding only two P3s of its own (both latent, neither live), and
+explicitly declining to escalate `omabackup-rev`'s largest finding (see
+below) to blocking. This round's own fixes are correction round 2 for
+this feature's review cycle -- the last self-directed round before any
+further finding goes to the user rather than being fixed here.
+
+**A wrong suggested fix, caught before landing it:** `omabackup-rev`
+proposed `local -` to scope `nullglob`'s mutation to the function, the
+same shape already used for trap save/restore elsewhere in this project.
+Tested directly before trusting it: `local -` only scopes `set -o`
+options (the ones in `$-`), never `shopt`-managed ones like `nullglob` --
+confirmed live (`local -; shopt -s nullglob` inside a function still
+leaks `nullglob=on` to the caller after return). Fixed instead with the
+actual established idiom for this (`lib/tui.sh`'s own `trap -p`/restore
+pattern, applied here as `shopt -p nullglob` saved and `eval`'d back).
+
+Six fixes landed:
+- **`_log_tail`'s sort was still newline-delimited.** The array-glob fix
+  (round 33) closed spaces; a LOG_DIR containing an embedded newline would
+  still split one path into two lines through `printf '%s\n' | sort`.
+  `omabackup-rev-2` independently confirmed this was a PRE-EXISTING
+  limitation the old `ls`-based version already had too (fails closed --
+  shows nothing -- not a live regression this round introduced). Fixed
+  with a NUL-delimited sort (`sort -z`, `mapfile -d ''`) regardless, and a
+  new test with a real embedded newline in the state path.
+- **A read failure was silently reported as "nothing logged."** `tail`'s
+  own exit status was never checked; an unreadable-but-existing day-file
+  (wrong permissions, or any other real I/O failure) produced the same
+  empty result as a legitimately empty log. Fixed by checking `tail`'s
+  status, re-confirming with a second `[[ -f ]]` so the one case that must
+  stay benign -- the file racing away between the loop's own check and the
+  `tail` call, via this project's own pruning under its own lock -- still
+  behaves like "this file had nothing," while a genuine read failure now
+  aborts with a clear, actionable message from `cmd_log_tail`.
+- **`nullglob`'s mutation leaked to the caller.** See above; fixed with
+  save/restore via `shopt -p`, not `local -`.
+- **`log-tail` silently ignored extra positional arguments.** `log-tail 2
+  typo` used to succeed printing 2 lines; now rejected with a usage
+  message, matching every other real subcommand's own exact-argument-count
+  discipline.
+- **The synchronized PTY test's one remaining absence check was still a
+  fixed-window guess** (`sleep 0.2`, the exact same class of fragility
+  already fixed once for the launch-failure QML probe's phase 3, round
+  omabackup-31) -- `omabackup-rev-2` measured that a broken-gate redraw
+  routes through a real subprocess spawn (`tui_header` plus `$cli config
+  show`) and can exceed 200ms on a loaded CI machine, which would pass the
+  test with the bug present. Redesigned around `omabackup-rev`'s own
+  suggested technique instead of trying to pick a better number: send `q`
+  itself as the continuing keystroke. `tui_read_line` accepts any line, so
+  a WORKING gate consumes it as "continue" and the process survives to a
+  redrawn menu (needing a second `q` to actually exit); a BROKEN gate lets
+  that same `q` fall straight through to the outer menu's own cancel
+  branch, and the whole process exits after just the one keystroke. The
+  observable becomes "is the process still alive", not a timing window --
+  no sleep, no guess. The driver itself was also hardened to match
+  `restore.test.sh`'s own established shape (a `driver_failed` flag,
+  SIGPIPE-isolated writes, a bounded poll-then-wait instead of an
+  unbounded `wait` that a stuck child could hang the whole suite on).
+- **Two tests were added for completeness, not defects**: `into ==
+  boundary` for `_into_cleanup` (the directory already existed before the
+  restore -- the function's own comment already documents this as a
+  no-op, and it is the most common real call shape), and the excess-
+  positional-argument rejection above.
+
+**Deliberately NOT absorbed into this round, flagged for the user
+instead:** `omabackup-rev`'s largest finding was that `_into_cleanup`'s
+round-33 fix, while correct for what it does, still is not CALLED from
+several real `cmd_restore` paths -- the `--json` preview path, and
+several apply-setup failures (state/base/backup/quar directory creation)
+that `die` before the fixed function is ever reached. A second, narrower
+part of the same finding: if `mkdir -p "$into"` itself only partially
+succeeds (creates some ancestors but not the final leaf), `_into_cleanup`
+starts its climb at the wrong point and would need to know which
+components were actually created, not just where `$into` and `$boundary`
+are. `omabackup-rev-2`, reviewing the same fix, confirmed it correct for
+what it addresses and did not escalate this to a blocking finding. This
+is a real gap, but a different, larger one than "the local-chaining bug
+made the function inert" (round 33's actual finding) -- auditing and
+extending cleanup coverage across `cmd_restore`'s many failure paths is
+closer to a small project of its own than a fix to land inside this
+review cycle, and is recorded here as a follow-up rather than attempted
+under this round's own scope.
+
+Full suite: **1298 passed, 0 failed**.
+
+### Round omabackup-35: `omabackup-rev-2` APPROVEs outright; a genuine second correction to a round-34 review suggestion; the point where self-directed correction stops
+
+`herdr-review` dispatched on round-34's own fixes -- this project's own
+"max 2 correction rounds" discipline was already at its limit going in
+(round 33 = initial review, round 34's fixes = correction 1, round 35 is
+the review of correction 2). `omabackup-rev-2` gave an explicit
+**APPROVE**, stating plainly that nothing in what this round changed
+reached P1/P2, and independently verified all four mechanisms this
+round's own review questions asked about by direct measurement.
+`omabackup-rev` found three more P2s and two P3s.
+
+**A second wrong suggestion caught, this time rev-2's own from round 34:**
+rev-2 had proposed `local -` for the nullglob fix; rev-2 tested it again
+this round, confirmed it was wrong for exactly the reason already found
+(scopes `set -o` flags, never `shopt`), and said so plainly rather than
+defending it -- "Estava errada, e confirmei isso eu mesmo aqui."
+
+**Genuine disagreement between the two reviewers, on one point:**
+`omabackup-rev`'s P3 argues the redesigned "send `q`, check liveness" PTY
+proof (round 34) has a sampling race -- a broken gate's own redraw could
+theoretically be observed as "menu redrawn, process still alive" in the
+narrow window between the redraw printing and the queued `q` actually
+being consumed, misclassifying it as the working-gate outcome.
+`omabackup-rev-2` explicitly verified the mechanism's soundness (the
+FIFO stays open throughout the observation, `tui_read_line`'s real call
+site never inspects its own input) and found no such window. Both are
+reasoning about the same code from different angles and neither has
+obviously the wrong premise -- this is exactly the kind of narrow,
+disputed-severity point this project's own review discipline says to
+surface rather than resolve unilaterally, especially now that the
+self-directed round budget is spent.
+
+**Applied now, cheap and undisputed:**
+- `cmd_log_tail`'s new "could not read" error message interpolated
+  `LOG_DIR` raw -- the header's own equivalent line was sanitized in
+  round 33, but this direct CLI error path was missed. Piped through
+  `tui_sanitize_field`, closing the same gap in the one place it was
+  still open.
+- A permanent regression for the nullglob save/restore fix itself
+  (round 34) -- the manual verification that motivated the fix was real,
+  but every existing `_log_tail` test happens to call it with nullglob
+  already at its bash default (off), which the ORIGINAL buggy version
+  also left off -- so none of the existing tests would have caught the
+  bug either. New test covers both starting states, plus the return-1
+  (read failure) path.
+- A comment documenting that `cmd_log_tail`'s own N validation
+  deliberately duplicates `_log_tail`'s internal one (`omabackup-rev-2`'s
+  own nit: worth a line so nobody "simplifies" one away later).
+
+**NOT applied, left for the user to weigh rather than treated as this
+round's own call:**
+- **`_log_tail` still discards `sort`/`wc`'s own exit status.**
+  `mapfile < <(pipe)` reports `mapfile`'s own status, not the producer
+  pipeline's; a failed `wc -l` reads as an empty string, which arithmetic
+  context treats as 0, so `remaining` could stop decreasing and let one
+  day-file contribute far more than its fair share of the N-line budget.
+  Real, but requires restructuring (dropping the external `sort`
+  entirely, or capturing its status some other way) rather than a small
+  patch.
+- **`cmd_status --json`'s `recentLog` masks a genuine read failure as
+  `[]`, same as "nothing logged yet."** This is arguably consistent with
+  the ALREADY-decided round-33/34 principle that `recentLog` must never
+  be able to break the whole status document (both reviewers converged on
+  exactly that for the Panel.qml compatibility fix) -- but it does mean
+  the distinction between "empty" and "couldn't read" is lost specifically
+  in this one JSON field, which is the case `omabackup-rev` is pointing
+  at. Whether that's an acceptable, already-implied tradeoff or a gap
+  worth a dedicated fix is a judgment call, not a clear-cut bug.
+- **The PTY test's disputed sampling race**, described above.
+
+Full suite: **1301 passed, 0 failed**.
+
+### A third correction round, explicitly authorized by the user past this project's own 2-round default
+
+The three items round 35 left for the user (`_log_tail`'s discarded
+`sort`/`wc` status, `recentLog`'s masked read failure, and the disputed
+PTY sampling race) were presented with a choice: accept as-is and finish,
+or spend one more round fixing all three. The user chose the second
+option explicitly, so this round is not a self-directed extension of the
+budget -- it is done on direct instruction.
+
+- **`_log_tail`'s `sort`/`wc` status.** `sort` runs inside a process
+  substitution feeding `mapfile` (needed so the populated array survives
+  outside a throwaway subshell), which means its own exit status is not
+  directly exposed the way a literal pipe's `PIPESTATUS` would be.
+  Verified instead of assumed: `sort` only ever reorders `files`, never
+  adds or drops an element, so comparing `${#sorted[@]}` against
+  `${#files[@]}` afterward is a direct, sufficient check -- no exit-status
+  plumbing through the substitution needed. `wc -l`'s own status is
+  checked directly (it is the last stage of its own inner pipe, so `$?`
+  right after the substitution already reflects it correctly), plus a
+  format check on its output before trusting it in arithmetic. Two new
+  tests stub each command to fail outright and confirm `_log_tail` returns
+  1 with no partial output, rather than silently under- or over-counting.
+- **`recentLog`'s masked read failure.** `cmd_status`'s own
+  `recentlog_json="$(_log_tail 5 | jq ...)"` runs under this script's
+  global `set -o pipefail` (line 9), so `_log_tail`'s own failure DOES
+  reach `$?` right after the assignment -- nothing previously read it.
+  Now captured explicitly into a new `recentLogError` boolean, added
+  alongside the existing `recentLog` field. `recentLog` itself still stays
+  `[]` on failure -- the round-33/34 principle holds, this field must
+  never break the whole document -- but the failure is no longer silently
+  indistinguishable from "nothing logged yet." Panel.qml's `applyStatus`
+  treats the new field the same optional-but-typed way as `recentLog`
+  itself (absent -> `false`, for older-CLI skew; present-but-wrong-type ->
+  reject the whole document), and the "Recent activity" section now shows
+  "Could not read the log." instead of "Nothing logged yet." when the flag
+  is set. New QML probe phase and a bash-level `status --json` test with a
+  real unreadable day-file cover both sides.
+- **The PTY test's disputed sampling race**, resolved by redesigning
+  around the technique `omabackup-rev` itself suggested rather than by
+  picking a side: send `x\nq\n` as the continuing input instead of a bare
+  `q`. With a working gate, `x` is consumed as "press enter to continue"
+  (any input accepted, nothing inspected) and `q` becomes the first real
+  menu choice -- 2 menu draws total before a clean exit. With a broken
+  gate, the flow falls straight through to the menu, `x` lands there as an
+  INVALID choice (forcing an extra "Please choose 1-8 or q." redraw)
+  before `q` is finally read as the exit choice -- 3 draws total. Both
+  keystrokes are queued up front; the test waits for the process to fully
+  and unambiguously exit before counting draws at all, closing the exact
+  sampling window `omabackup-rev` raised, rather than checking liveness
+  mid-flight. Verified directly against the regressed (gate-removed) code:
+  the failure reads `draws=3`, exactly the predicted broken-gate count,
+  not merely "some other number" -- proving the technique discriminates
+  the two cases for the reason claimed, not by accident.
+
+Full suite: **1306 passed, 0 failed**.
+
+### Round omabackup-36: the review of the user-authorized third round, and where this genuinely closes
+
+`herdr-review` dispatched on round-35's own fixes. `omabackup-rev` found
+one real P2 and one real P3, both fixed. `omabackup-rev-2` gave an
+explicit **APPROVE**, stated plainly "eu considero genuinamente
+concluído," and independently verified all four of this round's own
+review questions -- including two things `omabackup-rev` itself flagged
+as untested (`recentLogError`'s propagation through `sort`/`wc` failures
+specifically, not just the one unreadable-file case that had a real
+test).
+
+- **P2 (`omabackup-rev`) -- the array-length comparison for `sort`
+  (round 35's own fix) was not a complete substitute for its real exit
+  status.** A `sort` that emits every record correctly and only THEN
+  exits non-zero satisfies the length check while still being a real
+  failure -- `omabackup-rev`'s own suggested test (a stub `sort` that
+  `cat`s its input before `exit 1`) reproduced this exactly, sailing past
+  the round-35 check. Fixed by dropping the process substitution
+  entirely: `sort`'s output now goes to a real temp file, whose write
+  directly exposes `sort`'s own exit status (as the last stage of a real
+  pipe redirected to a file, checkable regardless of `pipefail`), and
+  `mapfile` reads that already-verified file via plain redirection --
+  no subshell involved, so the original "mapfile as the last stage of a
+  literal pipe loses its own variable" concern that motivated the process
+  substitution in the first place does not apply to a file redirect
+  either. New test uses the exact pass-through-then-fail stub.
+  `omabackup-rev-2`, reviewing the SAME pre-fix code from a different
+  angle, measured the residual gap as doubly benign (a `sort` that lies
+  about its own status after doing correct work costs nothing to ignore;
+  a `sort` that emitted CORRUPTED same-length paths would not survive the
+  loop's own `[[ -f ]]` check either way) and did not treat it as
+  blocking -- the fix landed anyway, going beyond what either reviewer
+  strictly required.
+- **P3 (`omabackup-rev`) -- no permanent regression for `status --json`'s
+  `recentLogError` against a real unreadable day-file.** Round 35 added a
+  QML probe phase that manually injects `{ recentLog: [], recentLogError:
+  true }` into a fixture `statusDoc` -- proving the PANEL renders the
+  flag correctly, never that `cmd_status --json` itself actually SETS it.
+  A genuine `chmod 000` day-file, driven through the real CLI end to end,
+  now covers this directly, alongside asserting the rest of the document
+  (`schemaVersion`, `destinations`) stays well-formed around it.
+  `omabackup-rev-2` independently exercised the two paths this new test
+  still didn't cover (a failing `sort` and a failing `wc`, each via a
+  PATH-shadowing stub around the real `cmd_status --json` call) and
+  confirmed both propagate correctly too.
+- **One cheap nit applied** (`omabackup-rev-2`): a comment on the PTY
+  test's own log fixture noting that its draw-counting mechanism is a
+  plain substring count over the whole transcript, so the fixture content
+  must stay free of the literal menu text "Choose an option" -- not
+  discovered by whoever next makes the fixture "more realistic."
+- **Not applied, explicitly deferred as a future simplification, not a
+  defect:** `omabackup-rev-2`'s own observation that day-files sorted by
+  name already come back in order from bash's OWN glob expansion (the
+  filenames are `omabackup-YYYY-MM-DD.log`), so the external `sort`
+  process could be eliminated entirely in favor of a plain bash reverse
+  iteration -- less code, no `PATH` dependency, no exit-status question
+  to answer at all. Correct and worth doing next time this function is
+  touched for another reason; not retrofitted into this already-landed
+  fix.
+
+Both reviewers converged on the same conclusion this round, from
+different directions: nothing left is a behavior defect, only
+method-quality nits on already-correct code, and continuing to iterate
+past this point would be diminishing returns. The one item both
+explicitly agree is genuinely still open -- `_into_cleanup`'s call-site
+coverage across `cmd_restore` -- remains recorded as its own follow-up,
+not something either round tried to fold in.
+
+Full suite: **1314 passed, 0 failed**.
+
 ## Open questions for the user, not yet decided
 
+- `_into_cleanup`'s round-33 fix works correctly for what it does, but is
+  still not CALLED from several real `cmd_restore` failure paths (the
+  `--json` preview path; several apply-setup failures before the state/
+  base/backup/quar directories exist) -- and separately, if `mkdir -p
+  "$into"` itself only partially succeeds, the function starts its climb
+  at the wrong point. Auditing and extending cleanup coverage across
+  `cmd_restore`'s many failure paths is its own small project, not
+  something absorbed into round 34's fix cycle (see that round's own
+  writeup above for the full finding).
 - What path should the first `dir` destination actually point at?
 - Should the systemd timer auto-commit (`sync --commit` unattended) or only
   auto-collect-and-diff, leaving commit to a manual action/keypress until
