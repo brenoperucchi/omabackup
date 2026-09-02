@@ -1661,6 +1661,350 @@ attributed to them:
   a fourth round.
 - Full suite: **1163 passed, 0 failed**.
 
+## Two more marketplace security findings: an unbounded restore extraction, and Panel.qml process/output containment
+
+Follow-up on issue #3968 after the AGENTS.md fix (`cd4857e`): `HANCORE-linux`
+flagged two more blockers at HEAD `cd4857e`, unrelated to logging.
+
+**1. `lib/bundle.sh:482` (`_zstd_extract`) -- restore decompressed an
+artifact fully before verification, with no size limit at all.** A shared
+destination is not a trusted source, and `verify_bundle`/`cmd_restore` both
+extract BEFORE checking anything -- extraction has to happen to have
+something to check. zstd's ratio is not bounded by the compressed file's
+size on disk (a 1.6KB archive of 50MB of zeros, built and measured live,
+decompresses to the full 50MB), so a hostile or corrupted artifact could
+fill the disk before the checksum/clone check ever ran. Fixed with `head -c`
+between `zstd -dc` and `tar -x` in the same pipe -- the archive file itself
+is still read exactly once, matching this function's own existing
+reasoning about checking a real pipe rather than a process substitution --
+so an oversized decompressed stream is cut off before `tar` writes past
+the cap; the existing `pipefail` handling turns tar's resulting "unexpected
+EOF" into the function's own failure, same as any other extraction
+failure. 4 GiB default (`OMABACKUP_RESTORE_MAX_BYTES` to override) --
+generous for what this tool actually backs up (this repo's own dotfiles
+archive measures ~1MB) while still bounding the worst case to a fixed
+number. Also bounds the worst-case tar member count, since every entry
+costs at least one 512-byte header in the exact stream the cap applies to
+-- no separate member-count check was needed on top of it. Verified live:
+the 50MB bomb above, under a 1MB test cap, left disk usage at ~999KB, not
+50MB. 5 new regressions in `test/bundle.test.sh` (57 total): the fixture
+really is lopsided (archive < 10KB, decompressed > 40MB), the bomb is
+refused and bounded, a real legitimate bundle far under the cap still
+extracts cleanly, and `restore` itself refuses a bomb artifact the same
+way it refuses any unextractable one.
+
+**2. `Panel.qml:594-668,718-824` -- QuickShell's own `Process` has no
+group-kill, and `StdioCollector` has no size cap.** Design consultation
+(`herdr-ask` round `omabackup-11`) before any QML was written, since this
+touches production UI code with no live QuickShell/Wayland environment to
+test interactively in this session by hand -- both reviewers gave
+substantive, partly-converging, partly-diverging positions; `omabackup-rev`
+proposed wrapping in `timeout`, `omabackup-rev-2` proposed reusing
+`bin/omabackup-tui`'s own already-hardened `_group_pgid_wait`/
+`_stop_group` via a new subcommand instead of a second QML implementation.
+Confirmed directly against `quickshell-mirror/quickshell`'s own source
+(the 0.3.1-1 build installed on this machine): `process.cpp` shows
+`running = false` calls `QProcess::terminate()` and `signal()` calls a
+bare `kill(pid, signal)` -- both target one PID, never a group; a timed-out
+`verify`/`status`/`sync`/`collect`/enable-disable that was itself blocked
+on a `git`/`rsync` child left that child orphaned. `datastream.hpp`/`.cpp`
+confirm `StdioCollector` appends every chunk to one `QByteArray` forever,
+no cap anywhere.
+
+Live-verified the one premise both reviewers flagged as needing it
+(`omabackup-rev-2`, explicitly: do not merge before checking) rather than
+assuming: a throwaway, isolated `qs -p <probe>.qml` (no panel config
+touched) confirmed QuickShell's own `Process`-spawned children do NOT get
+their own process group (`ps -o pid=,pgid=` showed the two differ) --
+exactly what makes `setsid --` in front of a command work as designed (a
+caller that is not already a process-group leader is what makes `setsid`
+exec in place rather than fork, per its own manual page).
+
+Fixed, synthesizing both reviewers' positions rather than picking one
+wholesale:
+
+- **Process-group containment**: a new internal subcommand,
+  `omabackup kill-group <pid>`, reusing the shape of
+  `bin/omabackup-tui`'s own hardened group-kill logic rather than a second
+  implementation in QML with no test suite exercising it (`omabackup-rev-2`'s
+  recommendation). Stricter than the tui wrapper's own version on purpose:
+  requires `pgid == pid` (the target really is its own group's leader)
+  rather than accepting any pgid that is merely not the caller's own --
+  correct because this subcommand is always invoked well after the target
+  started (no fork-vs-exec race to accommodate, unlike the tui wrapper's
+  own narrow post-fork window). Also refuses `pgid == 1` explicitly, found
+  while writing its own test: `kill -- -1` is not "process group 1", it is
+  POSIX's own broadcast case ("every process the caller has permission to
+  signal") -- caught and fixed before ever exercising it for real, not
+  discovered by running it. `verify`/`status`/`sync`/`collect`/
+  enable-disable's own `command` in Panel.qml is wrapped in `setsid --`;
+  `busyTimeoutTimer`'s `onTriggered` now calls `root.killGroup(pid)` with
+  the PID captured in the same statement `timedOut` is set, before
+  `running = false` (which reads `processId` back as `null`). 8 new
+  regressions in `test/panel.test.sh` covering the subcommand directly
+  (group-kill success including the spawned child, the own-group-leader
+  guard's fallback to single-pid, non-numeric-pid rejection, the pgid-1
+  broadcast guard via isolated `ps`/`kill` function stubs -- never a real
+  `kill -1`, the manifest exemption), plus a new headless QuickShell probe
+  (`test/qml/timeout-kills-descendant.qml`, matching this file's own
+  established `qs -p` probe methodology) proving the QML wiring itself --
+  not just the subcommand in isolation -- actually reaches and kills a
+  descendant process.
+- **Output byte cap**: `omabackup-rev-2`'s stronger argument, verified
+  directly against `datastream.cpp` rather than taken on its own premise --
+  `SplitParser`'s default `\n` delimiter would not have helped the actual
+  hot path (`verify --json`/`status --json` are single-line JSON, so the
+  delimiter is never reached until the stream ends, same as
+  `StdioCollector`) -- confirmed `SplitParser { splitMarker: "" }` emits
+  every chunk immediately via `read()` and never buffers internally
+  (`datastream.cpp`'s own empty-marker branch, read directly). `verifyProc`/
+  `statusProc`'s `stdout` uses that, feeding a new
+  `root.accumulateCapped(proc, chunk)` that owns the actual 256 KiB cap
+  (`root.maxOutputBytes`), latches a distinct `outputCapped` flag once
+  crossed (checked before `timedOut` in `onExited`, so a truncated buffer
+  never reaches `applyReport`/`applyStatus` as though it were valid JSON),
+  and kills the process the same way a timeout does (group and all, via
+  `killGroup`) rather than merely stopping this function's own
+  accumulation while the process keeps running. Documented honestly as a
+  consumer-side (QML) cap using JS string length (UTF-16 units), not a
+  byte-exact producer-side guarantee -- `omabackup-rev-2`'s own explicitly
+  acceptable fallback when a byte-exact guarantee is not required, chosen
+  over restructuring `bin/omabackup`'s two separate JSON-output sites
+  (`report()` for verify, a second inline `jq -n` call for status) into a
+  producer-side cap, given the added risk of touching well-established
+  reporting code for a lower-confidence attack surface: verify/status read
+  only this machine's own local, bounded configuration, never
+  attacker-controlled input the way `restore`'s artifact is. Buffers and
+  the latch are reset at the start of every run (`refresh()`), not just on
+  exit, so a capped run does not read as capped forever. 1 new headless
+  probe (`test/qml/output-cap-stops-accumulating.qml`): a well-formed
+  small output survives byte-for-byte, a 4000-byte single-line (no
+  newline at all) output past a 1000-byte test cap latches
+  `outputCapped`, stops growing, and triggers the kill path.
+- **Not applied to `sync`/`collect`/`switchProc`'s `stderr` collectors**:
+  `omabackup-rev-2` pushed back on how this was first framed here (round
+  omabackup-25) -- worth stating precisely rather than as an open
+  question implying there is a security boundary between them. The
+  declared threat model is a compromised or malfunctioning CLI; that
+  model does not distinguish stdout from stderr, and these three
+  `errBuffer` collectors are the exact same uncapped `StdioCollector` as
+  everything else was before this fix -- a CLI that floods stderr in a
+  loop grows the panel's memory exactly the same way. This is a
+  **triage decision**, not a principled split: `verify`/`status`'s stdout
+  was the specific single-line-JSON hot path both reviewers' arguments
+  were actually about, so it went first. The other three remain the same
+  exposure this whole entry describes, just not yet covered -- see "Open
+  questions" below; the same `accumulateCapped`/`SplitParser` pattern
+  extends to them directly.
+- Full suite: **1180 passed, 0 failed** as of this entry; see round
+  `omabackup-25` below for what a real review round found on top of it.
+
+### Review round `omabackup-25`: a process-group suicide bug, a race the whole fix existed to close, and a `head -c` sign flip
+
+`herdr-review` on the process/output hardening above found six real
+problems, one from `omabackup-rev-2` and five from `omabackup-rev` --
+the two most severe both live-reproduced, not just reasoned about:
+
+- **CONFIRMADO, most severe -- `omabackup-rev-2`'s finding, `omabackup-rev`
+  independently found the same class one branch over** -- `cmd_kill_group`
+  accepted `0` (and, separately, `1`) as a numeric pid. For `0`: `ps -p 0`
+  produces no valid pgid, so `_kg_stop_group` falls to its single-pid
+  branch and runs a bare `kill -TERM "$pid"` -- and `kill(2)` gives pid `0`
+  its own POSIX special case, distinct from the `-1` broadcast this file
+  already guarded: it signals **every process in the caller's own process
+  group**. Since `omabackup kill-group` shares QuickShell's own group
+  whenever invoked normally (the exact premise `setsid --` exists to
+  escape), `kill-group 0` would have SIGTERM'd the whole panel/bar.
+  Reproduced live, twice: `omabackup-rev-2` in an isolated session with a
+  sentinel process; this session again, independently, in a `setsid --wait`
+  session whose own test script died mid-run without reaching its own
+  final `echo` -- not merely predicted. For `1`: a legitimate pid
+  (init/systemd) that `_kg_stop_group`'s own `pgid != 1` guard correctly
+  refuses as a GROUP target, but that refusal falls through to the same
+  single-pid branch, which would run `kill -TERM 1` against the real init
+  process. Fixed by tightening `cmd_kill_group`'s own input validation to
+  `^[1-9][0-9]*$ && "$pid" != 1`, rejecting both before `_kg_stop_group`
+  -- and therefore before any `ps`/`kill` at all -- ever runs. 2 new
+  regressions in `test/panel.test.sh`, both against the real subcommand:
+  pid 0 in an isolated `setsid` session with a sentinel (dies mid-run
+  pre-fix, completes normally post-fix); pid 1, safe to test directly
+  since the fix rejects it before any signal is ever sent.
+- **CONFIRMADO-shaped, `omabackup-rev`'s finding -- the fix's own async
+  helper raced against a direct kill of the same target.** `killGroup()`
+  only *starts* a separate `Process` (bash, then `lib/*.sh` sourcing, then
+  its own `ps` lookup) -- not instant. Immediately after starting it, the
+  SAME calling code also set `proc.running = false` on the target
+  directly. If the direct kill reaped the leader first, the helper's own
+  `ps -o pgid= -p <pid>` lookup then found nothing (the pid was already
+  gone), fell through to a no-op single-pid signal, and the descendant --
+  the entire reason this mechanism exists -- was never reached.
+  `test/qml/timeout-kills-descendant.qml`'s own stand-in killer (an inline
+  `sh -c 'kill -TERM -"$1"'`, near-instant) could not have caught this: it
+  never raced the real subcommand's actual startup latency. Fixed by
+  removing every direct `proc.running = false` from `busyTimeoutTimer` and
+  `accumulateCapped` -- `killGroup()`'s own eventual signal is now the
+  ONLY thing that ever touches the target, so there is nothing left to
+  race, at any speed; QuickShell still detects the real exit and fires
+  `onExited` regardless of who signaled it. The probe was rewritten to
+  call the REAL `bin/omabackup kill-group` subcommand instead of a
+  stand-in (confirmed live: the probe reproduces `PARENT_GONE`/
+  `CHILD_ALIVE` -- the exact orphaning `omabackup-rev` described -- when
+  pointed at the OLD racy shape, and `PARENT_GONE`/`CHILD_GONE` against
+  the fix).
+- **`omabackup-rev`'s P1** -- the byte cap only ever covered `verify`/
+  `status`'s stdout; every stderr channel across all five processes
+  (including `verify`/`status`'s own) stayed on unbounded `StdioCollector`.
+  The declared threat model (a compromised or malfunctioning CLI) does not
+  distinguish stdout from stderr -- a `git`/`rsync`/hook writing rapidly
+  to stderr exhausts panel memory the same way, and could do it before the
+  45s timeout ever catches it, `omabackup-rev`'s own words, potentially
+  taking the whole bar down with it. Fixed by extending
+  `accumulateCapped`/`SplitParser{splitMarker:""}` to all five processes'
+  stderr too (generalized to take a `field` parameter -- `"buffer"` or
+  `"errBuffer"` -- so stdout and stderr on the same process share one
+  `outputCapped` latch). Found and fixed in the same pass: `errBuffer` was
+  never reset between runs (`StdioCollector`'s old
+  `onStreamFinished: proc.errBuffer = text` replaced the whole string
+  every time, so it never needed one; the new incremental
+  `proc[field] += chunk` does, or a failed run would show the PREVIOUS
+  run's stderr prepended to its own) -- reset alongside `buffer`/
+  `outputCapped` everywhere a run starts. `externalProc` (the detached TUI
+  launcher) intentionally excluded, same reasoning both reviewers already
+  agreed on for its group-kill exemption.
+- **`omabackup-rev`'s P2, real, live-verified** -- `lib/bundle.sh`'s
+  `OMABACKUP_RESTORE_MAX_BYTES` override reached `head -c` completely
+  unvalidated. GNU `head -c` gives a **leading minus its own opposite
+  meaning**: `-N` means "all but the last N bytes", not "the first N
+  bytes" (confirmed live: `printf '0123456789' | head -c -1` prints all
+  but the final byte). `OMABACKUP_RESTORE_MAX_BYTES=-1` would have turned
+  the cap into "everything except the last byte" -- functionally
+  unlimited for anything this function extracts. Fixed by validating the
+  override as a canonical positive decimal (`^[1-9][0-9]*$`) before use,
+  falling back to the safe 4 GiB default for anything else -- negative,
+  empty, non-digit, a leading `+`, or a leading zero. 7 new regressions in
+  `test/bundle.test.sh`: six non-canonical values (`-1`, `-0`, empty,
+  `abc`, `+9999999999`, `007`) each confirmed to fall back to exactly
+  `4294967296`, not reach `head -c` at all.
+- **`omabackup-rev`'s P2, documented not fixed** -- `SplitParser`'s
+  empty-marker branch converts each raw chunk to a `QString`
+  independently and does not retain incomplete trailing bytes for the
+  next chunk (confirmed against `datastream.cpp`'s own empty-marker code
+  path). A multi-byte UTF-8 character split across two separate reads can
+  arrive as replacement characters before `accumulateCapped` ever sees
+  it; `jq` does not ASCII-escape non-ASCII output by default, so a real
+  path, hostname, or label could in principle be corrupted this way.
+  Fixing this correctly needs the cap to live in the producer
+  (`bin/omabackup` itself, operating on whole, already-decoded strings)
+  rather than the consumer -- a larger redesign than this round of fixes
+  took on, given it was already past a lot of ground for one pass.
+  Documented in `Panel.qml`'s own `accumulateCapped` comment and in "Open
+  questions" below, not silently left uncovered.
+- **`omabackup-rev`'s P3, already independently found and fixed from
+  `omabackup-rev-2`'s own P3 in the same round** -- both `onExited`
+  handlers checked `timedOut` before `outputCapped`, opposite of what
+  their own comments claimed, so a run capped for output size could still
+  report "timed out" if `busyTimeoutTimer`'s `running`-based guard fired
+  in the same narrow async window (this file's own already-measured,
+  not-synchronous `exited` delivery). Fixed by swapping the check order in
+  both, clearing both flags atomically in the `outputCapped` branch.
+- Full suite: **1191 passed, 0 failed**.
+
+### Review round `omabackup-26` (correction round 2 of 2, verifying round omabackup-25's fixes): a residual dead-leader gap, and two test-quality gaps
+
+`herdr-review` on round-25's fixes found four more problems (all from
+`omabackup-rev`) and, from `omabackup-rev-2`, an explicit direct answer to
+the question this round's own dispatch asked ("does anything here block
+considering this done") plus two lower-severity findings of their own:
+
+- **`omabackup-rev-2`'s explicit answer**: **no**, nothing in their review
+  should block this. Both of `omabackup-rev-2`'s own findings this round
+  are P3, and neither is a blocker -- both are side effects of otherwise-
+  correct fixes (see below).
+- **`omabackup-rev`'s P1, real and fixed** -- the async `kill-group`
+  helper can still miss the whole group if the setsid-wrapped LEADER
+  exits (on its own, quickly) before the helper's own startup (bash, then
+  sourcing several `lib/*.sh` files) reaches its `ps -o pgid= -p "$pid"`
+  lookup: once that specific pid is gone, `ps` finds nothing, and the old
+  code fell through to a no-op single-pid signal against an already-dead
+  pid -- never trying the group at all, orphaning any child the leader
+  left behind. Fixed by no longer rediscovering the group id via `ps`:
+  every legitimate caller `setsid`-wraps its target first, so the
+  captured pid IS its own group id by construction, and that id keeps
+  meaning the same thing even after the specific leader process exits, as
+  long as any other member (an orphaned child) is still alive in it --
+  `kill -0 -- "-$pid"` asks exactly that, needing no live leader to
+  answer. The own-group and pid-0/1 guards move to compare directly
+  against `$pid` instead of a `ps`-derived value; `_kg_stop_group` no
+  longer calls `ps` for the target at all (only for its own pgid, to
+  check the own-group refusal). 4 new regressions in `test/panel.test.sh`:
+  `_kg_stop_group` called directly with 0 and 1 (bypassing
+  `cmd_kill_group`'s own validation, proving the second guard holds on
+  its own too), and the actual dead-leader case reproduced directly (a
+  `setsid`-wrapped leader that forks a child and exits immediately,
+  confirmed dead before `kill-group` is even invoked, not raced) --
+  `kill-group` still reaches the child.
+- **`omabackup-rev`'s P2, test-quality, fixed** -- `test/qml/
+  output-cap-stops-accumulating.qml` had drifted: it defined its own
+  local copy of `accumulateCapped`/`killGroup` for isolation, but that
+  copy still matched an EARLIER shape of the real functions (a direct
+  `proc.running = false`, a 2-argument signature) -- silently passing
+  while testing behavior Panel.qml no longer has. Re-synced to the
+  current 3-argument (`proc, field, chunk`) shape and the no-direct-kill
+  design, with an explicit comment that this is a hand-maintained mirror,
+  not an import, and will drift again if `Panel.qml`'s own functions
+  change without this file being updated too -- moving them to a shared
+  `.js` module Panel.qml would import was judged out of scope for this
+  round. Separately, `test/qml/timeout-kills-descendant.qml` used fixed
+  `/tmp` filenames (risking a stale file from an interrupted or
+  concurrent run being read as this run's own) and treated `kill -0 ""`
+  on an empty/missing pid file the same as "confirmed dead" -- a
+  precondition failure (the target never starting, the pid files never
+  being written) could have silently read as success. Fixed: unique
+  per-run filenames (`Date.now()` plus a random suffix), and the checker
+  now requires both pid files to hold an actual decimal pid before
+  treating either as meaningful, reporting a distinct
+  `PARENT_PID_MISSING`/`CHILD_PID_MISSING` otherwise rather than folding
+  into the same result as "gone."
+- **`omabackup-rev-2`'s P3, documented not fixed** -- `killGroup()`
+  starting a Process is now the ONLY path that ever stops a timed-out or
+  output-capped target (round omabackup-25's own fix for the race
+  `omabackup-rev` found). But if that helper Process fails to even start
+  (`killer.running = true` never actually execs, for whatever reason),
+  nothing recovers: `onExited` never fires, and `checking`/`syncing`/
+  `busy` stay stuck forever -- the panel would show every action disabled
+  with no way out. Before round omabackup-25, `running = false` was a
+  synchronous, always-succeeding action inside the panel's own process;
+  the fix traded a real race for removing that guaranteed fallback.
+  `omabackup-rev-2` rates this narrow (`root.cli` is a path `resolveProc`
+  already validated once and never clears, so a failed `exec` of it is
+  unlikely) and suggests a specific, race-safe recovery: re-arm
+  `busyTimeoutTimer` once (or a second, short timer) after the first
+  timeout, and on THAT second firing, if the process is still `running`,
+  fall back to a direct `proc.running = false` -- which by then does NOT
+  reopen the original race, since the race was specifically "a direct
+  kill emitted immediately, before the helper's own `ps` lookup runs";
+  one emitted seconds later gives the helper every chance first. Not
+  implemented this round (see "Open questions" below) -- a genuine new
+  behavioral change on top of an already-large round of fixes, better
+  reviewed on its own than folded in under this round's budget.
+- **`omabackup-rev-2`'s P3, documentation fixed** -- the round-25 UTF-8
+  deferral note was written describing the JSON stdout channel
+  specifically, but round 25 itself extended the same `SplitParser`/
+  `accumulateCapped` pattern to all five processes' stderr in the same
+  pass -- and stderr is where human-readable error text carrying real
+  user paths lives, if anything MORE likely to be non-ASCII than jq's own
+  JSON, not less. Neither document connected the two decisions. Fixed:
+  `Panel.qml`'s own comment on `accumulateCapped` now says the exposure
+  spans all five stderr channels too, not just the original two JSON
+  ones; not a behavior change, a scope correction to the existing note.
+- Full suite: **1194 passed, 0 failed**.
+- This is correction round 2 of the (separate, fresh) 2-round budget for
+  round omabackup-25's own findings; `omabackup-rev-2` gave an explicit
+  answer that nothing found this round should block considering the work
+  done, and the one item deliberately not fixed
+  (`omabackup-rev-2`'s backstop-timer suggestion) is reported to the user
+  below rather than taken to a further round.
+
 ## Open questions for the user, not yet decided
 
 - What path should the first `dir` destination actually point at?
@@ -1679,3 +2023,42 @@ attributed to them:
 - The three `configs/opencode/` files the repo ignores: adjust that
   `.gitignore` so the backup can store them, accept the hole and let the
   warning stand, or declare them excluded so the warning stops being noise?
+- **Panel.qml process/output hardening, not yet decided**: `accumulateCapped`
+  bounds the panel's own retained memory but is not byte-exact (JS string
+  length, UTF-16 units) and, more concretely, can corrupt a multi-byte
+  UTF-8 character that lands across two separate reads (`SplitParser`'s
+  empty-marker branch does not retain incomplete trailing bytes across
+  chunks -- confirmed against `datastream.cpp`, round omabackup-25,
+  `omabackup-rev`). Fixing this correctly means moving the cap to the
+  producer (`bin/omabackup` itself) instead of the consumer -- worth doing
+  as a dedicated pass, or accept the current QML-side cap as good enough
+  for what verify/status/sync/collect/enable-disable actually produce in
+  practice (config paths and hostnames are the only realistic source of
+  non-ASCII, and a corrupted display character is a cosmetic failure, not
+  a data-loss or security one)?
+- **Panel.qml process/output hardening, live verification still needed**:
+  this session confirmed the mechanism against real, headless QuickShell
+  (`qs -p`, no display) and against the real installed 0.3.1-1 library
+  source directly, but the actual panel, live, on a real bar, triggering a
+  real timeout or a real oversized output, has not been exercised -- both
+  reviewers were explicit that the QML wiring itself (property binding
+  order, the dynamically created killer Process's lifecycle, `busy`'s
+  visible state during a TERM→KILL sequence) is not verifiable by reading
+  code alone.
+- **Panel.qml process/output hardening, not yet decided (round
+  omabackup-26, `omabackup-rev-2`)**: `killGroup()`'s dynamically created
+  Process is now the ONLY thing that ever stops a timed-out or
+  output-capped target. If it fails to even start, nothing recovers --
+  `busy` stays stuck permanently, every panel action disabled, with no
+  path out short of restarting the panel. `omabackup-rev-2` rates this
+  narrow (the CLI path being launched is one `resolveProc` already
+  validated once) and suggests a specific, race-safe backstop: re-arm
+  `busyTimeoutTimer` once (or add a second, short timer) after the first
+  timeout fires, and on that SECOND firing, if the process is still
+  `running`, fall back to a direct `proc.running = false` -- emitted
+  seconds after the helper was already given its chance, this does not
+  reopen the race `omabackup-rev` found in round omabackup-25 (that race
+  was specifically about a direct kill winning immediately, before the
+  helper's own `ps` lookup could run). Worth adding as a genuine
+  behavioral change reviewed on its own, or accept the current
+  no-fallback design given how narrow the failure window is?

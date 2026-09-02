@@ -28,6 +28,14 @@ it "a timed-out Process's timeout message survives its own onExited handler"
 _qml_probe test/qml/timeout-message-not-overwritten.qml \
     && ok || fail "the timeout message was overwritten by the killed process's own exit handling"
 
+it "a timed-out process's own child (git/rsync-shaped) is killed too, not orphaned"
+_qml_probe test/qml/timeout-kills-descendant.qml \
+    && ok || fail "the direct process was killed but its child survived -- QuickShell's Process has no group-kill of its own (setRunning(false)/signal() both target a single PID), so the fix wraps the command in setsid and spawns a disposable kill-group helper on timeout, using the PID captured BEFORE running=false clears it"
+
+it "output past the panel's cap stops being accumulated, latches outputCapped, and kills the process -- output under it comes through unharmed"
+_qml_probe test/qml/output-cap-stops-accumulating.qml \
+    && ok || fail "either a small, well-formed output was not preserved byte-for-byte, or an oversized single-line output (StdioCollector's own unbounded buffer, confirmed in datastream.cpp) kept growing instead of latching outputCapped and stopping the process"
+
 it "a hung startup resolveProc still ends in cliMissing:true, not silence"
 _qml_probe test/qml/resolve-proc-gets-its-own-timeout.qml \
     && ok || fail "a hung resolveProc left cliMissing false -- the widget would stay visible and inert forever"
@@ -340,6 +348,197 @@ fi
 it "a wrapper signal also stops descendants of the CLI"
 [[ $SIGNAL_CHILD_ALIVE -eq 0 ]] \
     && ok || fail "wrapper TERM left a descendant of the CLI alive"
+
+# ── `omabackup kill-group` -- Panel.qml's own timeout has the same shape ────
+# The wrapper's own TERM-and-reap above covers bin/omabackup-tui's
+# supervision. Panel.qml's busyTimeoutTimer is a SEPARATE code path -- it
+# talks to QuickShell.Io.Process directly, which has no group-kill of its
+# own (confirmed against quickshell-mirror/quickshell's process.cpp:
+# setRunning(false) and signal() both call a bare, single-PID kill(2)) --
+# so a timed-out verify/status/sync/collect/enable-disable that was itself
+# blocked on a git/rsync child used to leave that child orphaned. The fix
+# is this subcommand, spawned by the panel against a `setsid`-wrapped
+# target's PID instead of reimplementing group-kill in QML (design
+# consultation, herdr-ask round omabackup-11). These tests exercise the
+# subcommand directly; test/qml/timeout-kills-descendant.qml (run above,
+# via _qml_probe) covers the QML wiring that calls it.
+KGROUP_HOME="$(mktemp -d)"
+KGROUP_PARENT_PID_FILE="$KGROUP_HOME/parent.pid"
+KGROUP_CHILD_PID_FILE="$KGROUP_HOME/child.pid"
+setsid -- bash -c '
+    sleep 300 &
+    echo $! >'"$KGROUP_CHILD_PID_FILE"'
+    echo $$ >'"$KGROUP_PARENT_PID_FILE"'
+    wait
+' </dev/null >/dev/null 2>&1 &
+disown
+for _ in {1..50}; do
+    [[ -s "$KGROUP_PARENT_PID_FILE" && -s "$KGROUP_CHILD_PID_FILE" ]] && break
+    /usr/bin/sleep 0.05
+done
+KGROUP_PARENT_PID="$(cat "$KGROUP_PARENT_PID_FILE" 2>/dev/null)"
+KGROUP_CHILD_PID="$(cat "$KGROUP_CHILD_PID_FILE" 2>/dev/null)"
+HOME="$(mktemp -d)" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$(mktemp -d)" \
+    XDG_RUNTIME_DIR=/nonexistent "$PWD/bin/omabackup" kill-group "$KGROUP_PARENT_PID" >/dev/null 2>&1
+/usr/bin/sleep 0.5
+
+it "kill-group stops a setsid-isolated target AND the child it spawned"
+{ ! kill -0 "$KGROUP_PARENT_PID" 2>/dev/null && ! kill -0 "$KGROUP_CHILD_PID" 2>/dev/null; } \
+    && ok || fail "expected both the target and its child gone after kill-group"
+
+# The guard that makes this safe to call blind from a timeout: a target
+# that was never setsid'd (a wiring mistake, not a hypothetical) shares
+# its OWN process group with whatever spawned it -- kill-group must refuse
+# to blast that shared group and fall back to signaling only the one pid
+# it was actually given, or a wiring bug anywhere else in the panel could
+# take the whole group down through this subcommand.
+KGSAFE_HOME="$(mktemp -d)"
+bash -c '
+    sleep 300 & TARGET_PID=$!
+    sleep 300 & SIBLING_PID=$!
+    printf "%s\n" "$TARGET_PID" >'"$KGSAFE_HOME"'/target.pid
+    printf "%s\n" "$SIBLING_PID" >'"$KGSAFE_HOME"'/sibling.pid
+    HOME="$(mktemp -d)" OMABACKUP_ROOT="'"$PWD"'" OMABACKUP_STATE="$(mktemp -d)" \
+        XDG_RUNTIME_DIR=/nonexistent "'"$PWD"'/bin/omabackup" kill-group "$TARGET_PID" >/dev/null 2>&1
+    /usr/bin/sleep 0.5
+    kill -0 "$TARGET_PID" 2>/dev/null && echo "TARGET_ALIVE" || echo "TARGET_GONE"
+    kill -0 "$SIBLING_PID" 2>/dev/null && echo "SIBLING_ALIVE" || echo "SIBLING_GONE"
+    kill "$SIBLING_PID" 2>/dev/null
+' >"$KGSAFE_HOME/out" 2>&1
+
+it "kill-group falls back to single-pid when the target was never its own group leader"
+assert_contains "$(cat "$KGSAFE_HOME/out")" "TARGET_GONE"
+assert_contains "$(cat "$KGSAFE_HOME/out")" "SIBLING_ALIVE"
+
+KGBAD_OUT="$(HOME="$(mktemp -d)" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$(mktemp -d)" \
+    XDG_RUNTIME_DIR=/nonexistent "$PWD/bin/omabackup" kill-group "not-a-pid; rm -rf /" 2>&1)"
+KGBAD_RC=$?
+
+it "kill-group rejects a non-numeric pid instead of doing something with it"
+assert_eq "$KGBAD_RC" "1"
+assert_contains "$KGBAD_OUT" "numeric pid"
+
+# `kill-group 0` reached the fallback branch's `kill -TERM "$pid"` with the
+# pid unchecked -- found by review (round omabackup-25): kill(2) treats
+# pid 0 as a SEPARATE special case from the -1 broadcast this file already
+# guards, distinct from both: it signals every process in the CALLER's
+# own process group. Since `omabackup kill-group` shares QuickShell's own
+# group whenever invoked normally (the exact premise `setsid --` exists
+# to escape), this would have killed the panel's own process group.
+# Reproduced live in an isolated setsid session before this fix (the test
+# script itself died mid-run, alongside a sentinel in the same group,
+# never reaching its own "rc=" line) -- this regression proves the fix
+# the same way, not just that an error message appears.
+KGZERO_HOME="$(mktemp -d)"
+cat >"$KGZERO_HOME/probe.sh" <<PROBEEOF
+#!/bin/bash
+set -u
+sleep 300 & echo \$! >"$KGZERO_HOME/sentinel.pid"
+HOME="\$(mktemp -d)" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="\$(mktemp -d)" \\
+    XDG_RUNTIME_DIR=/nonexistent "$PWD/bin/omabackup" kill-group 0 >"$KGZERO_HOME/out" 2>&1
+echo "kill_group_rc=\$?" >>"$KGZERO_HOME/out"
+echo "probe_reached_end" >"$KGZERO_HOME/reached_end"
+PROBEEOF
+chmod +x "$KGZERO_HOME/probe.sh"
+timeout 10 setsid --wait "$KGZERO_HOME/probe.sh" >/dev/null 2>&1
+KGZERO_SENTINEL="$(cat "$KGZERO_HOME/sentinel.pid" 2>/dev/null)"
+
+it "kill-group rejects pid 0 instead of signaling its own whole process group"
+[[ -f "$KGZERO_HOME/reached_end" ]] \
+    && ok || fail "the isolated probe script never reached its own end -- kill-group 0 killed its process group, itself included"
+assert_contains "$(cat "$KGZERO_HOME/out" 2>/dev/null)" "numeric pid greater than 1"
+[[ -n "$KGZERO_SENTINEL" ]] && kill -0 "$KGZERO_SENTINEL" 2>/dev/null \
+    && ok || fail "the sentinel in the same process group did not survive"
+kill -KILL "$KGZERO_SENTINEL" >/dev/null 2>&1 || true
+
+# pid 1 is a real, valid pid (init/systemd) -- _kg_stop_group's own
+# `pgid != 1` guard correctly refuses it as a GROUP target, but that
+# refusal falls through to the single-pid branch, which would run a bare
+# `kill -TERM 1` against the real init process. Found by review (round
+# omabackup-25): rejected at cmd_kill_group's own input validation now,
+# before _kg_stop_group -- and therefore before any `ps`/`kill` at all --
+# ever runs, so this is safe to test directly against the real pid 1
+# without risk: the die() fires first.
+KGONE_OUT="$(HOME="$(mktemp -d)" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$(mktemp -d)" \
+    XDG_RUNTIME_DIR=/nonexistent "$PWD/bin/omabackup" kill-group 1 2>&1)"
+KGONE_RC=$?
+
+it "kill-group rejects pid 1 (init) before ever calling ps or kill on it"
+assert_eq "$KGONE_RC" "1"
+assert_contains "$KGONE_OUT" "numeric pid greater than 1"
+
+# _kg_stop_group no longer rediscovers a target's pgid via `ps -p "$pid"`
+# -- found by review (round omabackup-26, `omabackup-rev`): it now trusts
+# $pid AS the group id directly (every real caller setsid-wraps its
+# target first, so this holds by construction), since the old ps-based
+# lookup only worked while the specific leader process was still alive --
+# see _kg_stop_group's own comment for the full reasoning and the gap
+# this closes. That redesign means the guard against pid 0/1 now lives as
+# a direct comparison against $pid itself, not against a ps-derived pgid
+# -- tested here by calling _kg_stop_group DIRECTLY (bypassing
+# cmd_kill_group's own input validation entirely) with 0 and 1, with
+# `kill` stubbed to just log calls. Defense in depth, same as
+# cmd_kill_group's own validation already covers -- this proves the
+# SECOND guard, inside _kg_stop_group itself, also holds on its own.
+for KGDIRECT_PID in 0 1; do
+    KGDIRECT_LOGFILE="$(mktemp)"
+    KGDIRECT_FN="$(sed -n "/^_kg_stop_group() {/,/^}/p" "$PWD/bin/omabackup")"
+    bash -c "
+        $KGDIRECT_FN
+        kill() { printf 'KILL_CALLED:%s\n' \"\$*\" >>'$KGDIRECT_LOGFILE'; return 0; }
+        _kg_stop_group $KGDIRECT_PID TERM
+    " >/dev/null 2>&1
+    KGDIRECT_LOG="$(cat "$KGDIRECT_LOGFILE" 2>/dev/null)"
+    rm -f "$KGDIRECT_LOGFILE"
+
+    it "_kg_stop_group itself refuses to treat pid $KGDIRECT_PID as a group id, even called directly"
+    assert_not_contains "$KGDIRECT_LOG" "CALLED:-TERM -- -$KGDIRECT_PID"
+    assert_contains "$KGDIRECT_LOG" "KILL_CALLED:-TERM $KGDIRECT_PID"
+done
+
+# The fix for the gap `omabackup-rev` found in round omabackup-26: a
+# setsid-wrapped leader that exits QUICKLY -- before this subcommand's own
+# startup (bash, then sourcing lib/*.sh) completes -- used to be
+# untraceable, since `ps -p <already-dead-pid>` finds nothing once the
+# leader is gone. Reproduced directly: the leader here forks a child and
+# exits IMMEDIATELY, well before kill-group is even invoked (there is no
+# race to win here on purpose -- the leader is already long dead by the
+# time the real subcommand starts), simulating the worst case rather than
+# hoping to catch a narrow timing window.
+KGDEAD_HOME="$(mktemp -d)"
+setsid -- bash -c '
+    sleep 300 & echo $! >'"$KGDEAD_HOME"'/child.pid
+    echo $$ >'"$KGDEAD_HOME"'/parent.pid
+' </dev/null >/dev/null 2>&1
+for _ in {1..50}; do
+    [[ -s "$KGDEAD_HOME/parent.pid" && -s "$KGDEAD_HOME/child.pid" ]] && break
+    /usr/bin/sleep 0.05
+done
+KGDEAD_PARENT="$(cat "$KGDEAD_HOME/parent.pid" 2>/dev/null)"
+KGDEAD_CHILD="$(cat "$KGDEAD_HOME/child.pid" 2>/dev/null)"
+for _ in {1..50}; do
+    kill -0 "$KGDEAD_PARENT" 2>/dev/null || break
+    /usr/bin/sleep 0.05
+done
+
+it "the leader really did exit before kill-group is even called (proving this tests the dead-leader case, not the live one)"
+kill -0 "$KGDEAD_PARENT" 2>/dev/null && fail "expected the leader to already be gone" || ok
+
+HOME="$(mktemp -d)" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$(mktemp -d)" \
+    XDG_RUNTIME_DIR=/nonexistent "$PWD/bin/omabackup" kill-group "$KGDEAD_PARENT" >/dev/null 2>&1
+/usr/bin/sleep 0.5
+
+it "kill-group still reaches a descendant even when the leader it was given already exited"
+kill -0 "$KGDEAD_CHILD" 2>/dev/null && fail "expected the child to be gone -- the group id survives its original leader's exit" || ok
+
+it "kill-group works even with a missing group manifest, same as log-event"
+KGNOMANI_HOME="$(mktemp -d)"
+/usr/bin/sleep 60 & KGNOMANI_PID=$!
+KGNOMANI_OUT="$(HOME="$KGNOMANI_HOME" OMABACKUP_ROOT="$PWD" \
+    OMABACKUP_GROUPS="$KGNOMANI_HOME/does-not-exist.json" OMABACKUP_STATE="$(mktemp -d)" \
+    XDG_RUNTIME_DIR=/nonexistent "$PWD/bin/omabackup" kill-group "$KGNOMANI_PID" 2>&1)"
+kill -KILL "$KGNOMANI_PID" >/dev/null 2>&1 || true
+assert_not_contains "$KGNOMANI_OUT" "group manifest not found"
 
 # Ctrl-C is special to asynchronous Bash jobs: without an explicit default
 # signal reset, the CLI inherits SIGINT=ignored and the wrapper escalates to

@@ -279,6 +279,121 @@ Panel {
     return out
   }
 
+  // QuickShell.Io.Process has no group-kill of its own: `running = false`
+  // sends SIGTERM to a single tracked PID (QProcess::terminate()), and
+  // `signal()` calls a bare, single-PID kill(2) -- confirmed directly
+  // against quickshell-mirror/quickshell's own process.cpp, the source for
+  // the 0.3.1-1 build this machine has installed. verify/status/sync/
+  // collect/enable-disable's own `command` is wrapped in `setsid --` for
+  // exactly this reason (see each Process below): it makes the tracked
+  // PID its own process-group leader, so THIS PID also names the whole
+  // tree -- including a `git`/`rsync` child a timed-out verb was blocked
+  // on, which used to survive as an orphan after busyTimeoutTimer gave up
+  // on the parent alone. Flagged in marketplace security review
+  // (https://github.com/omacom/omarchy-plugin-marketplace/issues/3968).
+  //
+  // Spawns `omabackup kill-group <pid>` rather than reimplementing
+  // process-group signal handling here (design consultation, herdr-ask
+  // round omabackup-11, both reviewers independently converged on this):
+  // this project already spent several review rounds getting that logic
+  // right once, in bin/omabackup-tui's own _group_pgid_wait/_stop_group --
+  // a second implementation, in QML, with no test suite exercising it,
+  // invites a third. The dynamically created Process is disposable and
+  // self-destroys once it exits; callers must pass the PID captured
+  // BEFORE setting `running = false` on the target, since `processId`
+  // reads back null once `running` itself is false.
+  function killGroup(pid) {
+    if (pid === null || pid === undefined || root.cli === "") return
+    var killer = Qt.createQmlObject(
+      'import Quickshell.Io; Process { }', root, "killGroupHelper")
+    killer.command = [root.cli, "kill-group", String(pid)]
+    killer.exited.connect(function() { killer.destroy() })
+    killer.running = true
+  }
+
+  // A producer-side byte ceiling belongs in bin/omabackup, not here (it is
+  // the actual producer; this is the consumer) -- but StdioCollector's own
+  // unbounded internal buffer is a real, separate problem this CAN fix:
+  // it appends every chunk to one QByteArray with no size check at all
+  // (confirmed against quickshell-mirror/quickshell's datastream.cpp), so
+  // a misbehaving or compromised CLI process could grow the panel's own
+  // memory without bound. Applied uniformly to both stdout and stderr,
+  // across all five CLI-launched processes below -- found by review
+  // (round omabackup-25, `omabackup-rev`): the declared threat model (a
+  // compromised or malfunctioning CLI) does not distinguish stdout from
+  // stderr, and a `git`/`rsync`/hook writing rapidly to stderr can exhaust
+  // memory before a timeout would ever catch it, same as stdout could.
+  // Every collector below uses `SplitParser { splitMarker: "" }` instead
+  // of `StdioCollector`: confirmed directly in datastream.cpp that an
+  // empty marker makes SplitParser emit every chunk immediately via
+  // `read()` and never append to its own internal buffer -- true
+  // incremental delivery, not a delimiter this JSON/text payload happens
+  // to lack. This function is what actually bounds memory: it owns the
+  // accumulation and the cap, past which it stops appending, marks a
+  // reason distinct from a timeout, and kills the process (group and
+  // all, same as a timeout would) rather than only stopping this
+  // function's OWN accumulation while the process keeps running and
+  // writing into a pipe buffer nobody reads. `field` names which property
+  // to accumulate into ("buffer" or "errBuffer") -- stdout and stderr on
+  // the SAME process share one `outputCapped` latch, since the message
+  // shown to the operator does not need to distinguish which channel
+  // overflowed.
+  //
+  // 256 KiB: generous for what these commands actually produce (a JSON
+  // finding per declared group and a handful of config fields on stdout;
+  // a few lines of human-readable error text on stderr), while still
+  // bounding the worst case to a fixed number. Measured in JS string
+  // length (UTF-16 code units), not raw bytes -- an exact byte count
+  // would need to live in bin/omabackup, the actual producer; this is an
+  // honest approximation, not a byte-exact guarantee, and said so here
+  // rather than presented as more precise than it is.
+  //
+  // KNOWN, documented limitation (found by review, round omabackup-25,
+  // `omabackup-rev`), not fixed here: `SplitParser`'s empty-marker branch
+  // converts each raw chunk to a QString independently and does not
+  // retain incomplete trailing bytes for the next chunk (confirmed
+  // against datastream.cpp's own empty-marker code path) -- so a
+  // multi-byte UTF-8 character split across two separate reads can arrive
+  // as replacement characters before this function ever sees it. `jq`
+  // does not ASCII-escape non-ASCII output by default, so a real path,
+  // hostname, or label containing one could, in principle, be corrupted
+  // this way in the two JSON stdout channels (verify/status). Since round
+  // omabackup-25, this function is ALSO used for all five processes'
+  // stderr (`omabackup-rev-2`'s own point, same round, on why the split
+  // was triage not a boundary) -- stderr is where human-readable error
+  // text carrying real user paths lives, and non-ASCII is if anything
+  // MORE likely there than in jq's own JSON, not less. The exposure
+  // quintupled in the very round that documented it; noted here so the
+  // two decisions (extend the cap everywhere, defer the UTF-8 fix) don't
+  // read as unrelated. Fixing this correctly needs the cap to live in the
+  // producer (bin/omabackup itself, operating on whole, already-decoded
+  // strings) rather than the consumer -- a larger change than either
+  // round of fixes took on; see "Open questions" in docs/PLAN.md.
+  //
+  // Does NOT set `proc.running = false` itself -- found by review (round
+  // omabackup-25): the killGroup() helper is its own separate Process,
+  // still starting up (launching bash, sourcing lib/*.sh) when this
+  // returns. If this ALSO terminated the leader directly and the leader
+  // happened to die first, the helper's own `ps -o pgid= -p <pid>` lookup
+  // (bin/omabackup:2882) would then find nothing for an already-reaped
+  // pid, fall through to a no-op single-pid signal, and never reach the
+  // group at all -- orphaning exactly the descendant this whole mechanism
+  // exists to catch. Letting killGroup()'s own eventual TERM (to the
+  // group, since a setsid-wrapped leader IS a member of its own group)
+  // be the ONLY thing that kills the leader removes the race outright:
+  // QuickShell's own `exited`/`runningChanged` still fire once the OS
+  // process actually dies, whoever signaled it.
+  readonly property int maxOutputBytes: 262144
+  function accumulateCapped(proc, field, chunk) {
+    if (proc.outputCapped) return
+    if (proc[field].length + chunk.length > root.maxOutputBytes) {
+      proc.outputCapped = true
+      root.killGroup(proc.processId)
+      return
+    }
+    proc[field] = proc[field] + chunk
+  }
+
   // keepError: a review round caught this call itself erasing the message an
   // operation had JUST set. sync/collect/switch's onExited sets root.lastError
   // on failure and then, unconditionally, called refresh() to pick up a fresh
@@ -296,8 +411,21 @@ Panel {
     root.checking = true
     if (!keepError) root.lastError = ""
     verifyProc.buffer = ""
+    // errBuffer reset too, not just buffer/outputCapped -- found while
+    // wiring stderr into the same accumulateCapped incremental append:
+    // StdioCollector's old `onStreamFinished: proc.errBuffer = text`
+    // replaced the whole string every run, so it never needed a reset;
+    // accumulateCapped's `proc[field] += chunk` does, or a failed run
+    // would show the PREVIOUS run's stderr text prepended to its own.
+    verifyProc.errBuffer = ""
+    verifyProc.outputCapped = false
     verifyProc.running = true
-    if (!statusProc.running) { statusProc.buffer = ""; statusProc.running = true }
+    if (!statusProc.running) {
+      statusProc.buffer = ""
+      statusProc.errBuffer = ""
+      statusProc.outputCapped = false
+      statusProc.running = true
+    }
     busyTimeoutTimer.restart()
   }
 
@@ -394,6 +522,8 @@ Panel {
 
   function collect() {
     if (root.cli === "" || root.cliMissing || root.busy) return
+    collectProc.errBuffer = ""
+    collectProc.outputCapped = false
     collectProc.running = true
     busyTimeoutTimer.restart()
   }
@@ -450,7 +580,10 @@ Panel {
     // as ["", "enable"].
     if (root.cli === "" || root.cliMissing || root.busy) return
     root.switching = true
-    switchProc.command = [root.cli, on ? "enable" : "disable"]
+    switchProc.errBuffer = ""
+    switchProc.outputCapped = false
+    // setsid: see verifyProc/root.killGroup() above.
+    switchProc.command = ["setsid", "--", root.cli, on ? "enable" : "disable"]
     switchProc.running = true
     busyTimeoutTimer.restart()
   }
@@ -524,6 +657,8 @@ Panel {
   function syncNow() {
     if (root.cli === "" || root.cliMissing || root.busy) return
     root.syncing = true
+    syncProc.errBuffer = ""
+    syncProc.outputCapped = false
     syncProc.running = true
     busyTimeoutTimer.restart()
   }
@@ -643,28 +778,46 @@ Panel {
       } else if (sTimedOut) {
         root.lastError = "status timed out after " + timedOutSec + "s"
       }
+      // root.killGroup(pid) is called with the PID captured in the SAME
+      // statement as timedOut being set -- before `running` could
+      // possibly change, which reads `processId` back as null once it
+      // does. Each of these five commands is wrapped in `setsid --` so
+      // this PID also names the whole process group, not just the one
+      // process QuickShell tracked.
+      //
+      // None of these branches sets `proc.running = false` itself
+      // anymore -- found by review (round omabackup-25), same reasoning
+      // as accumulateCapped's own comment above: killGroup() is a
+      // separate, still-starting Process, and directly terminating the
+      // leader here too could win the race and reap it before the
+      // helper's own PGID lookup runs, orphaning the very descendant
+      // this exists to catch. killGroup()'s own eventual TERM reaches
+      // the leader too (it is a member of its own group), and QuickShell
+      // still detects the real exit and fires onExited whoever signaled
+      // it -- busy stays true for exactly as long as the OS process
+      // genuinely is, not until this handler decided to say otherwise.
       if (verifyProc.running) {
         verifyProc.timedOut = true
-        verifyProc.running = false
+        root.killGroup(verifyProc.processId)
       }
       if (statusProc.running) {
         statusProc.timedOut = true
-        statusProc.running = false
+        root.killGroup(statusProc.processId)
       }
       if (syncProc.running) {
         syncProc.timedOut = true
         root.lastError = "sync timed out after " + Math.round(root.busyTimeoutMs / 1000) + "s"
-        syncProc.running = false
+        root.killGroup(syncProc.processId)
       }
       if (collectProc.running) {
         collectProc.timedOut = true
         root.lastError = "collect timed out after " + Math.round(root.busyTimeoutMs / 1000) + "s"
-        collectProc.running = false
+        root.killGroup(collectProc.processId)
       }
       if (switchProc.running) {
         switchProc.timedOut = true
         root.lastError = "enable/disable timed out after " + Math.round(root.busyTimeoutMs / 1000) + "s"
-        switchProc.running = false
+        root.killGroup(switchProc.processId)
       }
     }
   }
@@ -720,17 +873,40 @@ Panel {
     property string buffer: ""
     property string errBuffer: ""
     property bool timedOut: false
-    command: root.cli === "" ? ["true"] : [root.cli, "verify", "--json"]
-    stdout: StdioCollector { onStreamFinished: verifyProc.buffer = text }
-    stderr: StdioCollector { onStreamFinished: verifyProc.errBuffer = text }
+    property bool outputCapped: false
+    // setsid: see root.killGroup()'s own comment -- makes this process its
+    // own group leader, so a timeout can reach a git/rsync child too.
+    command: root.cli === "" ? ["true"] : ["setsid", "--", root.cli, "verify", "--json"]
+    stdout: SplitParser { splitMarker: ""; onRead: function(data) { root.accumulateCapped(verifyProc, "buffer", data) } }
+    stderr: SplitParser { splitMarker: ""; onRead: function(data) { root.accumulateCapped(verifyProc, "errBuffer", data) } }
     // verify exits non-zero when coverage fails, which is a result, not an
     // error. Only an empty document -- the CLI itself never answered -- means
     // the run went wrong, and now says what it printed to stderr rather than
     // a bare "no output" that swallowed the actual reason. The timedOut
     // branch returns before any of that: the timer already set the message
     // this run's actual outcome would otherwise immediately overwrite.
+    // outputCapped is checked FIRST, ahead of timedOut -- found by review
+    // (round omabackup-25): `running` does not update synchronously (this
+    // file's own busyTimeoutTimer comment already measured that, headless,
+    // for the exited signal), so accumulateCapped setting `running = false`
+    // does not stop busyTimeoutTimer's own `if (verifyProc.running)` guard
+    // from still reading true in that narrow window, setting timedOut too.
+    // The kill that follows is harmless either way (a second kill-group
+    // against an already-dead group is a no-op), but checking timedOut
+    // first would report "verify timed out after Ns" for a run that
+    // actually failed because its output exceeded the panel's own limit --
+    // losing exactly the distinction this flag exists to preserve. A
+    // truncated buffer is not valid JSON either way, so root.applyReport
+    // must never see one. Reset on every run's exit, same as timedOut, so
+    // a later normal run is not permanently shown as capped.
     onExited: function(code) {
       root.checking = false
+      if (verifyProc.outputCapped) {
+        verifyProc.outputCapped = false
+        verifyProc.timedOut = false
+        root.lastError = "verify: output exceeded the panel's limit"
+        return
+      }
       if (verifyProc.timedOut) { verifyProc.timedOut = false; return }
       if (verifyProc.buffer.trim() === "") {
         root.lastError = "verify: " + (verifyProc.errBuffer.trim() || ("no output, exit " + code))
@@ -745,9 +921,11 @@ Panel {
     property string buffer: ""
     property string errBuffer: ""
     property bool timedOut: false
-    command: root.cli === "" ? ["true"] : [root.cli, "status", "--json"]
-    stdout: StdioCollector { onStreamFinished: statusProc.buffer = text }
-    stderr: StdioCollector { onStreamFinished: statusProc.errBuffer = text }
+    property bool outputCapped: false
+    // setsid: see verifyProc/root.killGroup() above.
+    command: root.cli === "" ? ["true"] : ["setsid", "--", root.cli, "status", "--json"]
+    stdout: SplitParser { splitMarker: ""; onRead: function(data) { root.accumulateCapped(statusProc, "buffer", data) } }
+    stderr: SplitParser { splitMarker: ""; onRead: function(data) { root.accumulateCapped(statusProc, "errBuffer", data) } }
     // An empty buffer used to be silently ignored: the PREVIOUS statusDoc
     // stayed exactly where it was, rendered as though it were current, with
     // no sign the query itself had just failed. The stale document is still
@@ -759,8 +937,20 @@ Panel {
     // A review round found this only checked whether stdout was non-empty,
     // never `code` -- a process that printed a stale-but-parseable document
     // and THEN exited non-zero was accepted as a good status read. Checked
-    // now, the same way the failure branch already is.
+    // now, the same way the failure branch already is. outputCapped is
+    // checked FIRST, same reasoning as verifyProc (see its own onExited
+    // comment): `running` does not update synchronously, so a narrow
+    // window can leave both flags set, and checking timedOut first would
+    // report the wrong reason for a run that actually failed on output
+    // size. A truncated buffer is not valid JSON either way, so it must
+    // never reach applyStatus.
     onExited: function(code) {
+      if (statusProc.outputCapped) {
+        statusProc.outputCapped = false
+        statusProc.timedOut = false
+        root.lastError = "status: output exceeded the panel's limit"
+        return
+      }
       if (statusProc.timedOut) { statusProc.timedOut = false; return }
       if (statusProc.buffer.trim() !== "" && code === 0) {
         root.applyStatus(statusProc.buffer)
@@ -775,10 +965,22 @@ Panel {
     id: switchProc
     property string errBuffer: ""
     property bool timedOut: false
+    property bool outputCapped: false
     command: ["true"]
-    stderr: StdioCollector { onStreamFinished: switchProc.errBuffer = text }
+    stderr: SplitParser { splitMarker: ""; onRead: function(data) { root.accumulateCapped(switchProc, "errBuffer", data) } }
+    // outputCapped checked before timedOut -- same reasoning as verifyProc/
+    // statusProc's own onExited (see their comments): `running` does not
+    // update synchronously, so both flags can end up set for one run, and
+    // checking timedOut first would report the wrong reason.
     onExited: function(code) {
       root.switching = false
+      if (switchProc.outputCapped) {
+        switchProc.outputCapped = false
+        switchProc.timedOut = false
+        root.lastError = "enable/disable: output exceeded the panel's limit"
+        root.refresh(true)
+        return
+      }
       if (switchProc.timedOut) { switchProc.timedOut = false; root.refresh(true); return }
       if (code !== 0) {
         root.lastError = "enable/disable: " + (switchProc.errBuffer.trim() || ("failed, exit " + code))
@@ -793,8 +995,10 @@ Panel {
     id: syncProc
     property string errBuffer: ""
     property bool timedOut: false
-    command: root.cli === "" ? ["true"] : [root.cli, "sync", "--commit"]
-    stderr: StdioCollector { onStreamFinished: syncProc.errBuffer = text }
+    property bool outputCapped: false
+    // setsid: see verifyProc/root.killGroup() above.
+    command: root.cli === "" ? ["true"] : ["setsid", "--", root.cli, "sync", "--commit"]
+    stderr: SplitParser { splitMarker: ""; onRead: function(data) { root.accumulateCapped(syncProc, "errBuffer", data) } }
     // The exit code used to be thrown away entirely -- a sync that failed and
     // one that worked produced the exact same UI sequence (syncing -> false,
     // refresh). The refresh alone did not compensate: the next verify checks
@@ -803,9 +1007,17 @@ Panel {
     // said nothing was wrong. A review round then caught the refresh() call
     // itself erasing that same message a line later (refresh() used to clear
     // lastError unconditionally) -- keepError=true on the failure path is
-    // what stops that.
+    // what stops that. outputCapped checked before timedOut -- see
+    // verifyProc's own onExited comment for why.
     onExited: function(code) {
       root.syncing = false
+      if (syncProc.outputCapped) {
+        syncProc.outputCapped = false
+        syncProc.timedOut = false
+        root.lastError = "sync: output exceeded the panel's limit"
+        root.refresh(true)
+        return
+      }
       if (syncProc.timedOut) { syncProc.timedOut = false; root.refresh(true); return }
       if (code !== 0) {
         root.lastError = "sync: " + (syncProc.errBuffer.trim() || ("failed, exit " + code))
@@ -820,9 +1032,20 @@ Panel {
     id: collectProc
     property string errBuffer: ""
     property bool timedOut: false
-    command: root.cli === "" ? ["true"] : [root.cli, "collect", "--json"]
-    stderr: StdioCollector { onStreamFinished: collectProc.errBuffer = text }
+    property bool outputCapped: false
+    // setsid: see verifyProc/root.killGroup() above.
+    command: root.cli === "" ? ["true"] : ["setsid", "--", root.cli, "collect", "--json"]
+    stderr: SplitParser { splitMarker: ""; onRead: function(data) { root.accumulateCapped(collectProc, "errBuffer", data) } }
+    // outputCapped checked before timedOut -- see verifyProc's own
+    // onExited comment for why.
     onExited: function(code) {
+      if (collectProc.outputCapped) {
+        collectProc.outputCapped = false
+        collectProc.timedOut = false
+        root.lastError = "collect: output exceeded the panel's limit"
+        root.refresh(true)
+        return
+      }
       if (collectProc.timedOut) { collectProc.timedOut = false; root.refresh(true); return }
       if (code !== 0) {
         root.lastError = "collect: " + (collectProc.errBuffer.trim() || ("failed, exit " + code))

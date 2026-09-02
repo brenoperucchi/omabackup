@@ -396,6 +396,82 @@ _tz_pipe() {
 it "a tar that fails partway is not reported as a successful pipe"
 _tz_pipe; [[ $? -ne 0 ]] && ok || fail "pipefail did not surface tar's own failure"
 
+# ── _zstd_extract bounds the decompressed stream, not just the file on disk ─
+# Flagged in marketplace security review
+# (https://github.com/omacom/omarchy-plugin-marketplace/issues/3968): restore
+# extracts BEFORE verify_bundle's checksum/clone checks run, and a shared
+# destination is not a trusted source -- a small, highly-compressible archive
+# can decompress to a size limited only by disk space. A real bomb: 50MB of
+# zeros compresses to roughly 1.6KB.
+BOMBH="$(mktemp -d)"; mkdir -p "$BOMBH/src"
+head -c 50000000 /dev/zero >"$BOMBH/src/big.bin"
+tar -C "$BOMBH/src" -cf - . | zstd -q -19 -o "$BOMBH/bomb.tar.zst" 2>/dev/null
+
+it "a highly-compressible archive really does expand far past what it costs on disk"
+BOMBSIZE="$(zstd -dc "$BOMBH/bomb.tar.zst" 2>/dev/null | wc -c)"
+(( $(stat -c %s "$BOMBH/bomb.tar.zst") < 10000 && BOMBSIZE > 40000000 )) \
+    && ok || fail "bomb fixture is not actually lopsided: archive=$(stat -c %s "$BOMBH/bomb.tar.zst") decompressed=$BOMBSIZE"
+
+BOMBDEST="$(mktemp -d)"
+# BUNDLE_EXTRACT_MAX_BYTES is computed once when lib/bundle.sh is sourced --
+# the same pattern this file already uses for SYSTEMCTL/GH -- so the override
+# has to be in the environment BEFORE that source line, not prefixed onto the
+# function call after it.
+BOMBRC="$(OMABACKUP_RESTORE_MAX_BYTES=1000000 bash -c '
+    source lib/bundle.sh
+    _zstd_extract "$1" "$2"
+    printf %s $?
+' _ "$BOMBH/bomb.tar.zst" "$BOMBDEST")"
+
+it "_zstd_extract refuses an archive that decompresses past OMABACKUP_RESTORE_MAX_BYTES"
+[[ "$BOMBRC" != 0 ]] && ok || fail "expected a non-zero return for an oversized decompressed stream"
+
+it "and disk usage stays bounded near the cap, not the archive's full 50MB payload"
+BOMBWRITTEN="$(du -sb "$BOMBDEST" 2>/dev/null | cut -f1)"
+(( BOMBWRITTEN < 2000000 )) \
+    && ok || fail "expected well under 2MB written for a 1MB cap, got $BOMBWRITTEN bytes"
+
+BOMBLEGITDEST="$(mktemp -d)"
+BOMBLEGITRC="$(OMABACKUP_RESTORE_MAX_BYTES=1000000 bash -c '
+    source lib/bundle.sh
+    _zstd_extract "$1" "$2"
+    printf %s $?
+' _ "$BPATH" "$BOMBLEGITDEST")"
+
+it "a real, legitimate bundle -- far under the cap -- still extracts cleanly"
+assert_eq "$BOMBLEGITRC" "0"
+[[ -f "$BOMBLEGITDEST/manifest.json" ]] && ok || fail "expected manifest.json in the extraction, got: $(ls "$BOMBLEGITDEST" 2>&1)"
+
+it "restore itself refuses a bomb artifact the same way it refuses any unextractable one"
+BOMBRESTOREOUT="$(HOME="$(mktemp -d)" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$(mktemp -d)" \
+    OMABACKUP_RESTORE_MAX_BYTES=1000000 XDG_RUNTIME_DIR=/nonexistent \
+    "$OB" restore "$BOMBH/bomb.tar.zst" --into "$(mktemp -d)" 2>&1)"
+assert_contains "$BOMBRESTOREOUT" "could not extract"
+
+# GNU `head -c` gives a leading minus its own opposite meaning ("all but
+# the last NUM bytes", not "the first NUM bytes") -- found by review
+# (round omabackup-25): an unvalidated OMABACKUP_RESTORE_MAX_BYTES=-1
+# would have turned the cap into "everything except the last byte",
+# functionally unlimited. A non-canonical override now falls back to the
+# safe default instead of ever reaching `head -c`.
+for BOMBNEG_VALUE in -1 -0 "" "abc" "+9999999999" "007"; do
+    BOMBNEG_DEST="$(mktemp -d)"
+    BOMBNEG_EFFECTIVE="$(OMABACKUP_RESTORE_MAX_BYTES="$BOMBNEG_VALUE" bash -c '
+        source lib/bundle.sh
+        printf %s "$BUNDLE_EXTRACT_MAX_BYTES"
+    ')"
+    it "an invalid OMABACKUP_RESTORE_MAX_BYTES override ([$BOMBNEG_VALUE]) falls back to the safe default, not head -c's own negative meaning"
+    assert_eq "$BOMBNEG_EFFECTIVE" "4294967296"
+done
+
+# End-to-end, not just the isolated variable: a negative override actually
+# reaching `head -c` would still have looked capped against THIS bomb's
+# ~50MB payload -- "all but the last byte" of 50MB is still ~50MB, nowhere
+# near the unbounded difference a multi-gigabyte fixture would show, and
+# not practical to build in a fast test. The variable-level assertions
+# above are the precise, direct proof for this one; this fixture size
+# cannot distinguish the fixed and vulnerable paths on its own.
+
 # A prune failure inside _push_dir not being silently swallowed to /dev/null
 # is exercised in test/destinations.test.sh, through a real `dir` destination
 # and the actual `push` command -- _push_dir depends on too much of

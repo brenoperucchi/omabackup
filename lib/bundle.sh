@@ -468,6 +468,37 @@ _verify_extracted() {
     return $rc
 }
 
+# Ceiling on the DECOMPRESSED byte stream _zstd_extract will ever write to
+# disk. Flagged in marketplace security review
+# (https://github.com/omacom/omarchy-plugin-marketplace/issues/3968): a
+# shared destination is not a trusted source, and this function extracts
+# BEFORE verify_bundle's checksum/clone checks run -- extraction has to
+# happen to have anything to check, so a hostile or corrupted artifact
+# planted there could otherwise fill the disk before that check ever gets
+# a chance to reject it. zstd's own ratio is not bounded by the compressed
+# file's size on disk (highly repetitive input compresses to a fraction of
+# its expanded size), so limiting only the archive file itself would not
+# help. 4 GiB is generous for what this tool actually backs up -- this
+# repo's own dotfiles archive measures ~1MB (see this file's own header
+# comment) -- while still bounding the worst case to a fixed number
+# instead of "however much disk exists." Override with
+# OMABACKUP_RESTORE_MAX_BYTES for an unusually large legitimate backup.
+#
+# Validated as a canonical positive decimal before use -- found by review
+# (round omabackup-25): GNU `head -c` gives a LEADING MINUS its own
+# opposite meaning ("all but the last NUM bytes", not "the first NUM
+# bytes"), confirmed live (`printf '0123456789' | head -c -1` prints all
+# but the final byte). An unchecked `OMABACKUP_RESTORE_MAX_BYTES=-1` would
+# have silently turned the cap into "everything except the last byte" --
+# functionally unlimited for anything this function actually extracts. A
+# non-canonical value (empty, negative, `+N`, leading zero, non-digits)
+# falls back to the safe default instead of reaching `head -c` at all.
+if [[ "${OMABACKUP_RESTORE_MAX_BYTES:-}" =~ ^[1-9][0-9]*$ ]]; then
+    BUNDLE_EXTRACT_MAX_BYTES="$OMABACKUP_RESTORE_MAX_BYTES"
+else
+    BUNDLE_EXTRACT_MAX_BYTES=4294967296
+fi
+
 # _zstd_extract <archive> <dest-dir>
 # tar -xf <(zstd -dc ...) discards zstd's own exit status: the process
 # substitution runs zstd in a separate process feeding a pipe, and $? after
@@ -479,11 +510,26 @@ _verify_extracted() {
 # reasoning already applied to this file's compression side (build_bundle's
 # tar | zstd -o "$out.tmp"): $? reflects the worse of the two commands, not
 # whichever one the shell happened to still be waiting on.
+#
+# `head -c` sits between zstd and tar in the SAME pipe -- the archive file
+# on disk is still read exactly once, matching this function's own
+# reasoning above about checking the real pipe rather than a process
+# substitution -- so an oversized decompressed stream is cut off before
+# tar ever writes past the cap. Cutting the stream mid-archive leaves tar
+# looking at a truncated member or a missing end-of-archive marker, which
+# tar itself refuses as "Unexpected EOF in archive"; pipefail turns that
+# into this function's own non-zero return, indistinguishable from any
+# other extraction failure to every caller. This bounds the member count
+# too, not just total bytes: GNU tar has no native entry-count limit, but
+# every entry costs at least one 512-byte header block in the exact stream
+# this cap applies to, so the byte cap also caps the worst-case entry
+# count at roughly BYTES/512 -- a separate "too many files" check was not
+# needed on top of it.
 _zstd_extract() {
     local archive="$1" dest="$2"
     local _had_pf=0; [[ -o pipefail ]] && _had_pf=1
     set -o pipefail
-    zstd -dc "$archive" 2>/dev/null | tar -C "$dest" -x 2>/dev/null
+    zstd -dc "$archive" 2>/dev/null | head -c "$BUNDLE_EXTRACT_MAX_BYTES" | tar -C "$dest" -x 2>/dev/null
     local rc=$?
     (( _had_pf )) || set +o pipefail
     return $rc
