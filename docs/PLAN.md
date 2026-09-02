@@ -2005,6 +2005,261 @@ considering this done") plus two lower-severity findings of their own:
   (`omabackup-rev-2`'s backstop-timer suggestion) is reported to the user
   below rather than taken to a further round.
 
+### Both open items from rounds omabackup-25/26, arbitrated by `omabackup-scout`
+
+The user asked for `omabackup-scout` (this workspace's read-only arbiter
+agent) to decide the two items above rather than deciding either alone.
+
+- **UTF-8 corruption in `SplitParser`'s empty-marker mode**: decided
+  **accept the documented state, do not move the cap to the producer
+  now**. Scout's reasoning: the QML-side cap already achieves its actual
+  security goal (bounded panel memory); the residual defect only rarely
+  corrupts DISPLAYED text or could make `xdg-open` fail on a mangled
+  path -- it does not alter what any command does or write bad data.
+  Moving the cap to the producer would mean a cross-cutting redesign
+  spanning two JSON stdout channels and five stderr channels,
+  disproportionate to a cosmetic impact. This directly resolves
+  `omabackup-rev`'s P2 (wanted a real fix) versus `omabackup-rev-2`'s P3
+  (cosmetic, documentation-only) severity disagreement from round
+  omabackup-25/26 -- both were reasoning from the same facts, genuinely
+  disagreeing only on how much the cosmetic impact was worth fixing now.
+- **`killGroup()`'s missing fallback if its helper Process never actually
+  stops the target**: decided **implement the two-stage backstop now**.
+  Scout's reasoning: permanently locking `busy` (every panel action
+  disabled, no recovery short of restarting the panel) is a liveness
+  failure with no internal recovery path at all -- categorically worse
+  than a narrow race window, regardless of how rarely the helper actually
+  fails to start. A short second timer that only acts if the helper
+  genuinely did not resolve the target is small and safe; explicitly
+  confirmed safe against round omabackup-26's own fix specifically
+  (`_kg_stop_group` no longer needs to find a *live* leader via `ps` --
+  it trusts the setsid-captured pid as the group's own id directly, so a
+  delayed fallback has nothing left to race against).
+- **Implemented**: `killGroup(proc)` now takes the whole process object
+  (not just its pid, needed so the backstop can check `proc.running`
+  later) and arms a 3-second one-shot `Timer`, created the same way the
+  helper `Process` already is, alongside spawning the helper. On firing,
+  if the target is somehow STILL `running`, it falls back to a direct
+  `proc.running = false` -- QuickShell still detects the real exit and
+  fires `onExited` regardless of who or what actually stopped the
+  process. Does not fire early or interfere when the helper already
+  succeeded (the target is no longer `running` by the time the timer
+  checks). 1 new headless probe,
+  `test/qml/killgroup-backstop-rescues-stuck-helper.qml`: one target
+  whose "helper" is a plain `true` (starts, does nothing, standing in for
+  a helper that never signals anything at all) is still recovered by the
+  backstop; a second target alongside it, whose helper is a real,
+  working `kill`, is unaffected by the backstop existing at all.
+  Confirmed against a variant with the backstop code removed that the
+  broken-helper target stays stuck (`running` never becomes `false`) --
+  fail-before/pass-after, not just a passing assertion.
+- Full suite: **1195 passed, 0 failed**.
+
+### Maintainer re-review of `fc9f51a`: a member-count bomb the byte cap's own math didn't actually close
+
+`HANCORE-linux` re-reviewed the pushed commit directly on issue #3968 and
+confirmed the panel fix and byte ceiling both address the prior findings,
+but found one more real gap in `lib/bundle.sh:510-535`: this file's own
+comment had claimed the byte cap "also caps the worst-case entry count at
+roughly BYTES/512" -- true as stated, but nobody had actually done the
+division. `4294967296 / 512 = 8,388,608` -- not a meaningfully tight bound.
+An archive of that many empty files (header-only entries, no content
+blocks) stays nowhere near the byte ceiling while exhausting inodes and
+keeping extraction busy far longer than any real restore would --
+"consume millions of inodes... without approaching the byte limit," in
+the maintainer's own words.
+
+Fixed with a second, independent ceiling: `tar -xv`'s own member-by-member
+progress (one line per extracted file, confirmed live to go to stdout, not
+stderr) feeds a trailing `awk` that counts lines and exits 1 the instant
+the count passes `OMABACKUP_RESTORE_MAX_MEMBERS` (default 100,000 --
+generous against this repo's own ~1,200-file artifact, same reasoning as
+the byte default). GNU tar has no native entry-count limit to reach for
+instead. Once `awk`'s read end closes, `tar`'s next attempt to write
+another progress line gets SIGPIPE and dies -- measured live, twice, not
+assumed: 5,000 empty-file members capped at 50 stopped at 51 actually
+extracted; 100,000 members capped at 1,000 stopped at 1,002, in four
+milliseconds. Not exact -- tar can have a little more already in flight
+when the pipe closes -- but bounded to a small, fixed overshoot instead of
+the millions the byte-only cap would have let through. Confirmed live that
+bash's `pipefail` still correctly reports a middle-stage failure even when
+the pipeline's own last stage (`awk`) exits 0 -- the four-stage pipe (zstd
+| head | tar | awk) needed this checked directly, not assumed to still
+hold from the two- and three-stage cases already relied on elsewhere in
+this file.
+
+Found and fixed while writing this entry, before it ever reached a test:
+an actual typo (`// closes` instead of `# closes`) in the explanatory
+comment above `_zstd_extract`, which `bash -n` alone did not catch since a
+bare `//` is syntactically a valid (if semantically wrong) simple command,
+not a parse error.
+
+12 new regressions in `test/bundle.test.sh` (89 total): the many-tiny-files
+fixture confirmed to stay under 50KB on disk while carrying 10,000 members
+(proving the fixture is genuinely a member-shaped bomb, not a byte-shaped
+one); `_zstd_extract` refusing it under a lowered cap with disk usage
+bounded near the cap, not the full 10,000; a real, legitimate bundle far
+under the member cap still extracting cleanly; `restore` itself refusing a
+member bomb the same way it refuses any unextractable artifact; six
+non-canonical `OMABACKUP_RESTORE_MAX_MEMBERS` override values (mirroring
+the byte override's own validation tests exactly) all falling back to the
+safe default.
+
+Full suite: **1207 passed, 0 failed**.
+
+### Review round `omabackup-27`: a stale-backstop bug, a directory-amplification bypass of the member cap, and a silent `TAR_OPTIONS` bypass
+
+`herdr-review` on the backstop timer (added after `omabackup-scout`'s
+arbitration above) and the member-count cap (added after the maintainer's
+own re-review of `fc9f51a`, below) found two real P1s from `omabackup-rev`
+and two P2s. `omabackup-rev-2`'s own verdict for this round did not
+complete: mid-review, they were directly interrupted by the user in their
+own pane over an `rm -rf ./*` embedded in a test command they were about
+to run, and the round was left there rather than re-dispatched -- this
+round's fixes rest on `omabackup-rev`'s findings alone; `omabackup-rev-2`'s
+own independent pass on this specific diff is still open.
+
+- **P1, `Panel.qml` -- the backstop timer could kill a brand new run, not
+  just the stale one it was armed for.** `verifyProc`/`statusProc`/
+  `syncProc`/`collectProc`/`switchProc` are singleton `Process` objects,
+  reused across runs (`refresh()`/`syncNow()`/etc. all set `running =
+  true` again on the SAME object). The backstop's own callback only
+  checked `proc.running`, not which run it was watching: if the helper
+  killed the OLD run quickly and the operator started a brand NEW run of
+  the same object within the backstop's own 3-second window, the stale
+  backstop would see the new run as "still running" and kill it directly
+  -- a single-PID kill capable of reopening the exact descendant-orphaning
+  problem the whole mechanism exists to close, on a run it was never armed
+  for. Fixed by also comparing `proc.processId` against the pid captured
+  when that specific backstop was created -- a no-op for any run other
+  than the one it is actually watching. New headless probe,
+  `test/qml/killgroup-backstop-ignores-stale-run.qml`, driven by
+  `runningChanged` rather than fixed delays: kills a first run, starts a
+  second the instant the first is observed dead, and confirms the second
+  survives past the stale backstop's own window. Confirmed
+  fail-before/pass-after against the un-fixed comparison (the second run
+  died too, `deathCount=2`).
+- **P1, `lib/bundle.sh` -- the member-count cap counted tar's own
+  progress lines, not the filesystem objects extraction actually
+  creates.** GNU tar silently creates every missing intermediate
+  directory a member's path implies, and none of those auto-created
+  directories get their own line in `-v`'s progress output -- only the
+  one explicit member does. Confirmed live: a SINGLE crafted member at a
+  500-level-deep path (built with `tar --transform`, remapping a flat
+  file's name, since a real filesystem would need the directories to
+  already exist first) produced exactly one progress line but created
+  502 real filesystem entries on extraction. A flat per-member cap read
+  that as "1", nowhere near any reasonable ceiling regardless of how deep
+  the path actually went -- the scalable version of this attack is many
+  members, each moderately deep, none individually alarming. Fixed with
+  a weighted cost per member (`1 + slash count in the reported path`)
+  instead of a bare count, deliberately not deduplicated against shared
+  prefixes between siblings (that would need an unbounded set of seen
+  paths to track precisely -- itself a resource an adversarial archive
+  could grow without bound; a conservative per-member estimate needs no
+  such structure). A flat archive of shallow files behaves exactly like
+  the original bare-count cap. A new, separate `OMABACKUP_RESTORE_MAX_DEPTH`
+  (default 64) additionally refuses any SINGLE member whose own path is
+  absurdly deep outright. Documented honestly, not glossed over: for the
+  single-pathological-member case specifically, tar fully extracts one
+  member -- parent directories included -- before it ever prints that
+  member's own progress line, so detection necessarily comes after that
+  one entry's damage, not before it; bounded regardless by the OS's own
+  `PATH_MAX`, not by how many times an attacker repeats the pattern. 6
+  new regressions in `test/bundle.test.sh`: the deep-path fixture
+  confirmed to genuinely be one member with 500+ `/` characters in its
+  own path; `_zstd_extract` refusing it under the depth guard; a real,
+  legitimately-nested path (a handful of levels) still extracting
+  cleanly; six non-canonical `OMABACKUP_RESTORE_MAX_DEPTH` override
+  values falling back to the safe default.
+- **P2, `lib/bundle.sh` -- an inherited `TAR_OPTIONS` environment
+  variable could silently defeat the member cap entirely.** GNU tar
+  prepends `TAR_OPTIONS`'s contents to its own argv; confirmed live that
+  `TAR_OPTIONS=--index-file=/dev/null` redirects `-v`'s progress output
+  away from stdout completely, so the counting `awk` reads EOF
+  immediately, counts zero, and every member extracts with no cap in
+  effect at all -- regardless of how `OMABACKUP_RESTORE_MAX_MEMBERS`/
+  `_MAX_DEPTH` are configured. Fixed with `env -u TAR_OPTIONS` (does not
+  inherit the variable at all) AND an explicit `--index-file=/dev/stdout`
+  placed after it (confirmed live that an explicit option wins over a
+  prepended one, the ordinary last-one-wins rule for a single-valued tar
+  option) -- kept alongside `env -u`, not instead of it, since relying on
+  option-ordering precedent alone is a thinner guarantee than simply not
+  inheriting the variable. 1 new regression in `test/bundle.test.sh`:
+  the many-tiny-files bomb from the member-count fix, re-run with
+  `TAR_OPTIONS='--index-file=/dev/null'` set, still refused and still
+  bounded.
+- **P2, `test/bundle.test.sh` -- the member-count bomb fixture's own
+  build steps were not checked for success.** The file-creation loop and
+  the `tar | zstd` pipeline building the many-tiny-files fixture had no
+  exit-status checks; a silently-failed fixture (disk full, a corrupted
+  write) could have left an empty or missing archive, and the
+  assertions after it would still have read as "small", "refused", and
+  "bounded" for the wrong reason -- never reaching the real counting
+  pipeline at all. Fixed: each fixture-building step now fails loudly if
+  it fails, and a real listing of the built archive (not the loop's own
+  upper bound) asserts the true member count (10,001 -- 10,000 files
+  plus the directory entry itself), proving the fixture actually is what
+  the test claims rather than assuming the build commands worked.
+- Also found and fixed while writing the fix, before any test ever
+  touched it: a literal typo (`// closes` instead of `# closes`) in the
+  explanatory comment above `_zstd_extract`'s own byte-cap section, which
+  `bash -n` alone did not catch (a bare `//` is syntactically a valid, if
+  semantically wrong, simple command, not a parse error).
+- Full suite: **1222 passed, 0 failed**.
+
+**`omabackup-rev-2` completed their own round-27 verdict afterward,
+independently: `APPROVE`, no new findings.** Their review had been left
+mid-task (the `rm -rf ./*` interruption above); after redoing their own
+tests safely (a fresh `mktemp -d` per extraction, zero removals -- the
+old, abandoned scratch directory was deleted only afterward, with the
+user's explicit go-ahead), they confirmed:
+
+- **The backstop bug independently**, by reading the code alone, before
+  seeing this document's own fix -- the exact same P1 `omabackup-rev`
+  found, described down to the same realistic trigger sequence (timeout
+  fires, operator clicks "Check again" within the 3-second window, the
+  stale backstop kills the healthy new run). Verified the fix already in
+  the file matches what they would have proposed.
+- **No bypass of the member/depth cap via a newline in a member's own
+  name** (question 2 from the round-27 request): GNU tar's default
+  quoting escapes an embedded `\n` as the literal two characters `\`+`n`
+  in `--index-file`'s output, keeping one progress line per member --
+  tested across quoting styles (`literal`/`shell`/`escape`, all
+  consistent) and entry types (regular, directory, hardlink, symlink,
+  FIFO, and a 250-character name needing a GNU extension header -- 7
+  members, 7 lines). A genuine side finding: `env -u TAR_OPTIONS` (added
+  for the `/dev/null`-redirect bypass) turns out to ALSO be load-bearing
+  here -- `TAR_OPTIONS="--quoting-style=literal"` turns escaping off and
+  splits one member across two lines (6 members read as 7). Harmless for
+  the count specifically (it overcounts, so the cap fires earlier, not
+  later) but worth keeping documented so the `env -u` is never removed
+  later on the mistaken belief it only mattered for the other bypass --
+  added to the comment above `_zstd_extract`.
+- **A SIGPIPE-truncated extraction does not leave an observable partial
+  last file** (question 3): tested with 30 MiB-sized files and a low cap
+  -- tar died from SIGPIPE between complete members, not mid-write, and
+  every file on disk measured exactly its real size. More load-bearing
+  than that specific test result, though: all three of `_zstd_extract`'s
+  own callers already `rm -rf` the destination directory on any failure,
+  so nothing downstream ever observes a failed extraction's contents at
+  all, partial or not -- the cap failing is what makes this question
+  moot regardless of buffering specifics.
+- **One no-severity nit**: `OMABACKUP_RESTORE_MAX_MEMBERS`'s own name
+  suggests a flat count, but it governs the weighted cost described
+  above -- a path nested one level deep already costs 2 per member, not
+  1. The internal comment already explained the weighting; added a
+  sentence to the override's own user-facing documentation too, so
+  raising the value further than the literal member total suggests is
+  understood as sometimes legitimately necessary, not a sign something
+  is wrong.
+- Their own independent `./test/run.sh` matched exactly: **1207 passed,
+  0 failed** (the count at the time their review started, before this
+  session's own subsequent full-suite runs above).
+
+Full suite after both documentation additions: **1222 passed, 0
+failed**.
+
 ## Open questions for the user, not yet decided
 
 - What path should the first `dir` destination actually point at?
@@ -2023,19 +2278,6 @@ considering this done") plus two lower-severity findings of their own:
 - The three `configs/opencode/` files the repo ignores: adjust that
   `.gitignore` so the backup can store them, accept the hole and let the
   warning stand, or declare them excluded so the warning stops being noise?
-- **Panel.qml process/output hardening, not yet decided**: `accumulateCapped`
-  bounds the panel's own retained memory but is not byte-exact (JS string
-  length, UTF-16 units) and, more concretely, can corrupt a multi-byte
-  UTF-8 character that lands across two separate reads (`SplitParser`'s
-  empty-marker branch does not retain incomplete trailing bytes across
-  chunks -- confirmed against `datastream.cpp`, round omabackup-25,
-  `omabackup-rev`). Fixing this correctly means moving the cap to the
-  producer (`bin/omabackup` itself) instead of the consumer -- worth doing
-  as a dedicated pass, or accept the current QML-side cap as good enough
-  for what verify/status/sync/collect/enable-disable actually produce in
-  practice (config paths and hostnames are the only realistic source of
-  non-ASCII, and a corrupted display character is a cosmetic failure, not
-  a data-loss or security one)?
 - **Panel.qml process/output hardening, live verification still needed**:
   this session confirmed the mechanism against real, headless QuickShell
   (`qs -p`, no display) and against the real installed 0.3.1-1 library
@@ -2045,20 +2287,3 @@ considering this done") plus two lower-severity findings of their own:
   order, the dynamically created killer Process's lifecycle, `busy`'s
   visible state during a TERM→KILL sequence) is not verifiable by reading
   code alone.
-- **Panel.qml process/output hardening, not yet decided (round
-  omabackup-26, `omabackup-rev-2`)**: `killGroup()`'s dynamically created
-  Process is now the ONLY thing that ever stops a timed-out or
-  output-capped target. If it fails to even start, nothing recovers --
-  `busy` stays stuck permanently, every panel action disabled, with no
-  path out short of restarting the panel. `omabackup-rev-2` rates this
-  narrow (the CLI path being launched is one `resolveProc` already
-  validated once) and suggests a specific, race-safe backstop: re-arm
-  `busyTimeoutTimer` once (or add a second, short timer) after the first
-  timeout fires, and on that SECOND firing, if the process is still
-  `running`, fall back to a direct `proc.running = false` -- emitted
-  seconds after the helper was already given its chance, this does not
-  reopen the race `omabackup-rev` found in round omabackup-25 (that race
-  was specifically about a direct kill winning immediately, before the
-  helper's own `ps` lookup could run). Worth adding as a genuine
-  behavioral change reviewed on its own, or accept the current
-  no-fallback design given how narrow the failure window is?

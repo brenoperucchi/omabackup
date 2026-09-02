@@ -36,6 +36,14 @@ it "output past the panel's cap stops being accumulated, latches outputCapped, a
 _qml_probe test/qml/output-cap-stops-accumulating.qml \
     && ok || fail "either a small, well-formed output was not preserved byte-for-byte, or an oversized single-line output (StdioCollector's own unbounded buffer, confirmed in datastream.cpp) kept growing instead of latching outputCapped and stopping the process"
 
+it "killGroup's backstop timer rescues a target whose helper process never actually stops it, without interfering when the helper already succeeded"
+_qml_probe test/qml/killgroup-backstop-rescues-stuck-helper.qml \
+    && ok || fail "killGroup() becoming the only path that ever stops a target (round omabackup-25) removed the old guarantee that something always signals it -- if the helper Process fails to do its job, busy used to stay stuck forever with no recovery (omabackup-rev-2, round omabackup-26); the backstop timer added afterward (design consultation) must fall back to a direct kill once the helper has had every reasonable chance, and must NOT interfere when the helper already succeeded"
+
+it "killGroup's backstop timer ignores a stale run -- a new run started on the same reused Process object survives the OLD backstop firing"
+_qml_probe test/qml/killgroup-backstop-ignores-stale-run.qml \
+    && ok || fail "found by review (round omabackup-27): verifyProc/statusProc/syncProc/collectProc/switchProc are singleton Process objects reused across runs -- a backstop armed for one run's kill that only checked proc.running (not which run) could kill a BRAND NEW run started on the same object before its own window elapsed, reopening the descendant-orphaning problem on a run it was never armed for; fixed by also comparing proc.processId against the pid captured when the backstop was created"
+
 it "a hung startup resolveProc still ends in cliMissing:true, not silence"
 _qml_probe test/qml/resolve-proc-gets-its-own-timeout.qml \
     && ok || fail "a hung resolveProc left cliMissing false -- the widget would stay visible and inert forever"

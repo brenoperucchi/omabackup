@@ -299,16 +299,64 @@ Panel {
   // right once, in bin/omabackup-tui's own _group_pgid_wait/_stop_group --
   // a second implementation, in QML, with no test suite exercising it,
   // invites a third. The dynamically created Process is disposable and
-  // self-destroys once it exits; callers must pass the PID captured
-  // BEFORE setting `running = false` on the target, since `processId`
-  // reads back null once `running` itself is false.
-  function killGroup(pid) {
+  // self-destroys once it exits.
+  //
+  // Takes the whole `proc`, not just its pid -- needed for the backstop
+  // below, and safer than reading `proc.processId` a second time later:
+  // it reads back null once `running` goes false, so the pid this
+  // function itself needs is captured once, up front, the same instant
+  // the caller decided to kill something.
+  //
+  // Backstop timer, added by explicit decision (design consultation,
+  // herdr-ask, after round omabackup-25/26's own review cycle):
+  // `killGroup` becoming the ONLY thing that ever stops a timed-out or
+  // output-capped process (round omabackup-25's fix for a real race --
+  // see busyTimeoutTimer's own comment) removed the old guarantee that
+  // SOMETHING always signals the target. If this helper Process fails to
+  // even start, nothing recovers on its own: `onExited` never fires, and
+  // `busy` stays stuck permanently -- every panel action disabled, no
+  // path out short of restarting the panel (`omabackup-rev-2`'s finding,
+  // round omabackup-26). A short one-shot Timer checks back after giving
+  // the helper every reasonable chance, and falls back to a direct
+  // `proc.running = false` ONLY if the target is somehow still running by
+  // then. This does NOT reopen the race the direct kill used to cause:
+  // that race was specifically "a direct kill wins IMMEDIATELY, before
+  // the helper's own ps/kill sequence ever runs" -- a fallback emitted
+  // seconds later, after the helper (round omabackup-26's own fix: no
+  // longer even needs `ps` to find the group, since it trusts the
+  // setsid-captured pid as the group's own id directly) has had its full
+  // ~1s TERM-then-KILL window, is not competing with anything.
+  //
+  // Checked against the CAPTURED pid, not just `proc.running` -- found by
+  // review (round omabackup-27, `omabackup-rev`): `verifyProc`/
+  // `statusProc`/`syncProc`/`collectProc`/`switchProc` are singleton
+  // Process objects, reused across runs (`refresh()`/`syncNow()`/etc. all
+  // set `running = true` again on the SAME object). If the helper killed
+  // the OLD run quickly and the operator started a brand new run of that
+  // same process within the backstop's own window, a stale backstop that
+  // only checked `proc.running` would see the NEW run as "still running"
+  // and kill IT directly -- a single-PID kill, capable of reopening the
+  // exact descendant-orphaning problem this whole mechanism exists to
+  // close, on a run this backstop was never armed for. Comparing against
+  // the pid captured when THIS backstop was created makes it a no-op for
+  // any run other than the one it was actually watching.
+  readonly property int killGroupBackstopMs: 3000
+  function killGroup(proc) {
+    var pid = proc.processId
     if (pid === null || pid === undefined || root.cli === "") return
     var killer = Qt.createQmlObject(
       'import Quickshell.Io; Process { }', root, "killGroupHelper")
     killer.command = [root.cli, "kill-group", String(pid)]
     killer.exited.connect(function() { killer.destroy() })
     killer.running = true
+
+    var backstop = Qt.createQmlObject(
+      'import QtQuick; Timer { interval: ' + root.killGroupBackstopMs + '; repeat: false; running: true }',
+      root, "killGroupBackstop")
+    backstop.triggered.connect(function() {
+      if (proc.running && proc.processId === pid) proc.running = false
+      backstop.destroy()
+    })
   }
 
   // A producer-side byte ceiling belongs in bin/omabackup, not here (it is
@@ -388,7 +436,7 @@ Panel {
     if (proc.outputCapped) return
     if (proc[field].length + chunk.length > root.maxOutputBytes) {
       proc.outputCapped = true
-      root.killGroup(proc.processId)
+      root.killGroup(proc)
       return
     }
     proc[field] = proc[field] + chunk
@@ -778,8 +826,8 @@ Panel {
       } else if (sTimedOut) {
         root.lastError = "status timed out after " + timedOutSec + "s"
       }
-      // root.killGroup(pid) is called with the PID captured in the SAME
-      // statement as timedOut being set -- before `running` could
+      // root.killGroup(proc) reads proc.processId internally, in the
+      // SAME statement as timedOut being set -- before `running` could
       // possibly change, which reads `processId` back as null once it
       // does. Each of these five commands is wrapped in `setsid --` so
       // this PID also names the whole process group, not just the one
@@ -796,28 +844,31 @@ Panel {
       // still detects the real exit and fires onExited whoever signaled
       // it -- busy stays true for exactly as long as the OS process
       // genuinely is, not until this handler decided to say otherwise.
+      // killGroup() now also arms its own backstop timer (see its own
+      // comment) for the case where its helper Process never manages to
+      // signal anything at all.
       if (verifyProc.running) {
         verifyProc.timedOut = true
-        root.killGroup(verifyProc.processId)
+        root.killGroup(verifyProc)
       }
       if (statusProc.running) {
         statusProc.timedOut = true
-        root.killGroup(statusProc.processId)
+        root.killGroup(statusProc)
       }
       if (syncProc.running) {
         syncProc.timedOut = true
         root.lastError = "sync timed out after " + Math.round(root.busyTimeoutMs / 1000) + "s"
-        root.killGroup(syncProc.processId)
+        root.killGroup(syncProc)
       }
       if (collectProc.running) {
         collectProc.timedOut = true
         root.lastError = "collect timed out after " + Math.round(root.busyTimeoutMs / 1000) + "s"
-        root.killGroup(collectProc.processId)
+        root.killGroup(collectProc)
       }
       if (switchProc.running) {
         switchProc.timedOut = true
         root.lastError = "enable/disable timed out after " + Math.round(root.busyTimeoutMs / 1000) + "s"
-        root.killGroup(switchProc.processId)
+        root.killGroup(switchProc)
       }
     }
   }

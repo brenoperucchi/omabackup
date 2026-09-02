@@ -499,6 +499,74 @@ else
     BUNDLE_EXTRACT_MAX_BYTES=4294967296
 fi
 
+# Ceiling on a WEIGHTED SUM of extracted members, independent of the byte
+# ceiling above. Flagged in the same marketplace security review, a
+# follow-up round after the byte cap landed: this file's own earlier
+# reasoning claimed the byte cap "also caps the worst-case entry count at
+# roughly BYTES/512", since every tar entry costs at least one 512-byte
+# header -- true, but the actual number that math produces
+# (4294967296 / 512 = 8,388,608) is not a meaningfully tight bound. An
+# archive of that many empty files is a real, specifically-shaped bomb: it
+# stays nowhere near the byte ceiling (each entry is header-only) while
+# exhausting inodes and keeping extraction busy far longer than a normal
+# restore ever would.
+#
+# A flat member count alone is not enough either -- found by a SECOND
+# round of review, on the first member-count fix itself: GNU tar silently
+# creates every missing intermediate directory a member's path implies,
+# and none of those auto-created directories get their own line in `-v`'s
+# progress output, only the one explicit member does. Confirmed live: a
+# single crafted member at a 500-level-deep path (built with
+# `tar --transform` remapping a flat name, since a real filesystem would
+# need the directories to already exist) produced exactly ONE progress
+# line but created 502 real filesystem entries on extraction -- a flat
+# per-member cap would have counted that as "1", nowhere near any
+# reasonable ceiling, regardless of how deep the path actually went.
+#
+# Fixed with a weighted cost instead of a bare count: `1 + (slash count in
+# the reported path)` per member, approximating the worst-case number of
+# directory-plus-file objects that ONE entry could create if none of its
+# parent directories already existed -- deliberately not deduplicated
+# against sibling members that might share a prefix (that would need an
+# unbounded set of seen prefixes to track precisely, which is itself a
+# resource an adversarial archive could grow without bound; a
+# conservative per-member estimate needs no such structure, and erring
+# toward "counts as more expensive than it might actually be" is the
+# correct direction for a security ceiling). A flat archive of small files
+# (depth 0-1 each) behaves exactly like the original bare-count cap;
+# BUNDLE_EXTRACT_MAX_DEPTH additionally refuses any SINGLE member whose
+# own path is absurdly deep outright, independent of the budget -- the 500
+# case above, or worse, a much deeper one that would still fit under the
+# cumulative budget for just one or two members.
+#
+# 100,000 is generous for what this tool actually backs up -- this repo's
+# own artifact carries roughly 1,200 tracked files (see this file's own
+# header comment and the "large enough to cross argv's per-string limit"
+# test in test/bundle.test.sh), and real dotfiles paths rarely nest more
+# than a handful of levels deep, so the weighted cost for a legitimate
+# backup stays close to its own flat member count. Override with
+# OMABACKUP_RESTORE_MAX_MEMBERS for an unusually large legitimate backup
+# -- its name names the common case (a bare member count, when every path
+# is shallow) for readability, but what it actually bounds is the
+# weighted cost below, not a literal member count: raising it further
+# than the actual member total suggests may still be needed if those
+# members nest more than a level or two deep. Validated the same way as
+# the byte override, for the same reason (a non-canonical value must
+# never reach the counting pipeline below unvalidated). 64 levels is
+# generous for any real path this tool would ever back up
+# (`~/.config/app/deeply/nested/dir/file` is 6) while still
+# being a small, fixed number next to 500.
+if [[ "${OMABACKUP_RESTORE_MAX_MEMBERS:-}" =~ ^[1-9][0-9]*$ ]]; then
+    BUNDLE_EXTRACT_MAX_MEMBERS="$OMABACKUP_RESTORE_MAX_MEMBERS"
+else
+    BUNDLE_EXTRACT_MAX_MEMBERS=100000
+fi
+if [[ "${OMABACKUP_RESTORE_MAX_DEPTH:-}" =~ ^[1-9][0-9]*$ ]]; then
+    BUNDLE_EXTRACT_MAX_DEPTH="$OMABACKUP_RESTORE_MAX_DEPTH"
+else
+    BUNDLE_EXTRACT_MAX_DEPTH=64
+fi
+
 # _zstd_extract <archive> <dest-dir>
 # tar -xf <(zstd -dc ...) discards zstd's own exit status: the process
 # substitution runs zstd in a separate process feeding a pipe, and $? after
@@ -509,7 +577,9 @@ fi
 # observed. A real pipe with pipefail set is checked instead, the same
 # reasoning already applied to this file's compression side (build_bundle's
 # tar | zstd -o "$out.tmp"): $? reflects the worse of the two commands, not
-# whichever one the shell happened to still be waiting on.
+# whichever one the shell happened to still be waiting on -- confirmed this
+# still holds with more stages in the pipe below (a middle stage failing
+# while the last one succeeds is still caught; verified live, not assumed).
 #
 # `head -c` sits between zstd and tar in the SAME pipe -- the archive file
 # on disk is still read exactly once, matching this function's own
@@ -519,17 +589,71 @@ fi
 # looking at a truncated member or a missing end-of-archive marker, which
 # tar itself refuses as "Unexpected EOF in archive"; pipefail turns that
 # into this function's own non-zero return, indistinguishable from any
-# other extraction failure to every caller. This bounds the member count
-# too, not just total bytes: GNU tar has no native entry-count limit, but
-# every entry costs at least one 512-byte header block in the exact stream
-# this cap applies to, so the byte cap also caps the worst-case entry
-# count at roughly BYTES/512 -- a separate "too many files" check was not
-# needed on top of it.
+# other extraction failure to every caller.
+#
+# `env -u TAR_OPTIONS` and an explicit `--index-file=/dev/stdout` both
+# exist for the same reason, found by review: GNU tar prepends the
+# TAR_OPTIONS environment variable's contents to its own argv, so an
+# inherited `TAR_OPTIONS=--index-file=/dev/null` (confirmed live) silently
+# redirects `-v`'s progress output away from stdout entirely -- `awk` then
+# reads EOF immediately, counts zero, and every member extracts with no
+# cap in effect at all. Confirmed live that an explicit `--index-file`
+# placed after the (possibly hostile) prepended options wins, the normal
+# last-one-wins rule for a single-valued tar option -- kept alongside
+# `env -u`, not instead of it, since relying on option-ordering precedent
+# alone is a thinner guarantee than simply not inheriting the variable.
+#
+# `env -u TAR_OPTIONS` turned out to defend a SECOND thing too, found in
+# the same review round while verifying a member name containing a raw
+# newline is not a bypass of the depth/weighted-cost check below: GNU
+# tar's default quoting escapes an embedded `\n` as the two literal
+# characters `\`+`n`, keeping "one progress line per member" true even
+# then -- but `TAR_OPTIONS="--quoting-style=literal"` turns that escaping
+# off, letting a raw newline split one member across two progress lines
+# (confirmed live: 6 members read as 7 lines with that override in
+# effect, 6 with `env -u TAR_OPTIONS` in place). For the member-count
+# side this direction is harmless (it overcounts, so the cap fires
+# earlier, not later); do not read that as "this env var only matters for
+# the /dev/null case" and remove it later thinking the other bypass above
+# was the only reason it exists.
+#
+# `tar -xv`'s own member-by-member progress (one line per extracted file,
+# to stdout -- confirmed live that -v does not send this to stderr) feeds
+# a trailing `awk` that tracks the weighted cost described above and exits
+# 1 the instant either ceiling is crossed. GNU tar has no native
+# entry-count or nesting-depth limit of its own to reach for instead. Once
+# awk's read end closes, tar's next attempt to write another line gets
+# SIGPIPE and dies -- measured live: 5,000 empty-file (depth-0) members
+# capped at a 50-cost budget stopped at 51 actually extracted; 100,000
+# capped at 1,000 stopped at 1,002, in four milliseconds. A single
+# 500-level-deep member correctly makes extraction FAIL overall (the depth
+# guard rejects that one line), but does not stop its OWN 500-odd
+# directories from being created first -- tar fully extracts one member,
+# parent directories included, before it ever prints that member's own
+# progress line, so detection necessarily comes after that one entry's
+# damage, not before it. Bounded regardless: a single member's own path
+# length is itself bounded by the OS's own PATH_MAX (a few thousand bytes
+# on Linux), so the worst one entry can ever do is on that order, not
+# unbounded -- what the weighted-cost budget actually prevents is
+# REPEATING a moderately deep path across many members, the scalable
+# version of this attack. Not exact in the ordinary case either -- tar can
+# have a little more already in flight when the pipe closes -- but bounded
+# to a small, fixed overshoot instead of the millions either an unbounded
+# or a flat-count-only cap would have allowed through.
 _zstd_extract() {
     local archive="$1" dest="$2"
     local _had_pf=0; [[ -o pipefail ]] && _had_pf=1
     set -o pipefail
-    zstd -dc "$archive" 2>/dev/null | head -c "$BUNDLE_EXTRACT_MAX_BYTES" | tar -C "$dest" -x 2>/dev/null
+    zstd -dc "$archive" 2>/dev/null \
+        | head -c "$BUNDLE_EXTRACT_MAX_BYTES" \
+        | env -u TAR_OPTIONS tar -C "$dest" --index-file=/dev/stdout -xv 2>/dev/null \
+        | awk -v max="$BUNDLE_EXTRACT_MAX_MEMBERS" -v maxdepth="$BUNDLE_EXTRACT_MAX_DEPTH" '
+            { n++
+              depth = gsub(/\//, "&")
+              if (depth > maxdepth) exit 1
+              cost += depth + 1
+              if (cost > max) exit 1
+            }'
     local rc=$?
     (( _had_pf )) || set +o pipefail
     return $rc

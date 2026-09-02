@@ -472,6 +472,164 @@ done
 # above are the precise, direct proof for this one; this fixture size
 # cannot distinguish the fixed and vulnerable paths on its own.
 
+# ── member-count bomb: many tiny/empty entries, not one huge one ───────────
+# Flagged in marketplace security review, a follow-up round after the byte
+# cap above landed: this file's own earlier reasoning claimed the byte cap
+# "also caps the worst-case entry count at roughly BYTES/512" -- true, but
+# 4294967296 / 512 = 8,388,608, not a meaningfully tight bound. An archive
+# of that many empty files stays nowhere near the byte ceiling (header-only
+# entries) while exhausting inodes and keeping extraction busy far longer
+# than any real restore would.
+# Every step's own exit status is checked here, not just the archive's
+# final size -- found by review (round omabackup-27): a silently-failed
+# fixture (a `touch`/`tar`/`zstd` that never actually ran) could otherwise
+# leave an empty or missing archive, and the assertions below would still
+# read as "small", "refused", and "bounded" for the wrong reason, never
+# reaching the real counting pipeline at all. A real listing of the
+# archive, not the loop's own upper bound, is what asserts the true
+# member count -- proving the fixture actually is what this test claims,
+# not assuming the fixture-building commands worked.
+MANYH="$(mktemp -d)"; mkdir -p "$MANYH/src" "$MANYH/dest"
+for MANY_I in $(seq 1 10000); do : >"$MANYH/src/f$MANY_I" || fail "could not create fixture file f$MANY_I"; done
+tar -C "$MANYH/src" -cf - . | zstd -q -19 -o "$MANYH/many.tar.zst" 2>/dev/null \
+    || fail "fixture tar|zstd pipeline itself failed"
+
+it "the many-tiny-files fixture stays small in bytes while carrying thousands of members"
+[[ -s "$MANYH/many.tar.zst" ]] || fail "fixture archive is missing or empty"
+MANY_ARCHIVE_SIZE="$(stat -c %s "$MANYH/many.tar.zst")"
+(( MANY_ARCHIVE_SIZE < 50000 )) \
+    && ok || fail "expected the archive itself to stay well under 50KB, got $MANY_ARCHIVE_SIZE bytes"
+MANY_REAL_COUNT="$(zstd -dc "$MANYH/many.tar.zst" 2>/dev/null | tar -t | wc -l)"
+assert_eq "$MANY_REAL_COUNT" "10001"
+
+MANY_RC="$(OMABACKUP_RESTORE_MAX_MEMBERS=100 bash -c '
+    source lib/bundle.sh
+    _zstd_extract "$1" "$2"
+    printf %s $?
+' _ "$MANYH/many.tar.zst" "$MANYH/dest")"
+
+it "_zstd_extract refuses an archive whose member count exceeds OMABACKUP_RESTORE_MAX_MEMBERS"
+[[ "$MANY_RC" != 0 ]] && ok || fail "expected a non-zero return for 10,000 members under a 100-member cap"
+
+it "and the actual member count on disk stays bounded near the cap, not the archive's full 10,000 entries"
+MANY_WRITTEN="$(find "$MANYH/dest" -type f | wc -l)"
+(( MANY_WRITTEN < 1000 )) \
+    && ok || fail "expected well under 1000 files written for a 100-member cap, got $MANY_WRITTEN (measured live: 5,000 members capped at 50 stopped at 51; 100,000 capped at 1,000 stopped at 1,002)"
+
+# The real, shipped default (100,000), not a lowered test cap: the earlier
+# flat-count-only version of this test used a cap of 100, which happened
+# to still accommodate this repo's own bundle under bare member counting
+# -- but the weighted cost added by the depth fix (1 + slash count per
+# member, not just 1) legitimately pushes a real bundle's own total past
+# a cap that low, since the embedded tool copy nests a few levels deep
+# (tool/lib/*.sh, tool/bin/omabackup). Testing against the actual
+# production default is also the more meaningful question here anyway:
+# does a real, ordinary bundle pass under what genuinely ships, not
+# under an arbitrary smaller number chosen only for a fast test.
+MANYLEGIT_DEST="$(mktemp -d)"
+MANYLEGIT_RC="$(bash -c '
+    source lib/bundle.sh
+    _zstd_extract "$1" "$2"
+    printf %s $?
+' _ "$BPATH" "$MANYLEGIT_DEST")"
+
+it "a real, legitimate bundle -- far under the member cap -- still extracts cleanly"
+assert_eq "$MANYLEGIT_RC" "0"
+[[ -f "$MANYLEGIT_DEST/manifest.json" ]] && ok || fail "expected manifest.json in the extraction, got: $(ls "$MANYLEGIT_DEST" 2>&1)"
+
+it "restore itself refuses a member-count bomb the same way it refuses any unextractable artifact"
+MANYRESTOREOUT="$(HOME="$(mktemp -d)" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$(mktemp -d)" \
+    OMABACKUP_RESTORE_MAX_MEMBERS=100 XDG_RUNTIME_DIR=/nonexistent \
+    "$OB" restore "$MANYH/many.tar.zst" --into "$(mktemp -d)" 2>&1)"
+assert_contains "$MANYRESTOREOUT" "could not extract"
+
+# ── deep-path bomb: one member, hundreds of implied directories ────────────
+# Found by a SECOND round of review, on the member-count fix above itself:
+# GNU tar silently creates every missing intermediate directory a member's
+# path implies, and none of those auto-created directories get their own
+# line in `-v`'s progress output -- a flat per-member count would have
+# read a single 500-level-deep member as "1", nowhere near any reasonable
+# ceiling. `--transform` remaps a real, shallow file's name to a deep path
+# at archive-build time -- the only practical way to construct this
+# without actually creating 500 real nested directories first.
+DEEPH="$(mktemp -d)"; mkdir -p "$DEEPH/src" "$DEEPH/dest"
+printf 'x\n' >"$DEEPH/src/f.txt"
+DEEP_PATH="$(python3 -c "print('/'.join('d' + str(i) for i in range(500)) + '/f.txt')")"
+tar -C "$DEEPH/src" --transform="s|^f.txt|$DEEP_PATH|" -cf - f.txt | zstd -q -o "$DEEPH/deep.tar.zst" 2>/dev/null \
+    || fail "fixture tar --transform | zstd pipeline itself failed"
+
+it "the deep-path fixture really is one tar member implying hundreds of directories"
+DEEP_REAL_COUNT="$(zstd -dc "$DEEPH/deep.tar.zst" 2>/dev/null | tar -t | wc -l)"
+assert_eq "$DEEP_REAL_COUNT" "1"
+DEEP_SLASH_COUNT="$(zstd -dc "$DEEPH/deep.tar.zst" 2>/dev/null | tar -t | tr -dc '/' | wc -c)"
+(( DEEP_SLASH_COUNT >= 500 )) \
+    && ok || fail "expected the single member's own path to carry at least 500 '/' characters, got $DEEP_SLASH_COUNT"
+
+DEEP_RC="$(bash -c '
+    source lib/bundle.sh
+    _zstd_extract "$1" "$2"
+    printf %s $?
+' _ "$DEEPH/deep.tar.zst" "$DEEPH/dest")"
+
+it "_zstd_extract refuses a single member whose path depth exceeds OMABACKUP_RESTORE_MAX_DEPTH, not just a flat member-count cap"
+[[ "$DEEP_RC" != 0 ]] && ok || fail "expected a non-zero return for one 500-level-deep member under the default 64-level depth guard"
+
+DEEPLEGIT_DEST="$(mktemp -d)"; mkdir -p "$DEEPH/src2/a/b/c/d/e"
+printf 'y\n' >"$DEEPH/src2/a/b/c/d/e/f.txt"
+tar -C "$DEEPH/src2" -cf - . | zstd -q -o "$DEEPH/shallow.tar.zst" 2>/dev/null \
+    || fail "shallow fixture pipeline itself failed"
+DEEPLEGIT_RC="$(bash -c '
+    source lib/bundle.sh
+    _zstd_extract "$1" "$2"
+    printf %s $?
+' _ "$DEEPH/shallow.tar.zst" "$DEEPLEGIT_DEST")"
+
+it "a real, legitimately-nested path (a handful of levels) still extracts cleanly under the depth guard"
+assert_eq "$DEEPLEGIT_RC" "0"
+[[ -f "$DEEPLEGIT_DEST/a/b/c/d/e/f.txt" ]] && ok || fail "expected the nested file to have extracted"
+
+for DEEPNEG_VALUE in -1 -0 "" "abc" "+9999999999" "007"; do
+    DEEPNEG_EFFECTIVE="$(OMABACKUP_RESTORE_MAX_DEPTH="$DEEPNEG_VALUE" bash -c '
+        source lib/bundle.sh
+        printf %s "$BUNDLE_EXTRACT_MAX_DEPTH"
+    ')"
+    it "an invalid OMABACKUP_RESTORE_MAX_DEPTH override ([$DEEPNEG_VALUE]) falls back to the safe default"
+    assert_eq "$DEEPNEG_EFFECTIVE" "64"
+done
+
+# ── TAR_OPTIONS bypass: an inherited env var silently defeats the cap ──────
+# Found by review (round omabackup-27): GNU tar prepends the TAR_OPTIONS
+# environment variable's contents to its own argv. An inherited
+# `TAR_OPTIONS=--index-file=/dev/null` (confirmed live, standalone, before
+# this fix existed) silently redirects `-v`'s progress output away from
+# stdout entirely -- the counting `awk` then reads EOF immediately, counts
+# zero, and every member extracts with no cap in effect at all, regardless
+# of how it is configured.
+TAROPTH="$(mktemp -d)"; mkdir -p "$TAROPTH/dest"
+TAROPT_RC="$(TAR_OPTIONS='--index-file=/dev/null' OMABACKUP_RESTORE_MAX_MEMBERS=100 bash -c '
+    source lib/bundle.sh
+    _zstd_extract "$1" "$2"
+    printf %s $?
+' _ "$MANYH/many.tar.zst" "$TAROPTH/dest")"
+
+it "an inherited TAR_OPTIONS cannot silently defeat the member-count cap"
+[[ "$TAROPT_RC" != 0 ]] && ok || fail "expected a non-zero return even with TAR_OPTIONS trying to redirect tar's own progress output away from stdout"
+TAROPT_WRITTEN="$(find "$TAROPTH/dest" -type f | wc -l)"
+(( TAROPT_WRITTEN < 1000 )) \
+    && ok || fail "expected well under 1000 files written despite the TAR_OPTIONS bypass attempt, got $TAROPT_WRITTEN"
+
+# Same validation discipline as OMABACKUP_RESTORE_MAX_BYTES, for the same
+# reason: a non-canonical value must never reach the counting pipeline
+# unvalidated.
+for MANYNEG_VALUE in -1 -0 "" "abc" "+9999999999" "007"; do
+    MANYNEG_EFFECTIVE="$(OMABACKUP_RESTORE_MAX_MEMBERS="$MANYNEG_VALUE" bash -c '
+        source lib/bundle.sh
+        printf %s "$BUNDLE_EXTRACT_MAX_MEMBERS"
+    ')"
+    it "an invalid OMABACKUP_RESTORE_MAX_MEMBERS override ([$MANYNEG_VALUE]) falls back to the safe default"
+    assert_eq "$MANYNEG_EFFECTIVE" "100000"
+done
+
 # A prune failure inside _push_dir not being silently swallowed to /dev/null
 # is exercised in test/destinations.test.sh, through a real `dir` destination
 # and the actual `push` command -- _push_dir depends on too much of
