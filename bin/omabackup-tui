@@ -17,6 +17,7 @@ esac
 CLI_PID=""
 CLI_PGID=""
 HEARTBEAT_PID=""
+TUI_SIGNAL=""
 IPC_PID=""
 IPC_PGID=""
 CLEANED=0
@@ -168,17 +169,42 @@ _cleanup() {
 }
 
 _on_exit() {
-    local rc="$1"
+    local rc="$1" elapsed=$(( EPOCHSECONDS - _tui_start ))
     _cleanup TERM
+    # Calls the CLI on the exact path this wrapper just ran, instead of
+    # sourcing lib/log.sh and deriving OMABACKUP_ROOT here -- see
+    # cmd_log_event's own comment in bin/omabackup for why that derivation
+    # is unsafe (Panel.qml's CLI resolution prefers PATH). Run synchronously,
+    # not backgrounded: this script is about to exit, and a background job
+    # started on the way out is not guaranteed to survive whatever teardown
+    # follows (the wrapper's own process group). _log_write itself is local,
+    # bounded, best-effort work -- no network, no long waits -- but `timeout`
+    # bounds this call anyway: $cli is trusted in production (it is the exact
+    # binary this wrapper just ran seconds ago), yet nothing here should be
+    # able to make the panel wait forever for `_notify` below if it somehow
+    # is not -- confirmed live: without this bound, a `$cli` that does not
+    # actually implement `log-event` (as this file's own test fixtures
+    # legitimately substitute, to drive the wrapper in isolation) hangs this
+    # exit path indefinitely instead of ever reaching `_notify`.
+    if [[ -n "$TUI_SIGNAL" ]]; then
+        timeout --kill-after=2s 5s "$cli" log-event "$action (interactive)" "signal=$TUI_SIGNAL" "after ${elapsed}s" >/dev/null 2>&1
+    else
+        timeout --kill-after=2s 5s "$cli" log-event "$action (interactive)" "exit=$rc" "after ${elapsed}s" >/dev/null 2>&1
+    fi
     _notify "$rc"
 }
 
 _on_signal() {
     local signal="$1" rc="$2"
+    TUI_SIGNAL="$signal"
     _cleanup "$signal"
     exit "$rc"
 }
 
+# Set before the traps below, not after: _on_exit reads it unconditionally,
+# and a signal landing between installing the traps and this assignment
+# would otherwise hit an unset _tui_start.
+_tui_start=$EPOCHSECONDS
 trap '_on_exit "$?"' EXIT
 trap '_on_signal HUP 129' HUP
 trap '_on_signal INT 130' INT
@@ -190,18 +216,24 @@ HEARTBEAT_PID=$!
 # disabled unless it is redirected explicitly. The launcher hands us a PTY;
 # preserve that descriptor or the real CLI will believe it is non-interactive.
 CLI_GROUPED=0
+    # OMABACKUP_TUI_SUPERVISED tells the CLI it was launched by this
+    # wrapper, so a bare `config`/`restore` session does not also log its
+    # own outcome -- this wrapper's own log-event call in _on_exit is
+    # already the authoritative record for the session; without this, a
+    # panel-launched Settings/Restore open used to write two entries for
+    # the same open (found by review).
     if command -v setsid >/dev/null 2>&1; then
         # Bash marks SIGINT/SIGQUIT ignored for asynchronous jobs. Reset those
         # dispositions outside the child shell (trap - cannot reset a signal
         # that was ignored when Bash started) so a terminal Ctrl-C can reach
         # the CLI's own termios/snapshot cleanup while the wrapper supervises
         # its group.
-        setsid -- env --default-signal=INT,QUIT /bin/bash -c 'exec "$@"' omabackup-cli \
-            "$cli" "$action" <&0 &
+        setsid -- env --default-signal=INT,QUIT OMABACKUP_TUI_SUPERVISED=1 \
+            /bin/bash -c 'exec "$@"' omabackup-cli "$cli" "$action" <&0 &
     CLI_GROUPED=1
 else
-    env --default-signal=INT,QUIT /bin/bash -c 'exec "$@"' omabackup-cli \
-        "$cli" "$action" <&0 &
+    env --default-signal=INT,QUIT OMABACKUP_TUI_SUPERVISED=1 \
+        /bin/bash -c 'exec "$@"' omabackup-cli "$cli" "$action" <&0 &
 fi
 CLI_PID=$!
 if (( CLI_GROUPED )); then

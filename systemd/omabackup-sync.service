@@ -12,6 +12,12 @@ Type=oneshot
 # class as destinations.json. The leading `-` means a missing file is not an
 # error -- the CLI produces a far better message than systemd would.
 EnvironmentFile=-%h/.config/omabackup/env
+# This run already has a real log -- `journalctl --user -u
+# omabackup-sync.service` -- so it opts out of lib/log.sh's own file log,
+# which exists for what has no log anywhere else (an interactive TUI
+# session, a manual invocation). Without this, the two would duplicate
+# every timer-triggered run.
+Environment=OMABACKUP_LOG_SKIP=1
 ExecStart=%h/.config/omarchy/plugins/brenoperucchi.omabackup/bin/omabackup sync --commit
 
 # `sync` exits non-zero when coverage fails, and that is the whole point: the

@@ -1536,6 +1536,61 @@ cmd_reload() {
             || printf '  %s!%s could not pull; reloading what is on disk\n' "$YELLOW" "$NC"
     fi
 
+    # `.service` files only, never `.timer` -- found by review (round
+    # omabackup-22): `cmd_install` is the only thing that ever writes these
+    # units, so an instance updated the supported way (`reload`, or
+    # `omarchy plugin update`, which calls this) kept running its
+    # pre-OMABACKUP_LOG_SKIP=1 units indefinitely, duplicating the journal
+    # and the file log on every timer-triggered run. Re-running `install`
+    # by hand already picks up the new template, but that is not the
+    # documented update path. `.timer` is deliberately excluded: `install`
+    # already overwrites it unconditionally from the template on every run,
+    # which would discard a schedule set via `config set sync-schedule` --
+    # not a new problem to fix here, but one this narrower refresh must not
+    # accidentally reproduce for reload too.
+    #
+    # Written to a temp file in the same directory and moved into place
+    # only once _rewrite_execstart has actually produced non-empty output
+    # -- found by review (round omabackup-23): a plain `>` redirect
+    # truncates the target FIRST, so a read/write failure partway (disk
+    # full included) used to leave the live unit empty or partial while
+    # `|| true` silently swallowed the error and reload still reported
+    # success. A generation or daemon-reload failure now leaves the
+    # previously-working unit untouched and prints a warning instead of
+    # dying -- this is a best-effort refresh alongside reload's own real
+    # job (verifying the shell restart), not something that should block it.
+    if [[ -d "$UNIT_DIR" ]]; then
+        local reload_src="$OMABACKUP_ROOT/systemd" reload_unit reload_tmp reload_failed=0
+        for reload_unit in omabackup-sync.service omabackup-push.service; do
+            if [[ -f "$reload_src/$reload_unit" && -f "$UNIT_DIR/$reload_unit" ]]; then
+                reload_tmp="$UNIT_DIR/.omabackup-reload-$reload_unit.$$"
+                # Explicit `( ... )` subshell, not a direct call: found by
+                # review (round omabackup-24) that _rewrite_execstart calls
+                # die() -- a real `exit` -- for a source path containing a
+                # single quote or an unexpected ExecStart shape. Running in
+                # the main shell, that would have killed `reload` outright,
+                # skipping the warning below, the temp cleanup, AND
+                # reload's own real job of verifying the shell restart. A
+                # subshell contains the exit to just this one unit's
+                # generation attempt.
+                if ( _rewrite_execstart "$reload_src/$reload_unit" ) >"$reload_tmp" 2>/dev/null \
+                    && [[ -s "$reload_tmp" ]]; then
+                    chmod --reference="$UNIT_DIR/$reload_unit" "$reload_tmp" 2>/dev/null || chmod 644 "$reload_tmp"
+                    mv -f -- "$reload_tmp" "$UNIT_DIR/$reload_unit" 2>/dev/null || reload_failed=1
+                else
+                    rm -f -- "$reload_tmp"
+                    reload_failed=1
+                fi
+            fi
+        done
+        if (( reload_failed )); then
+            printf '  %s!%s could not refresh an installed systemd unit; the running one is untouched\n' "$YELLOW" "$NC"
+        else
+            "$SYSTEMCTL" --user daemon-reload >/dev/null 2>&1 \
+                || printf '  %s!%s systemctl daemon-reload failed after refreshing units\n' "$YELLOW" "$NC"
+        fi
+    fi
+
     local before files before_id
     before="$(_shell_started_at || echo 0)"
     before_id="$(_shell_identity || echo none)"
@@ -1739,7 +1794,15 @@ _restore_tui_recovery() {
         tui_read_line choice || return 0
         case "$choice" in
             1) return 1 ;;
-            2) "$cli" config; return 2 ;;
+            # `env -u`, not a plain call: OMABACKUP_TUI_SUPERVISED (set by
+            # bin/omabackup-tui on the whole subtree it launches) would
+            # otherwise be inherited here too, suppressing this session's
+            # own self-log -- but the wrapper only ever reports the OUTER
+            # "restore (interactive)" action, so this genuinely separate
+            # Settings visit opened from Restore's own recovery prompt
+            # would then have no log record anywhere (found by review,
+            # round omabackup-24).
+            2) env -u OMABACKUP_TUI_SUPERVISED "$cli" config; return 2 ;;
             q|Q|$'\033') printf 'Restore cancelled.\n'; return 0 ;;
             *) printf 'Please choose 1, 2 or q.\n' ;;
         esac
@@ -1790,7 +1853,25 @@ cmd_restore_tui() {
     # functions after this TUI exits. Signals use the same cleanup because a
     # Ctrl-C is a normal way to leave an interactive terminal, not a reason to
     # strand a complete backup copy in /tmp.
-    trap '_restore_tui_cleanup_snapshot; trap - RETURN INT TERM HUP' RETURN
+    #
+    # RETURN removes only itself, not INT/TERM/HUP too -- found by review
+    # (round omabackup-24, confirmed independently by both reviewers): the
+    # dispatch-level signal traps (bin/omabackup's own INT/TERM/HUP,
+    # installed before this function ever runs) are never explicitly
+    # saved here, so stripping all four back to bash's untrapped default on
+    # RETURN reopened the exact false-"ok" bug the dispatch-level traps
+    # exist to prevent, in the narrow window between this function
+    # returning and the process actually exiting: an untrapped signal
+    # there reaches the EXIT trap with $?=0 from before the signal, not the
+    # signal's own 128+n convention. Leaving these three in place instead
+    # is safe: _restore_tui_cleanup_snapshot is idempotent (a `local`
+    # snapshot_dir out of scope after this function has returned reads as
+    # unset, so it is simply a no-op), so a signal in that window still
+    # exits with the correct 130/143/129 -- just without the more
+    # descriptive "signal=INT" phrasing a session-scoped Ctrl-C gets
+    # (bin/omabackup-tui already covers that case for the panel-launched
+    # path; this is about a direct terminal invocation only).
+    trap '_restore_tui_cleanup_snapshot; trap - RETURN' RETURN
     trap '_restore_tui_cleanup_snapshot; exit 130' INT
     trap '_restore_tui_cleanup_snapshot; exit 143' TERM
     trap '_restore_tui_cleanup_snapshot; exit 129' HUP
@@ -2732,6 +2813,22 @@ cmd_version() {
     fi
 }
 
+# Internal only -- not printed in the usage text below. bin/omabackup-tui
+# calls this on the exact CLI path it just ran, instead of sourcing
+# lib/log.sh and deriving OMABACKUP_ROOT itself: the panel's own CLI
+# resolution (Panel.qml's resolveProc) prefers PATH over the plugin
+# directory, so a `dirname/dirname` derivation from $cli silently breaks
+# on a machine where `omabackup` is actually on PATH -- passes every test,
+# which always invokes this repo's own binary directly, and breaks only in
+# the one production shape testing does not cover. Found by design review
+# (herdr-ask round omabackup-10). Calling the CLI it already trusts avoids
+# the derivation question entirely and keeps rotation/pruning to one
+# implementation instead of two racing processes.
+cmd_log_event() {
+    (($# == 2 || $# == 3)) || die "usage: omabackup log-event ACTION OUTCOME [DETAIL]"
+    _log_write "$1" "$2" "${3:-}"
+}
+
 # ── artifacts ────────────────────────────────────────────────────────────────
 # What `restore` could be pointed at. Exists because a restore-picking UI
 # cannot list a `dir` destination itself -- Quickshell.Io.Process is the only
@@ -2805,14 +2902,76 @@ source "$OMABACKUP_ROOT/lib/restore.sh"
 source "$OMABACKUP_ROOT/lib/artifacts.sh"
 source "$OMABACKUP_ROOT/lib/schedule.sh"
 source "$OMABACKUP_ROOT/lib/tui.sh"
+source "$OMABACKUP_ROOT/lib/log.sh"
 source "$OMABACKUP_ROOT/lib/config.sh"
+
+CMD="${1:-}"; shift || true
+
+# An EXIT trap, not a post-call wrapper that logs after cmd_* returns: die()
+# (above) calls `exit 1` directly, so a wrapper of that shape would never
+# run for anything that fails via die -- which is most real failures in
+# this codebase. Found by design review (herdr-ask round omabackup-10)
+# against an earlier draft that logged this way.
+#
+# LOG_POLICY is decided in two passes, not one. This first pass, from $CMD
+# alone, runs before ANY argument parsing (which can die() too) and applies
+# OMABACKUP_LOG_SKIP immediately -- found by review (round omabackup-23,
+# fixing an incomplete first attempt from round omabackup-22): parking
+# every command at a single `failure` default until after parsing meant a
+# `--groups`-parse-time die() on an `always`-policy command like `sync`
+# stayed misclassified as `failure` -- coalesced against verify/status's
+# unrelated state instead of logging every time the way `sync` is supposed
+# to -- and OMABACKUP_LOG_SKIP checked only after parsing meant a
+# systemd-timer run that somehow died during parsing still wrote to the
+# file log despite the opt-out. A second pass below, once ARGS is known,
+# only narrows this for config/restore's own sub-command distinctions,
+# which $CMD alone cannot decide -- it never has to invent a policy from
+# nothing the way a single post-parse assignment did.
+_log_policy_for_cmd() {
+    case "$1" in
+        sync|push|collect|install|enable|disable|bundle|reload) printf always ;;
+        verify|status|restore|config) printf failure ;;
+        version|artifacts|help|log-event|"") printf never ;;
+        # Anything else reaches the final `die "unknown command"` below --
+        # still a real failure worth logging under whatever the user typed.
+        *) printf failure ;;
+    esac
+}
+LOG_POLICY="$(_log_policy_for_cmd "$CMD")"
+LOG_ACTION="$CMD"
+[[ -n "${OMABACKUP_LOG_SKIP:-}" ]] && LOG_POLICY=never
+_log_dispatch_signal=""
+_log_dispatch_start=$EPOCHSECONDS
+_log_dispatch_exit() {
+    local rc="$1"
+    case "$LOG_POLICY" in
+        always)  _log_run_always "$LOG_ACTION" "$rc" "$(( EPOCHSECONDS - _log_dispatch_start ))" "$_log_dispatch_signal" ;;
+        failure) _log_run_on_failure "$LOG_ACTION" "$rc" "$_log_dispatch_signal" ;;
+    esac
+}
+trap '_log_dispatch_exit "$?"' EXIT
+# Real signals, not just die()'s own `exit 1` -- found by review (round
+# omabackup-22, reproduced live): with no trap of its own, an unhandled
+# INT/TERM/HUP on a command run by hand (a Ctrl-C, or a closed terminal --
+# outside any TUI wrapper) reaches the EXIT trap with whatever `$?` was
+# set to BEFORE the signal arrived, which bash reports as 0 there. That
+# means an interrupted `sync` used to log a false "ok" -- exactly the
+# class of error this project treats as the worst a backup tool can make.
+# Mirrors bin/omabackup-tui's own HUP/INT/TERM traps (129/130/143) so the
+# panel-launched and the hand-run paths agree on what a signal means.
+_log_dispatch_on_signal() {
+    _log_dispatch_signal="$1"
+    exit "$2"
+}
+trap '_log_dispatch_on_signal HUP 129' HUP
+trap '_log_dispatch_on_signal INT 130' INT
+trap '_log_dispatch_on_signal TERM 143' TERM
 
 # Two levels: the loop below owns only what every command understands and
 # hands the rest, in order, to the command itself. It used to consume and shift
 # everything, which made `sync --commit` doubly impossible -- it died here as an
 # unknown flag, and even past that the shifting left $# at zero, so cmd_sync
 # was always called with an empty string and could never take the branch.
-CMD="${1:-}"; shift || true
 ARGS=()
 while (($#)); do
     case "$1" in
@@ -2823,7 +2982,7 @@ while (($#)); do
         --groups)
             (($# >= 2)) && [[ "$2" != -* ]] || die "--groups needs a value"
             ONLY="$2"; shift 2 ;;
-        -h|--help) CMD=help; shift ;;
+        -h|--help) CMD=help; LOG_POLICY=never; LOG_ACTION=help; shift ;;
         *) ARGS+=("$1"); shift ;;
     esac
 done
@@ -2832,14 +2991,98 @@ done
 # would look like it did something.
 reject_flags() { local c="$1"; shift; (($# == 0)) || die "unknown flag for $c: $1"; }
 
-[[ -f "$GROUPS_FILE" ]] || die "group manifest not found: $GROUPS_FILE"
-# restore validates --groups against the ARTIFACT's manifest, not this
-# machine's -- a group name valid for one is not necessarily valid for the
-# other, and checking here against the wrong file would refuse a legitimate
-# artifact-only group or accept a machine-only one that means nothing to it.
-if [[ "$CMD" != restore ]]; then
-    bad="$(_assert_groups_filter_understood)" \
-        || die "--groups names a group this manifest does not have: $bad"
+# Second pass: only narrows the coarse policy above for config/restore's
+# own sub-command distinctions, which $CMD alone cannot decide. Everything
+# else's policy is already final and immune to whatever these two branches
+# do -- the `sync --groups` gap this replaced is closed by never leaving
+# `sync` at a placeholder in the first place.
+case "$CMD" in
+    restore)
+        if [[ " ${ARGS[*]} " == *" --apply "* ]]; then
+            LOG_POLICY=always
+        elif (( ${#ARGS[@]} == 0 )); then
+            # Bare `restore` opens the interactive TUI directly -- a
+            # DIFFERENT action name than a specific artifact preview/apply
+            # call below (found by review: sharing "restore" let the outer
+            # session's own eventual "ok" overwrite an inner preview's
+            # "failed", or coalesce away a second same-day interruption
+            # that has nothing to do with the first).
+            LOG_ACTION="restore (interactive)"
+            if [[ -n "${OMABACKUP_TUI_SUPERVISED:-}" ]]; then
+                # Launched by bin/omabackup-tui, which already logs this
+                # exact session via its own post-exit `log-event` call --
+                # self-logging here too would double it (found by review).
+                LOG_POLICY=never
+            fi
+        fi
+        # else: an artifact path with no --apply (a preview call, whether
+        # standalone or from inside the interactive TUI above) stays at
+        # the coarse pass's `failure` -- a refused/failed preview (e.g.
+        # "this artifact does not verify -- refusing to restore from it")
+        # is one of the most useful lines this tool produces; only a
+        # successful, read-only preview -- run on every backup browsed in
+        # the Restore TUI -- is skipped.
+        ;;
+    config)
+        case "${ARGS[0]:-}" in
+            # `show`/`validate` are what the interactive TUI re-runs on
+            # every single redraw; logging those would flood the log with
+            # no new information.
+            show|validate) LOG_POLICY=never ;;
+            set|destination) LOG_POLICY=always; LOG_ACTION="config ${ARGS[0]}" ;;
+            "")
+                # Bare `config` opens the interactive TUI directly -- not
+                # necessarily through the panel's bin/omabackup-tui
+                # wrapper (found by review: the agreed scope is "any
+                # command run by hand", which this was still missing).
+                LOG_ACTION="config (interactive)"
+                if [[ -n "${OMABACKUP_TUI_SUPERVISED:-}" ]]; then
+                    # Same reasoning as restore above: the wrapper's own
+                    # log-event call already covers this exact session.
+                    LOG_POLICY=never
+                fi
+                ;;
+        esac
+        ;;
+esac
+# Known limitation, documented not fixed (round omabackup-24 review,
+# omabackup-rev's P2): unlike `sync --groups`, which is classified
+# `always` by the coarse pass above from $CMD alone, `config set --groups`
+# and `restore --apply --groups` still need THIS second pass -- which
+# only runs after the while-loop below has finished -- to be reclassified
+# from the coarse `failure` default to `always`. A `--groups` value
+# missing die()s inside that same loop, before this pass ever runs, so
+# that one parse mistake is logged under `failure`'s coalescing instead of
+# `always`: a first observation still writes once, but a REPEATED same
+# mistake coalesces away instead of logging every time the way a `sync`
+# parse failure now correctly does. Lower severity than a false "ok" --
+# this reduces visibility on a repeated rare user mistake, it does not
+# misreport an outcome -- and left for a dedicated pass rather than a
+# quick patch to dispatch/signal-adjacent code at the end of a correction
+# cycle already at its 2-round budget.
+# Re-applied, not just relied on from the coarse pass above: neither
+# branch above is reachable in practice with OMABACKUP_LOG_SKIP set (only
+# the systemd units set it, and they only ever run sync/push), but
+# `config set`/`destination` unconditionally assigning `always` would
+# silently win over it if that ever changed.
+[[ -n "${OMABACKUP_LOG_SKIP:-}" ]] && LOG_POLICY=never
+
+# `log-event` is exempt from the manifest checks below -- found by review:
+# it is the wrapper's own post-exit notification, called precisely when
+# something (a missing manifest included) already went wrong, and dying
+# here on that same missing manifest would silence the one call meant to
+# report it.
+if [[ "$CMD" != log-event ]]; then
+    [[ -f "$GROUPS_FILE" ]] || die "group manifest not found: $GROUPS_FILE"
+    # restore validates --groups against the ARTIFACT's manifest, not this
+    # machine's -- a group name valid for one is not necessarily valid for
+    # the other, and checking here against the wrong file would refuse a
+    # legitimate artifact-only group or accept a machine-only one that
+    # means nothing to it.
+    if [[ "$CMD" != restore ]]; then
+        bad="$(_assert_groups_filter_understood)" \
+            || die "--groups names a group this manifest does not have: $bad"
+    fi
 fi
 
 case "$CMD" in
@@ -2857,6 +3100,7 @@ case "$CMD" in
     restore) cmd_restore "${ARGS[@]}" ;;
     artifacts) cmd_artifacts "${ARGS[@]}" ;;
     config)    cmd_config "${ARGS[@]}" ;;
+    log-event) cmd_log_event "${ARGS[@]}" ;;
     ""|help)
         cat <<'USAGE'
 omabackup <command> [--json] [--groups a,b]

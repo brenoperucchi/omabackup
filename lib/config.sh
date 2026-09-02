@@ -263,7 +263,14 @@ _config_repo_tracked_only_note() {
 
 _config_show_json() {
     local destinations='{"schemaVersion":1,"destinations":[]}' sync_calendar push_calendar sync_cron push_cron sync_label push_label github_url repo_status
+    local log_retention_days log_config_exists log_config_valid
     [[ -f "$DESTINATIONS_FILE" ]] && destinations="$(cat -- "$DESTINATIONS_FILE")"
+    log_retention_days="$(_log_retention_days)"
+    log_config_exists=false; log_config_valid=true
+    if [[ -f "$LOG_CONFIG_FILE" ]]; then
+        log_config_exists=true
+        _log_retention_valid_file || log_config_valid=false
+    fi
     sync_calendar="$(timer_schedule omabackup-sync.timer || true)"
     push_calendar="$(timer_schedule omabackup-push.timer || true)"
     sync_cron="$(schedule_calendar_to_cron "$sync_calendar" || true)"
@@ -288,6 +295,9 @@ _config_show_json() {
         --arg githubUrl "$github_url" \
         --argjson githubActive "$( [[ -n "$github_url" ]] && echo true || echo false )" \
         --argjson enabled "$(scheduler_active && echo true || echo false)" \
+        --argjson logRetentionDays "$log_retention_days" \
+        --argjson logConfigExists "$log_config_exists" \
+        --argjson logConfigValid "$log_config_valid" \
         '{schemaVersion:1, repo:$repo, repoStatus:$repoStatus, envFile:$env, destinationsFile:$destfile,
           destinations:$destinations.destinations,
           github:{remote:"origin", configured:$githubActive, active:$githubActive,
@@ -298,7 +308,8 @@ _config_show_json() {
                      pushLabel:(if $pushLabel == "" then null else $pushLabel end),
                      calendar:{sync:(if $syncCalendar == "" then null else $syncCalendar end),
                                push:(if $pushCalendar == "" then null else $pushCalendar end)}},
-          enabled:$enabled}'
+          enabled:$enabled,
+          log:{retentionDays:$logRetentionDays, configExists:$logConfigExists, configValid:$logConfigValid}}'
 }
 
 _config_validate_json() {
@@ -312,6 +323,14 @@ _config_validate_json() {
     push="$(_config_file_schedule "$UNIT_DIR/omabackup-push.timer" || true)"
     [[ -n "$sync" ]] || errors+=("sync timer has no readable OnCalendar")
     [[ -n "$push" ]] || errors+=("push timer has no readable OnCalendar")
+    # Found by review (round omabackup-22): `config validate` covered
+    # repo/destinations/timers but nothing about log.json, so a hand-edited
+    # file could sit invalid (or over LOG_RETENTION_MAX_DAYS) while this
+    # command reported the configuration valid -- even though `config show`
+    # separately flags it. Only checked when the file actually exists:
+    # a missing log.json is not an error, it just means the default applies.
+    [[ -f "$LOG_CONFIG_FILE" ]] && ! _log_retention_valid_file \
+        && errors+=("log.json exists but is invalid")
     if (( JSON )); then
         printf '%s\n' "${errors[@]:-}" | jq -Rsc 'split("\n") | map(select(length > 0)) as $errors | {schemaVersion:1,valid:($errors|length==0),errors:$errors}'
     else
@@ -651,14 +670,15 @@ cmd_config_tui() {
         printf '  4) Backup schedule\n'
         printf '  5) Send schedule\n'
         printf '  6) Automatic backups\n'
+        printf '  7) Log retention\n'
         printf '  q) Cancel\n\n'
-        printf 'Choose an option [1-6/q]: '
+        printf 'Choose an option [1-7/q]: '
         tui_read_line choice || return 0
         rc=0
         case "$choice" in
             q|Q|$'\033') printf '\nConfiguration cancelled.\n'; return 0 ;;
             ''|*[!0-9]*)
-                notice="Please choose 1-6 or q."
+                notice="Please choose 1-7 or q."
                 continue
                 ;;
             1)
@@ -985,8 +1005,23 @@ cmd_config_tui() {
                     notice="${output:-Automatic backup setting was not changed.}"
                 fi
                 ;;
+            7)
+                printf 'Keep logs for how many days? [%s] (q to cancel): ' "$(_log_retention_days)"
+                tui_read_line value || return 0
+                if [[ "$value" == q || "$value" == Q || "$value" == $'\033' ]]; then
+                    notice="Log retention change cancelled."
+                    continue
+                fi
+                value="${value:-$(_log_retention_days)}"
+                output="$($cli config set log-retention-days "$value" 2>&1)"; rc=$?
+                if (( rc == 0 )); then
+                    notice="Log retention saved."
+                else
+                    notice="${output:-Log retention was not changed.}"
+                fi
+                ;;
             *)
-                notice="Please choose 1-6 or q."
+                notice="Please choose 1-7 or q."
                 continue
                 ;;
         esac
@@ -1000,7 +1035,7 @@ cmd_config_tui() {
 cmd_config() {
     local sub="${1:-}" key value id path keep doc dest_lock_fd shown
     local repo_status repo_value github_active github_value entries entry
-    local schedule_label enabled_value
+    local schedule_label enabled_value log_retention_show log_config_valid_show
     shift || true
     case "$sub" in
         show|"")
@@ -1050,6 +1085,14 @@ cmd_config() {
                 printf 'Send schedule: %s\n' "$(tui_sanitize_field "${schedule_label:-Not configured}")"
                 enabled_value="$(jq -r 'if .enabled then "on" else "off" end' <<<"$shown")" || die "could not read the current configuration"
                 printf 'Automatic backups: %s\n' "$(tui_sanitize_field "$enabled_value")"
+                log_retention_show="$(jq -r '.log.retentionDays' <<<"$shown")" || die "could not read the current configuration"
+                log_config_valid_show="$(jq -r '.log.configValid' <<<"$shown")" || die "could not read the current configuration"
+                if [[ "$log_config_valid_show" == false ]]; then
+                    printf 'Log retention: %s days (log.json is invalid -- using the default)\n' \
+                        "$(tui_sanitize_field "$log_retention_show")"
+                else
+                    printf 'Log retention: %s days\n' "$(tui_sanitize_field "$log_retention_show")"
+                fi
             fi
             ;;
         validate)
@@ -1057,7 +1100,7 @@ cmd_config() {
             _config_validate_json
             ;;
         set)
-            (($# == 2)) || die "usage: omabackup config set <repo|sync-schedule|push-schedule|enabled> VALUE"
+            (($# == 2)) || die "usage: omabackup config set <repo|sync-schedule|push-schedule|enabled|log-retention-days> VALUE"
             key="$1"; value="$2"
             case "$key" in
                 repo)
@@ -1105,6 +1148,12 @@ cmd_config() {
                         off|false|no|0) cmd_enable disable ;;
                         *) die "enabled expects on or off" ;;
                     esac
+                    ;;
+                log-retention-days)
+                    _log_retention_valid "$value" \
+                        || die "log retention must be a whole number of days between 1 and $LOG_RETENTION_MAX_DAYS"
+                    _log_config_write "$(_log_retention_normalize "$value")" \
+                        || die "could not write $(_tilde "$LOG_CONFIG_FILE")"
                     ;;
                 *) die "unknown config key: $key" ;;
             esac

@@ -186,6 +186,13 @@ exec tail -f /dev/null
 EOF
 cat >"$HEARTBEAT_HOME/cli" <<'EOF'
 #!/bin/bash
+# Explicit, not just safe by accident: found by review (round omabackup-22)
+# that this stub and HBARGV_CLI below were the only two of seven wrapper-
+# invoked stubs in this file without their own `log-event` guard -- both
+# happen to exit fast today because the file they poll for is already
+# non-empty by the time _on_exit's log-event call runs, but that is a
+# coincidence of timing, not a declared contract like the other five have.
+[[ "$1" == log-event ]] && exit 0
 for _ in {1..50}; do
     [[ -s "$HEARTBEAT_PID_FILE" ]] && exit 0
     /usr/bin/sleep 0.01
@@ -225,6 +232,7 @@ printf '#!/bin/bash\nexit 0\n' >"$HBARGV_HOME/bin/sleep"
 printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"%s"\n' "$HBARGV_CALL_LOG" >"$HBARGV_HOME/bin/omarchy-shell"
 cat >"$HBARGV_CLI" <<EOF
 #!/bin/bash
+[[ "\$1" == log-event ]] && exit 0
 for _ in {1..50}; do
     [[ -s "$HBARGV_CALL_LOG" ]] && exit 0
     /usr/bin/sleep 0.01
@@ -268,6 +276,10 @@ SIGNAL_OLD_PGID="$(ps -o pgid= -p "$$" | tr -d '[:space:]')"
 SIGNAL_PS_STATE="$SIGNAL_HOME/ps.count"
 cat >"$SIGNAL_CLI" <<'EOF'
 #!/bin/bash
+# The real CLI understands `log-event` (bin/omabackup-tui calls it from
+# _on_exit) and returns immediately; this stub must too, or the wrapper's
+# own post-exit call launches ANOTHER copy of the infinite loop below.
+[[ "$1" == log-event ]] && exit 0
 printf '%s\n' "$$" >"$SIGNAL_PID_FILE"
 ( trap '' HUP; trap 'exit 0' TERM; while :; do /usr/bin/sleep 1; done ) &
 printf '%s\n' "$!" >"$SIGNAL_HOME/child.pid"
@@ -336,6 +348,9 @@ INT_HOME="$(mktemp -d)"; mkdir -p "$INT_HOME/bin"
 INT_CLI="$INT_HOME/cli"; INT_READY="$INT_HOME/ready"; INT_MARKER="$INT_HOME/int"
 cat >"$INT_CLI" <<'EOF'
 #!/bin/bash
+# See SIGNAL_CLI's own comment above: the wrapper's _on_exit calls this
+# same path with `log-event`, which must not fall through into the loop.
+[[ "$1" == log-event ]] && exit 0
 printf ready >"$INT_READY"
 trap 'printf INT >"$INT_MARKER"; exit 0' INT
 while :; do /usr/bin/sleep 1; done
@@ -394,7 +409,7 @@ mkdir -p "$HANDOFF_HOME/bin"
 HANDOFF_CLI="$HANDOFF_HOME/fake-cli"
 HANDOFF_CALL_LOG="$HANDOFF_HOME/call.log"
 HANDOFF_CLI_LOG="$HANDOFF_HOME/cli.log"
-printf '#!/bin/bash\nprintf "%%s\\n" "$*" >"%s"\nexit 7\n' "$HANDOFF_CLI_LOG" >"$HANDOFF_CLI"
+printf '#!/bin/bash\n[[ "$1" == log-event ]] && exit 0\nprintf "%%s\\n" "$*" >"%s"\nexit 7\n' "$HANDOFF_CLI_LOG" >"$HANDOFF_CLI"
 printf '#!/bin/bash\nprintf "%%s\\n" "$*" >"%s"\n' "$HANDOFF_CALL_LOG" >"$HANDOFF_HOME/bin/omarchy-shell"
 chmod +x "$HANDOFF_CLI" "$HANDOFF_HOME/bin/omarchy-shell"
 HANDOFF_RC=0
@@ -418,7 +433,7 @@ assert_eq "$(cat "$HANDOFF_CALL_LOG" 2>/dev/null)" "brenoperucchi.omabackup tuiF
 
 SIGNAL_CLI="$HANDOFF_HOME/signal-cli"
 SIGNAL_CALL_LOG="$HANDOFF_HOME/signal-call.log"
-printf '#!/bin/bash\nkill -HUP "$$"\n' >"$SIGNAL_CLI"
+printf '#!/bin/bash\n[[ "$1" == log-event ]] && exit 0\nkill -HUP "$$"\n' >"$SIGNAL_CLI"
 printf '#!/bin/bash\nprintf "%%s\\n" "$*" >"%s"\n' "$SIGNAL_CALL_LOG" >"$HANDOFF_HOME/bin/omarchy-shell"
 chmod +x "$SIGNAL_CLI" "$HANDOFF_HOME/bin/omarchy-shell"
 SIGNAL_RC=0
@@ -437,6 +452,10 @@ assert_eq "$(cat "$SIGNAL_CALL_LOG" 2>/dev/null)" "brenoperucchi.omabackup tuiFi
 TTY_HOME="$(mktemp -d)"; TTY_CLI="$TTY_HOME/tty-cli"; TTY_MARKER="$TTY_HOME/marker"
 cat >"$TTY_CLI" <<'EOF'
 #!/bin/bash
+# The wrapper's own post-exit `log-event` call redirects this script's
+# stdout/stderr to /dev/null, which would otherwise overwrite TTY_MARKER
+# with a false "no-tty" and corrupt the real (PTY) invocation's result.
+[[ "$1" == log-event ]] && exit 0
 if [[ -t 0 && -t 1 ]]; then
     printf tty >"$TTY_MARKER"
 else
@@ -456,7 +475,16 @@ it "the terminal TUI wrapper preserves the PTY for its real CLI child"
 it "status exposes the manifest version used by the QuickShell panel"
 STATUS_JSON=""
 STATUS_RC=0
-STATUS_JSON="$(OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+# Isolated HOME/state and an explicit OMABACKUP_LOG_SKIP -- found by review
+# (round omabackup-22): without HOME overridden, `status`'s new
+# failure-policy logging wrote a real baseline/coalescing entry into
+# THIS MACHINE's actual ~/.local/state/omabackup/log/, not a test fixture,
+# on every suite run. This probe is about status's JSON output, not
+# logging, so skipping it explicitly is correct on top of the isolation,
+# not just belt-and-suspenders.
+STATUS_HOME="$(mktemp -d)"
+STATUS_JSON="$(HOME="$STATUS_HOME" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$STATUS_HOME/.state" OMABACKUP_LOG_SKIP=1 \
     XDG_RUNTIME_DIR=/nonexistent "$PWD/bin/omabackup" status --json)" || STATUS_RC=$?
 if (( STATUS_RC == 0 )); then
     assert_eq "$(printf '%s' "$STATUS_JSON" | jq -r '.tool.version')" "$(jq -r '.version' manifest.json)"

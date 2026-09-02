@@ -12,6 +12,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 EnvironmentFile=-%h/.config/omabackup/env
+# See omabackup-sync.service's own comment: this run already has a real log
+# via journalctl, so it opts out of the file log to avoid duplicating it.
+Environment=OMABACKUP_LOG_SKIP=1
 ExecStart=%h/.config/omarchy/plugins/brenoperucchi.omabackup/bin/omabackup push
 
 Nice=10

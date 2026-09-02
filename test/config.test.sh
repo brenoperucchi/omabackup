@@ -518,17 +518,17 @@ assert_contains "$NO_REPO_TUI" "Automatic backups:"
 assert_not_contains "$NO_REPO_TUI" "repo:"
 
 INVALID_TUI="$(_cfg_tui $'\nq\n')"
-OUT_OF_RANGE_TUI="$(_cfg_tui $'7\nq\n')"
+OUT_OF_RANGE_TUI="$(_cfg_tui $'8\nq\n')"
 
 it "keeps an empty menu choice in the same prompt instead of a dead end"
-assert_contains "$INVALID_TUI" "Please choose 1-6 or q."
+assert_contains "$INVALID_TUI" "Please choose 1-7 or q."
 assert_not_contains "$INVALID_TUI" "Unknown choice"
 assert_not_contains "$INVALID_TUI" "Press Enter to continue"
 [[ "$(grep -F -o 'Choose an option' <<<"$INVALID_TUI" | wc -l)" -ge 2 ]] \
     && ok || fail "empty input did not return to the menu"
 
 it "explains a numeric menu choice outside the advertised range"
-assert_contains "$OUT_OF_RANGE_TUI" "Please choose 1-6 or q."
+assert_contains "$OUT_OF_RANGE_TUI" "Please choose 1-7 or q."
 assert_not_contains "$OUT_OF_RANGE_TUI" "Unknown choice"
 [[ "$(grep -F -o 'Choose an option' <<<"$OUT_OF_RANGE_TUI" | wc -l)" -ge 2 ]] \
     && ok || fail "out-of-range input did not return to the menu"
@@ -628,7 +628,7 @@ fi
 it "an arrow key does not cancel the Config TUI"
 CFG_ARROW_OUT="$(cat "$CFG_ARROW_LOG" 2>/dev/null)"
 [[ $CFG_ARROW_PROMPT -eq 1 && $CFG_ARROW_WRITE -eq 1 && $CFG_ARROW_RC -eq 0 ]] \
-    && assert_contains "$CFG_ARROW_OUT" "Please choose 1-6 or q." \
+    && assert_contains "$CFG_ARROW_OUT" "Please choose 1-7 or q." \
     || fail "Config treated an arrow-key sequence as Escape"
 
 # Signals can arrive while the reader owns the terminal. Verify the raw
@@ -839,7 +839,7 @@ printf '[Timer]\nOnCalendar=hourly\nPersistent=true\n' >"$SEND_SCHEDULE_HOME/.co
 # No trailing blank line: entering "20" sets CONFIG_TUI_SCHEDULE and returns
 # straight to the main menu (lib/config.sh's case-1 branch `break`s out with
 # nothing left to confirm), so an extra "\n" here is consumed as an invalid
-# main-menu choice and prints a spurious "Please choose 1-6 or q." -- harmless,
+# main-menu choice and prints a spurious "Please choose 1-7 or q." -- harmless,
 # but it means the keystroke count was never actually traced against what the
 # TUI shows, the same imprecision that lets _cfg_tui_home's script -qec drift
 # out of phase (see its own comment).
