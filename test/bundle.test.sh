@@ -448,6 +448,55 @@ BOMBRESTOREOUT="$(HOME="$(mktemp -d)" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$(m
     "$OB" restore "$BOMBH/bomb.tar.zst" --into "$(mktemp -d)" 2>&1)"
 assert_contains "$BOMBRESTOREOUT" "could not extract"
 
+# `_zstd_extract`'s own genuine 124-on-timeout is already covered directly
+# (the slow-FIFO tests above) -- `cmd_restore` cannot be driven through a
+# real FIFO for this specific check, since it refuses a non-regular-file
+# artifact (`[[ -f "$artifact" ]]`) before `_zstd_extract` is ever
+# reached, and a REAL timeout large enough to drive through the full CLI
+# would make this one test slow for little extra confidence. The exact
+# branch under test -- extracted straight out of bin/omabackup, not a
+# hand-copied duplicate that could drift -- is exercised directly instead,
+# isolating exactly the new logic: does `cmd_restore` tell a timeout apart
+# from every other extraction failure, with the one thing an operator can
+# actually do about it -- found by review (round omabackup-28,
+# `omabackup-rev-2`): before this fix, a legitimate restore from slow
+# media that genuinely ran past OMABACKUP_RESTORE_TIMEOUT_SEC read
+# identically to "could not extract", the same message a corrupted or
+# malicious artifact gets, with no hint it was a time ceiling at all.
+it "cmd_restore tells a timeout apart from every other extraction failure, and names the override"
+RC124_BRANCH="$(sed -n '/local x _extract_rc;/,/^    fi$/p' "$OB")"
+RC124_MSG_OUT="$(bash -c '
+    _zstd_extract() { return 124; }
+    BUNDLE_EXTRACT_TIMEOUT_SEC=7
+    die() { printf "DIE: %s\n" "$*"; exit 1; }
+    _tilde() { printf "%s" "$1"; }
+    artifact=/some/artifact.tar.zst
+    _run() {
+        '"$RC124_BRANCH"'
+    }
+    _run
+')"
+assert_contains "$RC124_MSG_OUT" "exceeded the 7s time ceiling"
+assert_contains "$RC124_MSG_OUT" "OMABACKUP_RESTORE_TIMEOUT_SEC"
+assert_not_contains "$RC124_MSG_OUT" "could not extract"
+
+RC124_OK_BRANCH="$(sed -n '/local x _extract_rc;/,/^    fi$/p' "$OB")"
+RC124_OK_MSG_OUT="$(bash -c '
+    _zstd_extract() { return 2; }
+    BUNDLE_EXTRACT_TIMEOUT_SEC=7
+    die() { printf "DIE: %s\n" "$*"; exit 1; }
+    _tilde() { printf "%s" "$1"; }
+    artifact=/some/artifact.tar.zst
+    _run() {
+        '"$RC124_OK_BRANCH"'
+    }
+    _run
+')"
+
+it "and every OTHER extraction failure still gets the original generic message, not the timeout one"
+assert_contains "$RC124_OK_MSG_OUT" "could not extract"
+assert_not_contains "$RC124_OK_MSG_OUT" "time ceiling"
+
 # GNU `head -c` gives a leading minus its own opposite meaning ("all but
 # the last NUM bytes", not "the first NUM bytes") -- found by review
 # (round omabackup-25): an unvalidated OMABACKUP_RESTORE_MAX_BYTES=-1
@@ -596,6 +645,201 @@ for DEEPNEG_VALUE in -1 -0 "" "abc" "+9999999999" "007"; do
     it "an invalid OMABACKUP_RESTORE_MAX_DEPTH override ([$DEEPNEG_VALUE]) falls back to the safe default"
     assert_eq "$DEEPNEG_EFFECTIVE" "64"
 done
+
+# A byte-exact slow producer for a held-open FIFO, standing in for a slow
+# disk/filesystem in the two sections below. Deliberately NOT the more
+# obvious `while read -r -n1 -d ''; do printf ...; done` shape: found by
+# review (round omabackup-28, `omabackup-rev`, reproduced live) that a bash
+# variable cannot hold a NUL byte, so `read -d ''` treats NUL as its own
+# per-iteration delimiter and the following `printf '%s'` then emits
+# nothing for it -- a real tar|zstd stream from this repo (1,283 bytes, 14
+# of them NUL) came out the other end as 1,269 bytes, 14 short, with the
+# earlier tests never actually proving the byte-exact property they claimed
+# to. `dd` reads/writes raw bytes through file descriptors directly and
+# never passes them through a shell variable, so it has no such gap.
+# Fixture-scale only (fixtures here run tens to low hundreds of bytes): one
+# `dd` process per byte, so a megabyte-sized source would spawn a million of
+# them.
+_slow_feed_fifo() {  # _slow_feed_fifo <source-file> <fifo> <delay-seconds>
+    local src="$1" fifo="$2" delay="$3" size i
+    size="$(stat -c %s "$src")" || return 1
+    exec 9>"$fifo" || return 1
+    for (( i = 0; i < size; i++ )); do
+        # A mid-run failure here must stop the feeder rather than silently
+        # deliver fewer bytes than the source -- found by review (round
+        # omabackup-29, both `omabackup-rev` and `omabackup-rev-2`
+        # independently) as the same shape of defect this helper exists to
+        # close, even though `status=none` only suppresses dd's own summary
+        # line, never its error diagnostics or exit code (confirmed live).
+        dd if="$src" bs=1 skip="$i" count=1 status=none >&9 || { exec 9>&-; return 1; }
+        [[ "$delay" != 0 ]] && sleep "$delay"
+    done
+    exec 9>&-
+}
+
+# Proof of the claim above, independent of whether legit.tar.zst happens to
+# contain a NUL byte: a source built from literal bytes that deliberately
+# includes several NULs (a bash `printf` redirected straight to a file
+# writes raw bytes, unaffected by the shell-variable limitation -- this is
+# not the same code path as the buggy loop being replaced), fed through
+# _slow_feed_fifo with no delay, and hashed against the original.
+NULH="$(mktemp -d)"
+printf 'AB\x00CD\x00\x00EF\x00' >"$NULH/src.bin"
+mkfifo "$NULH/proof.fifo"
+_slow_feed_fifo "$NULH/src.bin" "$NULH/proof.fifo" 0 &
+NULH_FEEDER_PID=$!
+cat "$NULH/proof.fifo" >"$NULH/repro.bin"
+wait "$NULH_FEEDER_PID"; NULH_FEEDER_RC=$?
+
+it "_slow_feed_fifo reproduces a source containing embedded NUL bytes exactly, not just its non-NUL bytes"
+assert_eq "$NULH_FEEDER_RC" "0"
+assert_eq "$(stat -c %s "$NULH/repro.bin" 2>/dev/null)" "$(stat -c %s "$NULH/src.bin")"
+assert_eq "$(sha256sum <"$NULH/repro.bin" | cut -d' ' -f1)" "$(sha256sum <"$NULH/src.bin" | cut -d' ' -f1)"
+
+# ── wall-clock ceiling: byte/member/depth caps bound WHAT, not HOW LONG ────
+# Explicitly requested by the marketplace security review alongside the
+# member-count ceiling ("a separate practical member-count (AND
+# EXTRACTION-TIME) ceiling"), and initially missed entirely in the first
+# pass at that fix. A held-open FIFO, fed one byte at a time with a real
+# delay between each, stands in for a slow disk or filesystem -- the
+# archive itself is a real, valid, tiny .tar.zst; only the RATE it can be
+# read at is artificial. Proves the timeout kills the whole pipeline
+# (zstd, tar, and the counting awk together, not just whichever process
+# `timeout` directly spawned) rather than merely reporting a slow
+# extraction after the fact. Fed via _slow_feed_fifo (see above), not the
+# NUL-dropping read/printf loop.
+TIMEOUTH="$(mktemp -d)"; mkdir -p "$TIMEOUTH/src" "$TIMEOUTH/dest"
+printf 'x\n' >"$TIMEOUTH/src/f.txt"
+tar -C "$TIMEOUTH/src" -cf - . | zstd -q -o "$TIMEOUTH/legit.tar.zst" 2>/dev/null \
+    || fail "fixture tar|zstd pipeline itself failed"
+mkfifo "$TIMEOUTH/slow.fifo"
+_slow_feed_fifo "$TIMEOUTH/legit.tar.zst" "$TIMEOUTH/slow.fifo" 0.3 &
+TIMEOUT_WRITER_PID=$!
+
+TIMEOUT_START="$(date +%s)"
+TIMEOUT_RC="$(OMABACKUP_RESTORE_TIMEOUT_SEC=2 bash -c '
+    source lib/bundle.sh
+    _zstd_extract "$1" "$2"
+    printf %s $?
+' _ "$TIMEOUTH/slow.fifo" "$TIMEOUTH/dest")"
+TIMEOUT_ELAPSED=$(( $(date +%s) - TIMEOUT_START ))
+kill "$TIMEOUT_WRITER_PID" >/dev/null 2>&1 || true
+wait "$TIMEOUT_WRITER_PID" 2>/dev/null || true
+
+it "_zstd_extract is killed by its own wall-clock timeout against an artificially slow source, not left to run indefinitely"
+assert_eq "$TIMEOUT_RC" "124"
+(( TIMEOUT_ELAPSED <= 5 )) \
+    && ok || fail "expected the extraction to return near the 2s timeout, not wait for the full slow-write duration; took ${TIMEOUT_ELAPSED}s"
+
+it "no zstd/tar/awk process from the timed-out extraction survives it"
+sleep 0.5
+TIMEOUT_SURVIVORS="$(pgrep -f -- "$TIMEOUTH" 2>/dev/null | wc -l)"
+(( TIMEOUT_SURVIVORS == 0 )) \
+    && ok || fail "expected zero surviving processes with this extraction's own unique dest path ($TIMEOUTH) anywhere in their argv (tar's -C references it directly), found $TIMEOUT_SURVIVORS"
+
+TIMEOUTLEGIT_DEST="$(mktemp -d)"
+TIMEOUTLEGIT_RC="$(OMABACKUP_RESTORE_TIMEOUT_SEC=2 bash -c '
+    source lib/bundle.sh
+    _zstd_extract "$1" "$2"
+    printf %s $?
+' _ "$TIMEOUTH/legit.tar.zst" "$TIMEOUTLEGIT_DEST")"
+
+it "a real, legitimate bundle -- far from any timeout -- still extracts cleanly under a short configured ceiling"
+assert_eq "$TIMEOUTLEGIT_RC" "0"
+[[ -f "$TIMEOUTLEGIT_DEST/f.txt" ]] && ok || fail "expected f.txt in the extraction"
+
+for TIMEOUTNEG_VALUE in -1 -0 "" "abc" "+9999999999" "007"; do
+    TIMEOUTNEG_EFFECTIVE="$(OMABACKUP_RESTORE_TIMEOUT_SEC="$TIMEOUTNEG_VALUE" bash -c '
+        source lib/bundle.sh
+        printf %s "$BUNDLE_EXTRACT_TIMEOUT_SEC"
+    ')"
+    it "an invalid OMABACKUP_RESTORE_TIMEOUT_SEC override ([$TIMEOUTNEG_VALUE]) falls back to the safe default"
+    assert_eq "$TIMEOUTNEG_EFFECTIVE" "120"
+done
+
+# ── a real external signal must reach the nested timeout-created group ─────
+# Found by review (round omabackup-28, `omabackup-rev`), reproduced live
+# with real PIDs: `timeout` (without --foreground, deliberately -- see
+# _zstd_extract's own comment) creates a NEW process group for the whole
+# pipe, separate from whatever group the CALLER (bin/omabackup-tui's own
+# CLI_PGID tracking, or a bare terminal's own Ctrl-C) would signal. Without
+# forwarding, a cancelled restore could report done/cancelled at the
+# wrapper level while this pipe kept running underneath for up to the full
+# configured timeout. The same slow-FIFO fixture as the timeout test
+# above, but this time a real signal is sent to the extraction WHILE it is
+# still blocked reading from it -- not waiting for the timeout to expire
+# naturally -- confirming the whole nested group dies promptly and the
+# right 128+signal convention (129/130/143) comes back, not 124.
+SIGH="$(mktemp -d)"; mkdir -p "$SIGH/src"
+printf 'x\n' >"$SIGH/src/f.txt"
+tar -C "$SIGH/src" -cf - . | zstd -q -o "$SIGH/legit.tar.zst" 2>/dev/null \
+    || fail "fixture tar|zstd pipeline itself failed"
+
+for SIG_NAME_CODE in "HUP:129" "INT:130" "TERM:143"; do
+    SIG_NAME="${SIG_NAME_CODE%%:*}"
+    SIG_EXPECT="${SIG_NAME_CODE##*:}"
+    SIGDEST="$(mktemp -d)"
+    mkfifo "$SIGH/slow-$SIG_NAME.fifo"
+    _slow_feed_fifo "$SIGH/legit.tar.zst" "$SIGH/slow-$SIG_NAME.fifo" 0.3 &
+    SIG_WRITER_PID=$!
+
+    # A generous 120s (the real default) timeout on the extraction itself
+    # -- ONLY the forwarded signal should be what stops it; if forwarding
+    # were broken, this would hang for the rest of the test suite's own
+    # patience, not silently pass.
+    #
+    # `env --default-signal=INT,QUIT` in front of the backgrounded job --
+    # a bash script's own async (`&`) commands inherit SIGINT as SIG_IGN
+    # (a POSIX rule already documented and worked around elsewhere in this
+    # codebase, e.g. bin/omabackup-tui's own CLI launch), and a trap
+    # cannot override a disposition that was already SIG_IGN when the
+    # process started. Confirmed live while writing this test: without
+    # the reset, the INT case specifically (not HUP or TERM, which are
+    # not specially ignored this way) returned an unrelated rc after 35s
+    # instead of 130 within a couple -- the signal never reached
+    # _zstd_extract's own trap at all, this test's own backgrounding was
+    # the reason, not a real bug in the fix being tested.
+    SIG_START="$(date +%s)"
+    env --default-signal=INT,QUIT bash -c '
+        source lib/bundle.sh
+        _zstd_extract "$1" "$2"
+        printf %s $? >"$3"
+    ' _ "$SIGH/slow-$SIG_NAME.fifo" "$SIGDEST" "$SIGH/rc-$SIG_NAME" &
+    SIG_EXTRACT_PID=$!
+    sleep 1
+    kill -"$SIG_NAME" "$SIG_EXTRACT_PID"
+    wait "$SIG_EXTRACT_PID" 2>/dev/null
+    SIG_ELAPSED=$(( $(date +%s) - SIG_START ))
+    kill "$SIG_WRITER_PID" >/dev/null 2>&1 || true
+    wait "$SIG_WRITER_PID" 2>/dev/null || true
+
+    it "a real $SIG_NAME sent mid-extraction reaches the nested timeout group and returns $SIG_EXPECT quickly, not after the full timeout"
+    assert_eq "$(cat "$SIGH/rc-$SIG_NAME" 2>/dev/null)" "$SIG_EXPECT"
+    # 15s, not a tighter bound: the point being proven is "nowhere near
+    # the 120s default", not a precise latency number -- the actual
+    # signal-to-return time measured while writing this test was 1-2s for
+    # HUP/TERM and up to ~6s for INT specifically (env --default-signal's
+    # own reset adds a little overhead), comfortable margin either way.
+    (( SIG_ELAPSED <= 15 )) \
+        && ok || fail "expected this to return within a handful of seconds of the signal, not wait anywhere near the 120s default; took ${SIG_ELAPSED}s"
+
+    it "no zstd/tar/awk process from the $SIG_NAME-interrupted extraction survives it"
+    sleep 0.3
+    SIG_SURVIVORS="$(pgrep -f -- "$SIGDEST" 2>/dev/null | wc -l)"
+    (( SIG_SURVIVORS == 0 )) \
+        && ok || fail "expected zero surviving processes with this extraction's own unique dest path ($SIGDEST) anywhere in their argv, found $SIG_SURVIVORS"
+done
+
+it "a pre-existing TERM trap survives _zstd_extract's own temporary forwarding trap unchanged"
+SIGTRAP_OUT="$(bash -c '
+    source lib/bundle.sh
+    trap "echo MY_OWN_TRAP" TERM
+    BEFORE="$(trap -p TERM)"
+    _zstd_extract "$1" "$2" >/dev/null
+    AFTER="$(trap -p TERM)"
+    [[ "$BEFORE" == "$AFTER" ]] && echo SAME || echo "DIFFERENT: [$BEFORE] vs [$AFTER]"
+' _ "$SIGH/legit.tar.zst" "$(mktemp -d)")"
+assert_eq "$SIGTRAP_OUT" "SAME"
 
 # ── TAR_OPTIONS bypass: an inherited env var silently defeats the cap ──────
 # Found by review (round omabackup-27): GNU tar prepends the TAR_OPTIONS

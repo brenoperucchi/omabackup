@@ -556,6 +556,15 @@ fi
 # generous for any real path this tool would ever back up
 # (`~/.config/app/deeply/nested/dir/file` is 6) while still
 # being a small, fixed number next to 500.
+# This regex is not only a numeric-sanity check: these two values (unlike
+# the byte/timeout overrides above/below) are later passed as `awk -v
+# max=... -v maxdepth=...` in _zstd_extract. `awk -v` interprets
+# backslash-escape sequences in its value (POSIX/gawk behavior, not a
+# quirk) -- so restricting both to bare digits before they ever reach here
+# also forecloses any escape-sequence injection through `-v`, not just
+# "absurd value" (noted by review, round omabackup-28). Do not relax this
+# to something like `[[:digit:]]+` with a leading `-`/`+` allowed without
+# re-checking that consequence.
 if [[ "${OMABACKUP_RESTORE_MAX_MEMBERS:-}" =~ ^[1-9][0-9]*$ ]]; then
     BUNDLE_EXTRACT_MAX_MEMBERS="$OMABACKUP_RESTORE_MAX_MEMBERS"
 else
@@ -565,6 +574,25 @@ if [[ "${OMABACKUP_RESTORE_MAX_DEPTH:-}" =~ ^[1-9][0-9]*$ ]]; then
     BUNDLE_EXTRACT_MAX_DEPTH="$OMABACKUP_RESTORE_MAX_DEPTH"
 else
     BUNDLE_EXTRACT_MAX_DEPTH=64
+fi
+
+# Wall-clock ceiling on the WHOLE extraction pipeline, independent of the
+# three content-shaped ceilings above -- explicitly requested by the
+# marketplace security review alongside the member-count ceiling ("a
+# separate practical member-count (AND EXTRACTION-TIME) ceiling"), and
+# initially missed: the byte/member/depth caps bound WHAT can be written,
+# but nothing bounded HOW LONG getting there could take on a machine
+# whose disk, CPU, or filesystem is unusually slow -- three caps that are
+# each individually reasonable could still combine into a slow extraction
+# on hardware this project has no visibility into. 120 seconds is
+# generous for what this tool actually extracts (its own artifact
+# measures ~1MB) while still being a fixed number instead of "however
+# long the pipeline takes." Validated the same way as the other three
+# overrides, for the same reason.
+if [[ "${OMABACKUP_RESTORE_TIMEOUT_SEC:-}" =~ ^[1-9][0-9]*$ ]]; then
+    BUNDLE_EXTRACT_TIMEOUT_SEC="$OMABACKUP_RESTORE_TIMEOUT_SEC"
+else
+    BUNDLE_EXTRACT_TIMEOUT_SEC=120
 fi
 
 # _zstd_extract <archive> <dest-dir>
@@ -642,21 +670,129 @@ fi
 # or a flat-count-only cap would have allowed through.
 _zstd_extract() {
     local archive="$1" dest="$2"
-    local _had_pf=0; [[ -o pipefail ]] && _had_pf=1
-    set -o pipefail
-    zstd -dc "$archive" 2>/dev/null \
-        | head -c "$BUNDLE_EXTRACT_MAX_BYTES" \
-        | env -u TAR_OPTIONS tar -C "$dest" --index-file=/dev/stdout -xv 2>/dev/null \
-        | awk -v max="$BUNDLE_EXTRACT_MAX_MEMBERS" -v maxdepth="$BUNDLE_EXTRACT_MAX_DEPTH" '
-            { n++
-              depth = gsub(/\//, "&")
-              if (depth > maxdepth) exit 1
-              cost += depth + 1
-              if (cost > max) exit 1
-            }'
+    # The whole 4-stage pipe now runs inside a CHILD `bash -c`, launched
+    # by `timeout` below -- not directly in this function's own shell the
+    # way it used to. pipefail is therefore set INSIDE that child script
+    # (its own first line), not here: this function's own shell never
+    # evaluates a pipe of its own anymore, just the single `timeout`
+    # command, whose reported exit status already IS the child's
+    # pipefail-computed one (or 124, if it had to intervene) -- nothing
+    # left for this function's own pipefail state to affect.
+    #
+    # The whole pipe is wrapped in `timeout`, not just one stage: a slow
+    # disk or filesystem can make ANY of zstd/tar/awk's own reads or
+    # writes slow, not only extraction specifically -- explicitly
+    # requested by review alongside the member cap ("a separate practical
+    # member-count (AND EXTRACTION-TIME) ceiling"), initially missed.
+    # `timeout` without `--foreground` creates its own process group for
+    # the command it launches and signals that whole group on expiry
+    # (confirmed correct for this exact reason during an earlier round of
+    # Panel.qml hardening this session, cited there against the coreutils
+    # source) -- so a timeout here reaps zstd/head/tar/awk together, not
+    # just whichever one `timeout` directly spawned.
+    #
+    # The pipe is expressed as one `bash -c` argument, with every value it
+    # needs passed positionally (archive, byte cap, dest, member cap,
+    # depth cap, the awk program text itself) rather than interpolated
+    # into the script string -- keeps the whole thing to one level of
+    # quoting, and the values can never be re-interpreted as shell syntax
+    # by the child bash.
+    #
+    # `--kill-after=5s` -- found by review (round omabackup-28,
+    # `omabackup-rev-2`): without it, `timeout` sends TERM at the deadline
+    # and then WAITS for the child, so a stage that ignores or is slow to
+    # act on TERM makes the ceiling not actually hold. Measured live: a
+    # child ignoring TERM under a 3s `timeout` still reported `124`, but
+    # only after 20 real seconds -- the exit code said the ceiling held
+    # when it had not. This is the one place in the project where
+    # `timeout` IS the security control, not a convenience, and the only
+    # place `--kill-after` was missing; it appears everywhere else
+    # `timeout` is used this way (`bin/omabackup-tui`,
+    # `test/config.test.sh`, `test/log.test.sh`, `test/vm/run.sh`, and
+    # `test/vm.test.sh` even asserts the flag is present). Honest limit,
+    # not fixed by this or any `timeout` invocation: a stage blocked in
+    # uninterruptible I/O (state D -- a hung NFS mount, a dying disk)
+    # answers no signal, TERM or KILL, until the syscall itself returns.
+    # None of the four stages here install their own signal handling
+    # today, so in practice they die on TERM -- `--kill-after` is defense
+    # in depth for if that ever stops being true, not a fix for a live bug.
+    #
+    # `--` before both real paths (archive, dest) -- a nit from the same
+    # round: without it, a path beginning with `-` would be read by
+    # `zstd`/`tar` as an option rather than a filename. Unreachable by
+    # every current caller (`cmd_restore` already refuses a `-*` artifact
+    # argument before this runs; the other two build their own internal
+    # cache paths), and zstd already fails closed on it today -- but free,
+    # and removes the one way a legitimate path could fail confusingly.
+    local _awk_prog='{ n++; depth = gsub(/\//, "&"); if (depth > maxdepth) exit 1; cost += depth + 1; if (cost > max) exit 1 }'
+    timeout --kill-after=5s "${BUNDLE_EXTRACT_TIMEOUT_SEC}s" bash -c '
+        set -o pipefail
+        zstd -dc -- "$1" 2>/dev/null \
+            | head -c "$2" \
+            | env -u TAR_OPTIONS tar -C "$3" --index-file=/dev/stdout -xv -- 2>/dev/null \
+            | awk -v max="$4" -v maxdepth="$5" "$6"
+    ' _ "$archive" "$BUNDLE_EXTRACT_MAX_BYTES" "$dest" "$BUNDLE_EXTRACT_MAX_MEMBERS" "$BUNDLE_EXTRACT_MAX_DEPTH" "$_awk_prog" &
+    local _tpid=$! _tpgid _signaled=""
+    _tpgid="$(ps -o pgid= -p "$_tpid" 2>/dev/null | tr -d '[:space:]')"
+
+    # Forwards a caller-received HUP/INT/TERM into the process group
+    # `timeout` (without --foreground, deliberately -- see above) just
+    # created for the whole pipe -- found by review (round omabackup-28,
+    # `omabackup-rev`), reproduced live with real PIDs: that new group is
+    # NOT the same group `bin/omabackup-tui`'s own CLI_PGID tracking (or a
+    # bare terminal's own Ctrl-C) signals. Without this, a cancelled
+    # restore could report done/cancelled at the wrapper or terminal level
+    # while this pipe kept running underneath, for up to the full
+    # BUNDLE_EXTRACT_TIMEOUT_SEC. Saved/restored exactly like
+    # `lib/tui.sh`'s own `tui_read_line` already does for the identical
+    # reason: this function installs its own TEMPORARY traps and must not
+    # silently replace whatever `bin/omabackup`'s own dispatch-level traps
+    # were doing for the rest of the process's life once this returns.
+    local _saved_hup _saved_int _saved_term
+    _saved_hup="$(trap -p HUP)"; _saved_int="$(trap -p INT)"; _saved_term="$(trap -p TERM)"
+
+    _zstd_extract_forward() {
+        _signaled="$1"
+        [[ "$_tpgid" =~ ^[0-9]+$ ]] && kill -"$1" -- "-$_tpgid" >/dev/null 2>&1
+    }
+    trap '_zstd_extract_forward HUP' HUP
+    trap '_zstd_extract_forward INT' INT
+    trap '_zstd_extract_forward TERM' TERM
+
+    wait "$_tpid" 2>/dev/null
     local rc=$?
-    (( _had_pf )) || set +o pipefail
-    return $rc
+
+    # `wait` returns the instant a trapped signal is delivered to THIS
+    # process, whether or not `_tpid` has actually finished dying yet --
+    # confirmed live, and its own reported exit code (128+signal) at that
+    # point describes the interruption, not the pipe's real outcome. A
+    # SECOND `wait` on the same pid, tried first, does not reliably
+    # recover from this: confirmed live that it can simply hang rather
+    # than detect the child's real, later exit. Polling with `kill -0`
+    # instead -- already the proven mechanism this file's own callers and
+    # `bin/omabackup`'s `_kg_stop_group` both use elsewhere -- avoids
+    # relying on `wait`'s own state a second time. Bounded by the same
+    # window `--kill-after` already gives the group to actually die, so
+    # this loop is not an unbounded wait either.
+    if [[ -n "$_signaled" ]]; then
+        local _i
+        for _i in $(seq 1 100); do
+            kill -0 "$_tpid" 2>/dev/null || break
+            sleep 0.05
+        done
+        case "$_signaled" in
+            HUP)  rc=129 ;;
+            INT)  rc=130 ;;
+            TERM) rc=143 ;;
+        esac
+    fi
+
+    [[ -n "$_saved_hup" ]] && eval "$_saved_hup" || trap - HUP
+    [[ -n "$_saved_int" ]] && eval "$_saved_int" || trap - INT
+    [[ -n "$_saved_term" ]] && eval "$_saved_term" || trap - TERM
+    unset -f _zstd_extract_forward
+
+    return "$rc"
 }
 
 # verify_bundle <path> <run-embedded:0|1>

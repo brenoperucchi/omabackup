@@ -2260,6 +2260,186 @@ user's explicit go-ahead), they confirmed:
 Full suite after both documentation additions: **1222 passed, 0
 failed**.
 
+### A requirement from the maintainer's own comments, missed until re-reading them closely: an extraction-time ceiling
+
+Two things the maintainer had already asked for, in writing, in prior
+comments on issue #3968, were not (fully) acted on the first time --
+found on a careful re-read the user explicitly asked for, not a new
+review round:
+
+- Their SECOND comment (on `cd4857e`) already said "without
+  compressed/uncompressed byte **and member** limits" -- the member cap
+  did not land until round omabackup-25's follow-up, a full round later
+  than it could have.
+- Their THIRD comment (on `fc9f51a`) asked to "enforce a separate
+  practical member-count **(and extraction-time)** ceiling" -- the
+  extraction-time half was never implemented, and the reply comment sent
+  back didn't even mention it.
+
+Fixed now: `_zstd_extract`'s entire 4-stage pipe (`zstd | head | tar |
+awk`) is wrapped in `timeout`, a wall-clock ceiling independent of the
+byte/member/depth ceilings, which only bound WHAT gets written, not HOW
+LONG getting there can take on a machine whose disk or filesystem this
+project has no visibility into. `timeout` without `--foreground` creates
+its own process group for the command it launches and signals that whole
+group on expiry (the same fact already relied on for Panel.qml's own
+`kill-group` design, cited there against the coreutils source) -- so
+timing out here reaps zstd/head/tar/awk together, not just whichever
+process `timeout` directly spawned. The pipe itself moved into a
+`bash -c` child (so `timeout` has one process to launch and manage), with
+every value it needs -- archive path, byte cap, dest, member cap, depth
+cap, and the awk program text itself -- passed as positional arguments
+rather than interpolated into the script string, keeping the whole thing
+to one level of quoting. `OMABACKUP_RESTORE_TIMEOUT_SEC` (default 120s)
+follows the exact same validation discipline as the other three
+overrides.
+
+Verified live, not just by reading `timeout`'s own man page: a real,
+valid, tiny archive fed through a held-open FIFO one byte at a time with
+a real delay between each (simulating a slow disk without needing one)
+was killed at almost exactly a configured 2-second ceiling (`124`, GNU
+coreutils' own timeout exit code; measured wall-clock `2.002s`, not the
+full slow-write duration), with zero surviving zstd/tar/awk processes
+afterward -- confirming the whole group, not just one stage, actually
+gets reaped.
+
+Found and fixed in the same pass: `timeout` is a genuinely new
+dependency this introduces (part of the same GNU coreutils package as
+`head`/`tail`/`mv`/`cp`/`chmod`, already required elsewhere, so free to
+actually depend on) -- `test/deps.test.sh`'s own `DEPS_CORE` list, the
+project's canonical declaration of every tool it legitimately expects,
+did not include it, and a restricted-PATH test that deliberately excludes
+only `hostname` broke on the new, unanticipated `timeout: command not
+found`. Fixed by adding `timeout` to that list, and to `require_tools` at
+every call site that can reach `_zstd_extract` (`cmd_bundle`, `cmd_push`,
+`cmd_restore`) -- a clean, explicit "missing tool" message up front
+instead of a confusing mid-pipe failure if it is ever genuinely absent.
+
+9 new regressions in `test/bundle.test.sh`: the slow-FIFO scenario above
+(one for the timeout firing, one for the whole process group being gone
+afterward); a real, legitimate bundle extracting cleanly under a short
+but reasonable configured ceiling; six non-canonical
+`OMABACKUP_RESTORE_TIMEOUT_SEC` override values each falling back to the
+safe default.
+
+Full suite: **1233 passed, 0 failed**.
+
+### Round omabackup-28 review of the extraction-time ceiling: a real gap in it, closed
+
+`herdr-review` dispatched on the extraction-time-ceiling work above.
+`omabackup-rev` found one P1, since fixed; `omabackup-rev-2` found two P3s
+(also fixed) and confirmed the positional-parameter quoting airtight
+against hostile paths (embedded quotes, tabs, newlines, a leading `-`
+failing closed) with no new bypass.
+
+- **P1 (`omabackup-rev`) -- the nested `timeout` process group escapes
+  the caller's own supervision.** `timeout` without `--foreground`
+  creates its own PGID for the pipe it launches, separate from whatever
+  group the real caller (`bin/omabackup-tui`'s `CLI_PGID` tracking, or a
+  bare terminal's own Ctrl-C) would signal. Reproduced live with real
+  PIDs: a `TERM` sent to the simulated CLI's own process group left both
+  `timeout` and its child alive; an `INT` on the outer group left the
+  waiting shell's trap un-run after a full second. Fixed by having
+  `_zstd_extract` itself forward HUP/INT/TERM into the nested group: save
+  any pre-existing trap for each signal (`trap -p`, the same idiom
+  `lib/tui.sh`'s `tui_read_line` already uses), install a temporary
+  forwarding trap, `wait` once, and on interruption poll with `kill -0`
+  (not a second `wait` -- confirmed live that a second `wait` on an
+  already-once-interrupted pid can simply hang rather than detect the
+  child's real later exit) until the group is actually gone, then restore
+  the original traps exactly and return the standard 128+signal code
+  (129/130/143). Getting there needed working around two genuine bash
+  `wait`/trap subtleties beyond the one above, both confirmed live before
+  landing on this design: a background (`&`) job in a script inherits
+  SIGINT as `SIG_IGN` (POSIX), so a trap installed *inside* it has no
+  effect -- irrelevant to the production fix itself (the pipe's stages
+  install no traps of their own) but the reason one early test needed
+  `env --default-signal=INT,QUIT`; and `wait "$PID"` returns as soon as
+  ANY trapped signal reaches the *calling* process, regardless of whether
+  `$PID` has actually exited yet.
+- **P3 (`omabackup-rev-2`) -- `timeout` without `--kill-after` does not
+  actually guarantee the ceiling it exists to guarantee.** Measured live:
+  a child that ignores TERM still returned `124`, but only after 20 real
+  seconds under a configured 3s limit -- the exit code lied about the
+  ceiling having been respected. `--kill-after=5s` added, matching the
+  idiom already used everywhere else in this codebase `timeout` is a real
+  control (`bin/omabackup-tui`, `test/config.test.sh`,
+  `test/log.test.sh`, `test/vm/run.sh`, and `test/vm.test.sh` which
+  itself asserts the flag's presence) -- this was the one place it had
+  been missing. Honest limit noted in the review and kept in the code
+  comment: `--kill-after` closes "ignores/is slow to handle TERM", not a
+  stage blocked in kernel I/O wait (state `D`), which cannot be signaled
+  at all until its syscall returns.
+- **P3 (`omabackup-rev-2`) -- `timeout`'s own distinct `124` was being
+  thrown away into a generic, alarming message.** All three call sites
+  (`verify_bundle`, `_verify_cache_entry`, `cmd_restore`) collapsed every
+  extraction failure -- corrupted artifact, decompression bomb, *or* a
+  legitimate restore from slow media that genuinely exceeded the ceiling
+  -- into the same `return 1` / "could not extract". Fixed at the
+  highest-visibility site: `cmd_restore` now distinguishes `_extract_rc
+  == 124` and names `OMABACKUP_RESTORE_TIMEOUT_SEC` directly in the
+  message, so a slow-pendrive restore reads as "raise this if the artifact
+  is legitimately large" instead of implying corruption. The other two
+  call sites (local build/cache self-checks, not user-facing restores in
+  the same way) were left generic -- lower priority, not blocked on
+  anything.
+- Also cleaned up per `omabackup-rev-2`'s review, both nits rather than
+  findings: `--` added before both paths in the child pipe
+  (`zstd -dc -- "$1"`, `tar -C "$3" ... -- `) as free defense-in-depth
+  against a legitimate path starting with `-`, even though no real
+  caller can reach that today; and a comment added at the
+  `OMABACKUP_RESTORE_MAX_MEMBERS`/`_MAX_DEPTH` validation noting the
+  `^[1-9][0-9]*$` regex is load-bearing for a second reason beyond
+  numeric sanity -- both values are later passed as `awk -v`, which
+  interprets backslash-escape sequences in `-v` values (POSIX/gawk
+  behavior), so restricting them to bare digits first also forecloses
+  escape-sequence injection through `-v`.
+- `omabackup-rev`'s own P3 against the *test* fixtures (not the
+  production fix): the slow-FIFO producer test helper fed bytes through
+  `read -r -n1 -d '' | printf '%s'`, and a bash variable cannot hold a
+  NUL byte -- reproduced live against a real `tar | zstd` stream from
+  this repo (1,283 bytes, 14 of them NUL, came out 14 bytes short through
+  that loop), meaning the "byte-exact slow source" the tests claimed to
+  build was never actually proven byte-exact. Fixed by replacing the
+  loop with a shared `_slow_feed_fifo` helper that moves each byte
+  through `dd` on an open FD instead of a shell variable, plus a new,
+  dedicated regression that feeds a source built from literal bytes
+  including several NULs through the helper and asserts the reproduced
+  stream is byte- and hash-identical to the source -- proving the
+  property the later timeout/signal tests depend on, rather than
+  assuming it.
+
+Full suite after this round's fixes: **1250 passed, 0 failed**.
+
+### Round omabackup-29: the round-28 test fixes needed their own review, and had a real gap
+
+Dispatched narrowly, on just the two round-28-response changes above (the
+`_slow_feed_fifo` helper and the `awk -v` comment) -- explicitly scoped
+to skip re-reviewing the already-reviewed signal-forwarding/`--kill-after`/
+rc=124 layer itself. Both reviewers converged on the same gap, from
+different angles: `omabackup-rev` (P3) and `omabackup-rev-2` (nit, but
+endorsing the same fix) both found `_slow_feed_fifo` never checked its own
+`stat`/`exec`/`dd` exit status -- a mid-run `dd` failure would silently
+feed fewer bytes than the source, which is the exact shape of defect this
+helper exists to close, just relocated one level down. Fixed: each step
+now fails fast and closes the FIFO on error instead of continuing past a
+silent short feed; the NUL-byte proof test now asserts the feeder's own
+exit code is 0 instead of discarding it.
+
+`omabackup-rev-2` additionally verified, independently and exhaustively,
+that the fix actually holds: fed all 256 possible byte values (not just
+NUL) through the real helper and confirmed an identical hash out; ran the
+old `read -r -n1 -d ''` loop side by side against a NUL-containing source
+and confirmed it really did fail before this round's fix (a genuine
+fail-before/pass-after, not assumed); confirmed `status=none` suppresses
+only `dd`'s own summary line, never its error diagnostics or exit code;
+and confirmed the `awk -v` comment's claim and scope directly, including
+which two of the four overrides are and are not `awk -v`-bound. No
+disagreement between the two reviewers, and no findings against the
+already-reviewed round-28 layer resurfaced.
+
+Full suite after this round's fix: **1251 passed, 0 failed**.
+
 ## Open questions for the user, not yet decided
 
 - What path should the first `dir` destination actually point at?

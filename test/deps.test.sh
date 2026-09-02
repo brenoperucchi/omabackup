@@ -36,10 +36,17 @@ _only_path() {  # _only_path <dir> <tool...>
     done
 }
 
-# Everything the tool legitimately expects, minus hostname.
+# Everything the tool legitimately expects, minus hostname. `timeout` is a
+# genuinely new addition (round omabackup-27, marketplace security review):
+# _zstd_extract now wraps its whole extraction pipeline in it, a wall-clock
+# ceiling independent of the byte/member/depth ceilings that only bound
+# WHAT gets written, not HOW LONG getting there can take. Part of the same
+# GNU coreutils package as head/tail/mv/cp/chmod already in this list, so
+# it costs nothing new to actually depend on.
 DEPS_CORE=(bash jq git rsync sed awk gawk find sort uniq grep cut wc tr head tail
            basename dirname mkdir mktemp rm mv cp cat chmod ln readlink stat du
-           date uname sha256sum xargs diff tar zstd env sleep touch printf test)
+           date uname sha256sum xargs diff tar zstd env sleep touch printf test
+           timeout)
 
 # ── hostname is not a dependency ─────────────────────────────────────────────
 # It was, in the bundle's filename and in the retention pattern that decides

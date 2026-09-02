@@ -1656,7 +1656,7 @@ cmd_reload() {
 # Separate verb from `push` on purpose: building is cheap and local, sending is
 # slow and fallible, and only one of them should be able to fail at 3am.
 cmd_bundle() {
-    require_tools jq git tar zstd
+    require_tools jq git tar zstd timeout
     local repo="${OMABACKUP_REPO:-}" reused=0 path
     while (($#)); do
         case "$1" in
@@ -1703,7 +1703,7 @@ cmd_bundle() {
 # is what the timer calls. With an argument: that one, ignoring backoff, because
 # a human retrying on purpose should not serve out a penalty.
 cmd_push() {
-    require_tools jq git tar zstd
+    require_tools jq git tar zstd timeout
     local repo="${OMABACKUP_REPO:-}" rc=0 id detail safe_detail bundle name
     local -a explicit=()
     while (($#)); do
@@ -2205,17 +2205,33 @@ cmd_restore() {
     # though it escaped, and "0 files would be restored" reads exactly like a
     # clean artifact with nothing to do. Checked up front, named, so a
     # recovery tty's incomplete coreutils is not mistaken for an empty backup.
-    require_tools jq git tar zstd realpath
+    require_tools jq git tar zstd realpath timeout
 
     # Extracted once. The first version verified through verify_bundle, which
     # extracts into its OWN temp directory and discards it, then extracted the
     # SAME artifact file again here -- two reads of one file with a window
     # between them in which it could change. What is checked now is what is
     # used: extract, verify that exact directory, and only then read it.
-    local x; x="$(mktemp -d)" || die "could not make a working directory"
+    local x _extract_rc; x="$(mktemp -d)" || die "could not make a working directory"
     printf '  %schecking the artifact%s\n' "$DIM" "$NC" >&2
-    _zstd_extract "$artifact" "$x" \
-        || { rm -rf "$x"; die "could not extract $(_tilde "$artifact")"; }
+    _zstd_extract "$artifact" "$x"; _extract_rc=$?
+    if (( _extract_rc != 0 )); then
+        rm -rf "$x"
+        # 124 is `timeout`'s own, specific exit code for "I intervened" --
+        # found by review (round omabackup-28, `omabackup-rev-2`): every
+        # OTHER extraction failure (corruption, the byte/member/depth
+        # bombs) collapsed into this same generic message too, so a
+        # legitimate restore from slow media that genuinely took longer
+        # than OMABACKUP_RESTORE_TIMEOUT_SEC read identically to "this
+        # artifact is corrupted or malicious" -- an alarming, wrong
+        # conclusion for what might just be a slow USB drive or network
+        # mount. Told apart here, with the one thing an operator can
+        # actually do about it.
+        if (( _extract_rc == 124 )); then
+            die "extraction of $(_tilde "$artifact") exceeded the ${BUNDLE_EXTRACT_TIMEOUT_SEC}s time ceiling -- raise OMABACKUP_RESTORE_TIMEOUT_SEC if this artifact is legitimately large or the media is slow"
+        fi
+        die "could not extract $(_tilde "$artifact")"
+    fi
     # 0: never run the artifact's own tool/bin/omabackup here. A PoC confirmed
     # that a crafted artifact can replace that binary and have it execute --
     # with the operator's full privileges, in plan mode, before any --apply --
