@@ -68,6 +68,13 @@ it "Recent activity collapses to zero height, shows a placeholder when empty, an
 _qml_probe test/qml/activity-section-collapses-and-shows-lines.qml \
     && ok || fail "the Recent activity section's collapse/placeholder/content states are not all correct"
 
+# Panel reorg round (herdr-ask omabackup-13): the title row's version/Omarchy
+# text is anchored between headRow and the toggle specifically so it elides
+# instead of overlapping the one control this panel actually sets.
+it "the title row's Omarchy-version text elides rather than overlapping the toggle"
+_qml_probe test/qml/title-row-version-elides.qml \
+    && ok || fail "the title row's trailing version/Omarchy text can overlap the ToggleSwitch instead of eliding"
+
 it "a group row's custom-styled tooltip does not break the Row's own layout"
 _qml_probe test/qml/group-row-tooltip-is-safe-in-row.qml \
     && ok || fail "adding a HoverHandler/ToolTip child broke the Row's geometry"
@@ -87,7 +94,7 @@ PANEL_SOURCE="$(<Panel.qml)"
 # nobody can see while collapsed, the same "invisible still occupies
 # nothing" performance property cfgGrid already established).
 it "Recent activity's own state, guard, and model binding are all present in the real source"
-if [[ "$PANEL_SOURCE" == *'property bool activityExpanded: false'* \
+if [[ "$PANEL_SOURCE" == *'property bool activityExpanded: true'* \
       && "$PANEL_SOURCE" == *'function toggleActivity() {'* \
       && "$PANEL_SOURCE" == *'(parsed.recentLog === undefined || Array.isArray(parsed.recentLog))'* \
       && "$PANEL_SOURCE" == *'if (!Array.isArray(parsed.recentLog)) parsed.recentLog = []'* \
@@ -108,6 +115,83 @@ if [[ "$PANEL_SOURCE" == *'(parsed.recentLogError === undefined || typeof parsed
     ok
 else
     fail "recentLogError's shape guard, default, or its distinct UI message is missing from Panel.qml"
+fi
+
+# Panel reorg round (herdr-ask omabackup-13): three things a hand-maintained
+# QML mirror alone would not notice if the real source regressed.
+#
+# Extracted just like _into_cleanup's own test (test/restore.test.sh) rather
+# than matched as one exact multi-line literal against the whole file --
+# review round omabackup-38 found the literal-body form breaks on any
+# reformatting (a comment, reindentation) with a misleading failure message
+# blaming a settingsRevealTimer call that was never the actual cause. This
+# form only asserts the two things that actually matter, and is immune to
+# formatting inside the function.
+it "toggleActivity() no longer scrolls to the bottom on expand"
+TOGGLE_ACTIVITY_BODY="$(sed -n '/^  function toggleActivity() {/,/^  }/p' Panel.qml)"
+if [[ -n "$TOGGLE_ACTIVITY_BODY" \
+      && "$TOGGLE_ACTIVITY_BODY" == *'root.activityExpanded = !root.activityExpanded'* \
+      && "$TOGGLE_ACTIVITY_BODY" != *'settingsRevealTimer'* ]]; then
+    ok
+else
+    fail "toggleActivity() no longer toggles activityExpanded, or a settingsRevealTimer call crept back into its body -- which would scroll to the wrong place now that Recent activity sits above the fold"
+fi
+
+# Pre-existing gap caught while this same Button was being touched (review
+# omabackup-38): _tool_version() (bin/omabackup) can fail to "unknown", a
+# real string that never satisfies Panel.qml's own "?" fallback -- so the
+# version button must guard against both, not just "?".
+it "the version button is disabled for both the '?' and the 'unknown' failure values"
+if [[ "$PANEL_SOURCE" == *'enabled: root.toolVersion !== "?" && root.toolVersion !== "unknown"'* ]]; then
+    ok
+else
+    fail "the version button's enabled guard no longer covers the 'unknown' fallback _tool_version() can emit"
+fi
+
+# Review round omabackup-39's own P3: test/qml/title-row-version-elides.qml
+# is an independent hand-maintained mirror -- reverting ONLY the real
+# titleGroup/clip structure in Panel.qml back to the pre-fix, unprotected
+# form would leave that probe's own copy of the structure intact and still
+# green, proving nothing about the real file. This anchors the real source
+# directly: titleGroup exists with clip enabled (the *A*B* ordered pattern
+# matters here -- there is an unrelated, earlier `clip: true` on the
+# Flickable above, so the ordering confirms this is titleGroup's own), and
+# the toggle's vertical anchor targets titleGroup (a true sibling), not
+# headRow (which stopped being one the moment it moved inside titleGroup --
+# the exact silent runtime failure this same round caught: "Cannot anchor
+# to an item that isn't a parent or sibling").
+#
+# The second half is itself an ordered pair, not a bare substring check --
+# round omabackup-40 found the bare form matched this file's OWN comment
+# explaining the fix ("anchors.verticalCenter: titleGroup.verticalCenter,
+# not headRow.verticalCenter", right above the real property), so reverting
+# the actual code back to the broken headRow.verticalCenter reference while
+# leaving the comment in place still passed. Anchoring the pattern to
+# `id: toggleSwitch` first (the id line sits between the comment and the
+# real property) means only the genuine code line can satisfy it -- proven
+# by mutating a copy back to the broken form and confirming this ordered
+# form correctly fails where the bare substring form did not.
+it "the real Panel.qml has titleGroup's clip protection and a valid sibling anchor for the toggle"
+if [[ "$PANEL_SOURCE" == *'id: titleGroup'*'clip: true'* \
+      && "$PANEL_SOURCE" == *'id: toggleSwitch'*'anchors.verticalCenter: titleGroup.verticalCenter'* ]]; then
+    ok
+else
+    fail "titleGroup's clip protection or the toggle's corrected sibling anchor is missing from the real Panel.qml source"
+fi
+
+it "the GitHub status line lives inside Recent activity, and the empty placeholder no longer contradicts it"
+if [[ "$PANEL_SOURCE" == *'visible: root.activityExpanded && root.githubDestination !== null'* \
+      && "$PANEL_SOURCE" == *'text: "No activity logged yet."'* ]]; then
+    ok
+else
+    fail "the relocated GitHub status line or the reworded empty-log placeholder is missing from Panel.qml"
+fi
+
+it "the raw migration watermark is never rendered on the panel"
+if [[ "$PANEL_SOURCE" != *'migration " + root.watermark'* ]]; then
+    ok
+else
+    fail "a raw migration-watermark epoch is still being rendered somewhere on the panel"
 fi
 
 it "the Settings link delegates to the CLI-owned ANSI configuration"

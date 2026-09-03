@@ -224,7 +224,6 @@ Panel {
 
   readonly property int failCount: report && report.counts ? (report.counts.fail || 0) : 0
   readonly property int warnCount: report && report.counts ? (report.counts.warn || 0) : 0
-  readonly property int passCount: report && report.counts ? (report.counts.pass || 0) : 0
   // report.ok is now consulted explicitly, not only the finding counts -- a
   // review round's PoC ({"ok":false,"counts":[]}) passed applyReport's shape
   // check (ok was checked for TYPE, not VALUE) and still rendered as
@@ -642,14 +641,23 @@ Panel {
     if (root.configExpanded) settingsRevealTimer.restart()
   }
 
-  // Same reasoning and collapsed-by-default default as configExpanded
-  // above -- a glance at recent log activity, not something occupying
-  // permanent space over Groups/Destinations.
-  property bool activityExpanded: false
+  // Open by default, unlike configExpanded above: this section now sits
+  // near the top (right after the primary actions), carries the GitHub
+  // destination's status text as its first line, and a keyboard-only user
+  // has no other path to that text (see docs/PLAN.md's own writeup on
+  // this round) -- collapsing it by default would silently reopen that
+  // gap. A user can still collapse it manually; that is an honest,
+  // accepted residual, not something this default tries to prevent.
+  property bool activityExpanded: true
 
+  // No settingsRevealTimer.restart() here, unlike toggleSettings() above:
+  // that timer always scrolls to the BOTTOM of the Flickable
+  // (Panel.qml:~1145), which only made sense while this section lived
+  // there too. Now that it sits above the fold, restarting it on expand
+  // would scroll the panel away from the section a user just opened
+  // whenever Current settings also happens to be expanded.
   function toggleActivity() {
     root.activityExpanded = !root.activityExpanded
-    if (root.activityExpanded) settingsRevealTimer.restart()
   }
 
   // Restore is intentionally terminal-owned, just like Settings: the CLI
@@ -1481,37 +1489,130 @@ Panel {
             width: parent.width
             implicitHeight: headRow.implicitHeight
 
-            Row {
-              id: headRow
-              spacing: Style.space(6)
+            // Review round omabackup-38 found the anchored Omarchy Text below
+            // protects itself, but not headRow -- headRow itself still has no
+            // fixed width, and the version Button living inside it is now its
+            // rightmost child, so under a wide enough font-token override
+            // headRow's OWN content (not just the trailing text) could reach
+            // the toggle. Wrapping the whole left-hand group in one clipped,
+            // bounded Item closes that: the common case still elides the
+            // Omarchy text gracefully (unchanged), and the pathological case
+            // (headRow itself too wide) degrades to an abrupt clip instead of
+            // visually overlapping the toggle -- the toggle is declared after
+            // this Item, so it always paints on top and stays clickable
+            // either way, but this keeps the panel from drawing over its own
+            // content, not just over the one control that matters.
+            Item {
+              id: titleGroup
               anchors.left: parent.left
+              anchors.right: toggleSwitch.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              height: headRow.implicitHeight
+              clip: true
 
-              // One glance, one colour. Omarchy's palette has no green on
-              // purpose and neither does this: "fine" is muted ink rather than
-              // a reassuring tick, so colour here always means work to do.
-              Rectangle {
-                width: Style.space(8)
-                height: width
-                radius: width / 2
+              Row {
+                id: headRow
+                spacing: Style.space(6)
+                anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
-                color: root.failCount > 0 ? Color.urgent
-                     : (!root.scheduled || root.stale || root.destAlerts.length > 0) ? Color.accent
-                     : root.warnCount > 0 ? Color.accent
-                     : Color.muted
+
+                // One glance, one colour. Omarchy's palette has no green on
+                // purpose and neither does this: "fine" is muted ink rather
+                // than a reassuring tick, so colour here always means work
+                // to do.
+                Rectangle {
+                  width: Style.space(8)
+                  height: width
+                  radius: width / 2
+                  anchors.verticalCenter: parent.verticalCenter
+                  color: root.failCount > 0 ? Color.urgent
+                       : (!root.scheduled || root.stale || root.destAlerts.length > 0) ? Color.accent
+                       : root.warnCount > 0 ? Color.accent
+                       : Color.muted
+                }
+
+                Text {
+                  text: "OmaBackup"
+                  color: Color.foreground
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.title
+                }
+
+                // The version button used to sit in its own row further
+                // down, in body-sized text. Relocated here alongside the
+                // title; sized down to caption on purpose (it was never
+                // caption before), not a reuse -- see docs/PLAN.md's own
+                // note on this. qs.Ui.Button exposes `fontFamily`/`fontSize`
+                // (it is a BorderSurface/Rectangle, not Text -- no grouped
+                // `font` property exists on it), not `font.family`/
+                // `font.pixelSize` -- review round omabackup-38 caught this
+                // as an invalid property assignment that would have
+                // silently failed to apply.
+                Button {
+                  id: versionButton
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: root.versionCopied ? root.toolVersion + "  ✓ copied" : root.toolVersion
+                  bordered: false
+                  focusable: true
+                  // Pre-existing gap, caught by review round omabackup-38
+                  // while this button was already being touched: "?" is not
+                  // the only failure value in play. _tool_version()
+                  // (bin/omabackup) falls back to the literal string
+                  // "unknown" when the manifest can't be read -- a real
+                  // string, so it never hits Panel.qml's "?" fallback
+                  // (root.toolVersion === "?" only fires when the whole
+                  // `tool` object is missing from the status document, not
+                  // when its version field says "unknown"). Guard against
+                  // both so this button doesn't stay clickable-and-copyable
+                  // for a value that was never a real version.
+                  enabled: root.toolVersion !== "?" && root.toolVersion !== "unknown"
+                  foreground: root.versionCopied ? Color.foreground : Color.accent
+                  fontFamily: Style.font.family
+                  fontSize: Style.font.caption
+                  onClicked: root.copyToolVersion()
+                }
               }
 
+              // Anchored between headRow's own right edge and this group's
+              // own right edge, rather than folded into headRow's Row
+              // layout, so it gets a real bounded width and elides instead
+              // of ever growing further -- the same protection the
+              // runtime-identity row this replaced already had (width:
+              // parent.width - versionButton.width - ...), just expressed
+              // with anchors since headRow itself has no fixed width to
+              // subtract from.
               Text {
-                text: "OmaBackup"
-                color: Color.foreground
+                anchors.left: headRow.right
+                anchors.leftMargin: Style.space(6)
+                anchors.right: parent.right
+                anchors.verticalCenter: headRow.verticalCenter
+                text: "·  Omarchy " + root.omarchyVersion
+                color: Color.muted
                 font.family: Style.font.family
-                font.pixelSize: Style.font.title
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
               }
             }
 
             // The one control on this panel that actually sets something.
+            //
+            // anchors.verticalCenter: titleGroup.verticalCenter, not
+            // headRow.verticalCenter -- QML anchors only resolve against a
+            // parent or a true sibling, and headRow stopped being
+            // toggleSwitch's sibling once it moved inside titleGroup.
+            // Review round omabackup-39 caught the stale reference: it
+            // silently failed at runtime ("Cannot anchor to an item that
+            // isn't a parent or sibling"), leaving the toggle at its
+            // default vertical position instead of centered. titleGroup's
+            // own height equals headRow's implicitHeight and is itself
+            // centered in this Item, so titleGroup.verticalCenter and
+            // headRow.verticalCenter are the same Y coordinate -- this is
+            // the valid way to express the same intent.
             ToggleSwitch {
+              id: toggleSwitch
               anchors.right: parent.right
-              anchors.verticalCenter: headRow.verticalCenter
+              anchors.verticalCenter: titleGroup.verticalCenter
               checked: root.scheduled
               busy: root.switching
               interactive: root.cli !== "" && !root.cliMissing && !root.busy
@@ -1632,52 +1733,118 @@ Panel {
             }
           }
 
-          // The button's tooltip alone is not enough: qs.Ui.Button only shows
-          // it on `mouseArea.containsMouse`, never on keyboard focus, so a
-          // keyboard-only user would have no way to read the error or the
-          // last-sent age at all -- the chip this replaced showed it as
-          // plain, always-visible text. This restores that, redundantly with
-          // the tooltip rather than instead of it.
-          Text {
-            visible: root.githubDestination !== null
+          // ── recent activity, expanded by default ──────────────────────────
+          // Relocated here (was near the bottom, past Groups/Destinations/
+          // Current settings) and defaulted to open: this is now the panel's
+          // only source of the GitHub destination's status text once a mouse
+          // is not available (see docs/PLAN.md's writeup on this round for
+          // why). Same Item + header + "+"/"-" Text + full-Item MouseArea
+          // shape as "Current settings" below; no Behavior on height anywhere
+          // in this file, so this section does not invent that pattern only
+          // for itself -- the enclosing Flickable's own relayout is what
+          // makes expansion visible. Content is a flat list of lines (the
+          // Verification alerts Repeater's own shape), not a 2-column Grid --
+          // log lines are not key/value pairs. Fed by statusDoc.recentLog,
+          // already fetched on every status poll this panel already makes --
+          // no second Process/onExited block needed for this section alone.
+          Item {
             width: parent.width
-            horizontalAlignment: Text.AlignRight
-            text: "GitHub " + (root.githubDestination && root.githubDestination.failed
-                    ? root.githubDestination.errorMessage
-                    : root.githubDestination && root.githubDestination.lastSuccess !== ""
-                      ? "sent " + root.agoFromIso(root.githubDestination.lastSuccess) : "never sent")
-            color: root.githubDestination && root.githubDestination.failed ? Color.urgent : Color.muted
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+            implicitHeight: aHdr.implicitHeight + Style.space(5)
+            PanelSectionHeader { id: aHdr; anchors.left: parent.left; text: "Recent activity" }
+            Text {
+              anchors.left: aHdr.right
+              anchors.leftMargin: Style.space(4)
+              anchors.verticalCenter: aHdr.verticalCenter
+              text: root.activityExpanded ? "-" : "+"
+              color: Color.foreground
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+            PanelSeparator { anchors.bottom: parent.bottom; width: parent.width }
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.toggleActivity()
+            }
           }
 
-          // Runtime identity is compact and sits between the primary actions
-          // and the detailed sections. The OmaBackup version is a real button
-          // because it is useful when reporting a bug; the copy action writes
-          // only to Quickshell's Wayland clipboard.
-          Row {
-            width: parent.width
-            spacing: Style.space(4)
+          Column {
+            id: activityList
+            visible: root.activityExpanded
+            width: column.width
+            spacing: Style.space(2)
 
-            Button {
-              id: versionButton
-              text: root.versionCopied ? "OmaBackup " + root.toolVersion + "  ✓ copied"
-                                       : "OmaBackup " + root.toolVersion
-              bordered: false
-              focusable: true
-              enabled: root.toolVersion !== "?"
-              foreground: root.versionCopied ? Color.foreground : Color.accent
-              onClicked: root.copyToolVersion()
-            }
-
+            // Live status, not a log line: same GitHub text the panel used
+            // to show as its own standalone row (removed round omabackup-37,
+            // relocated here this round). Colour follows this column's own
+            // existing convention -- Color.muted/Color.urgent already mark
+            // "Could not read the log."/the empty placeholder below as
+            // meta/status rather than log content, so this fits the same
+            // register without a new sub-label or divider.
             Text {
-              anchors.verticalCenter: versionButton.verticalCenter
-              text: "·  Omarchy " + root.omarchyVersion + "  ·  migration " + root.watermark
-              color: Color.muted
+              visible: root.activityExpanded && root.githubDestination !== null
+              width: activityList.width
+              text: "GitHub " + (root.githubDestination && root.githubDestination.failed
+                      ? root.githubDestination.errorMessage
+                      : root.githubDestination && root.githubDestination.lastSuccess !== ""
+                        ? "sent " + root.agoFromIso(root.githubDestination.lastSuccess) : "never sent")
+              color: root.githubDestination && root.githubDestination.failed ? Color.urgent : Color.muted
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
               elide: Text.ElideRight
-              width: parent.width - versionButton.width - Style.space(4)
+            }
+
+            // Model gated on activityExpanded too, not just this Column's
+            // own visibility -- an empty-when-collapsed model keeps the
+            // Repeater from instantiating delegates for content nobody can
+            // see, the same "invisible still occupies nothing" reasoning
+            // this file's own collapsed-Grid test already established for
+            // cfgGrid above.
+            Repeater {
+              model: root.activityExpanded && root.statusDoc && Array.isArray(root.statusDoc.recentLog)
+                ? root.statusDoc.recentLog : []
+              Text {
+                required property var modelData
+                width: activityList.width
+                text: modelData
+                color: Color.foreground
+                opacity: 0.7
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
+
+            // Distinguished from "no activity logged yet" -- added round
+            // omabackup-35, alongside making the underlying day-file read
+            // failure a real, reported condition in cmd_status
+            // (recentLogError) instead of one silently indistinguishable
+            // from an empty log. Checked ahead of the plain-empty message
+            // below, since an unreadable log is never ALSO genuinely
+            // empty in a way worth saying so about.
+            Text {
+              visible: root.activityExpanded && root.statusDoc && root.statusDoc.recentLogError === true
+              width: activityList.width
+              text: "Could not read the log."
+              color: Color.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+            }
+
+            // "No activity logged yet.", not "Nothing logged yet." -- the
+            // GitHub status line above is not itself a log entry, and stays
+            // true even while it is visible (a configured GitHub
+            // destination with a genuinely empty command log is the normal
+            // first-run state, not an exotic one).
+            Text {
+              visible: root.activityExpanded &&
+                !(root.statusDoc && root.statusDoc.recentLogError === true) &&
+                !(root.statusDoc && Array.isArray(root.statusDoc.recentLog) && root.statusDoc.recentLog.length > 0)
+              width: activityList.width
+              text: "No activity logged yet."
+              color: Color.muted
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
             }
           }
 
@@ -1709,17 +1876,6 @@ Panel {
                 wrapMode: Text.WordWrap
               }
             }
-          }
-
-          Text {
-            visible: root.alerts.length === 0 && root.report !== null
-            width: parent.width
-            text: passCount + " checks passed. The backup covers every file the "
-                  + "system reads right now."
-            color: Color.muted
-            font.family: Style.font.family
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
           }
 
           Text {
@@ -2049,93 +2205,6 @@ Panel {
             CfgRow { k: "state";    v: root.config ? root.shortPath(root.config.state) : "—" }
             CfgRow { k: "folders";  v: root.config ? root.shortPath(root.config.destinationsFile) : "—" }
             CfgRow { k: "deny list"; v: root.config ? root.shortPath(root.config.denyList) : "—" }
-          }
-
-          // ── recent activity, collapsed by default ─────────────────────────
-          // Mirrors "Current settings" above exactly (same Item + header +
-          // "+"/"-" Text + full-Item MouseArea shape; no Behavior on height
-          // anywhere in this file, so this section does not invent that
-          // pattern only for itself -- the enclosing Flickable's own
-          // relayout is what makes expansion visible). Content is a flat
-          // list of lines (the Verification alerts Repeater's own shape,
-          // Panel.qml's alerts block), not a 2-column Grid -- log lines are
-          // not key/value pairs. Fed by statusDoc.recentLog, already
-          // fetched on every status poll this panel already makes -- no
-          // second Process/onExited block needed for this section alone.
-          Item {
-            width: parent.width
-            implicitHeight: aHdr.implicitHeight + Style.space(5)
-            PanelSectionHeader { id: aHdr; anchors.left: parent.left; text: "Recent activity" }
-            Text {
-              anchors.left: aHdr.right
-              anchors.leftMargin: Style.space(4)
-              anchors.verticalCenter: aHdr.verticalCenter
-              text: root.activityExpanded ? "-" : "+"
-              color: Color.foreground
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-            PanelSeparator { anchors.bottom: parent.bottom; width: parent.width }
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.toggleActivity()
-            }
-          }
-
-          Column {
-            id: activityList
-            visible: root.activityExpanded
-            width: column.width
-            spacing: Style.space(2)
-
-            // Model gated on activityExpanded too, not just this Column's
-            // own visibility -- an empty-when-collapsed model keeps the
-            // Repeater from instantiating delegates for content nobody can
-            // see, the same "invisible still occupies nothing" reasoning
-            // this file's own collapsed-Grid test already established for
-            // cfgGrid above.
-            Repeater {
-              model: root.activityExpanded && root.statusDoc && Array.isArray(root.statusDoc.recentLog)
-                ? root.statusDoc.recentLog : []
-              Text {
-                required property var modelData
-                width: activityList.width
-                text: modelData
-                color: Color.foreground
-                opacity: 0.7
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-              }
-            }
-
-            // Distinguished from "nothing logged yet" -- added round
-            // omabackup-35, alongside making the underlying day-file read
-            // failure a real, reported condition in cmd_status
-            // (recentLogError) instead of one silently indistinguishable
-            // from an empty log. Checked ahead of the plain-empty message
-            // below, since an unreadable log is never ALSO genuinely
-            // empty in a way worth saying so about.
-            Text {
-              visible: root.activityExpanded && root.statusDoc && root.statusDoc.recentLogError === true
-              width: activityList.width
-              text: "Could not read the log."
-              color: Color.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
-
-            Text {
-              visible: root.activityExpanded &&
-                !(root.statusDoc && root.statusDoc.recentLogError === true) &&
-                !(root.statusDoc && Array.isArray(root.statusDoc.recentLog) && root.statusDoc.recentLog.length > 0)
-              width: activityList.width
-              text: "Nothing logged yet."
-              color: Color.muted
-              font.family: Style.font.family
-              font.pixelSize: Style.font.caption
-            }
           }
 
           Text {

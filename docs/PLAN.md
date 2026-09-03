@@ -3184,8 +3184,522 @@ not something either round tried to fold in.
 
 Full suite: **1314 passed, 0 failed**.
 
+### Two panel-copy fixes from a real screenshot, and a real multi-monitor architecture bug found and deliberately not fixed yet — 2026-09-01
+
+The user reported a screenshot of the live panel: text felt "out of
+alignment," one line ("GitHub sent 11h ago") seemed to be pushing content
+down, another line ("7 checks passed. The backup covers every file the
+system reads right now.") "no longer made sense," and separately, across
+their real 3-monitor Hyprland setup (49"/27"/34"), enabling OmaBackup from
+one monitor's bar left the other monitors' panels showing it disabled —
+both the toggle state and the bar icon disagreeing across monitors. The
+user's own hunch was "isso está me cherando problema no waybar."
+
+**GitHub-sent line: removed, per the user's own choice.** Asked whether the
+layout complaint was a real positioning bug or just redundant/cluttered
+content; the user picked the latter (`É só redundante/poluído (remover a
+linha)`). Removed the `Text` block that duplicated the GitHub button's own
+tooltip (`sent Xh ago` / `never sent` / the failure message). One tradeoff
+worth recording, not raised with the user since it was not what they asked
+about: that line's own comment explained it existed specifically for
+keyboard-only users, since `qs.Ui.Button`'s tooltip only shows on
+`mouseArea.containsMouse`, never on keyboard focus. Removing it removes
+that affordance; nothing currently replaces it. Worth a look if a
+keyboard-navigation pass on the panel ever happens.
+
+**"N checks passed..." line: root cause found, then removed, per the
+user's own choice.** `passCount` (`Panel.qml`) counted `report.counts.pass`
+-- every `finding pass` the CLI's `verify` emits. That set was not stable:
+`git log -S` shows the sentence itself was written in `3c705d5` (05:28 on
+2026-08-24), while `probe_scheduled` and `probe_stale` (`bin/omabackup`)
+were both added later the *same day* (`ed08571` at 16:12, `ebd4bed` at
+17:47) and both contribute their own `pass` findings ("scheduled: the
+backup runs unattended," "last successful backup Xm ago") into the same
+count the sentence quotes. The sentence's claim -- "the backup covers
+every file the system reads right now" -- was accurate when every passing
+check was a coverage probe (hypr-lua, shell-json, plugins, migrations,
+packages, link-integrity); it stopped being accurate once two unrelated,
+non-coverage checks started contributing to the same N. This is what the
+user meant by "não faz mais sentido": not a subjective wording gripe, a
+sentence that quietly stopped being true as the set of things it counts
+grew. Presented three options (split coverage from operational counts and
+keep the sentence; reword to not overclaim; remove the sentence entirely,
+since the panel's own top summary line already says `covered · last
+backup Xh ago · N groups · N files`, and the new "Recent activity" section
+now gives a real detail view). The user chose removal. The now-unused
+`passCount` property was removed alongside it, not left as dead code.
+
+Both removals: no test referenced either removed string or the
+`passCount` property (checked directly before editing), so no test
+changes were needed. Full suite after: **1314 passed, 0 failed**.
+
+**Multi-monitor `IpcHandler` collision: a real, confirmed architectural
+bug, deliberately NOT fixed this round.** Investigating the third,
+per-monitor-inconsistency complaint surfaced Omarchy's own
+`Bar.qml` (`/usr/share/omarchy/shell/plugins/bar/Bar.qml`): it uses
+`Variants { model: Quickshell.screens }`, instantiating one full `Panel.qml`
+component *per monitor* -- confirmed against this machine's real 3-monitor
+setup (DP-2/49", HDMI-A-1/27", DP-1/34"). Each instance holds independent
+`statusDoc`/polling state, so a change on one monitor can take up to the
+full `refreshIntervalSec` (default 900s = 15min) to be reflected on the
+others -- a real but mild staleness issue on its own.
+
+The more severe part: each Panel.qml instance *also* declares its own
+```qml
+IpcHandler { target: "brenoperucchi.omabackup" }
+```
+with the identical target string. QuickShell only ever activates ONE
+IpcHandler per target name, process-wide -- confirmed directly with a
+minimal headless probe (two `IpcHandler` blocks sharing one target, in one
+file, run under `qs -p` with no display), which produced the literal
+warning:
+```
+Handler was registered but will not be used because another handler is
+registered for target iptest
+```
+**Scope check from round `omabackup-37`'s review, and it enlarged the
+finding**: the impact above, as first written, named only
+`tuiFinished`/`tuiHeartbeat`. `omabackup-rev-2` pointed out this
+undersells it -- the handler (`Panel.qml:1354-1362`) exposes six
+functions, not two: `refresh()`, `collect()`, `toggle()`,
+`tuiFinished(action)`, `tuiHeartbeat(token)`, `status()`. All six reach
+only the one winning instance when called through
+`omarchy-shell brenoperucchi.omabackup <fn>` -- confirmed directly against
+the same lines. So the collision is not "the TUI-callback path"; it is
+the plugin's *entire* external IPC surface. Concretely: `toggle` is the
+same function a bar-icon click already calls in-process on the clicked
+instance (which is why that instance always reacts correctly, and why the
+observed lag looks like the milder per-instance `statusDoc` staleness
+above) -- but an EXTERNAL `omarchy-shell brenoperucchi.omabackup toggle`
+call, e.g. from a Hyprland keybinding rather than a bar click, would reach
+only the winning instance, and the other monitors' panels would never
+learn anything happened at all, not even after their own next poll.
+`bin/omabackup-tui`'s `tuiFinished`/`tuiHeartbeat` calls (sent the same
+way) hit the identical ceiling: only ONE "winning" monitor's Panel.qml
+instance ever receives them, regardless of which monitor's panel actually
+opened the Settings/Restore TUI. If the panel that launched the TUI is
+not the instance whose IpcHandler won, its own
+`finishExternalTui`/`heartbeatExternalTui` never fires -- that panel
+instance is stuck showing the TUI as still-running until its own 900s
+`externalRecoveryTimer` finally gives up. This plausibly explains both the
+newly reported per-monitor toggle/icon divergence and the earlier,
+never-formally-resolved "Settings button looked dimmed but was still
+clickable" observation from an earlier round -- both are consistent with
+one monitor's panel never hearing back from an action it started.
+
+**Explicitly deferred, per the user's own instruction ("Só registrar e
+seguir depois").** No fix attempted this round -- recorded here as a
+confirmed, reproduced architectural finding for a future round. A real
+fix needs a design decision (a single shared IpcHandler surface instead
+of one per screen instance? a different target name per screen, with
+`bin/omabackup-tui` told which one to call? something else?) that is
+outside the scope of what was asked this round.
+
+### Round `omabackup-37` review of the above: one real gap in the `IpcHandler` finding's own scope, closed; one accessibility regression sent back to the user instead of auto-fixed
+
+`omabackup-rev-2` **APPROVE**d outright; `omabackup-rev` raised one P2
+finding. Neither disputed the other's silence -- no CONFLITO.
+
+- **CONFIRMADO in substance, diverging on remedy: removing the GitHub-sent
+  line took a real keyboard-accessibility path with it.** Both reviewers
+  independently reached the same underlying fact:
+  `qs.Ui.Button`/`/usr/share/omarchy/shell/Ui/Button.qml:130-132` shows
+  its tooltip only on `mouseArea.containsMouse`, `activeFocus` never
+  participates, and after the removal `githubDestination`'s error message
+  and last-sent age are reachable nowhere else in the file -- a
+  keyboard-only user focused on the (still fully `focusable: true`)
+  GitHub button can see that something is wrong (the color still changes)
+  but not what or when. `omabackup-rev` filed this as P2 with a concrete
+  minimal fix (show the same text, gated on the button's own
+  `activeFocus` instead of always-on, so it stays invisible for a mouse
+  user and answers the actual complaint about clutter). `omabackup-rev-2`
+  measured the same fact as P3/non-blocking but objected to the earlier
+  writeup's own framing -- filing this as a someday "keyboard-navigation
+  pass" nice-to-have undersells it, since the user's original choice
+  between "layout bug" and "remove as clutter" never included the
+  accessibility trade-off as one of the options. Since this is a
+  user-facing product choice made once already on incomplete information,
+  not a pure code-correctness defect, it was NOT auto-fixed -- taken back
+  to the user instead, with `omabackup-rev`'s own minimal-fix shape
+  offered as the concrete option to accept or decline.
+- **ÚNICO, applied: the `IpcHandler` finding's own impact section named
+  only `tuiFinished`/`tuiHeartbeat`, undersizing the real blast radius.**
+  `omabackup-rev-2` verified the handler exposes six functions, not two
+  (`refresh`, `collect`, `toggle`, `tuiFinished`, `tuiHeartbeat`,
+  `status`), all sharing the identical one-winner-per-target ceiling --
+  independently re-confirmed by reading `Panel.qml:1354-1362` directly.
+  `toggle` specifically maps to the user's own reported symptom when
+  called externally (a keybinding, not a bar click, which already works
+  in-process on the clicked instance). The writeup above was broadened in
+  place to name all six functions and the `toggle` connection, rather
+  than being left to undersell the scope for whoever picks this up next.
+- **Confirmed, not disputed: the `passCount` root-cause analysis holds.**
+  `omabackup-rev-2` did not take the writeup's word for it -- reread
+  `bin/omabackup:585-587`'s classification loop directly, confirmed both
+  `probe_stale` and `probe_scheduled` emit `pass` findings unrelated to
+  file coverage, and confirmed by ancestry (not just same-day timestamps)
+  that the sentence's own commit is an ancestor of both. `omabackup-rev`
+  did not comment on this point at all -- silence, not disagreement.
+- Both reviewers independently reran `./test/run.sh`: **1314 passed, 0
+  failed**, matching what was reported before the round.
+
+Not escalated to the user as a CONFLITO -- there wasn't one; the two
+reviewers converged on the same fact and differed only on remedy/severity,
+which is exactly the kind of product judgment this project routes back to
+the user rather than resolving as a review dispute.
+
+### Panel reorg: version into the title row, "Recent activity" promoted and expanded by default — 2026-09-02
+
+The user's own answer to round-37's accessibility question went further
+than picking one of the three narrow remedies offered: instead of
+restoring a standalone "GitHub sent ..." line, they proposed folding that
+information into "Recent activity" (defaulted to open), and separately
+asked to merge the OmaBackup/Omarchy version into the panel's title row,
+dropping the migration watermark from display. Per explicit user
+instruction, this went through a `herdr-ask` design consultation
+(round `omabackup-13`) *before* any code was written, not just a code
+review after -- both reviewers approved the direction but each found real,
+code-verified problems the initial plan draft missed. Full reasoning for
+every point below is in `docs/plans/rustling-doodling-sparkle.md`
+(retained, not a throwaway scratch file for this entry) -- this is the
+condensed record.
+
+**Accessibility, resolved for real this time.** `omabackup-rev` proposed
+building a real keyboard-operable disclosure control for the section
+header. `omabackup-rev-2` found something more basic and verified
+independently before trusting it: this panel's keyboard model
+(`PanelKeyCatcher`, `/usr/share/omarchy/shell/Ui/PanelKeyCatcher.qml`)
+intercepts Tab/Backtab unconditionally before any descendant sees them --
+it is a semantic-signal dispatcher a panel must wire up itself for
+cursor-style navigation, and `Panel.qml` wires only `onCloseRequested`/
+`onTabRequested` (→ `switchPanel()`, between top-level panels, not
+controls)/`onTextKey`. All six `focusable: true` occurrences in
+`Panel.qml` are genuinely dead configuration -- there is no path by which
+any of them can ever receive focus today. This settles the disagreement:
+the button was never keyboard-reachable in the first place, so a
+focus-gated remedy (one of the three options originally offered to the
+user) would have been a no-op, and the user's own chosen remedy
+(always-visible text, gated on nothing but the section being open) was
+the *only* one of the three that could have worked. No focusable control
+was added.
+
+**Two real defects the design consultation caught before they shipped:**
+the empty-log placeholder ("Nothing logged yet.") would have rendered
+directly under the new GitHub status line and read as contradictory on
+any configured-but-empty-log state (the normal first-run case) -- fixed
+by renaming it to "No activity logged yet." rather than adding a new
+`visible` condition, since the reworded text stays true either way. And
+`toggleActivity()` was still calling `settingsRevealTimer.restart()`,
+inherited unchanged from before the relocation; that timer scrolls to the
+Flickable's *bottom*, which only made sense while this section lived
+there -- after relocating it near the top, expanding it while "Current
+settings" was also expanded would have scrolled away from the section
+just opened. The call was removed from `toggleActivity()`; `toggleSettings()`'s
+own use of the same timer is untouched.
+
+**The `headRow` merge needed real width protection, not a live look.**
+`headRow` (the status dot + "OmaBackup" title) has no fixed width of its
+own and the `ToggleSwitch` is a sibling anchored independently to the
+right -- nothing reserved space between them. Both reviewers found this
+independently; `omabackup-rev-2` traced a concrete failure path a live
+look on this machine would not catch (`Style.fontToken()` returns a
+`shell.toml` font-size override unscaled, while the panel's own width
+scales by a different factor -- a user who overrides just the caption
+size widens the row without widening the panel). Fixed by anchoring the
+Omarchy-version text between `headRow.right` and the toggle's left edge
+with `elide: Text.ElideRight`, rather than folding it into `headRow`'s own
+Row layout -- the same protection the row it replaced already had
+(`width: parent.width - versionButton.width - ...`), just expressed with
+anchors since `headRow` itself has no width to subtract from. Proven with
+a new headless probe (`test/qml/title-row-version-elides.qml`) at a
+realistic narrow width, confirming eliding, not overlap.
+
+**The `watermark` property's planned removal was justified with a claim
+the code contradicts.** The original reasoning was "confirmed
+technical/opaque ... not restore-relevant on its own." Both reviewers
+independently read `lib/restore.sh`'s `_restore_verdict` and found the
+watermark is compared by the *same function*, the *same way*, for the
+*same purpose* as the Omarchy version -- it drives the `same`/`forward`/
+`behind` verdict and causes an outright refusal when unreadable or
+malformed. This project has one exact precedent this session for a
+correct-sounding justification quietly outliving the fact that grounded
+it -- the "N checks passed" line, closed just one round earlier -- so it
+was not repeated here: the real reason to drop it from the compact
+display line is narrower and still correct (a raw epoch is unreadable,
+not irrelevant), the `watermark` readonly property was **kept**, not
+deleted, and this entry states the corrected reason plainly for the
+record.
+
+**What actually shipped**, all in `Panel.qml`: the OmaBackup version
+button and Omarchy version text moved into the title row (version button
+label shortened to just the version number and shrunk to caption size,
+deliberately, not a reuse of its previous body-sized default); the
+now-empty runtime-identity row was deleted; "Recent activity" relocated
+from the footer to right after the primary actions/GitHub button, and
+`activityExpanded` now defaults to `true`; a GitHub status line (the same
+text/colour logic the round-37 removal took out) became the first line
+inside the relocated section, gated the same way as the rest of its
+content; the empty placeholder was reworded. `test/panel.test.sh` gained
+new structural anchors for all of the above (the `activityExpanded`
+default flip, `toggleActivity()`'s exact minimal body, the relocated
+GitHub line plus reworded placeholder, absence of the raw watermark
+string) and a new headless probe for the width-protection contract;
+`test/qml/activity-section-collapses-and-shows-lines.qml` was extended
+with GitHub-status phases crossed against log populated/empty/error
+states. Full suite: **1318 passed, 0 failed**.
+
+- **New open item, deferred deliberately, not started**: six
+  `focusable: true` occurrences in `Panel.qml`
+  (`Panel.qml:1592,1599,1617,1647,2142,2159` as of this round) are
+  confirmed dead configuration -- `PanelKeyCatcher` eats Tab before any
+  descendant sees it, and `Panel.qml` wires none of the
+  `onMoveRequested`/`onActivateRequested` signals a real intra-panel
+  keyboard navigation model would need. A future "make this panel
+  keyboard-navigable" project should start from those two signals, not
+  from `focusable`, which does nothing today.
+- **Honest residual, not a defect**: a user who manually re-collapses
+  "Recent activity" loses the keyboard-only path to the GitHub
+  destination's status again, until they reopen it. "Resolved by
+  default," not "resolved unconditionally" -- the section defaulting open
+  is what closes the gap, not anything inherent to the control itself.
+
+### Round `omabackup-38`: the code-level review of the panel reorg, and a real load-bearing bug caught before it shipped
+
+`herdr-review-dispatch` was run against the implementation above (not the
+design -- that was round `omabackup-13`, before any code existed).
+`omabackup-rev` finished within the round's timeout with three findings;
+`omabackup-rev-2` finished a genuinely complete, thorough verdict (245
+lines, ending in its own natural closing sections) but past the
+dispatcher's 1200s wait, so the automated round exited 1 -- read directly
+from disk rather than redispatched, since the file was evidently done, not
+truncated. `omabackup-rev-2`'s own verdict: **APPROVE, three P3s, none
+blocking.** All findings from both reviewers were applied; nothing was
+disputed between them (no CONFLITO), and nothing was escalated to the
+user.
+
+- **CONFIRMED the hard way -- read the real component before trusting the
+  claim.** `omabackup-rev`'s P1: the version `Button` moved into `headRow`
+  had `font.family`/`font.pixelSize` set on it. Read
+  `/usr/share/omarchy/shell/Ui/Button.qml` directly: it is a
+  `BorderSurface` (a `Rectangle` subtype), not `Text`, and exposes
+  `fontFamily`/`fontSize` as its own plain properties -- there is no
+  grouped `font` property on it at all. `font.family`/`font.pixelSize`
+  were invalid assignments that silently failed to apply, meaning the
+  intended caption-size downsizing never actually took effect --
+  `omabackup-rev-2`'s own width measurements in the design consultation
+  had assumed it did. Fixed: `fontFamily`/`fontSize`, matching the real
+  component's contract. The probe that should have caught this
+  (`test/qml/title-row-version-elides.qml`) used a plain `Text` as a
+  stand-in for the button, which happily accepts `font.*` -- a real gap in
+  what a hand-maintained mirror can catch, not something worth chasing
+  further here (importing the real `qs.Ui` component tree into a
+  standalone probe is a bigger change than this bug warranted).
+- **CONFIRMED independently by both reviewers, from different angles, and
+  actually fixed rather than just documented.** `omabackup-rev`'s P2 and
+  `omabackup-rev-2`'s own P3 both found the same gap: the first fix
+  (round `omabackup-13`) protected the trailing Omarchy-version *text*
+  from overlapping the toggle, but the version *button* had moved
+  *inside* `headRow`, which still has no width cap of its own -- under a
+  wide enough font-token override, `headRow`'s own content (the button
+  specifically, being its rightmost child) could reach the toggle before
+  the protected text even comes into play. `omabackup-rev-2` measured the
+  actual threshold (~doubling font tokens; the real panel has roughly
+  200px of slack) and judged it P3 given the toggle is declared after
+  this group and stays on top and clickable either way -- but explicitly
+  asked for the residual to be documented with the same clarity the
+  probe's own comment already gave it, not fixed. Since a proper fix was
+  cheap and the two reviewers had already done the hard part (finding and
+  bounding it precisely), it was fixed anyway: `headRow` and the Omarchy
+  text now live together inside one `titleGroup` Item, itself anchored
+  between the parent's left edge and the toggle's left edge with
+  `clip: true`. The common case still elides the Omarchy text gracefully,
+  unchanged; the pathological case (headRow itself too wide) now degrades
+  to an abrupt clip instead of ever visually overlapping the toggle.
+  `test/qml/title-row-version-elides.qml` gained a fourth phase at a
+  deliberately pathological width (150px, below headRow's own natural
+  width) proving `titleGroup`'s own bounds never cross the toggle and that
+  clipping is actually enabled, not just present in source.
+- **ÚNICO, applied: a test anchor that was stricter than its own stated
+  intent.** `omabackup-rev-2`'s finding: the `toggleActivity()` regression
+  matched the function's exact multi-line body, including whitespace --
+  any reformatting (a comment, reindentation) would fail it with a
+  misleading message blaming a `settingsRevealTimer` call that was never
+  the actual cause. Counted: it was the only multi-line literal match
+  among 66 `== *'…'*` patterns in the file -- new precedent, not existing
+  convention. Fixed by extracting just the function's own body (`sed`,
+  the same technique already established for `_into_cleanup` in
+  `test/restore.test.sh`) and asserting only the two things that actually
+  matter: `activityExpanded` is still toggled, and no
+  `settingsRevealTimer` call is in the body -- immune to formatting.
+- **ÚNICO, applied: a pre-existing gap in the version button's own
+  `enabled` guard, caught because the button was already being touched
+  this round.** `_tool_version()` (`bin/omabackup:106-109`) falls back to
+  the literal string `"unknown"` when the manifest can't be read; that
+  string never reaches Panel.qml's `"?"` fallback (`root.toolVersion`
+  only becomes `"?"` when the whole `tool` object is missing from the
+  status document, not when its version field itself says `"unknown"`),
+  so the button stayed enabled and copied the word "unknown" to the
+  clipboard in that failure mode. Present verbatim since before this
+  round; not introduced here. Fixed with a one-line guard widening
+  (`!== "?" && !== "unknown"`) and a new structural anchor, rather than
+  left as a separate follow-up, since the line sat directly inside the
+  block already being edited.
+- `omabackup-rev-2` also flagged, with full detail, that their own
+  independent `./test/run.sh` run showed **1314 passed, 4 failed**
+  against the **1318 passed, 0 failed** reported -- reconciled exactly
+  (1314 + 4 = 1318, same test set). Root-caused, not waved off: four
+  concurrent `./test/run.sh` invocations were running on this machine at
+  the time (the reviewer's own plus others), and the four failing
+  assertions were both signal-timing-sensitive (`took 40s` against an
+  expected few seconds). Re-ran the two affected files alone under lighter
+  load and both passed clean, confirming the failures were contention, not
+  a real regression from this diff -- worth remembering as an operational
+  note: this project's habit of running the full suite from multiple
+  agents/rounds concurrently on one machine can itself produce flaky
+  timing-sensitive red, unrelated to whatever diff is under review.
+
+Full suite after every fix above: **1319 passed, 0 failed**.
+
+### Round `omabackup-39`: verifying round 38's own fixes surfaced a genuinely new bug -- the second correction round in a row that found a real defect, not just polish
+
+Dispatched specifically to verify round 38's fixes, not as a fresh
+open-ended review. `omabackup-rev` found two things; `omabackup-rev-2` was
+not consulted for this specific round (round 38's verification was a
+single-reviewer dispatch). Both findings were real and were fixed; this
+is correction round 2 of this implementation's own 2-round budget.
+
+- **CONFIRMED, and a real one: `titleGroup`'s own introduction (round 38's
+  fix for the headRow-overlap gap) silently broke the toggle's vertical
+  anchor.** `ToggleSwitch` still read
+  `anchors.verticalCenter: headRow.verticalCenter`, but `headRow` stopped
+  being `ToggleSwitch`'s sibling the moment it moved inside `titleGroup` --
+  QML anchors only resolve against a parent or a true sibling. Verified
+  live, not just accepted on the reviewer's word: running the probe
+  produced the exact runtime warning firsthand, `Cannot anchor to an item
+  that isn't a parent or sibling`, and the toggle silently fell back to
+  its unrelated default vertical position instead of centering. The
+  probe's own horizontal-only assertions stayed green throughout, which
+  is exactly how this hid from round 38's own (green) suite run. Fixed:
+  `anchors.verticalCenter: titleGroup.verticalCenter` -- a true sibling of
+  `ToggleSwitch`, and geometrically identical to the original intent
+  since `titleGroup`'s height equals `headRow`'s implicitHeight and both
+  centers coincide. `test/qml/title-row-version-elides.qml` gained an
+  explicit vertical-centering assertion across every phase (not just the
+  horizontal ones it already had) -- confirmed to discriminate by mutating
+  a copy back to the broken reference and observing the same warning plus
+  a real ~9-11px vertical offset, not a rounding artifact.
+- **CONFIRMED, applied: the new width-protection probe was a self-
+  contained mirror with no structural anchor on the real `Panel.qml`.**
+  Reverting only the real file's `titleGroup`/`clip` structure back to
+  round 13's pre-fix form would have left the probe's own independent
+  copy of that structure intact and still green -- proving nothing about
+  the file it was meant to guard. Fixed with a new anchor in
+  `test/panel.test.sh` checking the real source directly for `titleGroup`
+  with `clip: true` (ordered, since an unrelated earlier `clip: true`
+  already exists on the containing Flickable) and the corrected
+  `anchors.verticalCenter: titleGroup.verticalCenter` reference. The same
+  finding also pointed out phase 4 never asserted that `headRow`'s content
+  actually exceeded `titleGroup`'s own width at the test's chosen
+  container size -- it could have passed even if the clip were never
+  truly exercised. Fixed with an explicit `headRow.implicitWidth >
+  titleGroup.width` precondition check, confirmed to discriminate by
+  mutating a copy with `clip: false` and observing the phase fail for the
+  stated reason.
+
+Full suite after these fixes: **1320 passed, 0 failed**.
+
+**Stopped here rather than continue self-directed correction.** This
+project's own review discipline caps self-directed correction at 2 rounds
+before checking with the user, even with findings still theoretically
+open -- and this made that concrete rather than procedural: round 38
+caught a real, load-bearing bug in the first implementation attempt
+(invalid `Button` property names); round 39, run specifically to *verify*
+round 38's fixes, caught a second real bug *introduced by fixing the
+first one* (the broken anchor). Two rounds in a row surfacing genuine
+defects, not diminishing-returns polish, was exactly the signal this
+project's own protocol exists to catch before a third autonomous pass
+compounds whatever the next one might miss -- so this was taken back to
+the user rather than continued alone.
+
+### Round `omabackup-40`: a user-authorized 3rd verification round -- the real code is now confirmed clean, but the regression test written to guard it was not
+
+The user explicitly authorized one more round past the normal budget
+("Mais uma rodada de verificação"), given the pattern above. Both
+reviewers converged on the same finding; nothing was disputed.
+
+- **CONFIRMED by both reviewers, independently, and it is a genuinely
+  ironic one.** The structural anchor added in round 39 to guard the
+  `titleGroup`/toggle anchor fix,
+  `"$PANEL_SOURCE" == *'anchors.verticalCenter: titleGroup.verticalCenter'*`,
+  matched this file's own explanatory comment about the fix ("anchors.
+  verticalCenter: titleGroup.verticalCenter, not headRow.verticalCenter",
+  written directly above the real property to document *why* the change
+  was made) just as well as it matched the real code. Reverting only the
+  actual property back to the broken `headRow.verticalCenter` reference,
+  with the comment left in place, kept the test green -- the more
+  carefully the fix was documented, the more certain the false pass
+  became. `omabackup-rev-2` proved this by running the exact test
+  condition against a real mutated copy and observing it report `ok`.
+  Fixed with an ordered pair anchored to `id: toggleSwitch` (the id line
+  sits between the comment and the real property, so only the genuine
+  code line can complete the match) -- both reviewers independently
+  verified this exact form; confirmed once more directly before landing
+  it, mutating a copy back to the broken anchor and observing the new
+  form correctly fail where the old one did not.
+- **`omabackup-rev-2` also did the most thorough verification this whole
+  implementation has had, and reported it clean.** Loaded the real
+  `Panel.qml` against the actual `qs.*` components (not a hand-maintained
+  mirror), with a minimal stub only for the one Wayland-dependent type --
+  zero anchor warnings anywhere in the file. Confirmed this harness
+  actually detects the class of bug at all by reintroducing round 39's
+  broken anchor into a copy and observing the exact warning at the exact
+  line. Cross-checked by enumerating all 18 id-based anchor references in
+  the file and walking the whole `titleGroup`/`headRow`/`toggleSwitch`
+  tree edge by edge -- every one resolves against a real parent or
+  sibling, no binding loops. Also corrected their own round-39 suggestion
+  in passing: a `Loader.status === Ready` probe would NOT have caught
+  either this round's bug or round 39's -- anchor violations are runtime
+  warnings, not load errors, so `status` stays `Ready` regardless. A real
+  guard needs both a successful load AND an empty anchor-warning capture.
+- Both reviewers reconfirmed the epsilon and geometry work from round 39
+  hold up under direct measurement (`omabackup-rev-2`: the vertical-
+  centering epsilon sits 3x above the real rounding error and 7x below
+  the broken-anchor signal, "não mascara regressão real nem produz falha
+  falsa"), and that the `clip: true` half of the round-39 anchor is
+  correctly ordered against the unrelated Flickable clip earlier in the
+  file -- only the `titleGroup.verticalCenter` half needed the fix above.
+- **Same operational note, a third time in a row**: `omabackup-rev-2`'s
+  own independent `./test/run.sh` again showed 4 failures (signal-timing
+  assertions in `bundle.test.sh`/`panel.test.sh`) that vanished when the
+  same two files were rerun alone -- reconfirmed as contention from
+  multiple concurrent full-suite runs on this machine, not a regression,
+  for the third consecutive round. Recorded again, not acted on further
+  here -- explicitly the suite owner's call, not a finding of this unit
+  of work.
+
+Full suite: **1320 passed, 0 failed.** Genuinely done now: this was a
+test-only fix (the real `Panel.qml` code was independently confirmed
+clean by real-component loading, not just re-reading), and no further
+round was dispatched.
+
 ## Open questions for the user, not yet decided
 
+- **Multi-monitor `IpcHandler` collision** (full writeup above, 2026-09-01):
+  every per-monitor Panel.qml instance declares an `IpcHandler` with the
+  same target, so only one instance ever receives ANY of the six exposed
+  IPC functions (`refresh`/`collect`/`toggle`/`tuiFinished`/
+  `tuiHeartbeat`/`status`), not just `bin/omabackup-tui`'s completion
+  callbacks -- confirmed via a real headless probe. Deferred by the user's
+  own request ("Só registrar e seguir depois"); needs a design decision
+  (shared handler vs. per-screen target vs. another approach) before a fix
+  is attempted.
+- **Dead `focusable: true` / no intra-panel keyboard navigation** (full
+  writeup above, 2026-09-02): `PanelKeyCatcher` intercepts Tab before any
+  descendant sees it, and `Panel.qml` never wires
+  `onMoveRequested`/`onActivateRequested` -- all six `focusable: true`
+  occurrences in the file do nothing today. Confirmed via direct code
+  reading during the `herdr-ask omabackup-13` design consultation, not
+  started as a fix.
 - `_into_cleanup`'s round-33 fix works correctly for what it does, but is
   still not CALLED from several real `cmd_restore` failure paths (the
   `--json` preview path; several apply-setup failures before the state/
