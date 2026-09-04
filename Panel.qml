@@ -1448,10 +1448,19 @@ Panel {
     // Sized against omarchy's own info panel, which is the house reference for
     // a panel with this much to say: it uses 430 wide and 560 tall. A little
     // wider here because the group list runs in two columns.
+    //
+    // Height raised from that 560 reference to 700 -- still within the same
+    // family other real Omarchy panels use (most cap at 560, the `agents`
+    // plugin's own panel already caps at 640) -- after a real screenshot
+    // showed "Recent activity" defaulting open pushed the Flickable below
+    // into a scroll that did not exist before that section was promoted
+    // near the top. `fittedContentHeight` still clamps to the available
+    // screen space first, so this only matters when the screen has the room
+    // to give; it does not force the panel taller than it needs to be.
     contentWidth: panel.fittedContentWidth(Style.space(470))
     contentHeight: panel.fittedContentHeight(
       column.implicitHeight + footerBar.height,
-      Style.space(560))
+      Style.space(700))
 
     PanelKeyCatcher {
       id: keyCatcher

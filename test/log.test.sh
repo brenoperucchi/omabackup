@@ -1228,21 +1228,25 @@ assert_eq "$LOGTAIL_SELF_OUT" "$(printf 'seed1\nseed2')"
 # ── cmd_status --json's recentLog field ─────────────────────────────────────
 STATUSLOG_HOME="$(_log_home)"
 
-it "status --json's recentLog reflects real log-event calls, capped at 5 lines"
-# Six distinct events, not three -- found by review (round omabackup-33,
-# `omabackup-rev`): three events fits entirely under the 5-line cap, so
-# the old version of this test would still pass against a version of
-# _log_tail that used a LARGER cap, or one that returned the lines in the
-# wrong order (it only checked substring containment, not an exact,
-# ordered array). Six events forces action1 to actually be dropped, and
-# comparing the exact ordered array (not just substring containment)
-# proves both the cap and the order in one assertion.
-for STATUSLOG_ACTION in action1 action2 action3 action4 action5 action6; do
+it "status --json's recentLog reflects real log-event calls, capped at 3 lines"
+# Four distinct events, not one or two -- same principle established by
+# review round omabackup-33 when the cap was 5 (six events then, one more
+# than the cap): fewer events than the cap would still pass against a
+# version of _log_tail with a LARGER cap, or one that returned lines in
+# the wrong order (substring containment alone would not catch either).
+# Cap dropped from 5 to 3 lines -- a real screenshot showed the panel's
+# "Recent activity" section, now expanded by default, still pushing the
+# main view into a scroll even with the panel's own height cap raised;
+# trimming the sample is the other half of that fix. Four events forces
+# action1 to actually be dropped, and comparing the exact ordered array
+# (not just substring containment) proves both the cap and the order in
+# one assertion.
+for STATUSLOG_ACTION in action1 action2 action3 action4; do
     _log_env "$STATUSLOG_HOME" log-event "$STATUSLOG_ACTION" ok "" >/dev/null 2>&1
 done
 STATUSLOG_JSON="$(_log_env "$STATUSLOG_HOME" status --json)"
 STATUSLOG_RECENT="$(printf '%s' "$STATUSLOG_JSON" | jq -c '[.recentLog[] | capture("  (?<a>action[0-9]+)  ") | .a]')"
-assert_eq "$STATUSLOG_RECENT" '["action2","action3","action4","action5","action6"]'
+assert_eq "$STATUSLOG_RECENT" '["action2","action3","action4"]'
 
 it "status --json's recentLog is an empty array, not null or missing, when nothing has been logged yet"
 STATUSLOG_EMPTY_HOME="$(_log_home)"

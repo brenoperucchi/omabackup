@@ -2789,11 +2789,15 @@ cmd_status() {
         # document reports recorded state and never probes the network, so the
         # panel can poll it as often as it likes.
         #
-        # recentLog: fixed at 5 lines, not a caller-supplied count -- this is
+        # recentLog: fixed at 3 lines, not a caller-supplied count -- this is
         # the panel's own "Recent activity" glance, refreshed for free on
         # every status poll it already makes; a real viewer with a
         # user-chosen line count is `omabackup log-tail N` / the Settings
-        # TUI's own "View log" item, not this document.
+        # TUI's own "View log" item, not this document. Was 5 until a real
+        # screenshot showed the section (now expanded by default, alongside
+        # the panel's own raised height cap) still pushing the panel into an
+        # internal scroll -- 3 lines keeps the glance real without costing
+        # the vertical space a 5-line sample did.
         #
         # `_log_tail`'s own exit status is captured explicitly right after
         # the assignment, not left to fall through unchecked -- found by
@@ -2812,7 +2816,7 @@ cmd_status() {
         # so a consumer (the panel) CAN show the two states differently
         # instead of that distinction being silently unrecoverable here.
         local recentlog_json recentlog_rc=0
-        recentlog_json="$(_log_tail 5 | jq -R -s 'rtrimstr("\n") | if length == 0 then [] else split("\n") end')" \
+        recentlog_json="$(_log_tail 3 | jq -R -s 'rtrimstr("\n") | if length == 0 then [] else split("\n") end')" \
             || recentlog_rc=$?
         (( recentlog_rc != 0 )) && recentlog_json='[]'
         jq -n --arg v "$ov" --arg c "$oc" --arg m "$om" --arg s "$STAGING" \
