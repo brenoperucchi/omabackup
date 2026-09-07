@@ -3682,8 +3682,668 @@ test-only fix (the real `Panel.qml` code was independently confirmed
 clean by real-component loading, not just re-reading), and no further
 round was dispatched.
 
+### Three marketplace security findings closed: an unbounded manifest read, an unbounded `git push`, and a checksum sidecar that trusted its own download host — 2026-09-06
+
+`HANCORE-linux` (marketplace security reviewer) re-scanned the validated
+commit (`3a3625e`) after the `validated` label was refreshed (see below)
+and found three new blockers, none overlapping the earlier rounds'
+findings -- these are in code the earlier reviews never reached.
+(https://github.com/omacom/omarchy-plugin-marketplace/issues/3968#issuecomment-5560428690)
+
+- **`lib/artifacts.sh` -- the same decompression-bomb shape `_zstd_extract`
+  already closed for restore, but in the LISTING path, which never got the
+  fix.** `_artifact_manifest_file` ran `zstd -dc | tar -xO ./manifest.json`
+  with no byte cap or timeout, once per matching file in a `dir`
+  destination -- a mount this tool shares with other processes by design.
+  A crafted archive could consume unbounded CPU/disk before ever being
+  marked invalid. Fixed with the same `head -c` byte cap +
+  `timeout --kill-after` idiom `_zstd_extract` (`lib/bundle.sh`) already
+  established, scaled down for what this call actually needs: 1 MiB
+  (`OMABACKUP_ARTIFACT_MANIFEST_MAX_BYTES`, a real manifest is a few
+  hundred bytes) and 10s (`OMABACKUP_ARTIFACT_MANIFEST_TIMEOUT_SEC`, one
+  small named member, not a whole restore). The dead, never-called sibling
+  function `_artifact_manifest` (returned bytes through a bash variable,
+  zero call sites) was deleted rather than also patched -- fixing code
+  nothing calls was not the point.
+
+  Proven properly, not just asserted: a real 50MB-decompressing bomb named
+  exactly `manifest.json`, directly against `_artifact_manifest_file`
+  (mirroring `lib/bundle.sh`'s own bomb test shape) -- confirmed the old
+  code wrote the full 50,000,000 bytes and returned success (`rc=0`), and
+  that `valid:false` alone would NOT have caught this (non-JSON content
+  fails jq's shape check regardless of whether the byte cap did anything,
+  so the CLI-level outcome looks identical either way). The real proof is
+  direct: the new code returns non-zero and the written file stays under
+  2MB for a 1MB cap. An end-to-end CLI test confirms the bound is actually
+  wired into `artifacts --json` at the default cap too, not just reachable
+  by calling the internal function directly.
+
+- **`lib/destinations.sh` -- `git push` with no timeout, and
+  `omabackup-push.service` with no `TimeoutStartSec`.** An unavailable or
+  hostile configured remote could hold the scheduled push timer
+  indefinitely, and unbounded output growth risked shell memory. Fixed
+  `_push_github` with the same `timeout --kill-after` idiom (120s default,
+  `OMABACKUP_PUSH_TIMEOUT_SEC`), plus a `tail -c` cap on the captured
+  output (8 KiB default, `OMABACKUP_PUSH_OUTPUT_MAX_BYTES` -- the useful
+  diagnostic line in a failed push is what git prints LAST, not first).
+  Added `TimeoutStartSec=300` to the systemd unit as the outer,
+  destination-agnostic ceiling covering the whole `push` invocation, not
+  just the github step.
+
+  Proven with the same fake-git PATH-shadow technique this file's own
+  credential-redaction tests already established: a fake `git` that sleeps
+  30s on `push` is killed within 10s wall-clock under a 2s
+  `OMABACKUP_PUSH_TIMEOUT_SEC` override, and push correctly reports
+  failure rather than a false success. Confirmed the test actually
+  discriminates by running the exact same scenario against the OLD,
+  unwrapped `_push_github` directly: it was still running past 8 real
+  seconds when an outer test-harness timeout had to kill it by force --
+  proving `OMABACKUP_PUSH_TIMEOUT_SEC` genuinely had no effect before this
+  fix. A separate fake `git` producing 50,000 bytes of failure output
+  confirms the captured/redacted output stays under 3,000 characters for a
+  1,000-byte cap.
+
+- **`test/vm/build-golden.sh` -- the ISO's "expected" checksum was fetched
+  from the same server that serves the ISO.** If `--sha256`/
+  `OMARCHY_VM_ISO_SHA256` was not supplied, the script fetched a checksum
+  sidecar from `iso.omarchy.org` -- the identical host serving the ISO
+  itself. A compromise of that one server could swap both files together,
+  and this script would have "verified" nothing while still booting the
+  result as an unattended installer. Test-only tooling (never runs as
+  part of the distributed plugin), but still in the scanned repository.
+  Fixed by removing the auto-fetch entirely: the existing
+  canonical-hex-64 validation now becomes the only path when no hash is
+  supplied, so it fails closed with a clear, actionable message instead of
+  silently trusting the download host's own claim about itself. The
+  `--sha256` usage text and this file's own header comment were updated to
+  match; two new static-content tests in `test/vm.test.sh` (matching this
+  file's own established convention of not actually running the KVM-
+  dependent builder end to end) confirm the auto-fetch code is gone and
+  the fail-closed contract is documented in its place.
+
+**A real regression these fixes exposed in an unrelated part of the test
+suite, found and fixed before considering this done.** Two existing
+`restore.test.sh` tests globally PATH-shadow `head` for an entire
+`omabackup restore` TUI session, corrupting or growing a source file on
+every `head -c` call, to simulate a corrupted/growing private snapshot at
+one specific call site (`bin/omabackup:2061`'s snapshot copy). The new
+`lib/artifacts.sh` fix above also calls `head -c` now, through a pipe,
+inside `artifacts_json` -- which the same restore TUI loop calls on
+*every* iteration, well before a backup number is even chosen. The
+unscoped stubs corrupted/grew the source during that unrelated listing
+call too, breaking both tests for a reason that had nothing to do with
+what either verifies (`corrupt-snapshot session exited 124`; a frozen-size
+assertion mismatched because the source had already grown before the real
+freeze point ran). Confirmed this was a real regression, not
+environmental flakiness, by stashing the fix and reproducing 255 passed
+on clean `HEAD` for the exact same file. Fixed by scoping both stubs to
+`[[ ! -p /dev/stdin ]]` -- the snapshot-copy call reads from a plain file
+redirect, while both the new listing call and `_zstd_extract`'s own
+existing extraction call read from a pipe -- a purely mechanical,
+reliable distinction that needed no knowledge of which specific call is
+running, only how its stdin is connected.
+
+Full suite: **1329 passed, 0 failed.**
+
+### Round `omabackup-41` review of the three security fixes: a real bug in the fix itself, caught by both reviewers, then a second real bug found in the reviewer's own suggested remedy -- verified live before landing, not taken on either side's word
+
+Both reviewers converged on the same critical defect in the `lib/artifacts.sh`
+fix above; `omabackup-rev` also found a separate credential-leak bug and two
+real robustness gaps, and `omabackup-rev-2` found a latent correctness gap
+in the `lib/destinations.sh` fix. Nothing was disputed between them --
+no CONFLITO.
+
+- **CONFIRMED by both reviewers, independently: the byte cap in
+  `_artifact_manifest_file` sat on the wrong side of `tar`, rejecting
+  legitimate bundles.** `head -c` originally sat BETWEEN `zstd -dc` and
+  `tar -xO`, capping the raw decompressed TAR STREAM tar is allowed to
+  read to LOCATE `./manifest.json` -- not what `tar -xO` actually
+  extracts. A real bundle's total size is unbounded on purpose
+  (`build_bundle` includes the whole `repo.bundle`, the dotfiles repo's
+  complete git history, which only grows), and `tar -C stage -cf - .` has
+  no `--sort`, so the manifest's own position in the archive is whatever
+  `readdir` happens to return. `omabackup-rev-2` reproduced this end to
+  end: a real, non-malicious 3MB artifact with `manifest.json` placed
+  after other content was reported `valid:false` ("corrupt or truncated
+  archive") and vanished from the restore TUI's own artifact list --
+  indistinguishable from a genuinely corrupt backup, for a backup that
+  was completely intact. Independently reproduced here too (a 2MB
+  artifact, same failure).
+
+  The reviewer's own suggested fix -- move the cap after `tar -xO`, add
+  `--occurrence=1` so tar stops scanning the instant it finds the member
+  -- was tested against all four relevant scenarios before landing, not
+  applied as given, because that testing found `--occurrence=1` itself
+  introduces a NEW bug: it makes `tar` exit the instant it is satisfied,
+  which closes `tar`'s own stdin while `zstd` may still be mid-write --
+  `zstd` then gets its own SIGPIPE (141) purely from `tar` stopping
+  early, and `pipefail`'s "rightmost non-zero" rule surfaces that
+  incidental 141 as the pipeline's own status even though `tar` itself
+  (position 1) exited 0. Measured directly: `--occurrence=1` against the
+  same legitimate 2MB fixture reported `pipestatus: 141 0 0` -- a
+  perfectly good backup, marked unrestorable again, by a different
+  mechanism than the original bug. Fixed by moving the cap after `tar
+  -xO` WITHOUT `--occurrence=1`: without it, `tar` reads its input
+  through to natural EOF regardless of when it finds the member, so
+  `zstd` is never cut off for a benign reason (`pipestatus: 0 0 0` for
+  the same fixture), and the bomb case pays no meaningful cost for
+  dropping it either -- `head -c`'s own early close still bounds the
+  pipe within single-digit milliseconds regardless, since nothing
+  downstream is still consuming `zstd`'s output past the cap. This also
+  preserves a separate, older regression ("a valid frame with trailing
+  garbage is marked invalid, not valid:true") without needing to reason
+  about it specially: `zstd` still runs to completion and still reports
+  real corruption it finds on its own, independent of where in the
+  archive the target member happens to sit. Also added `env -u
+  TAR_OPTIONS`, matching `_zstd_extract` (`lib/bundle.sh`), for
+  consistency -- not demonstrated exploitable on this specific
+  invocation, `omabackup-rev-2` tried and could not, but free.
+
+  Three new tests close the gap both reviewers independently flagged as
+  untested: a legitimate bundle whose manifest sits past the cap (proven
+  to fail under the old code, pass under the new one, and proven the
+  `--occurrence=1` alternative would have failed it too), the same
+  scenario through the real end-to-end CLI, and trailing-garbage-after-a-
+  valid-frame re-verified directly against the reordered pipe.
+
+- **CONFIRMED, `omabackup-rev`: truncating `git push`'s output before
+  redacting it could leak a credential fragment.** `dest_redact_output`'s
+  own regex requires the `scheme://` prefix to recognize a credential at
+  all; `tail -c`, applied before redaction, truncates by raw byte count
+  with no idea a URL's credential portion lives at the cut point. A long
+  enough message ahead of the real error (git's own transport errors
+  routinely repeat the remote URL) is all it takes to cut the `scheme://`
+  prefix away while leaving `TOKEN@host/path` intact in what `tail`
+  keeps -- unredacted. Reproduced live before fixing: an 8000-byte prefix
+  followed by a real credentialed URL, through the original `tail -c |
+  dest_redact_output` order, printed the raw token in full. Fixed by
+  reordering to `dest_redact_output | tail -c`: `sed` sees each complete
+  line as `git` produces it, before any truncation could split one, and
+  `tail -c` then only ever discards from the front of an
+  already-fully-redacted stream.
+- **CONFIRMED, `omabackup-rev-2`: `_push_github`'s failure detection
+  silently depended on the caller's own `pipefail` setting.** The
+  original fix's `out="$(... | tail ...)" || { ... }` form relies on
+  `bin/omabackup`'s global `set -uo pipefail` (line 9) to make `$?`
+  reflect `git`/`timeout` rather than `tail` (the pipe's last stage,
+  which almost never fails on its own). Reproduced live: with `pipefail`
+  explicitly disabled, a `git` killed by `timeout` after genuinely
+  hanging was reported as a false success (`rc=0`). Not live in
+  production today (`omabackup-rev-2` independently verified all five
+  `_had_pf` save/restore blocks in the project correctly leave `pipefail`
+  on), but a real latent gap, and inconsistent with the sibling fix in
+  the same diff: `_artifact_manifest_file` already sets `pipefail` inside
+  its own subshell, self-contained regardless of caller state. Fixed by
+  reading `${PIPESTATUS[0]}` inside the same subshell the pipe itself
+  runs in (`out="$( ... ; exit "${PIPESTATUS[0]}" )"; rc=$?`) --
+  self-contained the same way, and confirmed correct with `pipefail`
+  both on and off.
+- **CONFIRMED, `omabackup-rev`: `timeout`/`head` were never declared as
+  required tools**, even though `_artifact_manifest_file` (this same
+  round's own fix) now depends on both, and `cmd_restore_tui` never
+  declared ANY tool dependency at all before calling `artifacts_json` in
+  its own listing loop. A system missing either tool made every manifest
+  read look like a corrupt archive instead of the CLI naming the actual
+  missing dependency. Fixed: `require_tools jq find zstd tar timeout
+  head` added to both `cmd_artifacts` and the start of
+  `cmd_restore_tui`, with a new test proving the dependency error (not a
+  corrupt-archive symptom) is what a minimal `PATH` actually produces.
+
+**Two further findings from `omabackup-rev`, deliberately deferred rather
+than folded into this round:**
+
+- **The per-file timeout in `_artifacts_for_dest`'s loop does not bound
+  the AGGREGATE listing time across multiple slow/malicious files in one
+  shared destination.** N files that each block until their own timeout
+  keep one `artifacts` call busy for roughly N × 15s, with no overall
+  deadline, count limit, or honest "partial listing" state to report
+  when a budget like that runs out.
+- **The new `timeout`-created process groups in `lib/artifacts.sh` and
+  `lib/destinations.sh` do not forward HUP/INT/TERM the way
+  `_zstd_extract` (`lib/bundle.sh`) already does for the identical
+  shape.** A caller cancelled mid-listing or mid-push (Ctrl-C, or the TUI
+  wrapper itself being killed) could leave `zstd`/`tar`/`git` running in
+  the background for up to their own full timeout, since neither new
+  `timeout` invocation forwards a received signal into the process group
+  it created.
+
+Both are real and both reviewers' own severity read (P2, not P1) is
+correct: neither is the unbounded-resource-exhaustion shape HANCORE's
+original findings described (both new call sites already have a hard
+wall-clock ceiling regardless of caller behavior), and this project's own
+history already staged an identical improvement as a separate, later
+round once before (`_zstd_extract`'s own byte/member caps landed first;
+its signal-forwarding came in a subsequent round, not the same one). The
+signal-forwarding fix specifically wants a shared, extracted helper
+(`omabackup-rev`'s own suggestion) rather than a third hand-copied
+implementation of `_zstd_extract`'s already-nontrivial trap-save/PGID-
+kill/wait-with-poll logic -- worth doing once, correctly, for a future
+round rather than duplicating ad hoc here.
+
+Full suite: **1340 passed, 0 failed.**
+
+### Round `omabackup-42`: verifying round 41's own fixes surfaced a real, deeper tension in the credential fix, plus two bugs in my own verification tests -- all closed, no CONFLITO
+
+Dispatched specifically to verify round 41's fixes. Both reviewers
+independently reproduced everything already claimed correct and found
+real, additional issues -- `omabackup-rev-2` also used this round to
+publicly retract their own round-41 suggestion (`--occurrence=1`) after
+reproducing why it was wrong, which is worth recording in its own right.
+
+- **CONFIRMED, `omabackup-rev`: reordering to redact-before-truncate
+  (round 41's own fix for the credential leak) reopened the memory bound
+  the byte cap existed to hold.** `dest_redact_output` is `sed`, which
+  must buffer a complete LINE before it can emit or redact any of it --
+  running it before the byte cap meant a single, unterminated
+  pathological line was no longer bounded by that cap at all. Confirmed
+  live under a deliberately small 20MB `ulimit -v`: a single unterminated
+  line reaching `dest_redact_output` before any truncation aborted with
+  "cannot allocate memory" (200MB reproduces this reliably; 5MB sits in a
+  flaky boundary zone depending on process/heap layout, confirmed both
+  ways). This is exactly the unbounded-memory shape HANCORE's original
+  finding was about, just relocated from "the shell holds the raw bytes"
+  to "sed holds the raw bytes." Fixed with a genuinely different design,
+  not another reordering of the same two filters: bound the RAW byte
+  stream with `head -c (cap + 1)` FIRST -- before any line-buffering
+  filter ever sees it, the same technique `_artifact_manifest_file`
+  already uses for the identical reason -- and only if that raw capture
+  came back longer than the cap (truncation genuinely happened) discard
+  the first line of it outright (or the whole thing, if no newline exists
+  at all) before `dest_redact_output` ever runs. A truncation point can
+  only ever land inside git's first line under this capture shape, so
+  discarding that first line removes any partial credential it might
+  hold, and `sed` only ever processes an already-small, already-bounded
+  buffer regardless of how it's shaped. This closes both properties
+  instead of trading one for the other: bounded memory (proven again
+  under the same 20MB `ulimit -v`, now with no allocation failure) and no
+  credential leak (existing redaction tests re-verified against the new
+  design, all still passing).
+- **CONFIRMED, `omabackup-rev`: the SIGPIPE-based bomb detection in
+  `_artifact_manifest_file` cannot reliably catch truncation right at the
+  cap boundary.** Whether `head -c` cutting the stream reaches back as a
+  SIGPIPE through tar/zstd depends on pipe-buffer timing, not just on
+  whether the true content exceeds the cap -- confirmed live: a manifest
+  exactly cap+1 bytes long, whose truncated cap-byte prefix happened to
+  still read as complete, valid JSON on its own, produced `pipestatus 0 0
+  0` (no SIGPIPE anywhere) and was accepted as valid despite genuinely
+  exceeding the limit. Fixed by reading one byte MORE than the real cap
+  and explicitly checking the WRITTEN file's own size afterward: if it
+  reached `cap + 1`, the true content was at or past the limit regardless
+  of which exit codes did or didn't fire. This does not replace the
+  exit-status check -- that still catches missing members and zstd's own
+  real corruption -- it closes the one class those statuses cannot:
+  silent, unsignaled truncation. Two new tests (exactly at the cap stays
+  valid, exactly one byte over is rejected) use a small test-only cap so
+  the fixture stays cheap.
+- **CONFIRMED, `omabackup-rev`: the credential-truncation regression test
+  added in round 41 did not actually discriminate.** Its 8000-byte prefix
+  under an 8192-byte cap meant the whole ~58-byte credentialed URL always
+  fit inside what `tail -c` kept, regardless of ordering -- it passed
+  against both the fixed order and the original vulnerable order,
+  proving nothing. Fixed with a precisely computed fixture (500 bytes of
+  noise + an exact URL, a 40-byte cap) that lands the cut specifically
+  inside the credential token, past the `scheme://user:` prefix
+  `dest_redact_output` needs to recognize it at all -- confirmed this
+  exact fixture leaks a token fragment under the old order and does not
+  under the new one before landing it.
+- **CONFIRMED, `omabackup-rev`: the `pipefail`-independence regression
+  test added in round 41 passed for the wrong reason.** Capturing
+  `_push_github`'s own stdout ("0" on success) immediately followed by an
+  unredirected `printf %s $?` (also "0" on success) concatenated both
+  into the literal string `"00"` with no separator -- `[[ "$GHPF_RC" !=
+  0 ]]` reads that as "not equal to the string 0" and passes on exactly
+  the false-success case the test exists to catch. Fixed by redirecting
+  `_push_github`'s own stdout to `/dev/null` before capturing `$?`, and
+  tightened the assertion to `== 1` (the function's own real failure
+  code) rather than the weaker `!= 0`.
+- **CONFIRMED, `omabackup-rev-2`: `timeout`/`head` are `coreutils`, not
+  packages under their own binary name -- the missing-dependency install
+  hint would have suggested `pacman -S timeout`, a package that does not
+  exist.** `_pkg_for`'s fallback echoes the bare tool name for anything
+  not in its explicit mapping table. Fixed by adding `timeout`/`head`/
+  `realpath` → `coreutils` and `find` → `findutils` to that table --
+  `realpath`/`find` had the identical pre-existing gap in already-shipped
+  `require_tools` calls elsewhere, closed in the same table while it was
+  already being touched for `timeout`/`head`.
+- **`omabackup-rev-2`'s own round-41 suggestion (`--occurrence=1`) was
+  independently retracted, by them, in this round.** Their own
+  reproduction confirmed the shipped fix (no `--occurrence=1`) is correct
+  across all four scenarios, and confirmed exactly why their own earlier
+  suggestion was wrong: their round-41 test fixture happened to place
+  `manifest.json` as the LAST member in the archive, the same favorable
+  ordering the original bug required, not the adversarial one --
+  "ironicamente, é o mesmo erro de método do achado que eu tinha acabado
+  de fazer." Recorded here because the honest correction matters as much
+  as the finding.
+
+**One further finding from `omabackup-rev-2`, deliberately deferred and
+folded into the already-open aggregate-timeout item below, not fixed
+this round:** without `--occurrence=1`, `tar` keeps scanning the rest of
+the archive looking for further occurrences even after finding a small,
+early `manifest.json` -- measured: an 877KB archive whose tiny manifest
+sits before ~25GB of incompressible padding still cost 9.2s of CPU per
+listing call, and was still accepted as valid. The byte cap offers no
+protection against this shape at all (it only bounds what is written,
+never what must be read to confirm there is nothing more to find), so
+only the existing per-file `timeout` bounds it today, and that bound is
+per file, not per listing. `omabackup-rev-2` measured a concrete,
+tested fix for a future round rather than asking for it now (their own
+words: "não estou pedindo que entre agora... registro como trabalho
+próprio, com a medição pronta"): `--occurrence=1` together with an
+explicit `PIPESTATUS` check that accepts `zstd`'s incidental 141 only
+when `tar` itself exited 0 (i.e., distinguishing "SIGPIPE because tar
+finished early" from "SIGPIPE because something really broke") --
+measured to cut the 877KB/25GB fixture from 9.2s down to 2ms while still
+correctly rejecting the bomb, missing-member, and trailing-garbage
+cases.
+
+Full suite: **1347 passed, 0 failed.**
+
+### Round `omabackup-43` (user-authorized 3rd verification round): the credential leak is back, via a different mechanism, and both reviewers say the iterative approach itself has stopped working -- stopped here, not fixed again solo
+
+This round found the `_push_github` fix from round 42 is not actually
+correct, on two independent lines of evidence, and both reviewers'
+closing remarks say the same thing in different words: this specific
+function has now failed three rounds in a row, each fix closing one of
+three competing properties while reopening another, and what is missing
+is not another patch but a written specification of the properties
+together. No CONFLITO between the reviewers -- they converged on the
+same defect from different angles and neither was disputed.
+
+- **CONFIRMED by both reviewers, independently: the "discard the first
+  line if truncation happened" remedy protects the wrong end of a
+  `head -c` capture.** `head -c` keeps the FIRST `cap+1` bytes and cuts
+  the stream's OWN END -- so when truncation happens, it is the LAST
+  captured line that is split, not the first. The round-42 fix discarded
+  the first line unconditionally, leaving a truncated LATER line (which
+  can hold a mid-cut credential) to reach `dest_redact_output` intact.
+  `dest_redact_output`'s own regex requires a trailing `@` to recognize a
+  credential's userinfo at all; a cut that lands before that `@` produces
+  no match, and the fragment -- up to and including a COMPLETE token,
+  depending on exactly where the cut falls -- passes through unredacted.
+  `omabackup-rev-2` swept the cap across a real fixture (`fatal:
+  'https://u:ghp_FULLTOKEN@github.com/a/b.git'`) and found a real window
+  where the ENTIRE token survives in the clear (cap=40: `[fatal:
+  'https://u:ghp_FULLTOKEN]`, no `@` yet, so `dest_redact_output` never
+  engages). `omabackup-rev` independently confirmed the identical
+  mechanism with a two-line fixture placing the credential on line 2. The
+  round-42 test written specifically to catch this does not: its
+  own fixture's byte math was computed for a `tail -c` capture (the
+  round-41 shape) and never recomputed when the code shipped as
+  `head -c` instead -- both reviewers independently ran the exact fixture
+  against the shipped code with redaction on AND off and got the
+  identical "push failed" result either way, proving the test currently
+  discriminates nothing.
+- **CONFIRMED, `omabackup-rev`: `head -c` on `git`'s own combined
+  stdout/stderr can cut `git` itself off mid-operation.** Unlike
+  `_artifact_manifest_file`'s use of the same idiom (reading a static,
+  already-decompressed archive -- nothing on the other end of that pipe
+  has a real-world side effect from being cut off), `git push` is a live
+  operation with a real outcome. Once `head -c` has read its `cap+1`
+  bytes it closes its end of the pipe; if `git` is still writing
+  (verbose progress, a hook's own output) when that happens, `git`
+  receives SIGPIPE on ITS next write and typically dies to it, since it
+  installs no handler -- potentially before the push itself finishes, or
+  before its own exit code can be trusted to reflect whether the push
+  actually landed. Reproduced live: a producer writing 200,000 bytes
+  before its own `exit 0` was cut short and reported as a generic
+  failure.
+- **CONFIRMED, `omabackup-rev`: unvalidated arithmetic on a user-supplied
+  cap can silently reproduce a bug this project already fixed once.**
+  `$(( CAP + 1 ))` with `CAP` near the top of bash's signed 64-bit range
+  (already accepted by the existing `^[1-9][0-9]*$` validation, which
+  checks shape, not magnitude) wraps to a negative number -- and GNU
+  `head -c` treats a negative count as "all but the last N bytes," the
+  exact opposite of a cap, the identical class of bug `OMABACKUP_RESTORE_MAX_BYTES`
+  was hardened against in an earlier round. Reproduced: `CAP=18446744073709551614`
+  makes `$(( CAP + 1 ))` evaluate to `-1`.
+- **CONFIRMED, `omabackup-rev-2`: the credential-truncation test's OWN
+  fixture was computed for the wrong pipe shape a second time.** The
+  fixture comment explicitly says "a 40-byte cap keeps only
+  `CRETTOKEN@example.com/repo...`" -- true for `tail -c`, the shape the
+  fixture was designed against, but the shipped code captures with
+  `head -c 41`, which keeps 41 bytes of the leading padding and never
+  reaches the credential at all. Confirmed by running the exact fixture
+  with redaction on and off and getting the same result either way.
+  `omabackup-rev-2`'s own phrasing: the same defect `omabackup-rev`
+  reported in round 42 (a fixture that passed against both pipe orders),
+  reintroduced by fixing the code without re-deriving the test's own
+  arithmetic to match.
+- **Verified correct, no new finding: the `cap+1`-byte size check for
+  `_artifact_manifest_file`'s own boundary gap (round 42) holds under
+  exhaustive testing** (`omabackup-rev-2`, every offset from `cap-2`
+  through `cap+50` produced the right accept/reject decision, including
+  confirming the decision comes from the written size, not from `jq` or
+  any exit code), **and the `_pkg_for` mapping and the `pipefail`-
+  independence test fix are both solid** (both reviewers).
+
+**Both reviewers' closing observation, not itself a finding but the
+reason this stops here rather than continuing to a 4th self-directed
+round:** this is the fifth consecutive round in which fixing one
+property of this exact ten-line function broke a different one --
+redact-then-truncate leaked a credential; truncate-then-redact reopened
+the memory bound; the current bound-then-discard-a-line design leaks a
+credential again, via the opposite end of the same mechanism. Three
+properties are in real, simultaneous tension (bounded memory, a
+credential must never be split by truncation, and the USEFUL diagnostic
+is what git prints last, not first), and `omabackup-rev-2` explicitly
+declined to prescribe another quick swap after testing the obvious one
+(`head -c` → `tail -c` alone) and finding it independently broken by a
+different bug (command substitution stripping trailing newlines
+under-detects truncation when the cut lands exactly on a line boundary).
+Their own recommendation: a written specification of what all three
+properties actually require simultaneously, with one test per property
+that genuinely discriminates -- not another reactive pipe-order swap.
+Nothing was fixed in response to this round; `_push_github`'s output
+handling is unresolved and known-broken (the credential leak) as this
+entry is written.
+
+Full suite otherwise unaffected: **1347 passed, 0 failed** (the broken
+credential-truncation test still reports green, per both reviewers'
+own explicit warning -- it does not currently exercise the code path
+that leaks).
+
+### `_push_github`'s output handling redesigned around the user's own call: drop the live-diagnostic property instead of continuing to trade memory-safety against credential-safety
+
+Presented with round 43's finding (both properties cannot hold
+simultaneously under a `head -c` capture, and the obvious alternative
+`tail -c` fails for a fourth, different reason `omabackup-rev-2` found
+before suggesting it), the user chose the third option offered:
+**stop trying to satisfy all three properties in one pipe.** Terminal and
+persisted-state output on a failed push become a fixed, generic message
+("push failed (see log for details)"); the real, redacted output goes to
+this project's own persistent log (`lib/log.sh`) instead, one line at a
+time.
+
+**The redesign**, not a fifth pipe-order swap: `git push`'s combined
+stdout/stderr now redirects to a plain temporary FILE, never a pipe.
+This closes the round-43 finding neither prior design addressed at all --
+`omabackup-rev`'s point that piping into `head -c` risks SIGPIPE-ing
+`git` itself mid-write, a live operation with a real side effect, unlike
+`_artifact_manifest_file` reading an already-static archive. A file
+redirect has no reader to close early, so `git` always reaches its own
+real exit code, confirmed live with a fake `git` writing 400 lines of
+chatter before a completion marker: the marker exists every time,
+regardless of how small the output cap is set. Once `git` has actually
+exited, the file is read with `tail -c (cap + 1)` -- now provably safe,
+since there is no live writer left to interrupt -- and if that came back
+longer than the cap, the FIRST line of the truncated chunk is discarded
+(matching `tail -c`'s own truncation direction correctly this time: it
+keeps a stream's END and cuts its START, so the line at risk is the
+first one, the opposite of the `head -c` case rounds 41/42 dealt with).
+What remains is read one complete line at a time and each line is
+redacted and appended to the log via the existing `_log_write` primitive
+-- no line-buffering filter ever sees more than one already-small,
+already-verified-complete line at once, and there is no pipe left in the
+command that actually runs `git` at all, which also fully retires the
+`pipefail`/`PIPESTATUS` question three rounds spent getting right: `git`'s
+own `$?` is now the whole story.
+
+Verified directly against all four properties before landing: a cap sweep
+(5 to 100 bytes) across the exact fixture `omabackup-rev-2` used to prove
+a full credential token could leak found no leak at any point; the same
+200MB-unterminated-line fixture from round 42 stays memory-safe under
+`ulimit -v 20000` (now with no `sed`-driven allocation at all, since
+`tail -c` reads a completed file, not a live stream); `git` was confirmed
+to always reach its own natural completion regardless of cap size.
+
+**A second, independent finding from the same round, fixed at the same
+time in both affected files:** `omabackup-rev` found that neither
+`ARTIFACT_MANIFEST_MAX_BYTES` (`lib/artifacts.sh`) nor
+`DEST_PUSH_OUTPUT_MAX_BYTES` (`lib/destinations.sh`) validated an
+override's MAGNITUDE, only its shape (`^[1-9][0-9]*$`) -- a value near
+bash's signed 64-bit boundary makes each file's own `$(( cap + 1 ))`
+wrap to a negative number, and GNU `head`/`tail -c` treat a negative
+count as "all but the last N bytes," the exact inverse of a cap. This is
+the identical class of bug already closed once for
+`OMABACKUP_RESTORE_MAX_BYTES` (`lib/bundle.sh`) -- reproduced live in
+both new locations (`CAP=18446744073709551614` making `$(( CAP + 1 ))`
+evaluate to `-1`) and fixed with the same length-then-range validation
+pattern `_log_tail`'s own `LOG_TAIL_MAX_LINES` check already established,
+bounded at 1 GiB for both (far more headroom than either legitimate
+default -- 1 MiB, 8 KiB -- could plausibly need, nowhere near the
+overflow boundary even after `+ 1`).
+
+New tests: a cap sweep proving no credential leak in the real CLI
+end-to-end; a completion-marker test proving `git` is never cut off
+mid-write; one arithmetic-overflow regression per file, each asserting
+the override falls back to the safe default rather than resolving to a
+negative number. The now-obsolete "sanitizes Git transport controls
+before printing a push failure" test (checking the terminal, which no
+longer carries git's own text at all) was replaced with two: one
+confirming the terminal message is now the fixed generic form, one
+confirming the control-character-sanitization property moved to where
+git's own text actually goes now -- the log entry.
+
+Full suite: **1354 passed, 0 failed.**
+
+### Round `omabackup-44`: verifying the file-redirect redesign found the credential leak back for a FOURTH time, via a fourth mechanism -- fixed with the same idiom `_artifact_manifest_file` already established; one more finding left open by the user's own choice
+
+User-authorized verification round on the redesign above. Both reviewers
+independently converged on the same root cause for the same property
+that has now broken four rounds running:
+
+**P1, CONFIRMADO by both reviewers -- the truncation guard never fires
+on git's own output, because it always ends in a newline.**
+`raw="$(tail -c "$(( CAP + 1 ))" -- "$tmpfile")"` followed by
+`(( ${#raw} > CAP ))` looks sound, but bash's command substitution
+strips `raw`'s trailing newline unconditionally -- and since `git`'s
+combined stdout/stderr always ends in `\n`, the byte count of `raw` is
+always exactly `CAP`, never `CAP + 1`, regardless of how much was
+actually cut. The guard is therefore dead code in the ordinary case: the
+first line of a truncated capture is never discarded, and whatever
+`https://` fragment survives the cut is the only thing standing between
+a full credential and the log. `omabackup-rev-2` measured this directly
+against a plain 80-byte fixture (guard fires only when the source file
+has no trailing newline at all) and then against the CLI end-to-end with
+the project's own test fixture, reproducing leaks at caps 33-37 --
+including the complete token in the clear at cap 28. `omabackup-rev`
+reached the identical root cause independently and reproduced the same
+leak window (23-36) against a different fixture.
+
+**The fix**, tested by `omabackup-rev-2` across 192 combinations (2
+fixtures × caps 5-100) plus a multi-line case before being proposed:
+detect truncation off the file's own size (`stat -c %s -- "$tmpfile"`,
+read before the file is deleted), not off the post-substitution string
+length. This is not a new idiom -- it is the exact technique
+`_artifact_manifest_file` (`lib/artifacts.sh`) already uses for its own
+post-pipe size check, established two rounds ago for an analogous
+problem. Applied as a two-line change: capture `sz` via `stat` right
+before `raw` via `tail -c`, and gate the first-line discard on
+`sz > CAP` instead of `${#raw} > CAP`.
+
+Verified live before landing, with the reviewer's own reproduction
+fixture: a cap sweep from 5 to 100 against `fatal: 'https://u:ghp_FULLTOKEN@github.com/a/b.git'`
+found zero leaks with the fix applied. Confirmed the two updated tests
+actually discriminate -- reverted just this one guard back to `${#raw}`
+(not the whole file's other rounds of work) and re-ran: both new/updated
+tests failed exactly as expected against the reintroduced bug, then
+passed again once the fix was restored.
+
+**P2, CONFIRMADO by both reviewers -- the credential-leak tests were
+checking a surface the round-43 redesign had already made safe by
+construction, so they proved nothing about redaction.** Both the cap
+sweep ("no cap in the 5-100 byte range leaks...") and the mid-URL
+truncation test ("a credential is redacted even when it sits inside
+output...") asserted against the CLI's own stdout and
+`.lastError.message` -- but since round 43's redesign, the terminal only
+ever prints the fixed generic string and `.lastError.message` is derived
+from that same string, so both surfaces are safe unconditionally,
+whether or not `dest_redact_output` or the truncation guard work at all.
+The token was reaching the log the entire time these tests reported
+green. Fixed by pointing both tests at
+`$STATE/log/omabackup-<date>.log` instead -- the only surface git's own
+text still reaches -- matching the pattern the adjacent
+"sanitizes Git transport controls before writing a push failure to the
+log" test already established. Per `omabackup-rev`'s own suggestion,
+also added a positive assertion (a high cap where the URL fits whole and
+must appear in the log, redacted) proving the log-write path is
+genuinely exercised, not just silent-and-therefore-passing.
+
+**One more finding, ÚNICO (`omabackup-rev` only), left open by the
+user's own explicit choice rather than folded into this round:**
+because `git push`'s combined output now redirects straight to a plain
+temp file with no cap applied during the write itself, a hostile or
+misbehaving remote could grow that file for as long as `git` keeps
+writing -- bounded by `DEST_PUSH_TIMEOUT_SEC` (120s default) in wall-clock
+terms, but not in bytes, before `tail -c` ever gets to look at it. This
+moves the resource-exhaustion risk the original memory-bound property
+was protecting against from process memory (round 41's `sed`-based OOM)
+to disk/tmpfs -- a different resource, not eliminated. `omabackup-rev-2`
+did not independently flag this; not disputed, simply not raised. Not
+fixed this round: the user chose to apply only the tested, converged,
+low-risk P1 fix and its matching test correction, and to leave this
+second, differently-shaped concern (which would need either a bounded
+streaming consumer or an `ulimit -f`-style file-size cap on the
+`git`-running subshell) open rather than attempt a same-round fix on a
+function that has now seen four consecutive rounds of one-property-
+breaks-another.
+
+New/changed tests: the cap-sweep test now reads the log instead of
+stdout, plus a new positive-preservation test alongside it; the mid-URL
+truncation test now reads the log instead of stdout/`.lastError.message`.
+
+Full suite: **1353 passed, 0 failed.**
+
 ## Open questions for the user, not yet decided
 
+- **`_push_github`'s temp file has no byte cap while `git` is still
+  writing to it** (full writeup above, round `omabackup-44`, 2026-09-06):
+  the file-redirect redesign that closed the SIGPIPE and pipefail
+  questions moved the old memory-exhaustion risk (round 41's `sed`-based
+  OOM) to disk/tmpfs instead of eliminating it -- a hostile or hung
+  remote can grow the temp file for up to `DEST_PUSH_TIMEOUT_SEC` (120s
+  default) before anything caps it. Found by `omabackup-rev` only, not
+  disputed by `omabackup-rev-2`, and deliberately left unfixed this round
+  by the user's own choice -- would need either a bounded streaming
+  consumer (reintroducing some of the complexity the file redirect was
+  meant to avoid) or an `ulimit -f`-style file-size cap on the
+  `git`-running subshell.
+- **`lib/artifacts.sh`/`lib/destinations.sh`'s new `timeout`-wrapped process
+  groups don't forward signals, and `_artifacts_for_dest`'s per-file
+  timeout has no aggregate ceiling** (full writeup above, rounds
+  `omabackup-41`/`42`, 2026-09-06): a cancelled listing/push can leave
+  `zstd`/`tar`/`git` running in the background up to their own full
+  timeout. Separately, and measured precisely in round 42: without
+  `--occurrence=1`, `tar` scans a matched file's ENTIRE remaining archive
+  even after finding an early `manifest.json`, so a small manifest ahead
+  of a large amount of padding still costs real CPU per file (measured:
+  877KB archive, ~25GB of padding after the manifest, 9.2s of CPU, still
+  accepted as valid) -- the byte cap does not protect against this shape
+  at all, since it only bounds what gets WRITTEN, never what must be READ
+  to confirm nothing more is there. N such files in one shared
+  destination multiply that cost, with no overall budget or honest
+  partial-listing state when a cap like that is exceeded. Both P2/P3 (a
+  hard wall-clock ceiling already exists either way), deferred rather
+  than folded into either round. `omabackup-rev-2` measured a concrete
+  fix for the CPU-cost half in round 42, tested but not applied:
+  `--occurrence=1` together with an explicit `PIPESTATUS` check accepting
+  `zstd`'s own incidental SIGPIPE (141) only when `tar` itself exited 0 --
+  cut the 877KB/25GB fixture from 9.2s to 2ms while still correctly
+  rejecting the bomb/missing-member/trailing-garbage cases. The
+  signal-forwarding half still separately wants a shared helper extracted
+  from `_zstd_extract`'s own existing logic (`lib/bundle.sh`), not a third
+  hand-copied implementation.
 - **Multi-monitor `IpcHandler` collision** (full writeup above, 2026-09-01):
   every per-monitor Panel.qml instance declares an `IpcHandler` with the
   same target, so only one instance ever receives ANY of the six exposed

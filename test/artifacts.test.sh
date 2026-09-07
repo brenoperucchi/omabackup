@@ -163,6 +163,32 @@ assert_eq "$(jq -r '.destinations | length' <<<"$G2OUT")" "0"
 it "artifacts refuses an unknown flag rather than silently ignoring it"
 assert_contains "$(_art_env "$NH" artifacts --apply)" "unknown flag"
 
+# ── review round omabackup-41 (`omabackup-rev`): timeout/head were never
+# declared as required tools, even though _artifact_manifest_file (this same
+# round's own byte-cap/timeout fix) depends on both -- a system missing
+# either made every manifest read look like a corrupt archive instead of the
+# CLI naming the actual missing dependency ─────────────────────────────────
+DEPH="$(mktemp -d)"
+DEPPATH="$(mktemp -d)"
+for t in bash jq find zstd tar sh env cat printf mktemp grep sed cut basename dirname date wc stat rm mkdir cp mv chmod ls sort id readlink getent hostname; do
+    p="$(command -v "$t" 2>/dev/null)" && ln -sf "$p" "$DEPPATH/$(basename "$p")" 2>/dev/null
+done
+DEPOUT="$(PATH="$DEPPATH" HOME="$DEPH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$DEPH/.state" XDG_RUNTIME_DIR=/nonexistent "$OB" artifacts 2>&1)"
+
+it "artifacts reports missing timeout/head as a dependency error, not a corrupt-archive symptom"
+assert_contains "$DEPOUT" "missing required tool"
+assert_contains "$DEPOUT" "timeout"
+assert_contains "$DEPOUT" "head"
+
+# Found by review (round omabackup-42, `omabackup-rev-2`): timeout/head are
+# coreutils, not packages under their own binary name -- `_pkg_for`'s
+# fallback echoed the bare tool name, so the install hint above would have
+# read "pacman -S timeout", a package that does not exist.
+it "and names the real installable package (coreutils), not the bare binary name"
+assert_contains "$DEPOUT" "coreutils"
+assert_not_contains "$DEPOUT" "pacman -S timeout head"
+
 # ── review round: a pipeline that extracted fine and THEN failed ───────────
 # _artifact_manifest sets pipefail specifically so a zstd failure downstream
 # of tar is observed -- but the caller was not reading that status, only the
@@ -300,6 +326,191 @@ NUOUT="$(_art_env "$NUH" artifacts --json)"
 
 it "a manifest.json containing a raw NUL byte is rejected, not silently truncated and accepted"
 assert_eq "$(jq -r '.destinations[0].artifacts[0].valid' <<<"$NUOUT")" "false"
+
+# ── marketplace security review, 2026-09-06: a decompression bomb in the
+# LISTING path, not just restore's own extraction ──────────────────────────
+# https://github.com/omacom/omarchy-plugin-marketplace/issues/3968#issuecomment-5560428690:
+# _artifact_manifest_file ran `zstd -dc | tar -xO` over every matching file in
+# a `dir` destination -- a mount this tool shares with other processes by
+# design -- with no bound of its own. _zstd_extract (lib/bundle.sh) already
+# closed the identical shape for restore's own extraction; this proves the
+# listing path is now bounded the same way. A real bomb: 50MB of a repeated
+# byte named exactly `manifest.json` compresses to a few KB. Note this is NOT
+# proven by "valid:false" alone -- non-JSON content fails jq's own shape check
+# regardless of whether the byte cap did anything, so that alone cannot tell
+# a bounded read from an unbounded one that happened to reject the content
+# for an unrelated reason. The real proof is direct, same shape as
+# lib/bundle.sh's own bomb test: call _artifact_manifest_file itself and
+# measure what it actually wrote.
+BOMBASTAGE="$(mktemp -d)"
+head -c 50000000 /dev/zero | tr '\0' 'a' >"$BOMBASTAGE/manifest.json"
+BOMBARCHIVE="$(mktemp -d)/bomb.tar.zst"
+tar -C "$BOMBASTAGE" -cf - . 2>/dev/null | zstd -q -19 -o "$BOMBARCHIVE" 2>/dev/null
+
+it "a manifest.json decompression bomb really does compress to far less than it expands to"
+BOMBAFULLSIZE="$(zstd -dc "$BOMBARCHIVE" 2>/dev/null | tar -xO ./manifest.json 2>/dev/null | wc -c)"
+(( $(stat -c %s "$BOMBARCHIVE") < 10000 && BOMBAFULLSIZE > 40000000 )) \
+    && ok || fail "bomb fixture is not actually lopsided: archive=$(stat -c %s "$BOMBARCHIVE") decompressed=$BOMBAFULLSIZE"
+
+# ARTIFACT_MANIFEST_MAX_BYTES is computed once when lib/artifacts.sh is
+# sourced -- same pattern lib/bundle.sh's own BUNDLE_EXTRACT_MAX_BYTES test
+# already establishes -- so the override has to be in the environment BEFORE
+# that source line, not prefixed onto the function call after it.
+BOMBAOUTFILE="$(mktemp -d)/manifest.json"
+BOMBARC="$(OMABACKUP_ARTIFACT_MANIFEST_MAX_BYTES=1000000 bash -c '
+    source lib/artifacts.sh
+    _artifact_manifest_file "$1" "$2"
+    printf %s $?
+' _ "$BOMBARCHIVE" "$BOMBAOUTFILE")"
+
+it "_artifact_manifest_file refuses to let the decompressed stream exceed OMABACKUP_ARTIFACT_MANIFEST_MAX_BYTES"
+[[ "$BOMBARC" != 0 ]] && ok || fail "expected a non-zero return for an oversized decompressed stream"
+
+it "and the written file stays bounded near the cap, not the archive's full 50MB payload"
+BOMBAWRITTEN="$(stat -c %s "$BOMBAOUTFILE" 2>/dev/null || echo 0)"
+(( BOMBAWRITTEN < 2000000 )) \
+    && ok || fail "expected well under 2MB written for a 1MB cap, got $BOMBAWRITTEN bytes"
+
+# End-to-end: the same bomb, at the DEFAULT 1 MiB cap, through the real CLI --
+# proves the bound is actually wired into the listing path a user hits, not
+# just reachable by calling the internal function directly.
+BOMBAH="$(mktemp -d)"
+BOMBANAS="$BOMBAH/nas"; mkdir -p "$BOMBANAS"
+cp "$BOMBARCHIVE" "$BOMBANAS/omabackup-bomb-20200101-000000-bbbbbbbbbbbb.tar.zst"
+cat >"$BOMBAH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$BOMBANAS","keep":3}]}
+JSON
+BOMBAOUT="$(_art_env "$BOMBAH" artifacts --json)"
+
+it "artifacts --json marks the bomb artifact invalid through the real CLI, at the default cap"
+assert_eq "$(jq -r '.destinations[0].artifacts[0].valid' <<<"$BOMBAOUT")" "false"
+
+# ── review round omabackup-41 (both reviewers, independently): the first fix
+# above put the byte cap on the WRONG side of tar, rejecting a perfectly
+# legitimate large bundle whose own manifest.json happens to sit past 1 MiB
+# in the decompressed tar stream ──────────────────────────────────────────
+# A real bundle's own total size is unbounded on purpose (lib/bundle.sh's
+# build_bundle includes the whole repo.bundle -- the dotfiles repo's full git
+# history, which only grows) and `tar -C stage -cf - .` has no `--sort`, so
+# manifest.json's own position is whatever readdir happens to return, not
+# something this project controls. Neither prior test caught this: the bomb
+# fixture's own manifest.json IS the oversized content, at offset 0 -- this
+# fixture is a genuinely small, valid manifest sitting AFTER 2MB of unrelated
+# content, well past the 1 MiB default cap, proving the cap bounds what tar
+# extracts, not how far it may read to find the member.
+LATEH="$(mktemp -d)"
+LATESTAGE="$(mktemp -d)"
+head -c 2000000 /dev/urandom >"$LATESTAGE/aaa-bigfile.bin"
+printf '{"host":"late-manifest","createdAt":"2026-09-06T00:00:00Z"}' >"$LATESTAGE/zzz-manifest.json"
+mv "$LATESTAGE/zzz-manifest.json" "$LATESTAGE/manifest.json"
+LATEARCHIVE="$(mktemp -d)/late.tar.zst"
+tar -C "$LATESTAGE" -cf - . 2>/dev/null | zstd -q -o "$LATEARCHIVE" 2>/dev/null
+
+it "a legitimate bundle whose own total size exceeds the cap still extracts its (small) manifest"
+LATEOUTFILE="$(mktemp -d)/manifest.json"
+LATERC="$(bash -c '
+    source lib/artifacts.sh
+    _artifact_manifest_file "$1" "$2"
+    printf %s $?
+' _ "$LATEARCHIVE" "$LATEOUTFILE")"
+[[ "$LATERC" == 0 ]] && ok || fail "expected rc=0 for a legitimate bundle with a late manifest, got $LATERC"
+jq -e . "$LATEOUTFILE" >/dev/null 2>&1 && ok || fail "expected valid JSON in the extracted manifest"
+
+LATEH_NAS="$LATEH/nas"; mkdir -p "$LATEH_NAS"
+cp "$LATEARCHIVE" "$LATEH_NAS/omabackup-late-20200101-000000-cccccccccccc.tar.zst"
+cat >"$LATEH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$LATEH_NAS","keep":3}]}
+JSON
+LATEOUT="$(_art_env "$LATEH" artifacts --json)"
+
+it "and artifacts --json reports it valid:true through the real CLI, not vanished from the list"
+assert_eq "$(jq -r '.destinations[0].artifacts[0].valid' <<<"$LATEOUT")" "true"
+assert_eq "$(jq -r '.destinations[0].artifacts[0].host' <<<"$LATEOUT")" "late-manifest"
+
+# ── review round: a valid frame with trailing garbage must still be rejected
+# even without --occurrence=1 (the addition considered and rejected above) --
+# zstd runs to completion regardless of where in the archive tar's own
+# target member sits, so it still independently reports the corruption it
+# finds on its own. Not a new scenario -- the existing "trailing garbage"
+# test earlier in this file already covers it end to end; this is a direct,
+# low-level confirmation that the reordered pipe didn't quietly break it.
+it "trailing garbage after a valid frame is still rejected by the reordered pipe"
+GARBAGEH="$(mktemp -d)"
+printf '{"host":"x"}' >"$GARBAGEH/manifest.json"
+GARBAGEARCHIVE="$(mktemp -d)/garbage.tar.zst"
+tar -C "$GARBAGEH" -cf - . 2>/dev/null | zstd -q -o "$GARBAGEARCHIVE" 2>/dev/null
+printf 'trailing garbage' >>"$GARBAGEARCHIVE"
+GARBAGERC="$(bash -c '
+    source lib/artifacts.sh
+    _artifact_manifest_file "$1" "$2"
+    printf %s $?
+' _ "$GARBAGEARCHIVE" "$(mktemp -d)/manifest.json")"
+[[ "$GARBAGERC" != 0 ]] && ok || fail "expected a non-zero return for trailing garbage after a valid frame, got $GARBAGERC"
+
+# ── review round omabackup-42 (`omabackup-rev`): the pipe's own exit status
+# cannot detect truncation right at the cap boundary ────────────────────────
+# Whether `head -c` cutting the stream reaches back as a SIGPIPE through
+# tar/zstd depends on pipe-buffer timing, not just on whether the content
+# truly exceeds the cap -- confirmed live: a manifest exactly cap+1 bytes
+# long, whose truncated cap-byte PREFIX happens to still read as complete,
+# valid JSON on its own, produced pipestatus 0 0 0 (no SIGPIPE anywhere) and
+# was accepted as valid despite genuinely exceeding the configured limit.
+# This is a small cap deliberately, not the real 1 MiB default, so the test
+# fixture stays cheap.
+EDGEOUTFILE="$(mktemp -d)/manifest.json"
+EDGEARCHIVE="$(mktemp -d)/edge.tar.zst"
+EDGESTAGE="$(mktemp -d)"
+python3 -c "
+import json
+cap = 1000
+obj = json.dumps({'host': 'x'})
+pad = 'a' * (cap - len(obj))
+content = obj[:-1] + pad + obj[-1] + 'X'  # exactly cap+1 bytes; first cap bytes alone are valid JSON
+assert len(content) == cap + 1
+open('$EDGESTAGE/manifest.json', 'w').write(content)
+"
+tar -C "$EDGESTAGE" -cf - . 2>/dev/null | zstd -q -o "$EDGEARCHIVE" 2>/dev/null
+EDGERC="$(OMABACKUP_ARTIFACT_MANIFEST_MAX_BYTES=1000 bash -c '
+    source lib/artifacts.sh
+    _artifact_manifest_file "$1" "$2"
+    printf %s $?
+' _ "$EDGEARCHIVE" "$EDGEOUTFILE")"
+
+it "a manifest exactly one byte past the cap is rejected, even when no SIGPIPE ever fires"
+[[ "$EDGERC" != 0 ]] && ok || fail "expected a non-zero return for content exactly cap+1 bytes long, got $EDGERC"
+
+it "and a manifest exactly AT the cap (not one byte over) is still accepted"
+AT_CAP_OUTFILE="$(mktemp -d)/manifest.json"
+AT_CAP_ARCHIVE="$(mktemp -d)/atcap.tar.zst"
+AT_CAP_STAGE="$(mktemp -d)"
+python3 -c "
+import json
+cap = 1000
+obj = json.dumps({'host': 'x'})
+content = obj[:-1] + 'a' * (cap - len(obj)) + obj[-1]  # exactly cap bytes, valid JSON
+assert len(content) == cap
+open('$AT_CAP_STAGE/manifest.json', 'w').write(content)
+"
+tar -C "$AT_CAP_STAGE" -cf - . 2>/dev/null | zstd -q -o "$AT_CAP_ARCHIVE" 2>/dev/null
+AT_CAP_RC="$(OMABACKUP_ARTIFACT_MANIFEST_MAX_BYTES=1000 bash -c '
+    source lib/artifacts.sh
+    _artifact_manifest_file "$1" "$2"
+    printf %s $?
+' _ "$AT_CAP_ARCHIVE" "$AT_CAP_OUTFILE")"
+[[ "$AT_CAP_RC" == 0 ]] && ok || fail "expected rc=0 for content exactly at the cap (not over it), got $AT_CAP_RC"
+
+# ── review round omabackup-43 (`omabackup-rev`): unvalidated arithmetic on
+# a user-supplied cap can silently reproduce the exact head-c-negative-count
+# bug this project already closed once for OMABACKUP_RESTORE_MAX_BYTES --
+# `$(( CAP + 1 ))` on a CAP near bash's signed 64-bit boundary wraps negative,
+# and GNU `head -c` treats a negative count as "all but the last N bytes" ──
+AM_OVERFLOW_VAL="$(OMABACKUP_ARTIFACT_MANIFEST_MAX_BYTES=18446744073709551614 bash -c '
+    source lib/artifacts.sh
+    printf %s "$ARTIFACT_MANIFEST_MAX_BYTES"
+')"
+
+it "an OMABACKUP_ARTIFACT_MANIFEST_MAX_BYTES near the 64-bit boundary falls back to the safe default instead of wrapping negative"
+assert_eq "$AM_OVERFLOW_VAL" "1048576"
 
 # ── review round: an unmounted drive's empty mountpoint is not "empty" ─────
 # A destination that succeeded before (its state file has lastSuccess) but

@@ -13,51 +13,180 @@
 # unmounted is not the same fact as a NAS with nothing on it yet, and a `find`
 # that stopped partway is not a listing either -- same reasoning `prune_bundles`
 # already applies to deletion, applied here to what gets shown at all.
+#
+# _artifact_manifest_file's own decompressed-byte cap and wall-clock timeout,
+# below -- flagged by marketplace security review (2026-09-06): this listing
+# path runs `zstd -dc | tar -xO` over EVERY matching file in a `dir`
+# destination this tool shares with other processes by design (NAS,
+# Syncthing), with no bound of its own. `_zstd_extract` (lib/bundle.sh) closed
+# the identical shape for the restore path itself; this is the same fix
+# applied to the read-only listing path restore's own bound never covered.
+#
+# 1 MiB, not lib/bundle.sh's 4 GiB: a real manifest.json (host, createdAt,
+# omarchy identity, repo head/dirty, verify.ok) is a few hundred bytes. 1 MiB
+# is generous headroom for that shape while still bounding a crafted archive's
+# worst case to something that costs nothing to reject, not "however much CPU
+# and temp-filesystem space exists." Validated as a canonical positive decimal
+# before use, same reasoning as OMABACKUP_RESTORE_MAX_BYTES (lib/bundle.sh):
+# GNU `head -c -N` means "all but the last N bytes," the opposite of a cap, so
+# an unvalidated negative override would have made this functionally
+# unlimited instead of tighter.
+#
+# This cap MUST apply to what `tar -xO` writes OUT, not to how far it may
+# read to find the member -- round omabackup-41 review (both reviewers,
+# independently) caught the first version of this fix applying it to the
+# latter instead: `head -c` sat BETWEEN zstd and tar, bounding the raw
+# decompressed TAR STREAM tar is allowed to consume before giving up. A
+# legitimate bundle's own total size is unbounded on purpose (`build_bundle`,
+# lib/bundle.sh, includes the whole `repo.bundle` -- the dotfiles repo's full
+# git history, which only grows -- plus this tool's own ~500KB `tool/`
+# staging), and `tar -C stage -cf - .` has no `--sort`, so `./manifest.json`'s
+# own position in the archive is whatever `readdir` happens to return, not
+# something this project controls. `omabackup-rev-2` reproduced the failure
+# end to end: a real, non-malicious 3MB artifact with `manifest.json` placed
+# after `repo.bundle` was reported `valid:false` ("corrupt or truncated
+# archive") and vanished from the restore TUI's own artifact list entirely --
+# indistinguishable from a genuinely corrupt backup, for a backup that was
+# completely intact. See _artifact_manifest_file's own updated pipe order
+# below for the fix.
+# Length-bounded against ARTIFACT_MANIFEST_MAX_BYTES_CEILING before ANY
+# arithmetic context, same reasoning and shape as _log_tail's own
+# LOG_TAIL_MAX_LINES check (lib/log.sh) -- found by review (round
+# omabackup-43, `omabackup-rev`): `^[1-9][0-9]*$` alone accepts a decimal
+# so large that `_artifact_manifest_file`'s own `$(( ARTIFACT_MANIFEST_MAX_BYTES + 1 ))`
+# overflows bash's signed 64-bit `(( ))` and wraps to a negative number --
+# and GNU `head -c` treats a negative count as "all but the last N bytes,"
+# the exact opposite of a cap, the same class of bug already closed once
+# for OMABACKUP_RESTORE_MAX_BYTES (lib/bundle.sh). 1 GiB is far more
+# headroom than a real manifest.json's own default (1 MiB) could ever
+# plausibly need to grow into, while sitting nowhere near the overflow
+# boundary even after the `+ 1`.
+ARTIFACT_MANIFEST_MAX_BYTES_CEILING=1073741824
+if [[ "${OMABACKUP_ARTIFACT_MANIFEST_MAX_BYTES:-}" =~ ^[1-9][0-9]*$ ]] \
+    && (( ${#OMABACKUP_ARTIFACT_MANIFEST_MAX_BYTES} <= ${#ARTIFACT_MANIFEST_MAX_BYTES_CEILING} )) \
+    && (( 10#$OMABACKUP_ARTIFACT_MANIFEST_MAX_BYTES <= ARTIFACT_MANIFEST_MAX_BYTES_CEILING )); then
+    ARTIFACT_MANIFEST_MAX_BYTES="$OMABACKUP_ARTIFACT_MANIFEST_MAX_BYTES"
+else
+    ARTIFACT_MANIFEST_MAX_BYTES=1048576
+fi
 
-# _artifact_manifest <archive> -- prints manifest.json's bytes on stdout.
-# Mirrors _zstd_extract's own reasoning (lib/bundle.sh): `tar -xO` alone would
-# report only tar's exit status, and tar can finish reading the one member it
-# wants before a later zstd failure downstream of the pipe is ever observed --
-# a valid frame followed by trailing garbage extracts manifest.json cleanly
-# and only THEN fails, past the point tar had any reason to notice. pipefail
-# makes the pipeline's status the worse of the two, and the CALLER now reads
-# that status (a review round caught it not being read at all: an artifact
-# `restore` itself refuses as unextractable was still reported here as
-# valid:true). This never writes anything to disk and never runs the
-# artifact's own embedded tool -- listing is a read of one small JSON member,
-# not an extraction.
-_artifact_manifest() {
-    local archive="$1"
-    local _had_pf=0; [[ -o pipefail ]] && _had_pf=1
-    set -o pipefail
+# 10s, not lib/bundle.sh's 120s: this reads one small named member out of one
+# archive, not a whole backup's worth of files -- a real read finishes in a
+# fraction of a second even on slow media. Same canonical-positive-decimal
+# validation as OMABACKUP_RESTORE_TIMEOUT_SEC.
+if [[ "${OMABACKUP_ARTIFACT_MANIFEST_TIMEOUT_SEC:-}" =~ ^[1-9][0-9]*$ ]]; then
+    ARTIFACT_MANIFEST_TIMEOUT_SEC="$OMABACKUP_ARTIFACT_MANIFEST_TIMEOUT_SEC"
+else
+    ARTIFACT_MANIFEST_TIMEOUT_SEC=10
+fi
+
+# _artifact_manifest_file <archive> <outfile> -- writes manifest.json's bytes
+# to a FILE rather than through a bash variable. A review round found that a
+# manifest.json containing a raw NUL byte (a malicious artifact can put one
+# there; a bundle this tool built itself never would) got silently truncated
+# by bash's command substitution -- jq then validated and served the
+# TRUNCATED text as valid:true, with no sign the original bytes differed.
+# Reading straight from the file with `jq -e . <file>` / `jq --slurpfile`
+# never routes the bytes through a bash variable at all, so a raw NUL makes
+# the JSON syntactically invalid (NUL must be u0000-escaped inside a JSON
+# string) and jq correctly refuses it -- the right outcome, valid:false,
+# instead of a quiet truncation.
+#
+# The whole pipe runs under `timeout --kill-after`, the same idiom
+# `_zstd_extract` (lib/bundle.sh) and bin/omabackup-tui already use for
+# exactly this reason: `timeout` alone sends TERM at the deadline and then
+# WAITS for the child, so a stage that ignores or is slow to act on TERM
+# makes the ceiling not actually hold (measured live there: a child ignoring
+# TERM under a 3s timeout still reported 124, but only after 20 real
+# seconds). `timeout` without `--foreground` creates its own process group
+# for zstd/tar/head together and signals that whole group on expiry, so a
+# hung zstd does not outlive a killed tar.
+#
+# The byte cap sits AFTER `tar -xO`, not between zstd and tar (fixed in
+# round omabackup-41, see the comment above ARTIFACT_MANIFEST_MAX_BYTES for
+# the full story of why the first placement was wrong): `tar` is left free
+# to read as much of the decompressed stream as it needs to LOCATE
+# `./manifest.json`, however large the rest of the bundle is, and only the
+# bytes `tar -xO` actually EXTRACTS from that one member are bounded. A
+# crafted archive whose `manifest.json` member is itself a bomb is still
+# fully contained: `head -c`, now watching tar's own output instead of
+# zstd's, only ever writes up to the cap, and the resulting SIGPIPE back
+# through tar/zstd (once head stops reading) is exactly what `pipefail`
+# already turns into this pipe's own non-zero status -- measured directly:
+# tar itself exits non-zero (cut off mid-write of the oversized member),
+# distinct from a legitimate small manifest, where tar finishes writing
+# before head's cap is ever reached and both exit 0.
+#
+# Deliberately WITHOUT `--occurrence=1`, despite that flag looking like the
+# obvious complement (make tar stop as soon as it finds the member, instead
+# of reading to the archive's own end). Tried it, measured it, reverted it:
+# `--occurrence=1` makes tar exit the instant it is satisfied, which closes
+# tar's own stdin while zstd may still be mid-write -- zstd then gets its
+# OWN SIGPIPE (141) purely from tar stopping early, on every single
+# legitimate small manifest, indistinguishable by exit code alone from the
+# real failure this whole mechanism exists to catch. Confirmed live: with
+# `--occurrence=1`, a real, valid 2MB artifact reported `pipestatus: 141 0
+# 0` -- tar succeeded (its own status is 0), but pipefail's own "rightmost
+# non-zero" rule surfaces zstd's incidental 141 anyway, marking a perfectly
+# good backup unrestorable. Without `--occurrence=1`, tar reads its input
+# through to natural EOF regardless of when it finds the member, so zstd
+# never gets cut off for a benign reason -- `pipestatus: 0 0 0` for the same
+# fixture. This also preserves an existing, load-bearing property: a valid
+# zstd frame with trailing garbage appended must still be rejected (a
+# separate round's own regression, "a valid frame with trailing garbage is
+# marked invalid, not valid:true" -- `restore`'s own extraction of the WHOLE
+# archive has no early exit and WOULD hit that garbage and fail, so this
+# listing must not call the artifact valid:true first). `--occurrence=1`
+# would not have broken that specific case, but the version without it does
+# not need to reason about that separately: zstd still runs to completion
+# and still reports its own real corruption honestly either way. The
+# bomb case pays no meaningful cost for dropping `--occurrence=1` either --
+# `head -c`'s own early close already bounds the pipe within a few
+# milliseconds regardless (measured: ~4ms), since nothing downstream is
+# still consuming zstd's output past the cap.
+#
+# `env -u TAR_OPTIONS`, matching `_zstd_extract` (lib/bundle.sh:732): an
+# inherited TAR_OPTIONS could in principle redirect where tar's own output
+# goes, same class of bypass closed there -- not demonstrated exploitable on
+# this specific invocation (no `--index-file`/member-name-escaping surface
+# for it to redirect), but free, and keeps both `tar` invocations in this
+# project holding the same environment contract rather than two by accident.
+#
+# The pipe's own exit status is NOT sufficient to detect truncation right at
+# the cap boundary -- found by review (round omabackup-42, `omabackup-rev`):
+# whether `head -c` cutting off the stream actually reaches back as a
+# SIGPIPE through tar/zstd depends on pipe-buffer timing, not just on
+# whether the true content exceeds the cap. A large overage (the 50MB bomb)
+# reliably blocks tar mid-write and cascades a real SIGPIPE; a SMALL overage
+# (reproduced: exactly 1 byte past the cap) can have tar finish writing
+# everything -- overage included -- into the pipe buffer before `head`
+# finishes counting and closes, so tar exits 0 naturally and nothing is ever
+# cut off, even though `head` still quietly discarded the excess byte(s)
+# from its own output. Confirmed live: `pipestatus: 0 0 0`, function
+# returned 0, for a manifest exactly cap+1 bytes long whose truncated
+# cap-byte prefix happened to still be complete JSON on its own -- accepted
+# as valid despite genuinely exceeding the configured limit.
+#
+# Fixed by reading one byte MORE than the real cap (`cap + 1`) and then
+# explicitly checking the WRITTEN file's own size afterward: if it reached
+# `cap + 1`, the true content was at or past the limit regardless of which
+# exit codes did or didn't fire along the way. This does not replace the
+# exit-status check above it -- that still catches missing members and
+# zstd's own real corruption -- it closes the one class those statuses
+# cannot: silent, unsignaled truncation.
+_artifact_manifest_file() {
+    local archive="$1" out="$2" size
     # ./manifest.json, not manifest.json: the bundle's members are stored with
     # the leading "./" (tar -C stage -x's own doing, confirmed against a real
     # bundle), and tar -xO does not normalize that away when matching a name.
-    zstd -dc "$archive" 2>/dev/null | tar -xO ./manifest.json 2>/dev/null
-    local rc=$?
-    (( _had_pf )) || set +o pipefail
-    return $rc
-}
-
-# _artifact_manifest_file <archive> <outfile> -- like _artifact_manifest, but
-# writes to a FILE rather than returning bytes through a bash variable. A
-# review round found that a manifest.json containing a raw NUL byte (a
-# malicious artifact can put one there; a bundle this tool built itself never
-# would) got silently truncated by bash's command substitution -- jq then
-# validated and served the TRUNCATED text as valid:true, with no sign the
-# original bytes differed. Reading straight from the file with `jq -e .
-# <file>` / `jq --slurpfile` never routes the bytes through a bash variable at
-# all, so a raw NUL makes the JSON syntactically invalid (NUL must be
-# u0000-escaped inside a JSON string) and jq correctly refuses it -- the
-# right outcome, valid:false, instead of a quiet truncation.
-_artifact_manifest_file() {
-    local archive="$1" out="$2"
-    local _had_pf=0; [[ -o pipefail ]] && _had_pf=1
-    set -o pipefail
-    zstd -dc "$archive" 2>/dev/null | tar -xO ./manifest.json 2>/dev/null >"$out"
-    local rc=$?
-    (( _had_pf )) || set +o pipefail
-    return $rc
+    timeout --kill-after=5s "${ARTIFACT_MANIFEST_TIMEOUT_SEC}s" bash -c '
+        set -o pipefail
+        zstd -dc -- "$1" 2>/dev/null \
+            | env -u TAR_OPTIONS tar -xO ./manifest.json 2>/dev/null \
+            | head -c "$2"
+    ' _ "$archive" "$(( ARTIFACT_MANIFEST_MAX_BYTES + 1 ))" >"$out" || return $?
+    size="$(stat -c %s -- "$out" 2>/dev/null)" || return 1
+    (( size <= ARTIFACT_MANIFEST_MAX_BYTES ))
 }
 
 # _artifact_entry <path> <name> <size> <mtime-epoch>

@@ -36,7 +36,8 @@ leave a golden image for test/vm/run.sh.
 
 Options:
   --iso PATH       Omarchy ISO (default: ~/VMs/omabackup/omarchy-VERSION.iso)
-  --sha256 HASH    expected SHA-256 (default: official sidecar for versioned ISO)
+  --sha256 HASH    expected SHA-256 (required -- get this independently of
+                   the ISO's own download host, never from its sidecar file)
   --golden PATH    output disk (default: ~/VMs/omabackup/golden.qcow2)
   --ssh-key PATH   key to authorize in the guest
   --user USER      guest user (default: omatest)
@@ -114,11 +115,21 @@ if [[ ! -f "$ISO" ]]; then
     mv -- "$ISO.part" "$ISO"
 fi
 [[ -s "$ISO" ]] || die "Omarchy ISO is empty: $ISO"
-if [[ -z "$ISO_SHA256" && "$(basename "$ISO")" == "omarchy-$VERSION.iso" ]]; then
-    ISO_SHA256="$(curl -fsSL --retry 3 "https://iso.omarchy.org/omarchy-$VERSION.iso.sha256" | awk 'NR == 1 {print $1}')"
-fi
+# No auto-fetched fallback here on purpose -- flagged by marketplace security
+# review (2026-09-06, https://github.com/omacom/omarchy-plugin-marketplace/issues/3968#issuecomment-5560428690):
+# this script used to fetch the "expected" checksum from
+# https://iso.omarchy.org/omarchy-$VERSION.iso.sha256 when none was supplied
+# -- the SAME server that serves the ISO itself. A compromise of that one
+# server could swap the ISO and its own "expected" checksum together, and
+# this script would boot the result as an unattended installer having
+# "verified" nothing. A checksum is only a real check when it comes from
+# somewhere the artifact's own server does not control. Fail closed instead:
+# require --sha256 or OMARCHY_VM_ISO_SHA256 explicitly, sourced by whoever
+# runs this from wherever THEY independently trust (Omarchy's own signed
+# release announcement, a maintainer who already verified it, etc.), never
+# auto-fetched from the download host.
 [[ "$ISO_SHA256" =~ ^[[:xdigit:]]{64}$ ]] \
-    || die "provide a 64-character ISO SHA-256 with --sha256 or OMARCHY_VM_ISO_SHA256"
+    || die "provide a 64-character ISO SHA-256 with --sha256 or OMARCHY_VM_ISO_SHA256 -- obtained independently of $ISO's own download host, never auto-fetched from it"
 printf '%s  %s\n' "$ISO_SHA256" "$ISO" | sha256sum -c - >/dev/null \
     || die "Omarchy ISO checksum mismatch: $ISO"
 

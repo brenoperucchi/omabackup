@@ -2730,11 +2730,20 @@ assert_not_contains "$RTUIPREVOUT" "?[0;31m"
 # private snapshot is unreadable by restore. Corrupt the snapshot in the head
 # wrapper so the child restore command, rather than the TUI's copy step, owns
 # the preview failure branch.
+#
+# Scoped to a plain file redirect on stdin (`[[ -p /dev/stdin ]]` false), not
+# any `head -c` call system-wide -- lib/artifacts.sh's own bounded manifest
+# read (added alongside a marketplace-security fix) now also calls `head -c`,
+# but through a PIPE (`zstd -dc | head -c ... | tar -xO`), during the
+# artifacts_json listing this same restore TUI loop calls on every iteration,
+# well before a backup number is even chosen. An unscoped stub corrupted that
+# unrelated listing call too, breaking this test for a reason that had
+# nothing to do with what it verifies.
 cp -- "$RART" "$RTUICDEST/omabackup-test-20260829-000009.tar.zst"
 mkdir -p "$RTUIC/corrupt-snapshot-stub"
 cat >"$RTUIC/corrupt-snapshot-stub/head" <<'STUBEOF'
 #!/bin/bash
-if [[ "${1:-}" == "-c" ]]; then
+if [[ "${1:-}" == "-c" ]] && [[ ! -p /dev/stdin ]]; then
     /usr/bin/dd if=/dev/zero bs=1 count="$2" status=none
 else
     exec /usr/bin/head "$@"
@@ -2883,10 +2892,17 @@ RTUIGROWSIZE="$(stat -c %s "$RTUIGROWART")"
 printf '%s\n' "$RTUIGROWSIZE" >"$RTUIC/grow-source-size"
 printf '{"schemaVersion":1,"destinations":[{"id":"grow","type":"dir","path":"%s","keep":5,"enabled":true,"note":null}]}\n' \
     "$RTUIGROWDIR" >"$RTUIC/grow-destinations.json"
+# Scoped to a plain file redirect on stdin, not any `head -c` call
+# system-wide -- same reasoning as corrupt-snapshot-stub/head above:
+# lib/artifacts.sh's own bounded manifest read also calls `head -c`, through
+# a pipe, during the artifacts_json listing this restore TUI loop calls on
+# every iteration -- well before this test's own size-freeze path even runs.
+# An unscoped stub grew the source there too, freezing a size this test
+# never intended to observe.
 mkdir -p "$RTUIC/grow-head-stub"
 cat >"$RTUIC/grow-head-stub/head" <<'STUBEOF'
 #!/bin/bash
-if [[ "${1:-}" == "-c" ]]; then
+if [[ "${1:-}" == "-c" ]] && [[ ! -p /dev/stdin ]]; then
     /usr/bin/dd if=/dev/zero bs=4096 count=1 >>"${OMABACKUP_TEST_GROW_SOURCE:?}" 2>/dev/null || exit $?
 fi
 exec /usr/bin/head "$@"

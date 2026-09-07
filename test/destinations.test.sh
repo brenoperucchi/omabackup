@@ -276,17 +276,111 @@ GH_CONTROL_OUT="$(PATH="$GH_CONTROL_BIN:$PATH" HOME="$DH6E" OMABACKUP_GROUPS="$P
     OMABACKUP_DESTINATIONS="$DH6E/destinations.json" XDG_RUNTIME_DIR=/nonexistent \
     "$OB" push github 2>&1)"
 
-it "sanitizes Git transport controls before printing a push failure"
-GH_CONTROL_LINE="$(printf '%s\n' "$GH_CONTROL_OUT" | grep -F 'network down' || true)"
-# The command itself deliberately uses ANSI for its own frame and status
-# marker. Inspect only the transport-detail line, after removing that known
-# marker, so this assertion catches controls coming from Git rather than the
-# TUI's intentional presentation.
-GH_CONTROL_LINE="${GH_CONTROL_LINE//$'\033[0;31m'/}"
-GH_CONTROL_LINE="${GH_CONTROL_LINE//$'\033[0m'/}"
-GH_CONTROL_LINE="${GH_CONTROL_LINE//$'\033[2m'/}"
+# Round omabackup-43: git's own output is no longer surfaced live at all
+# (see _push_github's own comment for why three rounds of pipe-order
+# tuning could not make memory-bound + credential-safe + live-diagnostic
+# hold simultaneously, and the user's own call to drop the third
+# property). This test's original concern -- git's own control characters
+# must never reach a terminal unsanitized -- now applies to the LOG entry
+# _push_github writes instead, since that is the only place git's own
+# text still goes.
+it "the terminal push failure message is now the fixed, generic form -- git's own text does not reach it"
+assert_not_contains "$GH_CONTROL_OUT" "network down"
+assert_contains "$GH_CONTROL_OUT" "see log for details"
+
+it "sanitizes Git transport controls before writing a push failure to the log"
+GH_CONTROL_LOG="$DH6E/.state-control/log/omabackup-$(date +%F).log"
+[[ -f "$GH_CONTROL_LOG" ]] && ok || fail "expected a log entry for the failed push at $GH_CONTROL_LOG"
+GH_CONTROL_LINE="$(command grep -F 'network down' -- "$GH_CONTROL_LOG" || true)"
 assert_not_contains "$GH_CONTROL_LINE" $'\033'
 assert_contains "$GH_CONTROL_LINE" "network down"
+
+# ── review round omabackup-43 (both reviewers): three prior designs each
+# leaked a credential through a different mechanism -- swept across the
+# exact cap range where each one broke, to prove this design does not ──────
+#
+# Round omabackup-44 (both reviewers, independently): this sweep originally
+# inspected `$GHSWEEP_OUT` (the CLI's own stdout) and `.lastError.message`
+# -- but the round-43 redesign already made both of those safe BY
+# CONSTRUCTION (the terminal only ever prints the fixed generic string; see
+# "the terminal push failure message is now the fixed, generic form" above).
+# The sweep passed at every cap while the real bug -- the truncation guard
+# using `${#raw}` instead of the file's own `stat` size, so it never fired
+# on git's always-newline-terminated output -- put the full token in the
+# LOG at caps 33-37 the whole time. Fixed the same way the guard itself
+# was fixed: inspect where git's text actually goes now.
+GHSWEEPH="$(mktemp -d)"; GHSWEEPR="$GHSWEEPH/repo"; _dest_repo "$GHSWEEPR"
+git -C "$GHSWEEPR" remote add origin 'https://example.invalid/nonexistent.git'
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$GHSWEEPH/destinations.json"
+GHSWEEP_BIN="$GHSWEEPH/fake-bin"; mkdir -p "$GHSWEEP_BIN"
+cat >"$GHSWEEP_BIN/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" push origin HEAD "* ]]; then
+    printf "fatal: 'https://u:ghp_FULLTOKEN@github.com/a/b.git'\\n"
+    exit 1
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$GHSWEEP_BIN/git"
+GHSWEEP_LEAKED=0
+GHSWEEP_LOGGED_REDACTED=0
+for GHSWEEP_CAP in 5 10 20 30 33 34 35 36 37 38 39 40 41 42 50 60 100; do
+    PATH="$GHSWEEP_BIN:$PATH" HOME="$GHSWEEPH" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+        OMABACKUP_STATE="$GHSWEEPH/.state-$GHSWEEP_CAP" OMABACKUP_REPO="$GHSWEEPR" \
+        OMABACKUP_DESTINATIONS="$GHSWEEPH/destinations.json" XDG_RUNTIME_DIR=/nonexistent \
+        OMABACKUP_PUSH_OUTPUT_MAX_BYTES="$GHSWEEP_CAP" "$OB" push github >/dev/null 2>&1
+    GHSWEEP_LOG="$GHSWEEPH/.state-$GHSWEEP_CAP/log/omabackup-$(date +%F).log"
+    if [[ -f "$GHSWEEP_LOG" ]]; then
+        command grep -qF 'ghp_FULLTOKEN' -- "$GHSWEEP_LOG" && GHSWEEP_LEAKED="$GHSWEEP_CAP"
+        command grep -qF 'github.com/a/b.git' -- "$GHSWEEP_LOG" && GHSWEEP_LOGGED_REDACTED=1
+    fi
+done
+
+it "no cap in the 5-100 byte range leaks the credential token into the log, through the real CLI"
+[[ "$GHSWEEP_LEAKED" == 0 ]] && ok || fail "credential leaked into the log at cap=$GHSWEEP_LEAKED"
+
+it "the logging path is genuinely exercised -- at least one cap preserves the redacted diagnostic"
+[[ "$GHSWEEP_LOGGED_REDACTED" == 1 ]] && ok || fail "expected at least one cap to log the redacted (credential-free) URL, proving the log write path actually ran"
+
+# ── review round omabackup-43 (`omabackup-rev`): head -c on git's own live
+# stdout could cut git itself off via SIGPIPE before it finishes writing --
+# a completed marker written by git AFTER a lot of chatter proves git ran
+# to natural completion despite a cap much smaller than its own output ────
+GHDRAINH="$(mktemp -d)"; GHDRAINR="$GHDRAINH/repo"; _dest_repo "$GHDRAINR"
+git -C "$GHDRAINR" remote add origin 'https://example.invalid/nonexistent.git'
+GHDRAIN_BIN="$GHDRAINH/fake-bin"; mkdir -p "$GHDRAIN_BIN"
+GHDRAIN_MARKER="$(mktemp -u)"
+cat >"$GHDRAIN_BIN/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" push origin HEAD "* ]]; then
+    for i in \$(seq 1 400); do printf 'remote: progress chatter line %d\n' "\$i"; done
+    printf 'reached-the-end\n' >"$GHDRAIN_MARKER"
+    exit 1
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$GHDRAIN_BIN/git"
+rm -f "$GHDRAIN_MARKER"
+PATH="$GHDRAIN_BIN:$PATH" OMABACKUP_REPO="$GHDRAINR" OMABACKUP_PUSH_OUTPUT_MAX_BYTES=100 bash -c '
+    source lib/destinations.sh
+    _log_write() { :; }
+    _push_github >/dev/null
+'
+
+it "git itself is never cut off mid-write by a small output cap -- it always runs to its own natural completion"
+[[ -f "$GHDRAIN_MARKER" ]] && ok || fail "expected git's own completion marker to exist; a cap that interrupts git via SIGPIPE would prevent it from ever being written"
+rm -f "$GHDRAIN_MARKER"
+
+# ── review round omabackup-43 (`omabackup-rev`): unvalidated arithmetic on
+# a user-supplied cap can silently reproduce the exact head-c-negative-count
+# bug this project already closed once for OMABACKUP_RESTORE_MAX_BYTES ─────
+GHOVERFLOW_VAL="$(OMABACKUP_PUSH_OUTPUT_MAX_BYTES=18446744073709551614 bash -c '
+    source lib/destinations.sh
+    printf %s "$DEST_PUSH_OUTPUT_MAX_BYTES"
+')"
+
+it "an OMABACKUP_PUSH_OUTPUT_MAX_BYTES near the 64-bit boundary falls back to the safe default instead of wrapping negative"
+assert_eq "$GHOVERFLOW_VAL" "8192"
 
 mkdir -p "$DH6E/.state/destinations"
 printf '{"schemaVersion":1,"id":"github","lastError":{"at":"now","message":"old https://breno:ghp_ERROR_TOKEN@github.com/user/dotfiles.git error"}}\n' \
@@ -295,6 +389,184 @@ GH_OLD_STATE="$(_dest_env "$DH6E" "$DR6E" status --json)"
 
 it "redacts credentials already present in a legacy destination state"
 assert_not_contains "$GH_OLD_STATE" "ghp_ERROR_TOKEN"
+
+# ── review round omabackup-41 (`omabackup-rev`): truncating output before
+# redacting it can leak a credential fragment when the cut falls inside the
+# URL's own userinfo ────────────────────────────────────────────────────────
+# dest_redact_output's own regex requires the `scheme://` prefix to
+# recognize a credential at all -- a truncation that removes that prefix
+# while keeping `TOKEN@host/path` leaves the fragment unredacted. A long
+# enough failure message ahead of the real error (git's own verbose output,
+# or a wrapping shell's own noise) is all it takes.
+# Found by review (round omabackup-42, `omabackup-rev`): the FIRST version of
+# this test used an 8000-byte prefix under an 8192-byte cap, so the whole
+# credentialed URL (~58 bytes) always fit inside what `tail -c` keeps -- it
+# passed against BOTH the fixed order and the original vulnerable
+# tail-then-redact order, proving nothing. The prefix and cap below are
+# chosen precisely, not roughly: 500 bytes of noise + the exact URL below
+# sum to 558 bytes; a 40-byte cap keeps only `CRETTOKEN@example.com/repo:
+# fatal error\n` -- inside the token, past the `https://user:` prefix
+# `dest_redact_output`'s own regex needs to recognize a credential at all.
+# Confirmed live before landing this: run against the OLD
+# `tail -c | dest_redact_output` order, this exact fixture leaks
+# `CRETTOKEN` in the clear; against the fixed order, it does not.
+GHTRUNCH="$(mktemp -d)"; GHTRUNCR="$GHTRUNCH/repo"; _dest_repo "$GHTRUNCR"
+git -C "$GHTRUNCR" remote add origin 'https://example.invalid/nonexistent.git'
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$GHTRUNCH/destinations.json"
+GHTRUNC_BIN="$GHTRUNCH/fake-bin"; mkdir -p "$GHTRUNC_BIN"
+cat >"$GHTRUNC_BIN/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" push origin HEAD "* ]]; then
+    printf '%s' "\$(head -c 500 /dev/zero | tr '\\0' x)"
+    printf 'https://user:TOPSECRETTOKEN@example.com/repo: fatal error\\n'
+    exit 1
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$GHTRUNC_BIN/git"
+PATH="$GHTRUNC_BIN:$PATH" HOME="$GHTRUNCH" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$GHTRUNCH/.state" OMABACKUP_REPO="$GHTRUNCR" \
+    OMABACKUP_DESTINATIONS="$GHTRUNCH/destinations.json" XDG_RUNTIME_DIR=/nonexistent \
+    OMABACKUP_PUSH_OUTPUT_MAX_BYTES=40 "$OB" push github >/dev/null 2>&1
+
+# Round omabackup-44 (both reviewers, independently): the terminal and
+# .lastError.message are now safe by construction (round-43's redesign),
+# so asserting against them here proves nothing about redaction -- the log
+# is the only surface git's own text still reaches. Checked there instead.
+GHTRUNC_LOG="$GHTRUNCH/.state/log/omabackup-$(date +%F).log"
+GHTRUNC_LOG_CONTENT="$([[ -f "$GHTRUNC_LOG" ]] && cat -- "$GHTRUNC_LOG" || printf '')"
+
+it "a credential is redacted even when it sits inside output that would otherwise be truncated mid-URL"
+assert_not_contains "$GHTRUNC_LOG_CONTENT" "TOPSECRETTOKEN"
+assert_not_contains "$GHTRUNC_LOG_CONTENT" "CRETTOKEN"
+
+# ── review round omabackup-41 (`omabackup-rev-2`): the push's own failure
+# detection silently depended on the caller's `pipefail` setting ───────────
+# With `pipefail` off, `tail` (the pipe's own last stage) almost never fails
+# on its own, so `$?` reflected `tail`'s harmless success instead of a
+# genuinely timed-out `git`. `bin/omabackup:9` sets `set -uo pipefail`
+# globally today, so this was never live in production -- but `_push_github`
+# itself should not depend on that global staying true forever, the same
+# self-contained standard `_artifact_manifest_file` already holds itself to.
+GHPFH="$(mktemp -d)"; GHPFR="$GHPFH/repo"; _dest_repo "$GHPFR"
+git -C "$GHPFR" remote add origin 'https://example.invalid/nonexistent.git'
+GHPF_BIN="$GHPFH/fake-bin"; mkdir -p "$GHPF_BIN"
+cat >"$GHPF_BIN/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" push origin HEAD "* ]]; then
+    sleep 30
+    exit 0
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$GHPF_BIN/git"
+# _push_github's own stdout ("0" on success, its error text on failure) must
+# be redirected away here -- found by review (round omabackup-42,
+# `omabackup-rev`): capturing it inline ahead of the trailing `printf %s $?`
+# concatenates the two with no separator, so a SUCCESS ("0" printed by the
+# function) followed by rc=0 ("0" printed by `printf`) produced the string
+# "00" -- which `[[ "$GHPF_RC" != 0 ]]` reads as "not equal to the string 0"
+# and passes, on exactly the false-success this test exists to catch.
+GHPF_RC="$(PATH="$GHPF_BIN:$PATH" OMABACKUP_REPO="$GHPFR" OMABACKUP_PUSH_TIMEOUT_SEC=2 bash -c '
+    set +o pipefail
+    source lib/destinations.sh
+    _push_github >/dev/null
+    printf %s $?
+')"
+
+it "_push_github correctly reports a timed-out push as a failure even with pipefail explicitly disabled"
+[[ "$GHPF_RC" == 1 ]] && ok || fail "expected exactly rc=1 with pipefail off; got '$GHPF_RC' (a silent false-success would read '00' here)"
+
+# ── review round omabackup-42 (`omabackup-rev`): redacting before truncating
+# reopened the memory bound the byte cap exists to hold ────────────────────
+# `dest_redact_output` is `sed`, which must buffer a complete line before it
+# can emit any of it -- running it before the byte cap meant a single,
+# unterminated pathological line was no longer bounded by that cap at all.
+# `ulimit -v` makes this deterministic instead of "probably fine on a big
+# enough machine": a real OOM here, not a slow one. 200MB, not a smaller
+# size: measured directly that a 5MB line sits in a flaky boundary zone
+# under this same 20MB virtual-memory limit -- sometimes `sed` allocates it
+# without issue depending on process/heap layout on the day, sometimes not.
+# 200MB reliably reproduces the OOM against the OLD (pre-omabackup-42)
+# redact-then-truncate design across repeated runs, with no flakiness
+# margin to worry about.
+GHMEMH="$(mktemp -d)"; GHMEMR="$GHMEMH/repo"; _dest_repo "$GHMEMR"
+git -C "$GHMEMR" remote add origin 'https://example.invalid/nonexistent.git'
+GHMEM_BIN="$GHMEMH/fake-bin"; mkdir -p "$GHMEM_BIN"
+cat >"$GHMEM_BIN/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" push origin HEAD "* ]]; then
+    head -c 200000000 /dev/zero | tr '\\0' x
+    exit 1
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$GHMEM_BIN/git"
+GHMEM_RC="$(
+    ulimit -v 20000
+    PATH="$GHMEM_BIN:$PATH" OMABACKUP_REPO="$GHMEMR" bash -c '
+        source lib/destinations.sh
+        _push_github >/dev/null
+        printf %s $?
+    '
+)"
+
+it "_push_github stays bounded under a tight memory limit against a single 200MB unterminated line"
+[[ "$GHMEM_RC" == 1 ]] && ok || fail "expected a clean rc=1 under ulimit -v 20000; got '$GHMEM_RC' (empty means the subshell itself was killed -- OOM)"
+
+# ── marketplace security review, 2026-09-06: `git push` had no timeout, and
+# no cap on how much of its output this tool would hold in memory ──────────
+# https://github.com/omacom/omarchy-plugin-marketplace/issues/3968#issuecomment-5560428690:
+# an unavailable or hostile configured remote could hold the scheduled push
+# service indefinitely, and an unbounded sideband stream grows the shell's
+# own memory. Same fake-git PATH-shadow technique already established above
+# in this file for the credential-redaction tests.
+GHTMH="$(mktemp -d)"; GHTMR="$GHTMH/repo"; _dest_repo "$GHTMR"
+git -C "$GHTMR" remote add origin 'https://example.invalid/nonexistent.git'
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$GHTMH/destinations.json"
+GHTM_BIN="$GHTMH/fake-bin"; mkdir -p "$GHTM_BIN"
+cat >"$GHTM_BIN/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" push origin HEAD "* ]]; then
+    sleep 30
+    exit 0
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$GHTM_BIN/git"
+GHTM_START="$(date +%s)"
+GHTM_OUT="$(PATH="$GHTM_BIN:$PATH" HOME="$GHTMH" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$GHTMH/.state" OMABACKUP_REPO="$GHTMR" \
+    OMABACKUP_DESTINATIONS="$GHTMH/destinations.json" XDG_RUNTIME_DIR=/nonexistent \
+    OMABACKUP_PUSH_TIMEOUT_SEC=2 "$OB" push github 2>&1)"; GHTM_RC=$?
+GHTM_ELAPSED="$(( $(date +%s) - GHTM_START ))"
+
+it "a hanging git push is killed by OMABACKUP_PUSH_TIMEOUT_SEC rather than hanging push itself"
+(( GHTM_ELAPSED < 10 )) && ok || fail "expected well under 10s for a 2s timeout plus kill-after, took ${GHTM_ELAPSED}s"
+
+it "and push reports the failure, not a false success, when the git push step timed out"
+[[ "$GHTM_RC" != 0 ]] && ok || fail "expected a non-zero exit; got 0 with output: $GHTM_OUT"
+
+GHOUTH="$(mktemp -d)"; GHOUTR="$GHOUTH/repo"; _dest_repo "$GHOUTR"
+git -C "$GHOUTR" remote add origin 'https://example.invalid/nonexistent.git'
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$GHOUTH/destinations.json"
+GHOUT_BIN="$GHOUTH/fake-bin"; mkdir -p "$GHOUT_BIN"
+cat >"$GHOUT_BIN/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" push origin HEAD "* ]]; then
+    head -c 50000 /dev/zero | tr '\\0' x
+    exit 1
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+chmod +x "$GHOUT_BIN/git"
+GHOUT_OUT="$(PATH="$GHOUT_BIN:$PATH" HOME="$GHOUTH" OMABACKUP_GROUPS="$PWD/groups.default.json" \
+    OMABACKUP_STATE="$GHOUTH/.state" OMABACKUP_REPO="$GHOUTR" \
+    OMABACKUP_DESTINATIONS="$GHOUTH/destinations.json" XDG_RUNTIME_DIR=/nonexistent \
+    OMABACKUP_PUSH_OUTPUT_MAX_BYTES=1000 "$OB" push github 2>&1)"
+
+it "a failed push's captured output stays bounded near OMABACKUP_PUSH_OUTPUT_MAX_BYTES, not the full 50000-byte stream"
+(( ${#GHOUT_OUT} < 3000 )) && ok || fail "expected well under 3000 chars for a 1000-byte cap, got ${#GHOUT_OUT}"
 
 # The default timer path includes the implicit origin alongside configured
 # destinations. Naming a destination is an intentional narrow retry and must

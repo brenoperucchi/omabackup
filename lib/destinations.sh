@@ -19,6 +19,47 @@
 
 DEST_BACKOFF_CAP=21600   # 6h. Long enough to stop nagging, short enough to recover unattended.
 
+# _push_github's own timeout and output cap -- flagged by marketplace security
+# review (2026-09-06, https://github.com/omacom/omarchy-plugin-marketplace/issues/3968):
+# `git push` ran with no timeout of its own, and omabackup-push.service has no
+# `TimeoutStartSec` either, so an unavailable or hostile configured remote
+# could hold the scheduled push timer indefinitely -- worse than the timer
+# just failing, since a hung `push` never reaches the backoff/last-error
+# bookkeeping that would otherwise tell a user something is wrong. 120s
+# matches OMABACKUP_RESTORE_TIMEOUT_SEC's own default (lib/bundle.sh): a
+# push has to reach a real remote over the network, same order of magnitude
+# of "legitimately slow" as an extraction from slow media, not the ~10s a
+# purely local read gets. Same canonical-positive-decimal validation as the
+# other two timeout/byte-cap overrides in this project, for the same reason:
+# an unvalidated override must never widen into "unlimited."
+if [[ "${OMABACKUP_PUSH_TIMEOUT_SEC:-}" =~ ^[1-9][0-9]*$ ]]; then
+    DEST_PUSH_TIMEOUT_SEC="$OMABACKUP_PUSH_TIMEOUT_SEC"
+else
+    DEST_PUSH_TIMEOUT_SEC=120
+fi
+
+# 8 KiB of the TAIL of git's own combined stdout+stderr, not the head: the
+# useful diagnostic line in a failed push (an auth rejection, a non-fast-
+# -forward, a remote hook's own error) is what git prints LAST, and this
+# tool has no use for capturing an unbounded, possibly verbose sideband
+# stream (progress percentages, a large receive-pack's own chatter). This
+# cap is now read from a completed temp FILE (see _push_github's own
+# comment for why), never from git's own live stdout -- see the length-
+# then-range validation below, same reasoning as ARTIFACT_MANIFEST_MAX_BYTES
+# (lib/artifacts.sh): found by review (round omabackup-43, `omabackup-rev`)
+# that the bare `^[1-9][0-9]*$` shape check let an override large enough to
+# overflow bash's signed 64-bit arithmetic wrap negative once this file's
+# own `$(( ... + 1 ))` runs on it -- the exact GNU `head -c` negative-count
+# footgun already closed once for OMABACKUP_RESTORE_MAX_BYTES.
+DEST_PUSH_OUTPUT_MAX_BYTES_CEILING=1073741824
+if [[ "${OMABACKUP_PUSH_OUTPUT_MAX_BYTES:-}" =~ ^[1-9][0-9]*$ ]] \
+    && (( ${#OMABACKUP_PUSH_OUTPUT_MAX_BYTES} <= ${#DEST_PUSH_OUTPUT_MAX_BYTES_CEILING} )) \
+    && (( 10#$OMABACKUP_PUSH_OUTPUT_MAX_BYTES <= DEST_PUSH_OUTPUT_MAX_BYTES_CEILING )); then
+    DEST_PUSH_OUTPUT_MAX_BYTES="$OMABACKUP_PUSH_OUTPUT_MAX_BYTES"
+else
+    DEST_PUSH_OUTPUT_MAX_BYTES=8192
+fi
+
 # ── config ───────────────────────────────────────────────────────────────────
 _dest_json() { [[ -f "$DESTINATIONS_FILE" ]] && cat "$DESTINATIONS_FILE" || printf '{"destinations":[]}'; }
 
@@ -425,13 +466,117 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
 # §3 defines github as "commit + push". sync only ever did the commit half --
 # there was not a single `git push` in this tool, so an unattended timer would
 # have committed locally forever while the panel stayed green.
+#
+# Wrapped in `timeout --kill-after`, not `timeout` alone -- the same idiom
+# _zstd_extract (lib/bundle.sh) and bin/omabackup-tui already use, for the
+# same reason: `timeout` by itself sends TERM at the deadline and then WAITS
+# for the child, so a `git` stuck in a slow TLS handshake or ignoring TERM
+# would make the ceiling not actually hold. `--foreground` is deliberately
+# NOT passed: without it, `timeout` runs `git` in its own new process group
+# and signals that whole group on expiry, reaping any credential-helper or
+# ssh child `git` itself spawned, not just the direct `git` process.
+#
+# Three rounds (omabackup-41/42/43) tried to make ONE pipe simultaneously
+# memory-bounded, never split a credential, AND still surface git's own
+# tail as a live diagnostic -- each fix closed one of those three
+# properties and reopened a different one, confirmed by review every time:
+#
+# - truncate-then-redact (the original form) cut a credentialed URL's
+#   `scheme://user:` prefix away while leaving `TOKEN@host/path` intact --
+#   `dest_redact_output`'s regex needs that prefix to recognize a
+#   credential at all, so the fragment sailed through unredacted.
+# - redact-then-truncate (round 41's fix) closed that leak but reopened a
+#   memory bound: `dest_redact_output` is `sed`, which must buffer a
+#   complete LINE before it can emit or redact any of it -- a single
+#   pathological line with no newline was no longer bounded by the cap at
+#   all. Confirmed live under `ulimit -v 20000`: a real OOM.
+# - bound-raw-bytes-then-discard-the-first-line (round 42's fix) closed
+#   the memory bound correctly, but discarding the FIRST line only
+#   protects a `tail`-shaped capture. This function captures with
+#   `head -c`, which keeps the STREAM'S START and cuts its END -- so the
+#   line actually at risk of being split is the LAST one, and discarding
+#   the first left a truncated later line, credential included, to reach
+#   `dest_redact_output` without the trailing `@` its regex needs.
+#   Confirmed live (round 43, both reviewers independently): real windows
+#   where a complete credential token reaches the terminal/state in the
+#   clear. `omabackup-rev-2` tested the obvious next swap (`head`→`tail`)
+#   before suggesting it and found IT independently broken by a fourth
+#   bug: command substitution strips a trailing newline, so the
+#   truncation-detection guard itself under-counts by exactly one byte at
+#   a line boundary and never fires.
+#
+# The user's own call, once all three properties turned out not to be
+# simultaneously satisfiable by adjusting one pipe's ordering: drop the
+# third property instead of continuing to trade the other two back and
+# forth. `git`'s own output is no longer surfaced as a live diagnostic at
+# all -- on failure this returns a fixed, generic message, and the real
+# (redacted, complete-lines-only) output goes to this project's own
+# persistent log (`lib/log.sh`) instead, where a user who wants the detail
+# can read it with `omabackup log-tail` / the Settings TUI's own "View
+# log" item.
+#
+# This also sidesteps a SEPARATE bug the same three rounds surfaced but
+# never actually fixed (`omabackup-rev`, round 43): piping `git`'s own
+# live stdout into `head -c` risks cutting `git` ITSELF off via SIGPIPE if
+# it is still writing (progress output, a hook's own chatter) when the
+# cap is reached -- unlike `_artifact_manifest_file` reading an already-
+# decompressed, static archive, `git push` is a live operation with a
+# real side effect, and a `head -c` that closes early could interrupt it
+# before it finishes, or before its own exit code can be trusted.
+# Redirecting to a plain FILE instead of a pipe never has this problem:
+# `git` writes to disk for as long as it needs (bounded only by
+# `timeout`, the same wall-clock ceiling as before), and nothing reads
+# from it -- let alone stops reading -- until `git` has already exited.
+#
+# This also eliminates the `pipefail`/`PIPESTATUS` question three rounds
+# spent getting right (round 41, `omabackup-rev-2`): there is no pipe
+# left at all in the command that actually runs `git`, so its own `$?` is
+# the whole story, unconditionally, regardless of any shell's `pipefail`
+# setting.
 _push_github() {
-    local out
-    out="$(git -C "$OMABACKUP_REPO" push origin HEAD 2>&1)" || {
-        printf '%s' "${out:-push failed}" | dest_redact_output
-        return 1
-    }
-    printf '0'
+    local tmpfile rc sz raw line
+    tmpfile="$(mktemp)" || { printf 'push failed'; return 1; }
+    timeout --kill-after=5s "${DEST_PUSH_TIMEOUT_SEC}s" \
+        git -C "$OMABACKUP_REPO" push origin HEAD >"$tmpfile" 2>&1
+    rc=$?
+    if (( rc == 0 )); then
+        rm -f -- "$tmpfile"
+        printf '0'
+        return 0
+    fi
+    # Read from the now-complete, on-disk file -- `tail -c` here has none
+    # of the live-process risk described above, since `git` has already
+    # exited and nothing is left to interrupt. Truncation is detected off
+    # the FILE'S OWN byte size (`stat`), not off `${#raw}`'s length: round
+    # omabackup-44 (both reviewers, independently) found that command
+    # substitution strips `raw`'s trailing newline, and since `git`'s own
+    # output always ends in one, `${#raw}` under-counted by exactly one
+    # byte on every normal truncation -- the discard-the-first-line guard
+    # below never fired, and the leftover leading fragment of a split
+    # credential rode on whatever `https://` survived the cut. Same fix,
+    # same idiom, as _artifact_manifest_file's own post-pipe size check
+    # (lib/artifacts.sh, round omabackup-42): trust `stat`, not a shell
+    # string's length. `tail -c`'s own cut lands at the START of what it
+    # keeps -- the FIRST line of that chunk is the one that may be split,
+    # so it (not the last) is what gets discarded here.
+    sz="$(stat -c %s -- "$tmpfile" 2>/dev/null)" || sz=0
+    raw="$(tail -c "$(( DEST_PUSH_OUTPUT_MAX_BYTES + 1 ))" -- "$tmpfile" 2>/dev/null)"
+    rm -f -- "$tmpfile"
+    if (( sz > DEST_PUSH_OUTPUT_MAX_BYTES )); then
+        if [[ "$raw" == *$'\n'* ]]; then
+            raw="${raw#*$'\n'}"
+        else
+            raw=""
+        fi
+    fi
+    if [[ -n "$raw" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -n "$line" ]] || continue
+            _log_write push output "$(printf '%s' "$line" | dest_redact_output)"
+        done <<<"$raw"
+    fi
+    printf 'push failed (see log for details)'
+    return 1
 }
 
 push_destination() {  # push_destination <id> <bundle> <name> -> prints detail, returns status

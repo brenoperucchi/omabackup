@@ -18,6 +18,28 @@ else
     fail "golden builder is missing its safe opt-in contract"
 fi
 
+# Marketplace security review (2026-09-06,
+# https://github.com/omacom/omarchy-plugin-marketplace/issues/3968#issuecomment-5560428690):
+# the builder used to fetch its own "expected" checksum from
+# iso.omarchy.org/omarchy-$VERSION.iso.sha256 when none was supplied -- the
+# same server that serves the ISO itself, so a compromise there could swap
+# both files together and this script would verify nothing. Static-content
+# checks, matching this file's own established convention for the builder
+# (a real end-to-end run needs KVM and a golden image this suite
+# deliberately does not require) -- confirms the auto-fetch is gone and the
+# fail-closed contract is documented in its place.
+it "the golden builder no longer auto-fetches its checksum from the ISO's own download host"
+[[ "$BUILDER_SOURCE" != *'curl -fsSL --retry 3 "https://iso.omarchy.org'* ]] \
+    && ok || fail "a checksum sidecar fetch from the ISO's own host is still present"
+
+it "and requires an explicit, independently-sourced SHA-256 instead"
+if [[ "$BUILDER_SOURCE" == *'provide a 64-character ISO SHA-256'* \
+      && "$BUILDER_SOURCE" == *'never auto-fetched from'* ]]; then
+    ok
+else
+    fail "the fail-closed checksum requirement is not documented in the builder"
+fi
+
 it "the VM runner documents its real-guest contract"
 HELP="$($OB --help 2>&1)"
 assert_contains "$HELP" "QEMU/KVM"

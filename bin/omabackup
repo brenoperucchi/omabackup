@@ -202,6 +202,16 @@ _pkg_for() {
         jq)    printf 'jq' ;;
         git)   printf 'git' ;;
         tar)   printf 'tar' ;;
+        # timeout/head/realpath are coreutils, find is findutils -- neither
+        # is a real pacman package under its own binary name (confirmed:
+        # `pacman -Si timeout` does not resolve). Found by review (round
+        # omabackup-42, `omabackup-rev-2`) for timeout/head specifically,
+        # newly reachable once this round added both to require_tools calls
+        # in cmd_artifacts/cmd_restore_tui -- find/realpath had the identical
+        # pre-existing gap in their own already-shipped require_tools calls,
+        # closed in the same table while it was already being touched.
+        timeout|head|realpath) printf 'coreutils' ;;
+        find)  printf 'findutils' ;;
         *)     printf '%s' "$1" ;;
     esac
 }
@@ -1858,6 +1868,14 @@ cmd_restore_tui() {
     local destination path file created shown_destination shown_path shown_file shown_created shown_target hidden target target_path target_is_home home_path frozen_target current_target_path confirm plan_output apply_output rc recovery source_fd=-1 source_fd_path source_size snapshot_dir="" snapshot_artifact=""
     local -a target_args=()
     [[ -t 0 && -t 1 ]] || die "interactive restore needs a terminal; provide an artifact file"
+    # This TUI's own listing loop calls artifacts_json before any tool
+    # dependency was ever checked here -- found by review (round
+    # omabackup-41, omabackup-rev), alongside the same gate added to
+    # cmd_artifacts: a missing timeout/head (or any of the others
+    # artifacts_json already depended on before that fix) made every
+    # manifest read look like a corrupt archive instead of naming the
+    # actual missing tool.
+    require_tools jq find zstd tar timeout head
     # The selected source is shared storage. Keep a private snapshot for the
     # whole review/apply interaction so a replacement at the original path
     # cannot make apply act on bytes different from the preview. The RETURN
@@ -3053,7 +3071,12 @@ _kg_stop_group() {
 # same way to a human about to trust one of these to restore their machine.
 cmd_artifacts() {
     reject_flags artifacts "${@}"
-    require_tools jq find zstd tar
+    # timeout/head added alongside _artifact_manifest_file's own byte-cap/
+    # timeout fix (marketplace security review, 2026-09-06) -- found missing
+    # by review (round omabackup-41, omabackup-rev): without this, a system
+    # lacking either tool made every manifest read look like a corrupt
+    # archive instead of the CLI reporting the actual missing dependency.
+    require_tools jq find zstd tar timeout head
     if (( JSON )); then
         artifacts_json
     else

@@ -17,5 +17,17 @@ EnvironmentFile=-%h/.config/omabackup/env
 Environment=OMABACKUP_LOG_SKIP=1
 ExecStart=%h/.config/omarchy/plugins/brenoperucchi.omabackup/bin/omabackup push
 
+# Flagged by marketplace security review (2026-09-06): with no timeout here,
+# an unavailable or hostile configured remote could hold this scheduled
+# service indefinitely. `_push_github` (lib/destinations.sh) now bounds the
+# `git push` step itself with its own internal timeout, but this is the
+# outer, destination-agnostic ceiling covering the whole `push` invocation
+# -- every configured destination, not just github -- and it is what
+# actually stops systemd from treating the unit as still legitimately
+# starting forever. 300s is generous for a slow NAS or a slow remote on top
+# of _push_github's own 120s default, while still being a real, finite
+# ceiling rather than none at all.
+TimeoutStartSec=300
+
 Nice=10
 IOSchedulingClass=idle
