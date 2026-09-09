@@ -1541,7 +1541,19 @@ Panel {
                        : Color.muted
                 }
 
+                // anchors.verticalCenter, like every other child here: a Row
+                // positions x only, so an unanchored child keeps y = 0 --
+                // top-aligned, not centered. That went unnoticed because the
+                // title is not the tallest child: versionButton is a real
+                // qs.Ui.Button (caption text + controlPaddingY twice + its
+                // reserved border insets), measured at 28px against the
+                // title's own 19px, so the Row is 28px tall and the title sat
+                // 4.5px above the dot, the button and the Omarchy text, all
+                // three of which are centered. Reported from a real panel
+                // screenshot; reproduced and measured headlessly against the
+                // real Style/Button before fixing, not adjusted by eye.
                 Text {
+                  anchors.verticalCenter: parent.verticalCenter
                   text: "OmaBackup"
                   color: Color.foreground
                   font.family: Style.font.family

@@ -4305,6 +4305,68 @@ truncation test now reads the log instead of stdout/`.lastError.message`.
 
 Full suite: **1353 passed, 0 failed.**
 
+### Title row's "OmaBackup" text sat 4.5px above the rest of the row -- a real screenshot, reported and fixed the same session
+
+User reported the title row looked "desorganizada" in a real panel
+screenshot: the status dot next to "OmaBackup" was not horizontally
+aligned with the rest of the line. Reproduced headlessly against the
+REAL `qs.Ui.Button` and `qs.Commons.Style` (not the test suite's own
+invented mirror values) before touching anything:
+
+```
+headRow h=28
+dot        centerY=14
+titleText  centerY=9.5   <- 4.5px high
+versionBtn centerY=14
+omarchyTxt centerY=14
+```
+
+Root cause: a `Row` positions children on the x-axis only, and never
+touches `y`. The status dot, the version `Button` and the trailing
+Omarchy text all carry `anchors.verticalCenter: parent.verticalCenter`
+-- the "OmaBackup" `Text` was the only child of `headRow`
+(`Panel.qml:1544-1549`) that did not, so it kept its default `y = 0`
+(top-aligned) instead of centering. This stayed invisible for as long
+as the title happened to be the row's tallest child; it stopped being
+one once the version button moved into `headRow` (the panel reorg
+round, `herdr-ask omabackup-13`): `qs.Ui.Button` is a `BorderSurface`,
+not a `Text` -- caption text plus `controlPaddingY` (6) twice plus its
+own reserved border insets, measured headlessly at 52×28 for a "0.4.2"
+label against the title's own 75.5×19 at `Style.font.title` (14px, not
+the arbitrary 18 the existing probe mirror used). The Button, not the
+title, has set this row's height since that round -- the misalignment
+has likely been live since then, just not reported until this
+screenshot. Fixed with one `anchors.verticalCenter` on the title
+`Text`; confirmed live in the same headless probe, delta drops from
+4.5px to 0.5px (Qt's own whole-pixel anchor rounding).
+
+The existing regression probe (`test/qml/title-row-version-elides.qml`)
+did not catch this because its own hand-maintained mirror was not
+faithful to the real components it stands in for: `pixelSize: 18` for
+the title (real default: 14) and a bare `Text` for the version button
+(real: a `qs.Ui.Button`, 28px tall against the title's 19px) -- in that
+invented shape the title WAS the tallest child, so a missing vertical
+anchor on it could never show up. Rebuilt the mirror with the measured
+real dimensions (52×28 button, 75.5×19 title at 14px) and added an
+explicit assertion that every child of `headRow` shares one vertical
+center, checked in every phase (wide, `versionCopied`, narrow). Proved
+it discriminates: reverted the title's anchor in the probe alone,
+watched `titleCenterY` land at 8 against `dotCenterY`/`buttonCenterY`
+at 14 and the phase fail; restored, watched it pass at 14 across the
+board.
+
+Two adjacent points raised in the same conversation, checked and left
+as they are: the status dot staying accent-colored instead of
+returning to muted after the earlier GitHub destination fix is correct,
+not a regression -- `warnCount > 0` (the `omasession` no-remote finding
+below) independently keeps it lit, per the dot's own documented rule
+("colour here always means work to do"); and a plugin's `probe_plugins`
+finding cannot be suppressed per-plugin today (`lib/probes.sh` has no
+exclusion mechanism for it, unlike the compositor probe's
+`is_excluded`) -- corrected after initially telling the user otherwise.
+
+Full suite: **1353 passed, 0 failed.**
+
 ## Open questions for the user, not yet decided
 
 - **`_push_github`'s temp file has no byte cap while `git` is still

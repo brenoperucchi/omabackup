@@ -63,19 +63,41 @@ FloatingWindow {
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
 
-        Rectangle { width: 8; height: 8; radius: 4; anchors.verticalCenter: parent.verticalCenter }
+        Rectangle { id: dot; width: 8; height: 8; radius: 4; anchors.verticalCenter: parent.verticalCenter }
 
+        // pixelSize 14, not 18: Style.font.title's real default
+        // (Commons/Style.qml -- fontToken("title", fontPx(1.167)) == 14).
+        // The 18 this mirror used before was invented, and it inverted the
+        // one relationship that matters here -- it made the title the
+        // tallest child, so its missing vertical anchor could not show up.
         Text {
           id: titleText
+          anchors.verticalCenter: parent.verticalCenter
           text: "OmaBackup"
-          font.pixelSize: 18
+          font.pixelSize: 14
         }
 
-        Text {
+        // A bare Text stood in for the version Button before. That was the
+        // fidelity gap that hid the real bug: qs.Ui.Button is a
+        // BorderSurface, not a Text -- caption text plus controlPaddingY
+        // (6) twice plus its reserved border insets. Measured headlessly
+        // against the REAL component with the real Style tokens: 52x28 for
+        // a "0.4.2" label, against the title's own 75.5x19. The height is
+        // the load-bearing half: 28 > 19 is what makes the BUTTON, not the
+        // title, set this Row's height, which is why an unanchored title
+        // sat 4.5px above everything else on a real panel.
+        Item {
           id: versionButton
           anchors.verticalCenter: parent.verticalCenter
-          text: root.versionCopied ? root.toolVersion + "  ✓ copied" : root.toolVersion
-          font.pixelSize: 10
+          height: 28
+          width: versionLabel.implicitWidth + 24
+
+          Text {
+            id: versionLabel
+            anchors.centerIn: parent
+            text: root.versionCopied ? root.toolVersion + "  ✓ copied" : root.toolVersion
+            font.pixelSize: 10
+          }
         }
       }
 
@@ -130,6 +152,33 @@ FloatingWindow {
     return (titleGroup.x + titleGroup.width) <= toggleSwitch.x + 0.5
   }
 
+  // Every child of headRow must share ONE vertical center. A Row positions
+  // its children horizontally only -- it never touches y -- so a child
+  // without an explicit vertical anchor silently keeps y = 0 and rides the
+  // top of the row instead of its middle. That is exactly what shipped:
+  // the title Text was the only unanchored child here, and because the
+  // version Button (28px) is taller than the title (19px), the title sat
+  // 4.5px high against the dot, the button and the Omarchy text. Reported
+  // from a real panel screenshot; every horizontal assertion in this file
+  // stayed green throughout, which is precisely why this one exists.
+  function headRowSharesOneVerticalCenter() {
+    var rowCenter = headRow.height / 2
+    var centers = [
+      dot.y + dot.height / 2,
+      titleText.y + titleText.height / 2,
+      versionButton.y + versionButton.height / 2
+    ]
+    for (var i = 0; i < centers.length; i++) {
+      // 1px, not the strict half-pixel used for horizontal bounds: Qt
+      // rounds a verticalCenter resolution to a whole pixel, so a 19px
+      // child in a 28px row lands 0.5px off a raw float half-sum. The real
+      // bug is 4.5px -- an unanchored child is off by half the row's own
+      // slack, never by a rounding error, so 1px still discriminates.
+      if (Math.abs(centers[i] - rowCenter) > 1) return false
+    }
+    return true
+  }
+
   function toggleVerticallyCentered() {
     // Proves the anchor actually resolved, not just that it was written.
     // A silently-rejected anchor ("Cannot anchor to an item that isn't a
@@ -163,14 +212,19 @@ FloatingWindow {
       var overlapOkWide = noOverlap()
       var groupOkWide = groupNeverOverlapsToggle()
       var vCenterOkWide = toggleVerticallyCentered()
+      var rowCenteredWide = headRowSharesOneVerticalCenter()
       console.log("[phase1] elided=" + elidedWide + " overlapOk=" + overlapOkWide +
-        " groupOk=" + groupOkWide + " vCenterOk=" + vCenterOkWide + " omarchyX=" + omarchyText.x +
+        " groupOk=" + groupOkWide + " vCenterOk=" + vCenterOkWide +
+        " rowCentered=" + rowCenteredWide + " omarchyX=" + omarchyText.x +
         " omarchyPaintedWidth=" + omarchyText.paintedWidth + " toggleX=" + toggleSwitch.x +
         " toggleY=" + toggleSwitch.y + " toggleHeight=" + toggleSwitch.height +
         " titleGroupY=" + titleGroup.y + " titleGroupHeight=" + titleGroup.height +
-        " headRowImplicitHeight=" + headRow.implicitHeight)
-      if (elidedWide || !overlapOkWide || !groupOkWide || !vCenterOkWide) {
-        console.log("[result] the wide/default case should not need to elide, already overlaps, or the toggle is not vertically centered")
+        " headRowImplicitHeight=" + headRow.implicitHeight +
+        " dotCenterY=" + (dot.y + dot.height / 2) +
+        " titleCenterY=" + (titleText.y + titleText.height / 2) +
+        " buttonCenterY=" + (versionButton.y + versionButton.height / 2))
+      if (elidedWide || !overlapOkWide || !groupOkWide || !vCenterOkWide || !rowCenteredWide) {
+        console.log("[result] the wide/default case should not need to elide, already overlaps, the toggle is not vertically centered, or headRow's own children do not share one vertical center")
         Qt.exit(1)
         return
       }
@@ -200,11 +254,13 @@ FloatingWindow {
       var overlapOk = noOverlap()
       var groupOk = groupNeverOverlapsToggle()
       var vCenterOk = toggleVerticallyCentered()
+      var rowCentered = headRowSharesOneVerticalCenter()
       console.log("[phase2] versionCopied=true overlapOk=" + overlapOk + " groupOk=" + groupOk +
-        " vCenterOk=" + vCenterOk + " omarchyX=" + omarchyText.x + " omarchyPaintedWidth=" + omarchyText.paintedWidth +
+        " vCenterOk=" + vCenterOk + " rowCentered=" + rowCentered + " omarchyX=" + omarchyText.x +
+        " omarchyPaintedWidth=" + omarchyText.paintedWidth +
         " toggleX=" + toggleSwitch.x + " toggleY=" + toggleSwitch.y)
-      if (!overlapOk || !groupOk || !vCenterOk) {
-        console.log("[result] the versionCopied state overlapped the toggle or broke its vertical centering")
+      if (!overlapOk || !groupOk || !vCenterOk || !rowCentered) {
+        console.log("[result] the versionCopied state overlapped the toggle, broke its vertical centering, or split headRow's own shared vertical center")
         Qt.exit(1)
         return
       }
