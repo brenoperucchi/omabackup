@@ -4563,6 +4563,13 @@ path. The scrub retains the defence in depth, but this release does not add a
 mirror-only assertion for interpreter behavior that the end-to-end boundary
 already prevents. No finding blocks commit, push, or the marketplace follow-up.
 
+Released as `ea472fa5aad383ffe21a88a2852491a462af5179`
+(`fix: harden startup and atomic writes`) on `main`, pushed to `origin` after
+the final reviews. The marketplace follow-up was posted on issue
+`omacom/omarchy-plugin-marketplace#3968` as
+`issuecomment-5652785873`, asking `@HANCORE-linux` to re-review the updated
+commit. The pre-existing untracked `docs/plans/` directory remains excluded.
+
 ## Open questions for the user, not yet decided
 
 - **`_push_github`'s temp file has no byte cap while `git` is still
