@@ -143,6 +143,27 @@ it "success is recorded in the destination's own state file"
 it "and a successful destination carries no error"
 assert_eq "$(_state_of "$DH2" '.lastError // ""' nas)" ""
 
+# The destination state writer also uses a predictable temporary name. If a
+# shared state directory refuses its unlink, it must return failure before a
+# redirect can follow a planted link outside the state tree.
+DSH="$(mktemp -d)"; DSBIN="$DSH/bin"; mkdir -p "$DSH/state/destinations" "$DSH/outside" "$DSBIN"
+printf 'sensitive\n' >"$DSH/outside/victim"
+DSTMP="$DSH/state/destinations/nas.json.tmp"
+ln -s "$DSH/outside/victim" "$DSTMP"
+cat >"$DSBIN/rm" <<'SH'
+#!/bin/bash
+[[ "${!#}" == "$OMABACKUP_TEST_STATE_TMP" ]] && exit 1
+exec /usr/bin/rm "$@"
+SH
+chmod +x "$DSBIN/rm"
+DSRC=0
+PATH="$DSBIN:$PATH" OMABACKUP_TEST_STATE_TMP="$DSTMP" OMABACKUP_STATE="$DSH/state" \
+    bash -c 'source lib/destinations.sh; dest_state_write nas "{\"ok\":true}"' >/dev/null 2>&1 || DSRC=$?
+
+it "a failed destination-state temp unlink does not write through its symlink"
+[[ $DSRC -ne 0 && "$(cat "$DSH/outside/victim")" == sensitive ]] \
+    && ok || fail "the state writer opened a temp link after its unlink failed"
+
 # ── retention deletes only what it owns ──────────────────────────────────────
 # A NAS folder is shared with other data and with other machines' bundles.
 DH3="$(mktemp -d)"; DR3="$DH3/repo"; _dest_repo "$DR3"
@@ -676,6 +697,53 @@ _dest_env "$QH" "$QR" push nas >/dev/null
 it "a fresh directory is stamped and managed normally"
 [[ -f "$QNAS/.omabackup-destination" ]] && ok || fail "a directory we created was not stamped"
 
+# A dangling stamp link is not `-f`, so the old direct redirect followed it and
+# created a file outside the shared destination. It is hidden, which means the
+# ownership gate otherwise lets it through; the stamp writer itself must not
+# follow either the final name or its predictable temporary name.
+STH="$(mktemp -d)"; STR="$STH/repo"; _dest_repo "$STR"
+STNAS="$STH/nas"; STOUT="$STH/outside"; mkdir -p "$STNAS" "$STOUT"
+ln -s "$STOUT/victim" "$STNAS/.omabackup-destination"
+cat >"$STH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$STNAS","keep":1}]}
+JSON
+_dest_env "$STH" "$STR" push nas >/dev/null
+
+it "a dangling destination stamp does not redirect a write outside the destination"
+[[ ! -e "$STOUT/victim" ]] && ok || fail "the stamp redirect created $STOUT/victim"
+
+it "and the dangling stamp is not treated as an ownership grant"
+[[ -L "$STNAS/.omabackup-destination" ]] && ok || fail "the untrusted stamp was replaced"
+
+# The final stamp guard is not enough by itself: a symlink planted at the
+# predictable temporary name must never be opened after an unlink failure.
+TFH="$(mktemp -d)"; TFR="$TFH/repo"; _dest_repo "$TFR"
+TFNAS="$TFH/nas"; TFOUT="$TFH/outside"; TFBIN="$TFH/bin"; mkdir -p "$TFNAS" "$TFOUT" "$TFBIN"
+printf 'bundle\n' >"$TFH/bundle.tar.zst"
+printf 'unchanged\n' >"$TFOUT/victim"
+TFSTAMP="$TFNAS/.omabackup-destination.tmp"
+ln -s "$TFOUT/victim" "$TFSTAMP"
+cat >"$TFBIN/rm" <<'SH'
+#!/bin/bash
+last="${!#}"
+if [[ "$last" == "$OMABACKUP_TEST_STAMP_TMP" ]]; then
+    exit 1
+fi
+exec /usr/bin/rm "$@"
+SH
+chmod +x "$TFBIN/rm"
+cat >"$TFH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$TFNAS","keep":1}]}
+JSON
+TFRC=0
+PATH="$TFBIN:$PATH" OMABACKUP_TEST_STAMP_TMP="$TFSTAMP" DESTINATIONS_FILE="$TFH/destinations.json" \
+    bash -c 'source lib/bundle.sh; source lib/destinations.sh; _push_dir "nas" "$1" "omabackup-stamp-temp.tar.zst"' \
+    _ "$TFH/bundle.tar.zst" >/dev/null 2>&1 || TFRC=$?
+
+it "a failed stamp-temp unlink never writes through the planted symlink"
+[[ $TFRC -eq 0 && "$(cat "$TFOUT/victim")" == unchanged ]] \
+    && ok || fail "the failed unlink still redirected the stamp write"
+
 # ── a hostname is not a regular expression ─────────────────────────────────
 # ${host} went raw into the ERE, so a dot -- ordinary in a hostname -- matches
 # any character and widens retention to other machines' bundles.
@@ -914,6 +982,32 @@ assert_eq "$(cat "$PDH/outside/victim.txt")" "sensitive"
 
 it "and the destination gained a real bundle, not a redirected write"
 assert_eq "$(cat "$PDH/dir/omabackup-test-bundle.tar.zst" 2>/dev/null)" "bundle-content"
+
+# --remove-destination protects the temporary name only. Between its copy and
+# the final rename, a shared destination can replace the final name with a
+# directory or a symlink to one. Plain mv then treats that name as a directory
+# and nests the .tmp inside it; it neither replaces the final name nor leaves
+# the bundle where this function promises it did.
+PDFH="$(mktemp -d)"
+mkdir -p "$PDFH/dir" "$PDFH/outside/redirected"
+ln -s "$PDFH/outside/redirected" "$PDFH/dir/omabackup-final-bundle.tar.zst"
+printf 'final-bundle-content\n' >"$PDFH/bundle.tar.zst"
+cat >"$PDFH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$PDFH/dir","keep":5}]}
+JSON
+PDFRC=0
+DESTINATIONS_FILE="$PDFH/destinations.json" bash -c '
+    source lib/bundle.sh; source lib/destinations.sh
+    _push_dir "nas" "$1" "omabackup-final-bundle.tar.zst"
+' _ "$PDFH/bundle.tar.zst" >/dev/null 2>&1 || PDFRC=$?
+
+it "_push_dir replaces a final symlink-to-directory instead of nesting its temp file"
+[[ $PDFRC -eq 0 && -f "$PDFH/dir/omabackup-final-bundle.tar.zst" && ! -L "$PDFH/dir/omabackup-final-bundle.tar.zst" ]] \
+    && ok || fail "the final path was treated as a directory instead of one file name"
+
+it "and does not publish the temp file inside the symlink target"
+[[ ! -e "$PDFH/outside/redirected/omabackup-final-bundle.tar.zst.tmp" ]] \
+    && ok || fail "mv nested the temp file through the final symlink"
 
 # ── _dir_is_ours must not answer "yes" from a walk that stopped partway ─────
 # `done < <(find "$dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)` had no

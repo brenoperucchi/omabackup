@@ -1,8 +1,63 @@
-#!/bin/bash
+#!/usr/bin/bash -p
 # Keep the terminal-owned TUI alive independently of omarchy-launch-tui's
 # short-lived launcher process. The panel is notified only after the CLI has
 # really returned, including when the CLI reports an error.
 set -u
+
+# This wrapper runs ordinary Bash children for the selected CLI and Omarchy
+# helpers. `-p` protects only this first shell, so remove inherited Bash startup
+# hooks before those descendants exist. See bin/omabackup for the boundary's
+# rationale; use /proc rather than `unset` because Bash may reject an imported
+# function while leaving its raw environment entry available to a child.
+_scrub_bash_startup_env() {
+    local entry name self dirty=0
+    local -a clean_env=()
+    # Without procfs this wrapper cannot prove what its ordinary Bash children
+    # would inherit, so fail closed and tell a recovery environment how to
+    # restore that boundary.
+    [[ -r /proc/$$/environ ]] || {
+        printf 'omabackup-tui: cannot inspect inherited environment; mount procfs at /proc and retry\n' >&2
+        exit 126
+    }
+    while IFS= read -r -d '' entry; do
+        case "$entry" in
+            # Ordinary Bash descendants can honor these even though this
+            # privileged wrapper does not. Strip the whole startup state before
+            # the selected CLI or an Omarchy helper can inherit it.
+            BASH_ENV=*|BASH_FUNC_*|SHELLOPTS=*|BASHOPTS=*|PS4=*|BASH_XTRACEFD=*|CDPATH=*|GLOBIGNORE=*|ENV=*|KSH_ENV=*|ZDOTDIR=*) dirty=1 ;;
+            *)
+                # A raw execve environment may contain an entry without a
+                # NAME=VALUE shape. `env` would treat that entry as a command,
+                # so refuse it instead of replaying it during the clean re-exec.
+                name="${entry%%=*}"
+                [[ "$entry" == *=* && "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+                    printf 'omabackup-tui: invalid inherited environment entry\n' >&2
+                    exit 126
+                }
+                clean_env+=("$entry")
+                ;;
+        esac
+    done </proc/$$/environ
+    (( dirty )) || return 0
+    self="$(/usr/bin/readlink -f -- "$0")" || {
+        printf 'omabackup-tui: cannot resolve entry point\n' >&2
+        exit 126
+    }
+    exec /usr/bin/env -i -- "${clean_env[@]}" /usr/bin/bash -p "$self" "$@"
+    printf 'omabackup-tui: cannot restart with a clean environment\n' >&2
+    exit 126
+}
+_scrub_bash_startup_env "$@"
+
+# Do not inherit user-writable mise/bun/rbenv directories from the graphical
+# session before calling omarchy-shell, setsid, ps or the CLI's helpers. All
+# required Omarchy helpers are packaged in /usr/bin; /usr/local is not a
+# package-manager trust boundary. `-p` in this file's shebang prevents
+# BASH_FUNC_* environment functions from preempting these command names; the
+# startup scrub above removes those entries and BASH_ENV for every child too.
+OMABACKUP_SYSTEM_PATH=/usr/bin:/bin
+PATH="$OMABACKUP_SYSTEM_PATH"
+export PATH
 
 cli="${1:-}"
 action="${2:-}"
@@ -238,11 +293,11 @@ CLI_GROUPED=0
         # the CLI's own termios/snapshot cleanup while the wrapper supervises
         # its group.
         setsid -- env --default-signal=INT,QUIT OMABACKUP_TUI_SUPERVISED=1 \
-            /bin/bash -c 'exec "$@"' omabackup-cli "$cli" "$action" <&0 &
+            /usr/bin/bash -p -c 'exec "$@"' omabackup-cli "$cli" "$action" <&0 &
     CLI_GROUPED=1
 else
     env --default-signal=INT,QUIT OMABACKUP_TUI_SUPERVISED=1 \
-        /bin/bash -c 'exec "$@"' omabackup-cli "$cli" "$action" <&0 &
+        /usr/bin/bash -p -c 'exec "$@"' omabackup-cli "$cli" "$action" <&0 &
 fi
 CLI_PID=$!
 if (( CLI_GROUPED )); then

@@ -51,6 +51,21 @@ SECOND="$(cat "$AH/.state/last-sync" 2>/dev/null)"
 [[ -n "$SECOND" && "$SECOND" -ge "$FIRST" ]] \
     && ok || fail "an idle-but-healthy run did not count as success"
 
+# The final rename is safe only if the redirect cannot first follow a planted
+# temporary symlink. Without the unlink below, the timestamp lands in victim
+# and `mv -T` publishes the link as last-sync for every later run.
+LH="$(_stale_home)"
+mkdir -p "$LH/outside" "$LH/.state"; printf 'unchanged\n' >"$LH/outside/victim"
+ln -s "$LH/outside/victim" "$LH/.state/last-sync.tmp"
+_stale_env "$LH" "$LH/repo" sync --commit >/dev/null
+
+it "last-sync does not write through a pre-planted temporary symlink"
+assert_eq "$(cat "$LH/outside/victim")" "unchanged"
+
+it "and replaces that temporary link with a real state record"
+[[ -f "$LH/.state/last-sync" && ! -L "$LH/.state/last-sync" ]] \
+    && ok || fail "last-sync is not the real replacement file"
+
 it "a fresh machine is not stale"
 assert_eq "$(_stale_env "$AH" "$AH/repo" status --json | jq -r '.stale')" "false"
 

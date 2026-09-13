@@ -223,8 +223,10 @@ dest_state_write() {
     # this write land through the link, and the mv right after would move
     # the LINK itself over the real state file -- every future write for
     # this destination silently redirected from then on.
-    rm -f "$p.tmp" 2>/dev/null
-    printf '%s\n' "$doc" >"$p.tmp" && mv "$p.tmp" "$p"
+    if ! rm -f -- "$p.tmp" 2>/dev/null || [[ -e "$p.tmp" || -L "$p.tmp" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$doc" >"$p.tmp" && mv -T -- "$p.tmp" "$p"
 }
 
 _dest_record_success() {
@@ -300,7 +302,7 @@ prune_bundles() {  # prune_bundles <dir> <host> <keep> -> prints how many it rem
     }
     keep="$normalized_keep"
     [[ -d "$dir" ]] || return 1
-    if [[ ! -f "$dir/$DEST_STAMP" ]]; then
+    if [[ ! -f "$dir/$DEST_STAMP" || -L "$dir/$DEST_STAMP" ]]; then
         printf 'omabackup: refusing to prune a directory with no %s stamp: %s\n' "$DEST_STAMP" "$dir" >&2
         return 1
     fi
@@ -430,7 +432,11 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
     # destination gaining a bundle. --remove-destination unlinks whatever is
     # there first, so the write always lands on a fresh file at this path,
     # never through it.
-    cp --remove-destination "$bundle" "$dir/$name.tmp" 2>/dev/null && mv "$dir/$name.tmp" "$dir/$name" 2>/dev/null \
+    # -T is as important here as --remove-destination above: it makes the
+    # final name one filesystem entry. Without it, a final name changed into
+    # a directory (or a symlink to one) between copy and rename receives the
+    # temp file inside it instead of being replaced.
+    cp --remove-destination "$bundle" "$dir/$name.tmp" 2>/dev/null && mv -T -- "$dir/$name.tmp" "$dir/$name" 2>/dev/null \
         || { rm -f "$dir/$name.tmp" 2>/dev/null; printf 'cannot write into %s' "$dir"; return 1; }
     # The stamp is what lets retention delete here, so it can only be granted to
     # a directory this tool actually owns: empty, or holding nothing but its own
@@ -438,8 +444,17 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
     # pruned it, which meant the protection documented as "the rule that matters
     # most" wrote its own permission on the way in. Point this at ~/Documents now
     # and bundles still arrive -- nothing is ever deleted there.
-    if [[ ! -f "$dir/$DEST_STAMP" ]] && _dir_is_ours "$dir" "$name"; then
-        printf '%s\n%s\n' "$id" "$(_hostname)" >"$dir/$DEST_STAMP" 2>/dev/null
+    if [[ ! -e "$dir/$DEST_STAMP" && ! -L "$dir/$DEST_STAMP" ]] && _dir_is_ours "$dir" "$name"; then
+        # A dangling final stamp is not `-f`, but a redirect would still follow
+        # it. Write a fresh temporary entry, then rename one directory entry
+        # over the final name; do not grant retention ownership through a link.
+        if ! rm -f -- "$dir/$DEST_STAMP.tmp" 2>/dev/null \
+            || [[ -e "$dir/$DEST_STAMP.tmp" || -L "$dir/$DEST_STAMP.tmp" ]] \
+            || ! printf '%s\n%s\n' "$id" "$(_hostname)" >"$dir/$DEST_STAMP.tmp" 2>/dev/null \
+            || ! mv -T -- "$dir/$DEST_STAMP.tmp" "$dir/$DEST_STAMP" 2>/dev/null; then
+            rm -f -- "$dir/$DEST_STAMP.tmp" 2>/dev/null
+            printf 'could not mark %s for retention\n' "$dir" >&2
+        fi
     fi
     # Only now, with the new copy confirmed on disk. "Delete the old, upload the
     # new" is how you arrive at zero copies.
@@ -448,7 +463,7 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
     # anything had established the directory was ours -- so pointing the config
     # at somebody's folder deleted their half-written archives on the way in.
     # That is the failure the stamp exists to prevent, one line above the stamp.
-    if [[ -f "$dir/$DEST_STAMP" ]]; then
+    if [[ -f "$dir/$DEST_STAMP" && ! -L "$dir/$DEST_STAMP" ]]; then
         find "$dir" -maxdepth 1 -type f -regextype posix-extended \
             -regex ".*/omabackup-.+-${DEST_NAME_TAIL%\\.tar\\.zst}\.tar\.zst\.tmp" \
             -delete 2>/dev/null

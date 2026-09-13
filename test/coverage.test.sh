@@ -29,6 +29,20 @@ cat >"$CH/g.json" <<'JSON'
 JSON
 _cov_env "$CH" collect >/dev/null
 
+# Same atomic-write shape as last-sync and restore's journal: a final `mv -T`
+# is insufficient when a redirect has already followed `$dst.tmp` outside the
+# state tree. The unlink must happen before the redirect opens the file.
+mkdir -p "$CH/outside"; printf 'unchanged\n' >"$CH/outside/victim"
+ln -s "$CH/outside/victim" "$CH/.state/coverage.json.tmp"
+_cov_env "$CH" collect >/dev/null
+
+it "coverage does not write through a pre-planted temporary symlink"
+assert_eq "$(cat "$CH/outside/victim")" "unchanged"
+
+it "and replaces that temporary link with a real coverage record"
+[[ -f "$CH/.state/coverage.json" && ! -L "$CH/.state/coverage.json" ]] \
+    && ok || fail "coverage.json is not the real replacement file"
+
 it "collect records what each group actually covers"
 assert_eq "$(_cov_env "$CH" verify --json | jq -r '[.groups[] | select(.id=="app")] | length')" "1"
 

@@ -14,7 +14,7 @@ _config_atomic_write() {
         return 1
     fi
     chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
-    mv -f -- "$tmp" "$path"
+    mv -f -T -- "$tmp" "$path"
 }
 
 _config_env_set() {
@@ -44,7 +44,7 @@ _config_env_set() {
         printf '%s=%s\n' "$key" "$value" >>"$tmp" || { rm -f -- "$tmp"; return 1; }
     fi
     chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
-    mv -f -- "$tmp" "$file"
+    mv -f -T -- "$tmp" "$file"
 }
 
 _config_absolute_path() {
@@ -132,7 +132,7 @@ _config_timer_set() {
         return 1
     fi
     chmod --reference="$file" "$tmp" 2>/dev/null || chmod 644 "$tmp"
-    mv -f -- "$tmp" "$file"
+    mv -f -T -- "$tmp" "$file"
 }
 
 _config_file_schedule() {
@@ -1163,7 +1163,7 @@ cmd_config() {
                             || die "timer reload failed and rollback could not start"
                         if ! printf '%s\n' "$previous_timer" >"$rollback_tmp" \
                            || ! chmod "$previous_mode" "$rollback_tmp" \
-                           || ! mv -f -- "$rollback_tmp" "$timer_file"; then
+                           || ! mv -f -T -- "$rollback_tmp" "$timer_file"; then
                             rm -f -- "$rollback_tmp"
                             die "timer reload failed and rollback could not restore the previous schedule"
                         fi

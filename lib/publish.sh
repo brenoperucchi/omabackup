@@ -128,7 +128,7 @@ _publish_file() {  # _publish_file <src> <dst> <repo-root> [<repo-root-rp>]
         if ! rm -f "$dst.tmp" 2>/dev/null || [[ -e "$dst.tmp" || -L "$dst.tmp" ]]; then
             return 1
         fi
-        jq -S . "$src" >"$dst.tmp" && mv "$dst.tmp" "$dst"
+        jq -S . "$src" >"$dst.tmp" && mv -T -- "$dst.tmp" "$dst"
     else
         # `cp -p`, not `rsync`. rsync costs ~44ms to start against cp's ~0.5ms,
         # and this runs once per staged file: 597 files spent 27 of a sync's 33

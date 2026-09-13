@@ -8,10 +8,11 @@ Documentation=https://github.com/brenoperucchi/omabackup
 
 [Service]
 Type=oneshot
-# OMABACKUP_REPO lives here, not in the unit: it is machine identity, the same
-# class as destinations.json. The leading `-` means a missing file is not an
-# error -- the CLI produces a far better message than systemd would.
-EnvironmentFile=-%h/.config/omabackup/env
+# The CLI parses ~/.config/omabackup/env itself through its allow-list. Do not
+# import it here: EnvironmentFile would inject every key before the CLI could
+# reject policy overrides. The CLI re-pins PATH unconditionally; this is the
+# scheduler's matching defence-in-depth default.
+Environment=PATH=/usr/bin:/bin
 # This run already has a real log -- `journalctl --user -u
 # omabackup-sync.service` -- so it opts out of lib/log.sh's own file log,
 # which exists for what has no log anywhere else (an interactive TUI

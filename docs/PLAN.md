@@ -8,7 +8,7 @@ Codex, a fresh terminal, another machine) — it is what lets a cold session,
 regardless of which coding agent is reading it, pick up where the last one
 left off. Read this file first, in full, before touching any code.
 
-Last updated: 2026-08-31.
+Last updated: 2026-09-13.
 
 ---
 
@@ -4366,6 +4366,202 @@ exclusion mechanism for it, unlike the compositor probe's
 `is_excluded`) -- corrected after initially telling the user otherwise.
 
 Full suite: **1353 passed, 0 failed.**
+
+### Session resumed from the security-audit handoff — 2026-09-13
+
+Read the predecessor's handoff and this plan in full. The handoff reports
+two confirmed audit findings awaiting the user's decision: inherited PATH
+resolution in the entry points/services, and `_push_dir`'s final `mv`
+without `-T`. Neither fix nor its scope has been approved; neither was
+implemented or independently re-tested during this context-only resumption.
+Consult the original session history selectively if more evidence is needed.
+
+Checkout observed at `8f9f12f`, manifest `0.4.3`, with no tracked changes
+before this note and an existing untracked `docs/plans/` directory, left
+untouched. No tests, review round, commit, or push were run this session.
+
+### Audit hardening approved and implemented — 2026-09-13
+
+After the user approved the two findings and a consultation with the
+OmaSession maintainer agent, this checkout now closes both surfaces.
+
+- Production entry points (`bin/omabackup` and `bin/omabackup-tui`) now use
+  `#!/usr/bin/bash -p` and replace `PATH` with exactly `/usr/bin:/bin`, before
+  configuration or libraries load. Those are package-manager directories for
+  every required tool and Omarchy helper; `/usr/local` was intentionally
+  removed because it is local policy, not this trust boundary. The few nested
+  Bash invocations in artifact and bundle operations also use `bash -p`, so
+  an inherited `BASH_FUNC_*` cannot revive inside a child shell. This initial
+  version's `EnvironmentFile=` ordering claim was corrected in round 46; see
+  the authorized remediation note below.
+- The first version exposed `OMABACKUP_TEST_ALLOW_INHERITED_PATH=1` as an
+  environment seam. Review round 45 correctly found that any caller (and the
+  services' `EnvironmentFile=`) could set it to disable both controls. It was
+  removed from shipped code. `test/run.sh` instead makes a disposable full
+  checkout, strips the two PATH assignments only in that test copy, and keeps
+  the original checkout available to regressions that must exercise the
+  production executable. This preserves fixture shims without a production
+  opt-out or a route for a faulty test to commit in the real checkout.
+- Every final, atomic publication that replaces a file now uses `mv -T --`.
+  This includes `_push_dir`'s destination artifact, destination state,
+  configuration, bundle cache, publish normalization, restore journals, and
+  the installed service refresh. A stage-directory assembly move remains a
+  plain `mv`, because its destination is intentionally a directory rather
+  than a final name being published. Round 45 also found the same temporary
+  symlink opening before `last-sync` and `coverage.json`; both now unlink the
+  predictable `.tmp` before redirecting, matching the existing destination,
+  publish, and restore writers.
+- The original regressions failed against the pre-fix tree: `deps.test.sh` had
+  **13 passed, 2 failed** (the counterfeit `git` ran and static path policy
+  was absent), and `destinations.test.sh` had **89 passed, 2 failed** (a final
+  symlink-to-directory captured the temporary artifact). After the fixes,
+  those focused suites report **15 passed, 0 failed** and **91 passed, 0
+  failed**, respectively. The review additions prove that the obsolete seam
+  value still cannot select a fake `git`, an imported `git` function is not
+  run, and service ordering makes the fixed PATH prevail. They also preplant
+  `last-sync.tmp` and `coverage.json.tmp` links; a controlled removal of the
+  two new unlinks produced **2 failures in each** focused suite, then both
+  passed when restored. `bash -n` is clean. The final complete suite reports
+  **1363 passed, 0 failed**.
+- `manifest.json` is now version `0.4.4`, as required for a visible plugin
+  update.
+
+Blind parallel review round `omabackup-45` returned request changes. Its
+confirmed service/seam finding and the accepted additional issues (imported
+Bash functions, child Bash calls, and the two remaining predictable `.tmp`
+writes) are incorporated above. Correction round 2 is the remaining gate
+before commit, push, and the follow-up on the plugin issue.
+
+#### Review round `omabackup-46` (correction round 2 of 2): not approved
+
+The two reviewers did not approve the corrected diff. Their overlapping
+evidence confirms that `bash -p` on the entry points does not sanitize the
+startup environment inherited by descendants: the two `/bin/bash -c` launcher
+calls in `bin/omabackup-tui` still accept both `BASH_ENV` and imported
+functions, and packaged Omarchy helper scripts with ordinary Bash shebangs
+can do the same. The explicit wrapper child needs `-p`; any broader cleanup
+must protect helpers as well, rather than assuming the privileged parent
+clears their environment.
+
+They also independently corrected round 45's systemd assumption:
+`EnvironmentFile=` overrides `Environment=` regardless of textual order.
+The entry point's unconditional PATH reset remains the actual effective
+defence, but the units, their comments, and the static line-order regression
+must not claim otherwise. `omabackup-rev-2` additionally showed that the same
+`EnvironmentFile` still exports policy variables such as
+`OMABACKUP_SECRETS_DENY` before the CLI's allow-list parser can see them;
+that reopens the documented toothless-deny-list path on timer runs.
+
+Three smaller unique findings were accepted as valid but not yet implemented:
+the test-copy `sed` must prove it altered exactly the expected assignments;
+the predictable destination stamp redirect needs the same no-follow atomic
+write treatment as the other state writers; and dependency specs should call
+the executable directly rather than `bash "$OB"`, which bypasses its
+privileged shebang.
+
+The review protocol caps this at two correction rounds. No further code,
+commit, push, or issue comment had been made after round 46 until the user
+explicitly authorized the following remediation cycle.
+
+#### Authorized remediation after review round `omabackup-46`: awaiting final review
+
+The user authorized the fixes despite the normal two-round cap. Both entry
+points now inspect `/proc/$$/environ` before configuration or helpers load;
+if `BASH_ENV` or any `BASH_FUNC_*` entry was inherited, they re-exec through
+`env -i` and `bash -p` with only those startup hooks removed. This protects
+ordinary Bash descendants as well as the privileged entry point. The TUI's
+two CLI launchers also explicitly use `bash -p`.
+
+The systemd services no longer have `EnvironmentFile=` at all. The CLI is the
+one place that parses `~/.config/omabackup/env`, accepting only repository and
+destination location values; the units retain an explicit package-only PATH as
+defence in depth. This prevents a timer invocation from receiving policy
+overrides before the CLI can reject them.
+
+`test/run.sh` now proves each copied entry point had exactly one production
+PATH assignment and export before stripping them for fixtures, then proves
+both are absent. The destination ownership stamp rejects an existing or
+dangling final link and writes through a temporary file followed by `mv -T`;
+retention likewise requires a regular, non-link stamp. Dependency specs now
+execute their fixture binary directly, preserving its privileged shebang.
+
+New regressions initially failed: `deps.test.sh` reported **15 passed, 3
+failed** (unit import, unverified test-copy patch, and TUI `BASH_ENV`), while
+the dangling-stamp scenario created the outside victim. With the remediations,
+the focused suites report **18 passed, 0 failed** and **93 passed, 0 failed**
+for `deps.test.sh` and `destinations.test.sh`, respectively. `bash -n` and
+`git diff --check` are clean. The normal foreground complete suite reports
+**1367 passed, 0 failed**. A further blind parallel Herdr review remains
+required before commit, push, and the marketplace follow-up.
+
+#### Review round `omabackup-47`: remediating its confirmed boundary findings
+
+Both reviewers found that the first startup-scrub implementation replayed raw
+`/proc/$$/environ` entries straight into `env -i`. A malformed entry without
+`NAME=VALUE` syntax could therefore become `env`'s command; one reviewer also
+demonstrated option-shaped input. New `test/deps.test.sh` constructs an actual
+raw `execve` environment with `BASH_ENV=/dev/null` and `/usr/bin/printf` as a
+malformed entry. It failed against the first scrub (`rc=0`, with `printf`
+running) and now requires exit 126 and the explicit invalid-entry diagnostic.
+Both entrypoints validate every retained entry's name, remove the complete
+Bash startup state (`BASH_ENV`, functions, shell options, trace settings and
+other shell startup hooks), and use `env -i --` for the re-exec boundary.
+
+One reviewer also found that the new destination-stamp writer ignored an
+`rm` failure before redirecting its predictable temporary name. The new
+destination regression plants that temporary symlink, makes only its unlink
+fail, and proves the external victim stays unchanged. `_push_dir` now
+short-circuits before the redirect if unlinking failed or a temporary entry
+remains. The final stamp continues to use `mv -T`, and a backup still succeeds
+without granting retention ownership when stamping cannot complete.
+
+The unique `SHELLOPTS`/`PS4` observation was measured through the actual
+privileged entrypoint as well: `bash -p` normalizes inherited `SHELLOPTS`
+before it launches an ordinary Omarchy helper, so the claimed helper execution
+does not reproduce in the shipped path. The scrub now removes those values
+nevertheless, so the re-exec boundary does not depend on that interpreter
+detail. The reviewer’s `/proc` recovery concern is documented as a deliberate
+fail-closed boundary, not silently treated as an approval condition.
+
+Post-remediation focused runs are **19 passed, 0 failed** for
+`deps.test.sh` and **94 passed, 0 failed** for `destinations.test.sh`; syntax
+and whitespace checks are clean. The normal foreground full suite reports
+**1369 passed, 0 failed**. Final parallel review remains required before
+publication.
+
+#### Review round `omabackup-48`: approved core hardening; final writer gap closed
+
+`omabackup-rev-1` approved the round after retesting the raw `execve`
+payloads, conventional contaminated environments, the stamp unlink failure
+and the procfs diagnostic. `omabackup-rev-2` also confirmed that the three
+round-47 issues were closed and considered the security work authorized, but
+identified two follow-ups. Its proposed `SHELLOPTS` coverage path does not
+reproduce through the shipped `#!/usr/bin/bash -p` entrypoint: privileged Bash
+normalizes the inherited option before it can reach an ordinary helper. The
+scrub still removes that state, but no mirror-only regression was added for a
+path that is already closed by the interpreter.
+
+The other follow-up was valid: `dest_state_write` and `restore_record` still
+ignored a failed unlink before redirecting their predictable temporary names.
+Permanent regressions now plant each temporary symlink, make only its `rm`
+fail, and prove the outside victim remains unchanged. They failed before the
+fix (`destinations.test.sh` **94 passed, 1 failed**; `restore.test.sh` **255
+passed, 1 failed**) and pass after it (**95 passed, 0 failed** and **256
+passed, 0 failed**). Both writers now short-circuit and report ordinary write
+failure instead of opening a retained temporary entry. Syntax and whitespace
+checks remain clean. The normal foreground release suite reports **1371
+passed, 0 failed**.
+
+#### Review round `omabackup-49`: approved for release
+
+Both reviewers approved the final writer fixes. The sole remaining unique
+observation was a non-blocking coverage request for every startup-state name
+in the scrub case. It was evaluated against the actual privileged entrypoint:
+`bash -p` already normalizes `SHELLOPTS` before a helper can inherit it, so
+removing that extra scrub arm does not reproduce the claimed helper execution
+path. The scrub retains the defence in depth, but this release does not add a
+mirror-only assertion for interpreter behavior that the end-to-end boundary
+already prevents. No finding blocks commit, push, or the marketplace follow-up.
 
 ## Open questions for the user, not yet decided
 

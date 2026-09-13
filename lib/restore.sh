@@ -908,8 +908,11 @@ restore_record() {
             "$(dirname "$p")" >&2
         return 1
     }
-    rm -f "$p.tmp" 2>/dev/null
-    if printf '%s\n' "$doc" >"$p.tmp" 2>/dev/null && mv "$p.tmp" "$p" 2>/dev/null; then
+    if ! rm -f -- "$p.tmp" 2>/dev/null || [[ -e "$p.tmp" || -L "$p.tmp" ]]; then
+        printf 'omabackup: could not save the restore journal at %s\n' "$p" >&2
+        return 1
+    fi
+    if printf '%s\n' "$doc" >"$p.tmp" 2>/dev/null && mv -T -- "$p.tmp" "$p" 2>/dev/null; then
         return 0
     fi
     printf 'omabackup: could not save the restore journal at %s\n' "$p" >&2

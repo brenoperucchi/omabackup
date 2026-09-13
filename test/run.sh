@@ -1,7 +1,48 @@
-#!/bin/bash
+#!/usr/bin/bash -p
 # Minimal runner. Usage: ./test/run.sh [pattern]
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Many permanent regressions deliberately place a fake command on PATH. A
+# production executable may not carry an environment opt-out for that: any
+# caller, including a systemd EnvironmentFile, could set it. Instead, run the
+# suite in a disposable complete checkout and remove the two path assignments
+# only from that test build. The shipped files never see the test marker or
+# inherit the shims. Keeping .git in the copy also means a faulty spec cannot
+# commit against the developer's actual checkout.
+if [[ ${OMABACKUP_TEST_BUILD:-} != 1 ]]; then
+    TEST_COPY="$(mktemp -d)" || exit 1
+    trap 'rm -rf "$TEST_COPY"' EXIT
+    mkdir -p "$TEST_COPY/repo" || exit 1
+    rsync -a --exclude='.herdr' --exclude='docs/plans' "$ROOT/" "$TEST_COPY/repo/" || exit 1
+    _unpin_test_copy() {
+        local entry path_count export_count
+        for entry in "$@"; do
+            path_count="$(/usr/bin/grep -cx 'PATH="$OMABACKUP_SYSTEM_PATH"' "$entry")"
+            export_count="$(/usr/bin/grep -cx 'export PATH' "$entry")"
+            [[ "$path_count" == 1 && "$export_count" == 1 ]] || {
+                printf 'test runner: expected exactly one production PATH assignment in %s\n' "$entry" >&2
+                return 1
+            }
+        done
+        /usr/bin/sed -i '/^PATH="$OMABACKUP_SYSTEM_PATH"$/d; /^export PATH$/d' "$@" || return 1
+        for entry in "$@"; do
+            path_count="$(/usr/bin/grep -cx 'PATH="$OMABACKUP_SYSTEM_PATH"' "$entry")"
+            export_count="$(/usr/bin/grep -cx 'export PATH' "$entry")"
+            [[ "$path_count" == 0 && "$export_count" == 0 ]] || {
+                printf 'test runner: could not remove production PATH assignment in %s\n' "$entry" >&2
+                return 1
+            }
+        done
+    }
+    _unpin_test_copy "$TEST_COPY/repo/bin/omabackup" "$TEST_COPY/repo/bin/omabackup-tui" || exit 1
+    OMABACKUP_TEST_BUILD=1 OMABACKUP_PRODUCTION_ROOT="$ROOT" \
+        "$TEST_COPY/repo/test/run.sh" "$@"
+    exit $?
+fi
+
+cd "$ROOT"
 
 # Specs never clean up their own `mktemp -d` fixtures -- 216 calls across the
 # suite, zero of them removed. Scoped to a throwaway TMPDIR and torn down on

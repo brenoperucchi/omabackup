@@ -179,7 +179,7 @@ _artifact_manifest_file() {
     # ./manifest.json, not manifest.json: the bundle's members are stored with
     # the leading "./" (tar -C stage -x's own doing, confirmed against a real
     # bundle), and tar -xO does not normalize that away when matching a name.
-    timeout --kill-after=5s "${ARTIFACT_MANIFEST_TIMEOUT_SEC}s" bash -c '
+    timeout --kill-after=5s "${ARTIFACT_MANIFEST_TIMEOUT_SEC}s" bash -p -c '
         set -o pipefail
         zstd -dc -- "$1" 2>/dev/null \
             | env -u TAR_OPTIONS tar -xO ./manifest.json 2>/dev/null \

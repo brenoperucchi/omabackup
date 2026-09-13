@@ -14,6 +14,12 @@
 # about it is worse than the missing package.
 
 OB="$PWD/bin/omabackup"
+# `test/run.sh` executes this spec from a disposable checkout whose entry
+# points deliberately retain fixture PATH shims. These assertions must run the
+# shipped executable, not that test build, so a fake command cannot hide a
+# production bypass.
+PROD_ROOT="${OMABACKUP_PRODUCTION_ROOT:-$PWD}"
+PROD_OB="$PROD_ROOT/bin/omabackup"
 
 # A PATH containing exactly the named tools and nothing else, so "missing" is a
 # fact rather than a simulation.
@@ -35,6 +41,130 @@ _only_path() {  # _only_path <dir> <tool...>
         p="$(type -P "$t" 2>/dev/null)" && ln -sf "$p" "$d/$t"
     done
 }
+
+# ── inherited PATH cannot select a tool ─────────────────────────────────────
+# The graphical user systemd manager on this machine inherited user-writable
+# mise/bun/rbenv directories before /usr/bin. A program planted there was the
+# command `require_tools` and the later operation both ran. This test leaves a
+# fake git at the front of the inherited PATH and also supplies the obsolete
+# seam name: bundle must complete with the real git and the fake must never
+# execute. This proves no environment value can opt out of production policy.
+PATHH="$(mktemp -d)"; PATHBIN="$PATHH/bin"; PATHREPO="$PATHH/repo"
+mkdir -p "$PATHBIN" "$PATHREPO/configs/app" "$PATHH/home/.config/app"
+git init -q "$PATHREPO"; git -C "$PATHREPO" config user.email t@t; git -C "$PATHREPO" config user.name t
+printf 'repo\n' >"$PATHREPO/configs/app/f.txt"
+git -C "$PATHREPO" add -A && git -C "$PATHREPO" commit -qm one
+printf 'live\n' >"$PATHH/home/.config/app/f.txt"
+cat >"$PATHH/groups.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,"paths":["~/.config/app"]}]}
+JSON
+cat >"$PATHBIN/git" <<'SH'
+#!/bin/bash
+printf 'fake git ran\n' >>"$OMABACKUP_PATH_PROBE"
+exec /usr/bin/git "$@"
+SH
+chmod +x "$PATHBIN/git"
+PATHPROBE="$PATHH/fake-git-ran"
+PATHOUT="$(env OMABACKUP_TEST_ALLOW_INHERITED_PATH=1 \
+    PATH="$PATHBIN:$PATH" OMABACKUP_PATH_PROBE="$PATHPROBE" HOME="$PATHH/home" \
+    OMABACKUP_GROUPS="$PATHH/groups.json" OMABACKUP_STATE="$PATHH/state" \
+    OMABACKUP_REPO="$PATHREPO" XDG_RUNTIME_DIR=/nonexistent \
+    "$PROD_OB" bundle 2>&1)"
+PATHRC=$?
+
+it "bundle ignores a fake git and the obsolete test seam on inherited PATH"
+[[ ! -e "$PATHPROBE" ]] && ok || fail "the inherited-PATH git executed"
+
+it "and still resolves the real git from its fixed system PATH"
+[[ $PATHRC -eq 0 ]] && ok || fail "bundle failed after rejecting the inherited PATH: $PATHOUT"
+
+FUNCPROBE="$PATHH/imported-function-ran"
+FUNCOUT="$(env 'BASH_FUNC_git%%=() { printf imported-function-ran >>"$OMABACKUP_PATH_PROBE"; }' \
+    OMABACKUP_PATH_PROBE="$FUNCPROBE" HOME="$PATHH/home" \
+    OMABACKUP_GROUPS="$PATHH/groups.json" OMABACKUP_STATE="$PATHH/state-function" \
+    OMABACKUP_REPO="$PATHREPO" XDG_RUNTIME_DIR=/nonexistent \
+    "$PROD_OB" bundle 2>&1)"
+FUNCRC=$?
+
+it "the production shebang rejects an imported git function before tool lookup"
+[[ ! -e "$FUNCPROBE" && $FUNCRC -eq 0 ]] && ok || fail "the imported function ran or bundle failed: $FUNCOUT"
+
+# A shell cannot export a malformed environment name, but execve can. The
+# startup scrub must reject one rather than handing it to `env`, where the
+# first entry without NAME=VALUE syntax becomes a command to execute.
+MALENVOUT="$(PROD_OB="$PROD_OB" /usr/bin/python3 - 2>&1 <<'PY'
+import ctypes
+import os
+
+program = os.environ['PROD_OB'].encode()
+argv = (ctypes.c_char_p * 5)(program, b'not-a-cli', b'config', b'token', None)
+envp = (ctypes.c_char_p * 5)(
+    b'BASH_ENV=/dev/null',
+    b'/usr/bin/printf',
+    b'PATH=/usr/bin:/bin',
+    b'HOME=/tmp',
+    None,
+)
+ctypes.CDLL(None).execve(program, argv, envp)
+raise OSError(ctypes.get_errno(), 'execve')
+PY
+)"
+MALENVRC=$?
+
+it "a malformed inherited environment is refused before env can execute it"
+[[ $MALENVRC -eq 126 && "$MALENVOUT" == *"invalid inherited environment entry"* ]] \
+    && ok || fail "the malformed entry reached env instead: rc=$MALENVRC output=$MALENVOUT"
+
+_unit_is_self_contained() {  # _unit_is_self_contained <unit>
+    ! grep -q '^EnvironmentFile=' "$1" \
+        && [[ "$(grep -cx 'Environment=PATH=/usr/bin:/bin' "$1")" == 1 ]]
+}
+
+it "entry points use privileged Bash and services do not import arbitrary env"
+if grep -q '^#!/usr/bin/bash -p$' "$PROD_OB" \
+   && grep -q '^#!/usr/bin/bash -p$' "$PROD_ROOT/bin/omabackup-tui" \
+   && grep -q '^PATH="$OMABACKUP_SYSTEM_PATH"$' "$PROD_OB" \
+   && grep -q '^PATH="$OMABACKUP_SYSTEM_PATH"$' "$PROD_ROOT/bin/omabackup-tui" \
+   && _unit_is_self_contained "$PROD_ROOT/systemd/omabackup-sync.service" \
+   && _unit_is_self_contained "$PROD_ROOT/systemd/omabackup-push.service"; then
+    ok
+else
+    fail "a user service can still import an arbitrary environment file"
+fi
+
+it "the disposable test build verifies both production PATH pins before patching"
+if grep -q '_unpin_test_copy' "$PROD_ROOT/test/run.sh" \
+   && grep -q 'expected exactly one production PATH assignment' "$PROD_ROOT/test/run.sh"; then
+    ok
+else
+    fail "the test-copy patch can silently become a no-op"
+fi
+
+# The TUI's own privileged shebang is insufficient if its launcher gives
+# BASH_ENV back to a non-privileged child shell. The fake CLI must run, but the
+# startup file must never be sourced by the wrapper, its launcher, or an IPC
+# helper it starts after the CLI returns.
+TUIH="$(mktemp -d)"; TUI_PROBE="$TUIH/probe"; TUI_CLI="$TUIH/cli"; TUI_ENV="$TUIH/bash-env"
+cat >"$TUI_CLI" <<'SH'
+#!/bin/bash
+[[ "$1" == config ]] && printf 'cli-ran\n' >>"$OMABACKUP_TUI_PROBE"
+SH
+cat >"$TUI_ENV" <<'SH'
+printf 'bash-env-ran\n' >>"$OMABACKUP_TUI_PROBE"
+SH
+chmod +x "$TUI_CLI"
+TUIOUT="$(env BASH_ENV="$TUI_ENV" OMABACKUP_TUI_PROBE="$TUI_PROBE" \
+    OMABACKUP_LOG_SKIP=1 XDG_RUNTIME_DIR=/nonexistent \
+    "$PROD_ROOT/bin/omabackup-tui" "$TUI_CLI" config token 2>&1)"
+TUIRC=$?
+
+it "the TUI strips BASH_ENV before launching its CLI and helpers"
+if [[ $TUIRC -eq 0 && "$(cat "$TUI_PROBE" 2>/dev/null)" == 'cli-ran' ]]; then
+    ok
+else
+    fail "the TUI launched a child with BASH_ENV: $TUIOUT"
+fi
 
 # Everything the tool legitimately expects, minus hostname. `timeout` is a
 # genuinely new addition (round omabackup-27, marketplace security review):
@@ -66,7 +196,7 @@ PATH="$XBIN" command -v hostname >/dev/null 2>&1 && fail "the fixture still has 
 XOUT="$(PATH="$XBIN" HOME="$XH" OMABACKUP_ROOT="$PWD" \
     OMABACKUP_GROUPS="$PWD/groups.default.json" OMABACKUP_STATE="$XH/.state" \
     OMABACKUP_REPO="$XR" XDG_RUNTIME_DIR=/nonexistent \
-    bash "$OB" bundle --json 2>&1)"
+    "$OB" bundle --json 2>&1)"
 
 it "bundle still builds with no hostname binary on the system"
 [[ -n "$(printf '%s' "$XOUT" | jq -r '.path // empty' 2>/dev/null)" ]] \
@@ -93,7 +223,7 @@ cat >"$YH/g.json" <<'JSON'
 JSON
 YOUT="$(PATH="$YBIN" HOME="$YH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$YH/g.json" \
     OMABACKUP_STATE="$YH/.state" XDG_RUNTIME_DIR=/nonexistent \
-    bash "$OB" collect 2>&1)"
+    "$OB" collect 2>&1)"
 YRC=$?
 
 it "collect without rsync fails instead of half-working"
@@ -125,7 +255,7 @@ PATH="$ZBIN" command -v zstd >/dev/null 2>&1 && fail "the fixture still has zstd
 
 PATH="$ZBIN" HOME="$ZH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$ZH/g.json" \
     OMABACKUP_STATE="$ZH/.state" XDG_RUNTIME_DIR=/nonexistent \
-    bash "$OB" verify >/dev/null 2>&1
+    "$OB" verify >/dev/null 2>&1
 ZRC=$?
 
 it "verify still runs on a machine with no zstd and no tar"
@@ -134,7 +264,7 @@ it "verify still runs on a machine with no zstd and no tar"
 it "collect too -- copying files needs no archiver"
 PATH="$ZBIN" HOME="$ZH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$ZH/g.json" \
     OMABACKUP_STATE="$ZH/.state2" XDG_RUNTIME_DIR=/nonexistent \
-    bash "$OB" collect >/dev/null 2>&1
+    "$OB" collect >/dev/null 2>&1
 [[ $? -eq 0 ]] && ok || fail "collect refused to run over a bundle-only dependency"
 
 ZR="$ZH/repo"; mkdir -p "$ZR"; git init -q "$ZR"
@@ -142,7 +272,7 @@ git -C "$ZR" config user.email t@t; git -C "$ZR" config user.name t
 printf 'x\n' >"$ZR/f.txt"; git -C "$ZR" add -A; git -C "$ZR" commit -qm one
 ZOUT="$(PATH="$ZBIN" HOME="$ZH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$ZH/g.json" \
     OMABACKUP_STATE="$ZH/.state" OMABACKUP_REPO="$ZR" XDG_RUNTIME_DIR=/nonexistent \
-    bash "$OB" bundle 2>&1)"
+    "$OB" bundle 2>&1)"
 
 it "but bundle says exactly what it needs"
 assert_contains "$ZOUT" "zstd"

@@ -214,7 +214,7 @@ Three ways in, in order of preference:
 3. **Run the tool.** `tool/` holds the omabackup that produced this bundle,
    at the version that produced it:
 
-       OMABACKUP_ROOT=$PWD/tool bash tool/bin/omabackup status
+       OMABACKUP_ROOT=$PWD/tool bash -p tool/bin/omabackup status
 
 Before restoring anything, read `manifest.json`:
 
@@ -384,7 +384,7 @@ build_bundle() {
     local comprc=$?
     (( _had_pf )) || set +o pipefail
     (( comprc == 0 )) || { rm -rf "$stage" "$out.tmp"; return 1; }
-    mv "$out.tmp" "$out" || { rm -rf "$stage" "$out.tmp"; return 1; }
+    mv -T -- "$out.tmp" "$out" || { rm -rf "$stage" "$out.tmp"; return 1; }
     rm -rf "$stage"
     # Proved here, not in whichever command happened to ask. verify_bundle used
     # to live in cmd_bundle alone, so `push` -- the verb that actually sends --
@@ -461,7 +461,7 @@ _verify_extracted() {
     if (( run_embedded )); then
         OMABACKUP_ROOT="$x/tool" OMABACKUP_GROUPS="$x/tool/groups.default.json" \
             OMABACKUP_STATE="$x/.state" XDG_RUNTIME_DIR=/nonexistent \
-            bash "$x/tool/bin/omabackup" status --json >/dev/null 2>&1 || rc=1
+            bash -p "$x/tool/bin/omabackup" status --json >/dev/null 2>&1 || rc=1
     fi
 
     rm -rf "$clone"
@@ -670,7 +670,7 @@ fi
 # or a flat-count-only cap would have allowed through.
 _zstd_extract() {
     local archive="$1" dest="$2"
-    # The whole 4-stage pipe now runs inside a CHILD `bash -c`, launched
+    # The whole 4-stage pipe now runs inside a CHILD `bash -p -c`, launched
     # by `timeout` below -- not directly in this function's own shell the
     # way it used to. pipefail is therefore set INSIDE that child script
     # (its own first line), not here: this function's own shell never
@@ -691,7 +691,7 @@ _zstd_extract() {
     # source) -- so a timeout here reaps zstd/head/tar/awk together, not
     # just whichever one `timeout` directly spawned.
     #
-    # The pipe is expressed as one `bash -c` argument, with every value it
+    # The pipe is expressed as one `bash -p -c` argument, with every value it
     # needs passed positionally (archive, byte cap, dest, member cap,
     # depth cap, the awk program text itself) rather than interpolated
     # into the script string -- keeps the whole thing to one level of
@@ -725,7 +725,7 @@ _zstd_extract() {
     # cache paths), and zstd already fails closed on it today -- but free,
     # and removes the one way a legitimate path could fail confusingly.
     local _awk_prog='{ n++; depth = gsub(/\//, "&"); if (depth > maxdepth) exit 1; cost += depth + 1; if (cost > max) exit 1 }'
-    timeout --kill-after=5s "${BUNDLE_EXTRACT_TIMEOUT_SEC}s" bash -c '
+    timeout --kill-after=5s "${BUNDLE_EXTRACT_TIMEOUT_SEC}s" bash -p -c '
         set -o pipefail
         zstd -dc -- "$1" 2>/dev/null \
             | head -c "$2" \

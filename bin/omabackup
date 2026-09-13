@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/bash -p
 # omabackup -- dotfile backup with verified coverage and a declared restore
 # range. The heavy lifting lives here, outside QML: an error inside quickshell
 # takes down the bar, the dock and the menu at once, and restoring has to work
@@ -7,6 +7,72 @@
 # Usage: omabackup <collect|verify|status> [--json] [--groups a,b]
 
 set -uo pipefail
+
+# `-p` stops this shell from importing BASH_FUNC_* definitions, but leaves the
+# raw environment intact for ordinary, non-privileged Bash children. Several
+# Omarchy helpers are such children, so BASH_ENV or an imported function could
+# still run after this entry point had made its own command lookup safe. Inspect
+# the inherited environment before loading configuration or a library and, only
+# when it carries a Bash startup hook, re-exec with those entries removed. Bash
+# itself cannot reliably unset an imported-function entry that it rejected; an
+# `env -i` re-exec is the boundary that removes it for every descendant too.
+_scrub_bash_startup_env() {
+    local entry name self dirty=0
+    local -a clean_env=()
+    # No /proc means this process cannot prove what an ordinary Bash child
+    # would inherit. Fail closed rather than silently skip the boundary; a
+    # recovery chroot can mount procfs and retry with the same artifact.
+    [[ -r /proc/$$/environ ]] || {
+        printf 'omabackup: cannot inspect inherited environment; mount procfs at /proc and retry\n' >&2
+        exit 126
+    }
+    while IFS= read -r -d '' entry; do
+        case "$entry" in
+            # Ordinary Bash descendants can honor these even though this
+            # privileged entry point does not. Strip the whole startup state,
+            # not only BASH_ENV/functions, before helpers inherit it.
+            BASH_ENV=*|BASH_FUNC_*|SHELLOPTS=*|BASHOPTS=*|PS4=*|BASH_XTRACEFD=*|CDPATH=*|GLOBIGNORE=*|ENV=*|KSH_ENV=*|ZDOTDIR=*) dirty=1 ;;
+            *)
+                # `env` treats its first non-NAME=VALUE operand as the command
+                # to run. A raw execve environment can contain such an entry,
+                # so never replay it into the re-exec boundary.
+                name="${entry%%=*}"
+                [[ "$entry" == *=* && "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
+                    printf 'omabackup: invalid inherited environment entry\n' >&2
+                    exit 126
+                }
+                clean_env+=("$entry")
+                ;;
+        esac
+    done </proc/$$/environ
+    (( dirty )) || return 0
+    self="$(/usr/bin/readlink -f -- "$0")" || {
+        printf 'omabackup: cannot resolve entry point\n' >&2
+        exit 126
+    }
+    exec /usr/bin/env -i -- "${clean_env[@]}" /usr/bin/bash -p "$self" "$@"
+    printf 'omabackup: cannot restart with a clean environment\n' >&2
+    exit 126
+}
+_scrub_bash_startup_env "$@"
+
+# A graphical user systemd manager inherits the login session's PATH. On this
+# machine that put user-writable mise, bun and rbenv directories before
+# /usr/bin, so a program planted there ran as this tool's `git`, `tar`, etc.
+# Pin command lookup before loading configuration or any library. Every command
+# this plugin needs, including the Omarchy helpers, is packaged in /usr/bin;
+# /usr/local is deliberately absent because it is local policy, not a
+# package-manager trust boundary.
+#
+# `-p` in the shebang prevents this shell from importing BASH_FUNC_* entries;
+# the startup scrub above removes those entries and BASH_ENV before an ordinary
+# Bash descendant can use them. The supported entry point is this executable,
+# never `bash bin/omabackup` (which would bypass the interpreter flag). The
+# test runner exercises a disposable copy of this file when its fixtures need
+# command shims; this shipped file has no environment-controlled opt-out.
+OMABACKUP_SYSTEM_PATH=/usr/bin:/bin
+PATH="$OMABACKUP_SYSTEM_PATH"
+export PATH
 
 # Machine config, read by everyone rather than by systemd alone.
 #
@@ -150,8 +216,12 @@ _hostname() { uname -n 2>/dev/null || printf 'unknown-host'; }
 # then call the machine stale for a backup that had actually run.
 record_sync_success() {
     mkdir -p "$(dirname "$LAST_SYNC_FILE")" 2>/dev/null || return 1
+    # A pre-planted `.tmp` symlink would make the redirect write outside the
+    # state directory, and `mv -T` would then publish that symlink as the
+    # record. Unlink it before opening, as the other atomic state writers do.
+    rm -f -- "$LAST_SYNC_FILE.tmp" 2>/dev/null || return 1
     printf '%s' "$(date +%s)" >"$LAST_SYNC_FILE.tmp" 2>/dev/null || return 1
-    mv "$LAST_SYNC_FILE.tmp" "$LAST_SYNC_FILE" 2>/dev/null || return 1
+    mv -T -- "$LAST_SYNC_FILE.tmp" "$LAST_SYNC_FILE" 2>/dev/null || return 1
 }
 
 # The stamp itself, only when it is a number. Handing jq the file's raw
@@ -210,7 +280,7 @@ _pkg_for() {
         # in cmd_artifacts/cmd_restore_tui -- find/realpath had the identical
         # pre-existing gap in their own already-shipped require_tools calls,
         # closed in the same table while it was already being touched.
-        timeout|head|realpath) printf 'coreutils' ;;
+        timeout|head|realpath|stat) printf 'coreutils' ;;
         find)  printf 'findutils' ;;
         *)     printf '%s' "$1" ;;
     esac
@@ -218,14 +288,21 @@ _pkg_for() {
 
 require_tools() {
     local t missing=() pkgs=()
+
+    # `type -P` asks the same question the shell's program lookup will answer
+    # (an executable on the fixed system PATH), while excluding aliases and
+    # functions. The privileged interpreter in the shebang also declines
+    # BASH_FUNC_* imports before this script starts, so a function cannot
+    # preempt the later command invocation by name.
     for t in "$@"; do
-        command -v "$t" >/dev/null 2>&1 || { missing+=("$t"); pkgs+=("$(_pkg_for "$t")"); }
+        type -P "$t" >/dev/null 2>&1 || { missing+=("$t"); pkgs+=("$(_pkg_for "$t")"); }
     done
-    (( ${#missing[@]} )) || return 0
-    printf '%somabackup: missing required %s: %s%s\n' \
-        "$RED" "$([[ ${#missing[@]} -gt 1 ]] && echo tools || echo tool)" "${missing[*]}" "$NC" >&2
-    printf '  install with: %spacman -S %s%s\n' "$CYAN" "${pkgs[*]}" "$NC" >&2
-    exit 1
+    if (( ${#missing[@]} )); then
+        printf '%somabackup: missing required %s: %s%s\n' \
+            "$RED" "$([[ ${#missing[@]} -gt 1 ]] && echo tools || echo tool)" "${missing[*]}" "$NC" >&2
+        printf '  install with: %spacman -S %s%s\n' "$CYAN" "${pkgs[*]}" "$NC" >&2
+        exit 1
+    fi
 }
 
 finding() {
@@ -995,13 +1072,14 @@ write_coverage() {
         return 1
     }
     if ! mkdir -p "$(dirname "$COVERAGE_FILE")" 2>/dev/null \
+    || ! rm -f -- "$COVERAGE_FILE.tmp" 2>/dev/null \
     || ! printf '%s' "$rows" | jq -R -s --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
            --arg manifest "$mhash" \
            '{schemaVersion:1, at:$at, manifest:$manifest,
              groups: (split("\n") | map(select(length>0) | split("\t")
                       | {id:.[0], files:(.[1]|tonumber), bytes:(.[2]|tonumber)}))}' \
            >"$COVERAGE_FILE.tmp" 2>/dev/null \
-    || ! mv "$COVERAGE_FILE.tmp" "$COVERAGE_FILE" 2>/dev/null; then
+    || ! mv -T -- "$COVERAGE_FILE.tmp" "$COVERAGE_FILE" 2>/dev/null; then
         _retire_coverage "could not record coverage at $(_tilde "$COVERAGE_FILE")"
         return 1
     fi
@@ -1586,7 +1664,7 @@ cmd_reload() {
                 if ( _rewrite_execstart "$reload_src/$reload_unit" ) >"$reload_tmp" 2>/dev/null \
                     && [[ -s "$reload_tmp" ]]; then
                     chmod --reference="$UNIT_DIR/$reload_unit" "$reload_tmp" 2>/dev/null || chmod 644 "$reload_tmp"
-                    mv -f -- "$reload_tmp" "$UNIT_DIR/$reload_unit" 2>/dev/null || reload_failed=1
+                    mv -f -T -- "$reload_tmp" "$UNIT_DIR/$reload_unit" 2>/dev/null || reload_failed=1
                 else
                     rm -f -- "$reload_tmp"
                     reload_failed=1

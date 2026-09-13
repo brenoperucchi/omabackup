@@ -165,6 +165,26 @@ assert_eq "$(cat "$SLH/outside/victim.json")" "sensitive"
 it "and the real record still lands at the real path"
 assert_contains "$(cat "$SLH/state/restore-last.json" 2>/dev/null)" 'ok'
 
+# A failed unlink is not equivalent to no link: the writer must stop before
+# opening its predictable temporary name, even when the target stays writable.
+RULH="$(mktemp -d)"; RUBIN="$RULH/bin"; mkdir -p "$RULH/state" "$RULH/outside" "$RUBIN"
+printf 'sensitive\n' >"$RULH/outside/victim.json"
+RUTMP="$RULH/state/restore-last.json.tmp"
+ln -s "$RULH/outside/victim.json" "$RUTMP"
+cat >"$RUBIN/rm" <<'SH'
+#!/bin/bash
+[[ "${!#}" == "$OMABACKUP_TEST_RESTORE_TMP" ]] && exit 1
+exec /usr/bin/rm "$@"
+SH
+chmod +x "$RUBIN/rm"
+RURC=0
+PATH="$RUBIN:$PATH" OMABACKUP_TEST_RESTORE_TMP="$RUTMP" OMABACKUP_STATE="$RULH/state" \
+    bash -c 'source lib/restore.sh; restore_record "{\"ok\":true}"' >/dev/null 2>&1 || RURC=$?
+
+it "a failed restore-journal temp unlink does not write through its symlink"
+[[ $RURC -ne 0 && "$(cat "$RULH/outside/victim.json")" == sensitive ]] \
+    && ok || fail "the restore writer opened a temp link after its unlink failed"
+
 # ── review round: a journal that cannot be saved warns, rather than staying silent ─
 RESTUB="$(mktemp -d)/locked"; mkdir -p "$RESTUB"; chmod 000 "$RESTUB" 2>/dev/null
 RERR="$(OMABACKUP_STATE="$RESTUB/nested" bash -c 'source lib/restore.sh; restore_record "{}"' 2>&1 >/dev/null)"
