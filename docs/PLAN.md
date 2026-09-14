@@ -8,7 +8,7 @@ Codex, a fresh terminal, another machine) — it is what lets a cold session,
 regardless of which coding agent is reading it, pick up where the last one
 left off. Read this file first, in full, before touching any code.
 
-Last updated: 2026-09-13.
+Last updated: 2026-09-14.
 
 ---
 
@@ -4659,3 +4659,8 @@ commit. The pre-existing untracked `docs/plans/` directory remains excluded.
   order, the dynamically created killer Process's lifecycle, `busy`'s
   visible state during a TERM→KILL sequence) is not verifiable by reading
   code alone.
+
+### README badge (2026-09-14)
+
+Added the upstream **Built for Omarchy** badge to `README.md`, using the
+revision-pinned SVG supplied by `tcballard/omarchy-badges`.
