@@ -35,6 +35,11 @@ OMABACKUP_REPO=~/path/to/your/dotfiles ~/.config/omarchy/plugins/brenoperucchi.o
 `install` writes the systemd timers (sync every 15 minutes, push hourly) and
 enables them. Nothing runs unattended before this step.
 
+Safe lock acquisition uses Python 3 (`pacman -S python`). If it is absent,
+ordinary log appends remain best-effort, while failure coalescing and retention
+pruning report that the lock runtime is unavailable; destination changes refuse
+to run until the dependency is installed.
+
 ## Uninstall
 
 ```bash

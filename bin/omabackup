@@ -272,6 +272,7 @@ _pkg_for() {
         jq)    printf 'jq' ;;
         git)   printf 'git' ;;
         tar)   printf 'tar' ;;
+        python3) printf 'python' ;;
         # timeout/head/realpath are coreutils, find is findutils -- neither
         # is a real pacman package under its own binary name (confirmed:
         # `pacman -Si timeout` does not resolve). Found by review (round
@@ -3219,8 +3220,41 @@ source "$OMABACKUP_ROOT/lib/restore.sh"
 source "$OMABACKUP_ROOT/lib/artifacts.sh"
 source "$OMABACKUP_ROOT/lib/schedule.sh"
 source "$OMABACKUP_ROOT/lib/tui.sh"
+source "$OMABACKUP_ROOT/lib/lock.sh"
 source "$OMABACKUP_ROOT/lib/log.sh"
 source "$OMABACKUP_ROOT/lib/config.sh"
+
+# Internal children used by _lock_exec. The Python boundary opens fd 9 once;
+# these functions only flock that inherited descriptor and run the protected
+# body. They are intentionally not part of the public usage surface.
+_lock_fd_required() {
+    : 2>/dev/null >&9 || die "safe lock descriptor was not inherited"
+}
+
+cmd_lock_prune() {
+    (($# == 0)) || die "invalid lock operation"
+    _lock_fd_required
+    flock -x -w 5 9 || return 0
+    _log_prune_locked
+    flock -u 9 || true
+}
+
+cmd_lock_failure() {
+    (($# == 3)) || die "invalid lock operation"
+    [[ "$2" =~ ^[0-9]+$ ]] || die "invalid lock operation"
+    _lock_fd_required
+    flock -x -w 5 9 || return 0
+    _log_failure_locked "$1" "$2" "$3"
+    flock -u 9 || true
+}
+
+cmd_lock_destination() {
+    (($# >= 1)) || die "invalid lock operation"
+    _lock_fd_required
+    flock -x 9 || die "could not lock destinations"
+    _config_destination_locked "$@"
+    flock -u 9 || true
+}
 
 CMD="${1:-}"; shift || true
 
@@ -3248,7 +3282,7 @@ _log_policy_for_cmd() {
     case "$1" in
         sync|push|collect|install|enable|disable|bundle|reload) printf always ;;
         verify|status|restore|config) printf failure ;;
-        version|artifacts|help|log-event|kill-group|log-tail|"") printf never ;;
+        version|artifacts|help|log-event|kill-group|log-tail|__lock-prune|__lock-failure|__lock-destination|"") printf never ;;
         # Anything else reaches the final `die "unknown command"` below --
         # still a real failure worth logging under whatever the user typed.
         *) printf failure ;;
@@ -3400,7 +3434,8 @@ esac
 # install a person would reach for `log-tail` to explain -- refusing here
 # would mean the one command meant to explain a broken install cannot run
 # on one.
-if [[ "$CMD" != log-event && "$CMD" != kill-group && "$CMD" != log-tail ]]; then
+if [[ "$CMD" != log-event && "$CMD" != kill-group && "$CMD" != log-tail \
+   && "$CMD" != __lock-prune && "$CMD" != __lock-failure && "$CMD" != __lock-destination ]]; then
     [[ -f "$GROUPS_FILE" ]] || die "group manifest not found: $GROUPS_FILE"
     # restore validates --groups against the ARTIFACT's manifest, not this
     # machine's -- a group name valid for one is not necessarily valid for
@@ -3414,6 +3449,9 @@ if [[ "$CMD" != log-event && "$CMD" != kill-group && "$CMD" != log-tail ]]; then
 fi
 
 case "$CMD" in
+    __lock-prune) cmd_lock_prune "${ARGS[@]}" ;;
+    __lock-failure) cmd_lock_failure "${ARGS[@]}" ;;
+    __lock-destination) cmd_lock_destination "${ARGS[@]}" ;;
     version)  cmd_version "${ARGS[@]}" ;;
     verify)  reject_flags verify "${ARGS[@]}"; cmd_verify ;;
     collect) reject_flags collect "${ARGS[@]}"; cmd_collect ;;

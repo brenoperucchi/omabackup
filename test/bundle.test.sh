@@ -258,6 +258,18 @@ it "editing the tool changes the cache key, with no commit involved"
 it "and undoing the edit brings the old key back"
 assert_eq "$FPBACK" "$FPBEFORE"
 
+printf '\n# a Python helper edit must invalidate the same cache key\n' >>"$FPTOOL/lib/lock.py"
+FPPYDIRTY="$(_fpkey)"
+cp "$PWD/lib/lock.py" "$FPTOOL/lib/lock.py"
+FPPYBACK="$(_fpkey)"
+
+it "editing the Python lock helper changes the cache key too"
+[[ -n "$FPPYDIRTY" && "$FPPYDIRTY" != "$FPBACK" ]] \
+    && ok || fail "Python helper edits do not change the tool fingerprint"
+
+it "and undoing the Python helper edit restores the key"
+assert_eq "$FPPYBACK" "$FPBACK"
+
 it "a key cannot be built when the tool cannot be read"
 OMABACKUP_ROOT=/nonexistent bash -c 'source '"$PWD"'/lib/bundle.sh
     bundle_cache_path "$1" "$2"' _ "$FPR" "$FPC" >/dev/null 2>&1 \
@@ -266,7 +278,7 @@ OMABACKUP_ROOT=/nonexistent bash -c 'source '"$PWD"'/lib/bundle.sh
 # ── the manifest is part of the code the cache key describes ────────────────
 # _tool_commit used to cover this by accident: committing a manifest edit
 # moved the tool's own HEAD, which changed the key too. _tool_fingerprint
-# replaced that with a hash of bin/omabackup + lib/*.sh alone -- the manifest
+# replaced that with a hash of bin/omabackup + the shipped lib sources -- the manifest
 # itself, which ships inside the artifact as tool/groups.default.json and is
 # what cmd_restore reads to decide what the artifact contains, was left out.
 GMH="$(mktemp -d)"; GMC="$GMH/cache"; GMR="$GMH/repo"
@@ -571,7 +583,7 @@ MANY_WRITTEN="$(find "$MANYH/dest" -type f | wc -l)"
 # -- but the weighted cost added by the depth fix (1 + slash count per
 # member, not just 1) legitimately pushes a real bundle's own total past
 # a cap that low, since the embedded tool copy nests a few levels deep
-# (tool/lib/*.sh, tool/bin/omabackup). Testing against the actual
+# (tool/lib/*.sh and tool/lib/*.py, tool/bin/omabackup). Testing against the actual
 # production default is also the more meaningful question here anyway:
 # does a real, ordinary bundle pass under what genuinely ships, not
 # under an arbitrary smaller number chosen only for a fast test.
@@ -956,7 +968,7 @@ WMX2="$(_unpack "$WMPATH2")"
 assert_eq "$(jq -r '.omarchy.migrationWatermark' "$WMX2/manifest.json")" "1800000000"
 
 # ── a cache hit must not serve tampered POLICY, only the tool was checked ───
-# _verify_cache_entry's fingerprint check covers tool/bin/omabackup + lib/*.sh
+# _verify_cache_entry's fingerprint check covers tool/bin/omabackup + shipped lib sources
 # -- the CODE. It said nothing about tool/groups.default.json -- the POLICY
 # that decides which groups are coupled. A PoC confirmed the gap: a cache
 # entry with ONLY that one file swapped (coupled:true -> false, SHA256SUMS

@@ -53,7 +53,7 @@ _tool_fingerprint() {
     # unreadable installation would have shared.
     local blob h
     [[ -r "$OMABACKUP_ROOT/bin/omabackup" ]] || return 1
-    blob="$(cat "$OMABACKUP_ROOT/bin/omabackup" "$OMABACKUP_ROOT"/lib/*.sh 2>/dev/null)" || return 1
+    blob="$(cat "$OMABACKUP_ROOT/bin/omabackup" "$OMABACKUP_ROOT"/lib/*.sh "$OMABACKUP_ROOT"/lib/*.py 2>/dev/null)" || return 1
     [[ -n "$blob" ]] || return 1
     h="$(printf '%s' "$blob" | sha256sum 2>/dev/null | cut -c1-16)" || return 1
     [[ -n "$h" ]] || return 1
@@ -68,7 +68,7 @@ _tool_fingerprint() {
 _tool_fingerprint_of() {
     local dir="$1" blob h
     [[ -r "$dir/tool/bin/omabackup" ]] || return 1
-    blob="$(cat "$dir/tool/bin/omabackup" "$dir/tool"/lib/*.sh 2>/dev/null)" || return 1
+    blob="$(cat "$dir/tool/bin/omabackup" "$dir/tool"/lib/*.sh "$dir/tool"/lib/*.py 2>/dev/null)" || return 1
     [[ -n "$blob" ]] || return 1
     h="$(printf '%s' "$blob" | sha256sum 2>/dev/null | cut -c1-16)" || return 1
     [[ -n "$h" ]] || return 1

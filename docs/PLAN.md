@@ -4664,3 +4664,46 @@ commit. The pre-existing untracked `docs/plans/` directory remains excluded.
 
 Added the upstream **Built for Omarchy** badge to `README.md`, using the
 revision-pinned SVG supplied by `tcballard/omarchy-badges`.
+
+### Lock-file audit against the OmaSession requirement (2026-09-15)
+
+The OmaSession maintainer requirement for lock files is structural: open the
+basename once with `O_NOFOLLOW` from an already validated directory descriptor,
+then preserve that fd through the critical section; a safe check followed by a
+Bash `exec N>path` still reopens the name and leaves a TOCTOU window.
+
+OmaBackup has the same unsafe final open in exactly three places:
+`lib/log.sh:147` (`.prune.lock`), `lib/log.sh:210` (per-action failure lock),
+and `lib/config.sh:1194` (`destinations.json.lock`). A local reproduction with
+`.prune.lock` planted as a symlink truncated its external target, confirming the
+mechanism. These paths do not cross a privilege boundary, so this is local
+integrity/sabotage rather than privilege escalation; that lowers severity but
+does not meet the same-file discipline the maintainer requested for OmaSession.
+
+The conclusion after the `herdr-ask` design consultation is to apply the same
+structural lock treatment to all three locks. `mkdir -m 700` alone is not
+enough: it narrows only directory creation and does not reject a pre-existing
+symlink or close the unsafe open.
+
+The remediation now uses `lib/lock.py`/`lib/lock.sh`: the helper walks and
+validates the lock directory by descriptor, opens the basename once with
+`O_NOFOLLOW` and no truncation, rejects symlinks and non-regular lock objects,
+then execs a hidden OmaBackup child with the descriptor preserved on fd 9.
+The interpreter is resolved through the pinned system `PATH` and run with
+Python isolated/no-site flags, so inherited `PYTHONPATH`, `PYTHONHOME`, user
+site files, and `sitecustomize` hooks cannot execute at this boundary.
+`lib/log.sh` and `lib/config.sh` run their existing critical sections through
+that child, so Bash only calls `flock` on the inherited descriptor. Permanent
+regressions live in `test/locks.test.sh` and cover all three preplanted
+symlink cases, FIFO refusal, mutual exclusion, no truncation, fd preservation,
+and ignored Python startup hooks. The logging paths also check the shared
+runtime before suppressing their best-effort errors: when `python3` is absent,
+failure coalescing stops without inventing `.last-*` state, while ordinary log
+appends remain available and one actionable warning is emitted per process.
+The focused lock suite reports 18 passed; the focused log suite reports 115
+passed; the complete suite reports 1391 passed, 0 failed. The bundle tool
+fingerprint also includes `lib/*.py`, with a regression proving that edits to
+`lock.py` invalidate the cache key; the focused bundle suite reports 120
+passed. Herdr review rounds 50, 51 and 52 approved the lock mechanism; the
+round-52 dependency concern was resolved through the required scout analysis
+and documented regression before commit.

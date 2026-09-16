@@ -11,10 +11,30 @@
 # the user's intent (how many days to keep) lives in config; the events
 # themselves are observation, so they live in the state directory.
 
+# Tests and small library callers source log.sh directly. Keep the same lock
+# boundary available there as in the main entry point.
+if ! declare -F _lock_exec >/dev/null 2>&1; then
+    _log_lib_dir="${BASH_SOURCE[0]%/*}"
+    [[ "$_log_lib_dir" == "${BASH_SOURCE[0]}" ]] && _log_lib_dir=.
+    source "$_log_lib_dir/lock.sh"
+fi
+
 LOG_DIR="${OMABACKUP_LOG_DIR:-$OMABACKUP_STATE/log}"
 LOG_CONFIG_FILE="${OMABACKUP_LOG_CONFIG:-$HOME/.config/omabackup/log.json}"
 LOG_RETENTION_DEFAULT_DAYS=30
 LOG_RETENTION_MAX_DAYS=3650
+_LOG_LOCK_RUNTIME_WARNED=0
+
+_log_lock_runtime_available() {
+    _lock_python_available && return 0
+    if (( ! _LOG_LOCK_RUNTIME_WARNED )); then
+        printf '%s\n' \
+            'omabackup: persistent failure logging and log retention unavailable: missing python3; install with: pacman -S python' \
+            >&2
+        _LOG_LOCK_RUNTIME_WARNED=1
+    fi
+    return 1
+}
 
 # A user-typed decimal that eventually reaches a bash arithmetic context
 # (the `find`-by-filename-date cutoff and this file's own bound check).
@@ -98,11 +118,26 @@ _log_config_write() {
 # actually asked for. Appends do not need the lock (a short line under
 # O_APPEND is already atomic below PIPE_BUF); only deletion needs to be
 # exclusive between concurrent writers, so only pruning runs inside it.
+_log_prune_locked() {
+    local cutoff f fdate
+    cutoff="$(date -d "-$(( $(_log_retention_days) - 1 )) days" +%F 2>/dev/null)"
+    if [[ -n "$cutoff" ]]; then
+        for f in "$LOG_DIR"/omabackup-*.log; do
+            [[ -f "$f" ]] || continue
+            fdate="$(basename -- "$f")"
+            fdate="${fdate#omabackup-}"; fdate="${fdate%.log}"
+            [[ "$fdate" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
+            [[ "$fdate" < "$cutoff" ]] && rm -f -- "$f"
+        done
+    fi
+}
+
 _log_write() {
-    local action outcome detail today line lock_fd cutoff f fdate
+    local action outcome detail today line lock_runtime_available=0
     action="$(tui_sanitize_field "${1:-}")"
     outcome="$(tui_sanitize_field "${2:-}")"
     detail="$(tui_sanitize_field "${3:-}")"
+    _log_lock_runtime_available && lock_runtime_available=1
     {
         mkdir -p -- "$LOG_DIR" 2>/dev/null
         chmod 700 -- "$LOG_DIR" 2>/dev/null
@@ -136,29 +171,15 @@ _log_write() {
         # either, so the practical impact is small, but it is worth
         # knowing if a mostly-idle machine still shows old files past N.
         #
-        # `-w 5`, not a blocking `flock -x`: this runs inside an EXIT trap,
-        # after the wrapped command has already finished -- best-effort
-        # pruning blocking that exit path indefinitely (found by review: a
-        # logger suspended while holding the lock would do exactly that)
-        # is worse than skipping one day's prune and catching up on the
-        # next write.
-        if (( first_of_day )); then
-            lock_fd=""
-            exec {lock_fd}>"$LOG_DIR/.prune.lock"
-            if [[ -n "$lock_fd" ]] && flock -x -w 5 "$lock_fd"; then
-                cutoff="$(date -d "-$(( $(_log_retention_days) - 1 )) days" +%F 2>/dev/null)"
-                if [[ -n "$cutoff" ]]; then
-                    for f in "$LOG_DIR"/omabackup-*.log; do
-                        [[ -f "$f" ]] || continue
-                        fdate="$(basename -- "$f")"
-                        fdate="${fdate#omabackup-}"; fdate="${fdate%.log}"
-                        [[ "$fdate" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || continue
-                        [[ "$fdate" < "$cutoff" ]] && rm -f -- "$f"
-                    done
-                fi
-                flock -u "$lock_fd"
-            fi
-            [[ -n "$lock_fd" ]] && eval "exec ${lock_fd}>&-"
+        # The lock helper opens this pathname with O_NOFOLLOW, then execs a
+        # child that inherits fd 9. This shell never reopens the lock name;
+        # the child takes the short, best-effort flock on that descriptor.
+        # `-w 5`, not a blocking flock, keeps an EXIT-trap logger from hanging
+        # forever behind a suspended writer.
+        if (( first_of_day && lock_runtime_available )); then
+            _lock_exec "$LOG_DIR" .prune.lock \
+                "$_OMABACKUP_ROOT/bin/omabackup" __lock-prune \
+                >/dev/null 2>&1 || true
         fi
     } 2>/dev/null
     return 0
@@ -199,37 +220,40 @@ _log_run_always() {
 # to interleave and leave `.last-*` inconsistent with what was actually
 # logged -- found by review. Per-action, not one global lock, so `verify`
 # and `status` never wait on each other.
-_log_run_on_failure() {
-    local action="$1" rc="$2" signal="${3:-}" state_file lock_fd outcome last today last_day
-    mkdir -p -- "$LOG_DIR" 2>/dev/null
+_log_failure_locked() {
+    local action="$1" rc="$2" signal="${3:-}" state_file outcome last today last_day
     state_file="$LOG_DIR/.last-$(printf '%s' "$action" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_')"
     (( rc == 0 )) && outcome="ok" || outcome="failed"
     today="$(date +%F)"
-    {
-        lock_fd=""
-        exec {lock_fd}>"$state_file.lock"
-        if [[ -n "$lock_fd" ]] && flock -x -w 5 "$lock_fd"; then
-            last="$(cat -- "$state_file" 2>/dev/null)"
-            if [[ "$last" != "$outcome" ]]; then
-                if (( rc == 0 )); then
-                    _log_write "$action" "ok" ""
-                elif [[ -n "$signal" ]]; then
-                    _log_write "$action" "failed (signal $signal)" ""
-                else
-                    _log_write "$action" "failed (exit $rc)" ""
-                fi
-                printf '%s' "$outcome" >"$state_file" 2>/dev/null
-                printf '%s' "$today" >"$state_file.day" 2>/dev/null
-            elif [[ "$outcome" == "failed" ]]; then
-                last_day="$(cat -- "$state_file.day" 2>/dev/null)"
-                if [[ "$last_day" != "$today" ]]; then
-                    _log_write "$action" "still failing (exit $rc)" ""
-                    printf '%s' "$today" >"$state_file.day" 2>/dev/null
-                fi
-            fi
-            flock -u "$lock_fd"
+    last="$(cat -- "$state_file" 2>/dev/null)"
+    if [[ "$last" != "$outcome" ]]; then
+        if (( rc == 0 )); then
+            _log_write "$action" "ok" ""
+        elif [[ -n "$signal" ]]; then
+            _log_write "$action" "failed (signal $signal)" ""
+        else
+            _log_write "$action" "failed (exit $rc)" ""
         fi
-        [[ -n "$lock_fd" ]] && eval "exec ${lock_fd}>&-"
+        printf '%s' "$outcome" >"$state_file" 2>/dev/null
+        printf '%s' "$today" >"$state_file.day" 2>/dev/null
+    elif [[ "$outcome" == "failed" ]]; then
+        last_day="$(cat -- "$state_file.day" 2>/dev/null)"
+        if [[ "$last_day" != "$today" ]]; then
+            _log_write "$action" "still failing (exit $rc)" ""
+            printf '%s' "$today" >"$state_file.day" 2>/dev/null
+        fi
+    fi
+}
+
+_log_run_on_failure() {
+    local action="$1" rc="$2" signal="${3:-}" state_file
+    _log_lock_runtime_available || return 0
+    mkdir -p -- "$LOG_DIR" 2>/dev/null
+    state_file="$LOG_DIR/.last-$(printf '%s' "$action" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_')"
+    {
+        _lock_exec "$LOG_DIR" "$(basename -- "$state_file").lock" \
+            "$_OMABACKUP_ROOT/bin/omabackup" __lock-failure \
+            "$action" "$rc" "$signal" || true
     } 2>/dev/null
     return 0
 }

@@ -1063,8 +1063,42 @@ cmd_config_tui() {
     done
 }
 
+_config_destination_locked() {
+    local id path keep doc
+    case "${1:-}" in
+        add)
+            (($# == 4)) || die "usage: omabackup config destination add ID PATH KEEP"
+            id="$2"; path="$3"; keep="$4"
+            [[ "$id" =~ ^[A-Za-z0-9_-]+$ ]] || die "destination id is invalid"
+            [[ "$id" != github ]] || die "github is implicit; configure the repo instead"
+            path="$(_config_absolute_path "$path")" || die "destination path must be absolute"
+            keep="$(_dest_keep_normalize "$keep")" || die "destination keep must be a positive integer within the supported range"
+            _config_validate_destinations || die "existing destinations.json is invalid"
+            doc="$(_config_destinations_doc)"
+            doc="$(jq -c --arg id "$id" --arg path "$path" --argjson keep "$keep" '
+                .schemaVersion=1 | .destinations=(.destinations // [])
+                | if any(.destinations[]; .id == $id) then error("destination already exists")
+                  else .destinations += [{id:$id,type:"dir",path:$path,keep:$keep,enabled:true,note:null}]
+                  end' <<<"$doc")" || die "could not add destination"
+            _config_write_destinations "$doc" || die "could not write $(_tilde "$DESTINATIONS_FILE")"
+            ;;
+        remove)
+            (($# == 2)) || die "usage: omabackup config destination remove ID"
+            id="$2"
+            doc="$(_config_destinations_doc)"
+            _config_validate_destinations || die "existing destinations.json is invalid"
+            jq -e --arg id "$id" 'any(.destinations[]; .id == $id)' <<<"$doc" >/dev/null \
+                || die "destination does not exist: $id"
+            doc="$(jq -c --arg id "$id" '.destinations=(.destinations // []) | .destinations |= map(select(.id != $id))' <<<"$doc")" \
+                || die "could not remove destination"
+            _config_write_destinations "$doc" || die "could not write $(_tilde "$DESTINATIONS_FILE")"
+            ;;
+        *) die "usage: omabackup config destination <add|remove> ..." ;;
+    esac
+}
+
 cmd_config() {
-    local sub="${1:-}" key value id path keep doc dest_lock_fd shown
+    local sub="${1:-}" key value path keep shown
     local repo_status repo_value github_active github_value entries entry
     local schedule_label enabled_value log_retention_show log_config_valid_show
     shift || true
@@ -1190,41 +1224,12 @@ cmd_config() {
             esac
             ;;
         destination)
+            [[ "$DESTINATIONS_FILE" == /* ]] || die "destinations path must be absolute: $DESTINATIONS_FILE"
             mkdir -p "$(dirname "$DESTINATIONS_FILE")" || die "could not create the destinations directory"
-            exec {dest_lock_fd}>"$DESTINATIONS_FILE.lock" || die "could not lock destinations"
-            flock -x "$dest_lock_fd" || die "could not lock destinations"
-            case "${1:-}" in
-                add)
-                    (($# == 4)) || die "usage: omabackup config destination add ID PATH KEEP"
-                    id="$2"; path="$3"; keep="$4"
-                    [[ "$id" =~ ^[A-Za-z0-9_-]+$ ]] || die "destination id is invalid"
-                    [[ "$id" != github ]] || die "github is implicit; configure the repo instead"
-                    path="$(_config_absolute_path "$path")" || die "destination path must be absolute"
-                    keep="$(_dest_keep_normalize "$keep")" || die "destination keep must be a positive integer within the supported range"
-                    _config_validate_destinations || die "existing destinations.json is invalid"
-                    doc="$(_config_destinations_doc)"
-                    doc="$(jq -c --arg id "$id" --arg path "$path" --argjson keep "$keep" '
-                        .schemaVersion=1 | .destinations=(.destinations // [])
-                        | if any(.destinations[]; .id == $id) then error("destination already exists")
-                          else .destinations += [{id:$id,type:"dir",path:$path,keep:$keep,enabled:true,note:null}]
-                          end' <<<"$doc")" || die "could not add destination"
-                    _config_write_destinations "$doc" || die "could not write $(_tilde "$DESTINATIONS_FILE")"
-                    ;;
-                remove)
-                    (($# == 2)) || die "usage: omabackup config destination remove ID"
-                    id="$2"
-                    doc="$(_config_destinations_doc)"
-                    _config_validate_destinations || die "existing destinations.json is invalid"
-                    jq -e --arg id "$id" 'any(.destinations[]; .id == $id)' <<<"$doc" >/dev/null \
-                        || die "destination does not exist: $id"
-                    doc="$(jq -c --arg id "$id" '.destinations=(.destinations // []) | .destinations |= map(select(.id != $id))' <<<"$doc")" \
-                        || die "could not remove destination"
-                    _config_write_destinations "$doc" || die "could not write $(_tilde "$DESTINATIONS_FILE")"
-                    ;;
-                *) die "usage: omabackup config destination <add|remove> ..." ;;
-            esac
-            flock -u "$dest_lock_fd"
-            eval "exec ${dest_lock_fd}>&-"
+            require_tools python3
+            _lock_exec "$(dirname "$DESTINATIONS_FILE")" "$(basename "$DESTINATIONS_FILE").lock" \
+                "$_OMABACKUP_ROOT/bin/omabackup" __lock-destination "$@" \
+                || die "could not lock destinations"
             ;;
         *) die "usage: omabackup config [show|validate|set|destination]" ;;
     esac
