@@ -5041,3 +5041,27 @@ Round `omabackup-59`, reviewed independently by `omabackup-rev-1` and
 The review covers the comparison text only; it is not a security
 certification of the external plugin and does not authorize code changes,
 commit, push, or issue activity.
+
+### HANCORE request audit for current HEAD (2026-09-18)
+
+The Marketplace issue was re-read after publishing `e47ef6a`. HANCORE's
+runtime blockers are present in this commit's ancestry: distributable agent
+instruction files were removed in `cd4857e`; restore byte/member/depth/time
+limits and panel process/output bounds were closed through `fc9f51a`,
+`e93dee3`, and `c436791`; artifact-manifest bounds, bounded push handling, and
+the pinned VM ISO hash were added in `e7ea558`; and the later startup/atomic
+write and lock hardening is in `ea472fa`/`18ffb87`. The current tree still has
+no tracked `AGENTS.md` or `.herdr/reviewer.md`.
+
+The remaining HANCORE request is a release-process item, not an unimplemented
+runtime fix: obtain fresh exact-SHA Marketplace validation and the destructive
+backup/restore audit against the current HEAD. The latest `e47ef6a` commit is
+documentation-only, so its issue comment must not be represented as that fresh
+validation; no HANCORE validation comment for `e47ef6a` is present yet.
+
+### README cross-reference (2026-09-18)
+
+The README now links to [OmaSession](https://github.com/brenoperucchi/omasession)
+with the same complementary-project framing used by OmaSession's README for
+OmaBackup: OmaSession restores live windows and workspaces, while OmaBackup
+restores Omarchy dotfiles and configuration.
