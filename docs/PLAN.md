@@ -8,7 +8,7 @@ Codex, a fresh terminal, another machine) — it is what lets a cold session,
 regardless of which coding agent is reading it, pick up where the last one
 left off. Read this file first, in full, before touching any code.
 
-Last updated: 2026-09-14.
+Last updated: 2026-09-18.
 
 ---
 
@@ -4707,3 +4707,337 @@ fingerprint also includes `lib/*.py`, with a regression proving that edits to
 passed. Herdr review rounds 50, 51 and 52 approved the lock mechanism; the
 round-52 dependency concern was resolved through the required scout analysis
 and documented regression before commit.
+
+### Board audit and review preflight (2026-09-16)
+
+The OpenBoard for this project contains three live tasks. T21 (`blocked` / Need
+you) tracks publication of the lock hardening; its implementation, permanent
+regressions, and `./test/run.sh` validation are complete, while the push and
+issue follow-up remain open. T22 (`blocked` / Need you) is the owner of the
+pending decision to publish `18ffb87` to `origin/main`. T23 (`blocked` / Need
+you) preserves the real follow-up to issue #3968 after publication, gated on
+that push. None is obsolete or may be marked done without the corresponding
+human decision or follow-up.
+
+Each task now records its objective, evidence, next step, and completion
+criterion in the board notes. Evidence remains the local commit `18ffb87`, the
+published issue comment, and the full-suite result of 1391 passed and 0 failed;
+the pre-existing untracked `docs/plans/` directory remains outside the commit.
+
+The formal board-plan review was first attempted as `omabackup-53`, but the
+dispatcher aborted before sending requests because `omabackup-rev-1` changed
+profile during reset (`gpt5.6luna` → `gpt6astra`). No `verdict.md` exists for
+that attempt. After the profile stabilized, rounds `omabackup-54` and
+`omabackup-55` produced valid board/documentation vereditos. Their findings
+were applied: the snapshot now includes literal notes and round history, T22
+owns the push decision, T21's completion criterion requires publication, T23
+is gated on publication, and the PLAN update has an explicit board step. The
+automatic scout analysis `omabackup-17` then returned **INCERTEZA** on three
+remaining semantic choices: whether T21's criterion must include step 6,
+whether cancellation means archive/reformulate or `done`, and whether T22 ends
+at the decision or stays open through the push. Those points are recorded in
+the board notes and await Breno's decision. No review preflight failure is
+treated as a verdict, and no destructive action is taken from it.
+
+### Read-only comparison with `huey-holdings-llc/omabackup` (2026-09-17)
+
+The public repository at `https://github.com/huey-holdings-llc/omabackup` was
+inspected at its `main` tip (manifest `0.8.0`). It is a separate implementation
+with a different plugin id and data contract, not a drop-in update for this
+checkout. Its center is a daily `snapshot` over `allowlist.txt`, drift
+categories and popup triage; this project remains centered on the declarative
+group manifest, live-reader coverage probes, version-coupled restore quarantine
+and derived multi-destination bundles.
+
+Useful ideas to evaluate later: a `setup check` doctor, a stable human/JSON
+problem contract, a filename-level credential gate in addition to the existing
+history-wide deny-list scan, and a GitHub visibility/push-url gate before a
+remote push. Those are recommendations only; no compatibility or migration
+between the two data formats was assumed. The external lock implementation
+still opens its lock path through Bash redirection, while this repository's
+current lock boundary opens the final component with `O_NOFOLLOW` and carries
+the descriptor into the critical section; that security property must be kept.
+No code, manifest, or backup-data changes were made for this comparison.
+
+### Development plan: evaluate and incorporate selected external mechanisms (2026-09-17)
+
+This plan turns the read-only comparison with
+`huey-holdings-llc/omabackup` into bounded work. It does not merge the
+external data format, allowlist model, service layout, or lock implementation.
+The existing declarative manifest, live-reader coverage, version-coupled
+restore quarantine, content-addressed bundles, history-wide secret scan, and
+descriptor-safe lock boundary remain the compatibility and security baseline.
+
+#### Phase 0 — design and evidence (current)
+
+1. Review this plan with `omabackup-rev-1` and `omabackup-rev-2` through the
+   Herdr review workflow; reconcile findings before implementation.
+2. Record the review verdicts, accepted scope, rejected external mechanisms,
+   and any unresolved design conflict in this document and on the OpenBoard.
+3. Keep the work split into independently reviewable units so each unit has a
+   permanent regression specification before code is changed.
+4. Acceptance: both reviewer verdicts are present, every finding is marked
+   accepted, rejected with evidence, or escalated, and the resulting scope is
+   reflected in this document and the board before Phase 1 starts. Any
+   unresolved P0/P1 security finding blocks Phase 1 until Breno records an
+   evidence-based resolution or explicit owner decision; marking it merely
+   “escalated” is insufficient.
+
+#### Phase 1 — remote privacy and push decision gate (P0)
+
+1. Normalize the exact fetch URL, `origin`, and every `remote.*.pushurl` for
+   the private backup repository identified by `OMABACKUP_REPO`; this gate
+   never governs the public OmaBackup source checkout.
+2. Refuse mismatched or ambiguous destinations. Pin the approved remote
+   identity and require explicit reauthorization for any change to the
+   normalized fetch URL or complete pushurl set, including a private-to-private
+   GitHub change. Block non-GitHub remotes by
+   default; an explicit trust entry may opt into a deliberately unsupported
+   host only when it names the exact normalized fetch URL and complete
+   pushurl set, is visible in doctor/status output, and is never presented as
+   proof that the destination is private.
+3. Probe GitHub visibility immediately before a push using an anonymous,
+   canonical API request with redirects restricted to the expected GitHub
+   host. Public (`200`) blocks, private or absent (`404`) may proceed, and
+   rate limits, network errors, unexpected status, or host changes are
+   inconclusive and block that push. A persisted probe from an earlier
+   invocation is stale and never authorizes a later push; a fresh conclusive
+   probe is required each time. Treat an accepted anonymous `404` as “not
+   publicly readable at this exact canonical URL”, not as proof that the
+   repository exists or is private; record that semantics in the status
+   contract.
+4. Bind persisted state to a redacted fingerprint of the normalized fetch URL
+   and the complete pushurl set. Persist only a redacted decision reason, the
+   last conclusive probe time, and its age in status output and JSON; never
+   persist userinfo, tokens, headers, or raw probe URLs. Never weaken the
+   existing secret scanner or bundle verification.
+5. Run this gate only in the explicit `push` command, before any network
+   write. An inconclusive result skips/fails that push with a documented exit
+   status; it never makes `push` create a commit and never makes
+   `sync --commit` depend on network access. The already-pending T21/T22 push
+   remains a separate owner decision.
+6. With multiple destinations, apply the decision per destination: a blocked
+   GitHub destination is not allowed to receive data, safe `dir` destinations
+   may continue, and the aggregate command reports partial failure with a
+   nonzero exit and explicit human/JSON per-destination results. A blocked
+   destination must never be reported as successful.
+7. Acceptance: permanent tests cover URL normalization, every pushurl,
+   fingerprint changes, public/404/inconclusive responses, stale state,
+   redirects/host changes, redaction, private-to-private reauthorization,
+   mixed destination aggregation, and no-network local commit behavior; the
+   full suite passes.
+
+#### Phase 2 — filename credential gate (P1)
+
+1. Before enabling the gate, run a read-only migration preflight that detects
+   existing credential-shaped paths declared outside `secrets` and reports an
+   exact move/remediation. Then add a fail-closed gate before staging is
+   published to the backup worktree,
+   before any bundle is created, and before any destination is touched, for
+   credential-shaped names such as
+   `.env`, `.netrc`, `.git-credentials`, `id_*`, `*.pem`, `*.key`, and
+   `*.p12`, including relevant private-key header cases.
+2. Require an explicit manifest entry in the `secrets` group for any such
+   name; the manifest remains the authority for what is collected, and the
+   filename gate rejects the same name outside that explicit group. A failed
+   gate cleans or rolls back partial staging and cannot be bypassed by
+   manifest exclusions, local triage, or history-scan results. Keep the
+   existing history-wide deny-list scanner as a second, independent layer.
+3. Acceptance: tests prove each blocked shape is rejected before commit,
+   safe names remain eligible, an explicitly declared secret still passes
+   through the normal scanner and verify path, and a rejected item cannot
+   remain in staging, the worktree, a commit, a bundle, or any destination,
+   including after partial failure. Scan names across every tree/ref that a
+   bundle will contain and enforce the same gate for a direct `bundle` command;
+   pre-existing historical hits require explicit migration or quarantine
+   before such a bundle is allowed.
+
+#### Phase 3 — setup doctor and stable problem contract (P1)
+
+1. Add one read-only `setup check` doctor command that reports exactly
+   `ok`, `warn`, or `fail` with actionable remediation and stable JSON
+   (`schemaVersion`, ordered problem records, redacted details). Preserve the
+   CLI's existing status convention: exit 0 for ok or warn, exit 2 for a
+   failed check, and exit 1 for a doctor command error; the JSON level is the
+   source of truth for distinguishing ok from warn.
+2. Cover repository identity, destination configuration, required binaries,
+   service/timer installation, lock/runtime prerequisites, and push privacy
+   state without changing user data.
+3. Acceptance: fixture tests cover healthy, warning, failure, and stale or
+   inconclusive privacy states and assert exact `ok`/`warn`/`fail` values,
+   `schemaVersion`, field types, deterministic problem ordering, exit 0/1/2
+   semantics, redaction, and human-readable fixes.
+
+#### Phase 4 — structured drift and persisted triage (P2)
+
+1. Map the current manifest/diff results to explicit `NEW`, `MODIFIED`,
+   `GONE`, `TOOBIG`, `EXCLUDED`, and `ERROR` categories without replacing
+   version-coupled restore or live-reader checks.
+2. Persist allow/ignore decisions separately from the declarative manifest,
+   with descriptor-safe atomic locking, path plus content/manifest identity,
+   reason, timestamp, and explicit expiry. Expose them consistently in CLI,
+   status JSON, and the panel. Compute categories from the staging result
+   across the existing `collect → diff → verify → commit` cycle; incomplete
+   or ambiguous scans fail closed, and triage state must not bypass the
+   non-empty-diff, secret-scan, or verify gates for commit.
+3. Acceptance: tests cover category assignment, durable triage, and safe
+   behavior when a scan is incomplete or ambiguous, plus descriptor-safe lock
+   contention, content/manifest identity changes, expiry, and decisions that
+   cannot release a secret or bypass verify. Define `TOOBIG` as the
+   manifest-declared byte limit, retain the item out of bundles/destinations,
+   and require the same fail-closed behavior in CLI, status JSON, and panel;
+   fixtures cover changed identity, expired decisions, concurrent writers,
+   and each commit gate.
+
+#### Phase 5 — optional QML/service consolidation (P3)
+
+Evaluate, after Phases 1–4, whether a shared `Service.qml` singleton watching
+an atomic status file produced by the CLI reduces duplicated process wiring.
+The producer, path, schema, ownership, retention, and atomic write contract
+must be specified first; QML may only read it asynchronously through the
+existing process boundary and never perform git/I/O itself. Adopt it only if
+a live-panel test proves lifecycle, timeout, output-limit, and multi-monitor
+behavior; otherwise keep the current implementation and document the reason.
+
+#### Explicit non-goals and gates
+
+- Do not import the external `allowlist.txt` or snapshot data contract.
+- Do not replace the descriptor-safe lock with Bash redirection.
+- Do not auto-push or change systemd scheduling as part of this plan.
+- The already-pending publication of `18ffb87` in T21/T22 remains a separate
+  owner decision; this plan does not silently apply a new gate to that action
+  or mark it complete.
+- Every implementation phase requires a failing permanent regression before
+  the fix, a Herdr review round, and `./test/run.sh` before completion.
+- No commit, push, or marketplace comment is authorized by this plan alone;
+  publication remains a separate owner decision.
+
+#### Plan review reconciliation (2026-09-17)
+
+The formal Herdr review rounds `omabackup-56` and `omabackup-57` examined this
+plan with `omabackup-rev-1` and `omabackup-rev-2`. Their findings were
+incorporated in sequence: the first round closed the repository target, stale
+probe, manifest precedence, staging boundary, doctor contract, triage
+identity, and QML producer gaps; the second closed remote pinning, historical
+bundle coverage, migration preflight, deterministic doctor fixtures,
+`TOOBIG` limits, unresolved-security blocking, and multi-destination
+aggregation. The pre-existing untracked `docs/plans/` directory was excluded
+from the second review and remains outside this plan change.
+
+After the two-round limit, `herdr-ask --reviewer scout` consultation
+`omabackup-18` returned **APPROVED**: no residual P0/P1 ambiguity blocks
+starting Phase 1, provided the Phase 0 reconciliation is recorded here and on
+the OpenBoard. The scout's scope was design readiness only; it did not approve
+implementation, publication, commit, push, or remote issue activity.
+
+OpenBoard registration is complete in project `omabackup`: T88 records the
+reviewed parent plan and is done; T89–T93 are queued as `ready` for Phases 1–5
+respectively. Existing blocked publication tasks T21–T23 were preserved.
+
+### Read-only comparison with `gladimdim/omarchy-config-sync-plugin` (2026-09-18)
+
+The external plugin was inspected at main commit
+`011d20e2f13d966a8a45bcede93727b6fa8a8558` (manifest version `1.2.24`). It is
+not a competing backup engine: it is an interactive, multi-machine Omarchy
+configuration synchronizer. Its data contract is a linked clone, by default
+under `$XDG_DATA_HOME/omarchy-config-sync/repo` (falling back to
+`~/.local/share`), or any local checkout the user links in place, with a
+private GitHub repository as the recommended source of truth. OmaBackup
+remains a public code plugin plus a separate private data repository, with
+content-addressed bundles, coverage verification, secret-history scanning,
+destination state, and version-coupled restore quarantine.
+
+#### What the external plugin does better
+
+- It has a clearer first-machine/next-machine workflow: `Publish this machine`
+  seeds the repository and `Apply` consumes it on another host.
+- Its panel exposes per-file review and selective operations: shortcut
+  cherry-picking, whole-plugin selection, theme application, helper-script
+  discovery, and per-file Keep local/Take repo decisions.
+- It handles ordinary two-machine drift as a product feature: local-only,
+  incoming, both-changed, and merge-conflict states are visible, and clean
+  Git divergence is merged automatically when the clone is not dirty.
+- It has strong operational bounds in the Python backend: non-interactive Git,
+  timeouts, capped stdout/stderr, process-group termination, clone disk
+  budgets, aggregate copy budgets, descriptor-bound source/destination paths,
+  `O_NOFOLLOW`, regular-file checks, containment checks, and timestamped local
+  backups before apply.
+- Its portability rules are more specialized for Omarchy: machine-local
+  display paths, opt-in extra machine-local paths, Hyprland local overlays,
+  safe shortcut extraction, theme slug validation, and preservation of the
+  sync widget when applying `shell.json`.
+
+#### Where OmaBackup is stronger or has a different responsibility
+
+- OmaBackup's declarative group manifest and live-reader coverage probe answer
+  whether the backup still covers what the running system reads; the external
+  plugin validates that a tree looks like Omarchy config but does not provide
+  the same coverage contract.
+- OmaBackup treats backup history as an artifact: the Git history and derived
+  bundles are verified, the secret scanner checks history, and restore is
+  constrained by a declared version range. The external plugin is optimized
+  for applying the latest selected state and does not implement this restore
+  provenance/range model.
+- OmaBackup has independent `github` and `dir` destinations, per-destination
+  retention/state, and a timer-driven CLI that remains useful without the bar.
+  The external plugin's publish path is panel-driven and assumes the linked
+  config repository is the destination.
+
+#### Risks and gaps to avoid importing
+
+- The external documentation tells users to keep the repository private and
+  says not to put tokens, `.env` files, or private keys in it, but the inspected
+  backend has no OmaBackup-equivalent history-wide secret gate. Neither
+  project currently enforces GitHub visibility before pushing: OmaBackup's
+  visibility/push authorization gate remains an open Phase 1 item in this
+  PLAN. The external private-repository rule is guidance, not an enforced
+  privacy proof.
+- `cmd_publish` stages with `git add -A` and commits the clone's whole index.
+  That is acceptable only if the linked clone is treated as exclusively owned
+  by the plugin; it would sweep pre-staged unrelated work in a shared
+  worktree. OmaBackup's scoped staging/commit discipline must remain separate.
+- The backend clears `core.hooksPath` for its Git operations. This prevents a
+  host hook from blocking a bar action, but it also deliberately bypasses local
+  Git hooks; that tradeoff must not be copied into the public backup path
+  without an explicit decision.
+- The external private-repository recommendation is not an equivalent of a
+  fresh remote visibility check. Its documented dependency on a private GitHub
+  repository should remain a product warning unless a gate is added.
+
+#### Mechanisms worth evaluating for OmaBackup
+
+1. Adopt the external panel vocabulary for selected-file review and explicit
+   per-file conflict decisions where it fits our manifest and restore gates.
+2. Reuse its bounded subprocess/process-group pattern and aggregate byte budget
+   ideas where an OmaBackup path still lacks an equivalent bound.
+3. Add an optional machine-local marker concept to group metadata, but keep the
+   manifest as the authority and preserve live-reader coverage reporting.
+4. Treat shortcut portability analysis and helper-script discovery as a
+   possible future `configs/hypr` enhancement, gated by tests that prove the
+   resulting file remains loadable on the target machine.
+5. Do not import its linked-clone data contract, whole-index commit behavior,
+   private-repository-only assumption, or direct repo-to-machine Apply path
+   without OmaBackup's staging, verification, secret, and restore gates.
+
+The external repository declares `python3 -m unittest tests.test_config_sync -v`
+as its development check. The inspection checkout contained 158 test methods,
+but that count and the inspected commit are provenance from the local checkout,
+not artifacts preserved in the review snapshot. A local run during this
+comparison did not produce a trustworthy completion result and was stopped; no
+external test result is treated as evidence. No OmaBackup code, manifest,
+backup data, commit, or push changed for this comparison.
+
+#### Review of this comparison (2026-09-18)
+
+Herdr review round `omabackup-58` found three factual/documentation issues:
+the OmaBackup visibility gate was still planned rather than implemented,
+`404` was not present in the external material, and the external clone/apply
+model had been described too broadly. It also requested the XDG/in-place clone
+qualification and provenance for the test count. All findings were corrected
+in this section.
+
+Round `omabackup-59`, reviewed independently by `omabackup-rev-1` and
+`omabackup-rev-2`, returned **APPROVE** with no remaining actionable findings.
+The review covers the comparison text only; it is not a security
+certification of the external plugin and does not authorize code changes,
+commit, push, or issue activity.
