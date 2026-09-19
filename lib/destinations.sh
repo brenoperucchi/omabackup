@@ -256,12 +256,15 @@ dest_github_push_url() {
 #     that has to agree with git's byte for byte is a second place to be wrong,
 #     and nobody spells a hostname this way by accident.
 #   - a transport helper whose address is not a URL (`ext::ssh git@github.com
-#     ...`). A helper can reach anywhere, and only a URL says where.
+#     ...`). A helper can reach anywhere, and only a URL says where. `ext::`
+#     is always a command with arguments, even when its first token looks like
+#     a URL, so it is never an address we can safely map to GitHub.
 # The caller refuses all three.
 #
 # Never prints its input: a remote URL may carry a token in its userinfo.
 dest_github_slug() {
     local u="$1" rest auth path="" host helper=0
+    [[ "$u" =~ ^[Ee][Xx][Tt]:: ]] && return 2
     if [[ "$u" =~ ^[A-Za-z0-9][A-Za-z0-9+.-]*::(.*)$ ]]; then
         u="${BASH_REMATCH[1]}"
         helper=1

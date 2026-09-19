@@ -449,7 +449,7 @@ done
 # helper whose address is not a URL (`ext::...`) can reach anywhere at all. The
 # gate cannot say which repository either one names, so neither is pushed to.
 for PG6C_URL in 'https://%67ithub.com/o/r' 'https://github%2ecom/o/r' 'ssh://git@%67ithub.com/o/r' \
-                'ext::ssh git@github.com %S o/r'; do
+                'ext::ssh git@github.com %S o/r' 'ext::https://github.com/o/r'; do
     PG6C="$(mktemp -d)"; _gate_fixture "$PG6C" "$PG6C_URL" 404
     PG6C_OUT="$(_gate_push "$PG6C" github)"
 
