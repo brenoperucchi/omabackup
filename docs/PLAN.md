@@ -5076,8 +5076,8 @@ probe in his plugin and reshaped to this project's destination model.
 is reduced to `OWNER/REPO` by `dest_github_slug` and looked up anonymously by
 `dest_remote_visibility` at `https://api.github.com/repos/OWNER/REPO`. `200`
 refuses the push, `404` lets it out, anything else skips it. The refusal is an
-ordinary per-destination failure, so `cmd_push` needed no change beyond adding
-`curl` to `require_tools`: `lastError`, backoff, a non-zero `push`, `dir`
+ordinary per-destination failure, so `cmd_push` needed no change at all (see
+the review round below for `curl`): `lastError`, backoff, a non-zero `push`, `dir`
 destinations unaffected, and the panel shows it through the existing
 `lastError.message` path with no QML change. Nothing is persisted as an
 authorization; each push asks again. `sync --commit` still never touches the
@@ -5121,3 +5121,43 @@ foreign packages: `pacman -Qqem` exits 1 when the query matches nothing, and
 `collect_generated` reads any non-zero status as failure. Reproduced in the
 same container. The suite also needs a `hostname` binary (seven more specs fail
 without `inetutils`), although the tool itself does not.
+
+#### Review round on PR #1 (2026-09-19)
+
+Breno's formal review of `b6f0eb9` confirmed the ordinary GitHub URL path, the
+redirect/proxy/authentication controls, per-destination failure handling and
+the reported test results, and returned three findings. All three were
+verified against the code before being accepted, and all three were right.
+
+1. **Remote spellings that bypassed the probe.** `dest_github_slug` still
+   listed the schemes it knew, so `https::https://github.com/o/r` and a
+   percent-encoded host (`https://%67ithub.com/o/r`, which curl and git both
+   decode to github.com) returned "not GitHub" and were pushed to unasked.
+   Checking the reviewers' two cases turned up more of the same family:
+   `git+ssh://`, `ssh+git://` and an upper-case scheme. The scheme is no longer
+   consulted; whatever precedes `://`, the host decides. A transport-helper
+   prefix is stripped and its address parsed like any other. What cannot be
+   read is refused closed (status 2): a `%` anywhere in the host, and a helper
+   whose address is not a URL (`ext::...`). A `%` is refused rather than
+   decoded on purpose, so there is no second decoder that has to agree with
+   git's byte for byte.
+2. **A 404 from a curl that exited non-zero was read as permission.** The
+   first version ignored curl's exit status to avoid the `000000`
+   concatenation trap. Both are consulted now and kept apart: the text is
+   validated on its own, the status comes from `$?`, and any non-zero exit is
+   inconclusive whatever was printed. The detail reads `HTTP 404, curl exit 18`
+   so a 404 in the log is not misread.
+3. **`curl` in `cmd_push`'s `require_tools` blocked `dir`-only machines.** It is
+   looked for inside `_push_github_gate` instead, at the moment there is a
+   GitHub repository to ask about. Without it the github destination fails on
+   its own and names `pacman -S curl`; `dir` destinations and non-GitHub
+   origins never need it. `bin/omabackup` is byte-identical to `main` again.
+
+Regressions were written first and confirmed failing against `b6f0eb9`: 10 new
+destination specs and 2 new dependency specs failed there.
+
+`./test/run.sh destinations` — **148 passed, 0 failed**.
+`./test/run.sh deps` — **24 passed, 0 failed**.
+Full suite — **1398 passed, 51 failed**, the same failing set as `main`'s
+**1340 passed, 51 failed** in the same network-less Arch container. Still not
+run on a live Omarchy session.

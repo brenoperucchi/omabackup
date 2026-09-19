@@ -153,8 +153,9 @@ push URL that names a GitHub repository. A public repository is refused; one
 that is not publicly readable is pushed to; and if GitHub cannot be asked
 (no network, a rate limit), that push is skipped and retried later rather than
 guessed at. The refusal shows up on the `github` destination in the panel and
-in `status --json`, and your other destinations still get their bundle. This
-needs `curl`, which every Arch install already has.
+in `status --json`, and your other destinations still get their bundle. Only
+this GitHub check needs `curl`, which every Arch install already has; a
+`dir` destination never asks for it.
 
 ## Design
 

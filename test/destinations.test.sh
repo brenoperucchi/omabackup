@@ -359,7 +359,31 @@ for PG3_CASE in "403 0 rate-limited" "500 0 server-error" "301 0 redirected" "00
 done
 
 it "curl printing 000 AND exiting non-zero is one answer, not the string 000000"
-assert_contains "$(_state_of "$PG3" '.lastError.message // ""' github)" "HTTP 000)"
+PG3_MSG="$(_state_of "$PG3" '.lastError.message // ""' github)"
+[[ "$PG3_MSG" == *"HTTP 000"* && "$PG3_MSG" != *000000* ]] && ok || fail "got: $PG3_MSG"
+
+# A status code is only an answer if the transfer that carried it finished.
+# Found by review (PR #1): curl can print 404 and STILL exit non-zero -- a
+# connection cut after the status line, a timeout once the headers are in --
+# and the first version never looked at curl's exit status at all, precisely
+# to dodge the 000000 trap above. It dodged it by reading an incomplete 404 as
+# permission to push.
+PG3B="$(mktemp -d)"; _gate_fixture "$PG3B" 'https://github.com/user/dotfiles.git' 404 18
+PG3B_OUT="$(_gate_push "$PG3B" github)"
+PG3B_RC=$?
+
+it "HTTP 404 from a curl that exited non-zero is inconclusive, not permission to push"
+[[ $PG3B_RC -ne 0 && ! -e "$PG3B/git.pushes" && "$PG3B_OUT" == *skipped* ]] && ok \
+    || fail "rc=$PG3B_RC pushed=$([[ -e "$PG3B/git.pushes" ]] && echo yes || echo no) out: $PG3B_OUT"
+
+it "and the detail says the transfer failed, so a 404 in the log is not misread"
+assert_contains "$(_state_of "$PG3B" '.lastError.message // ""' github)" "curl exit 18"
+
+PG3C="$(mktemp -d)"; _gate_fixture "$PG3C" 'https://github.com/user/dotfiles.git' 200 18
+PG3C_OUT="$(_gate_push "$PG3C" github)"
+
+it "HTTP 200 from a curl that exited non-zero still never pushes"
+[[ ! -e "$PG3C/git.pushes" ]] && ok || fail "pushed on an incomplete 200: $PG3C_OUT"
 
 # a probe that hangs must not hang push: same bound, same reason, as git push's own
 PG4="$(mktemp -d)"; _gate_fixture "$PG4" 'https://github.com/user/dotfiles.git' 404
@@ -403,6 +427,35 @@ for PG6_URL in 'http://github.com/o/r' 'https://GitHub.com/o/r' 'https://user@gi
 
     it "every spelling of a GitHub remote asks about the same owner/repo: $PG6_URL"
     assert_eq "$(awk '{print $NF}' "$PG6/curl.calls" 2>/dev/null)" "https://api.github.com/repos/o/r"
+done
+
+# Found by review (PR #1): git accepts more spellings of a GitHub remote than
+# the first parser knew, and everything it did not know fell into "not GitHub",
+# where the gate has nothing to say and the push goes out unasked. A
+# transport-helper prefix (`https::https://github.com/o/r`) and the `git+ssh`/
+# `ssh+git` aliases reach the same repository, so they are recognized and asked
+# about like any other spelling.
+for PG6B_URL in 'https::https://github.com/o/r' 'git+ssh://git@github.com/o/r.git' \
+                'ssh+git://git@github.com/o/r' 'HTTPS://github.com/o/r'; do
+    PG6B="$(mktemp -d)"; _gate_fixture "$PG6B" "$PG6B_URL" 404
+    _gate_push "$PG6B" github >/dev/null
+
+    it "a spelling git accepts is still GitHub, and is still asked about: $PG6B_URL"
+    assert_eq "$(awk '{print $NF}' "$PG6B/curl.calls" 2>/dev/null)" "https://api.github.com/repos/o/r"
+done
+
+# What cannot be recognized is refused closed instead. curl and git both decode
+# a percent-encoded host (`%67ithub.com` IS github.com on the wire), and a
+# helper whose address is not a URL (`ext::...`) can reach anywhere at all. The
+# gate cannot say which repository either one names, so neither is pushed to.
+for PG6C_URL in 'https://%67ithub.com/o/r' 'https://github%2ecom/o/r' 'ssh://git@%67ithub.com/o/r' \
+                'ext::ssh git@github.com %S o/r'; do
+    PG6C="$(mktemp -d)"; _gate_fixture "$PG6C" "$PG6C_URL" 404
+    PG6C_OUT="$(_gate_push "$PG6C" github)"
+
+    it "a remote whose host cannot be read plainly is never probed and never pushed to: $PG6C_URL"
+    [[ ! -e "$PG6C/curl.calls" && ! -e "$PG6C/git.pushes" && "$PG6C_OUT" == *skipped* ]] \
+        && ok || fail "probed=$([[ -e "$PG6C/curl.calls" ]] && echo yes || echo no) pushed=$([[ -e "$PG6C/git.pushes" ]] && echo yes || echo no) out: $PG6C_OUT"
 done
 
 PG7="$(mktemp -d)"; _gate_fixture "$PG7" 'https://breno:ghp_PROBE_TOKEN@github.com/user/dotfiles.git' 200

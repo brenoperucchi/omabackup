@@ -219,8 +219,9 @@ dest_github_push_url() {
 
 # Reduce a remote URL to the GitHub repository it names. Prints OWNER/REPO.
 #   0  a GitHub remote, and exactly one owner/repo
-#   1  not a GitHub remote at all (the caller leaves it alone)
-#   2  a GitHub host whose path does NOT reduce to exactly owner/repo
+#   1  positively not a GitHub remote (the caller leaves it alone)
+#   2  cannot be cleared: a GitHub host whose path does NOT reduce to exactly
+#      owner/repo, or an address whose host cannot be read plainly at all
 #
 # One normaliser for every spelling, because the first version of this idea
 # (in huey-holdings-llc/omabackup, where it was ported from) matched four
@@ -230,39 +231,58 @@ dest_github_push_url() {
 # pushed to with the gate believing it had nothing to say. Scheme, userinfo,
 # port, case and the FQDN root dot are all stripped before the host is compared.
 #
+# The port of that normaliser then repeated the same mistake one level up, and
+# review of PR #1 found it: it still listed the SCHEMES it knew, and everything
+# else fell through to status 1. Git knows more than it did. A transport-helper
+# prefix (`https::https://github.com/o/r`), the `git+ssh://` and `ssh+git://`
+# aliases, and any `<name>://` git would hand to a `git-remote-<name>` helper
+# all reach github.com, and all read as "not GitHub". So the scheme is no
+# longer consulted at all: whatever comes before `://`, the HOST decides.
+#
 # The host must be EXACTLY github.com (or ssh.github.com, GitHub's own port-443
 # SSH endpoint). No suffix matching: `github.com.attacker.net` is somebody
 # else's machine, and asking api.github.com about the path on it would be
 # asking about a repository that has nothing to do with where the data goes.
 #
-# Status 2 exists because "unidentifiable" must never collapse into "not
-# GitHub". `https://github.com/o/r/..` once produced the slug `o/r/..`; curl
-# normalised the dot-segment before sending, the probe asked about a DIFFERENT
-# repository, and that repository's 404 was read as "private". A GitHub remote
-# this function cannot name is one the gate cannot clear, so the caller refuses
-# it. The slug is about to be interpolated into a URL, which is the other
-# reason the character set is anchored and `.`/`..` segments are rejected.
+# Status 2 exists because "cannot tell" must never collapse into "not GitHub":
+#   - `https://github.com/o/r/..` once produced the slug `o/r/..`; curl
+#     normalised the dot-segment before sending, the probe asked about a
+#     DIFFERENT repository, and that repository's 404 was read as "private".
+#     The slug is about to be interpolated into a URL, which is the other
+#     reason the character set is anchored and `.`/`..` segments are rejected.
+#   - a percent sign in the host. Git and curl both decode it, so
+#     `%67ithub.com` IS github.com on the wire while comparing unequal to it
+#     here (review, PR #1). It is refused rather than decoded: a second decoder
+#     that has to agree with git's byte for byte is a second place to be wrong,
+#     and nobody spells a hostname this way by accident.
+#   - a transport helper whose address is not a URL (`ext::ssh git@github.com
+#     ...`). A helper can reach anywhere, and only a URL says where.
+# The caller refuses all three.
 #
 # Never prints its input: a remote URL may carry a token in its userinfo.
 dest_github_slug() {
-    local u="$1" rest auth path="" host
-    case "$u" in
-        http://*|https://*|ssh://*|git://*)
-            rest="${u#*://}"
-            auth="${rest%%/*}"
-            [[ "$rest" == */* ]] && path="${rest#*/}"
-            ;;
-        *://*) return 1 ;;
-        *:*)
-            # scp-like `[user@]host:path`. Git's own rule: a colon that comes
-            # after a slash belongs to a local path, not to a host.
-            auth="${u%%:*}"; path="${u#*:}"
-            [[ "$auth" == */* ]] && return 1
-            ;;
-        *) return 1 ;;
-    esac
+    local u="$1" rest auth path="" host helper=0
+    if [[ "$u" =~ ^[A-Za-z0-9][A-Za-z0-9+.-]*::(.*)$ ]]; then
+        u="${BASH_REMATCH[1]}"
+        helper=1
+    fi
+    if [[ "$u" =~ ^[A-Za-z][A-Za-z0-9+.-]*://(.*)$ ]]; then
+        rest="${BASH_REMATCH[1]}"
+        auth="${rest%%/*}"
+        [[ "$rest" == */* ]] && path="${rest#*/}"
+    elif (( helper )); then
+        return 2
+    elif [[ "$u" == *:* ]]; then
+        # scp-like `[user@]host:path`. Git's own rule: a colon that comes
+        # after a slash belongs to a local path, not to a host.
+        auth="${u%%:*}"; path="${u#*:}"
+        [[ "$auth" == */* ]] && return 1
+    else
+        return 1
+    fi
     auth="${auth##*@}"
     host="${auth%%:*}"
+    [[ "$host" == *%* ]] && return 2
     host="${host,,}"
     host="${host%.}"
     case "$host" in
@@ -308,18 +328,33 @@ dest_github_slug() {
 #                     curl's own limit is the polite one; `timeout --kill-after`
 #                     is for a curl that has stopped listening
 #
-# curl prints `000` AND exits non-zero when it cannot connect. Its exit status
-# is deliberately not consulted: `code=$(curl ...) || code=000` concatenates
-# the two into "000000", which matches none of the arms below for the wrong
-# reason. The captured text is validated instead, and anything that is not
-# three digits (including the empty output of a killed curl) is 000.
+# The status code and curl's exit status are BOTH consulted, and kept apart:
+#   - curl prints `000` AND exits non-zero when it cannot connect. The obvious
+#     `code=$(curl ...) || code=000` concatenates the two into "000000", which
+#     matches none of the arms below for the wrong reason. So the captured text
+#     is validated on its own (anything that is not three digits, including the
+#     empty output of a killed curl, is 000) and the exit status is read from
+#     `$?`, never folded into the string.
+#   - the first version stopped there and never looked at the exit status at
+#     all, and review of PR #1 found what that cost: curl can print `404` and
+#     STILL exit non-zero -- a connection cut after the status line, a timeout
+#     once the headers are in -- and an incomplete 404 was read as permission
+#     to push. A status code is only an answer if the transfer that carried it
+#     finished. Any non-zero exit is inconclusive whatever was printed, and the
+#     detail says so (`404, curl exit 18`) so that a 404 in the log is not
+#     misread later. `timeout` killing curl lands here too (124 or 137).
 dest_remote_visibility() {
-    local slug="$1" code
+    local slug="$1" code crc
     code="$(timeout --kill-after=5s "${DEST_PROBE_TIMEOUT_SEC}s" \
         curl -q --silent --proto '=https' --max-redirs 0 --no-netrc --noproxy '*' \
             --max-time "$DEST_PROBE_TIMEOUT_SEC" --output /dev/null --write-out '%{http_code}' \
             "https://api.github.com/repos/$slug" 2>/dev/null)"
+    crc=$?
     [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+    if (( crc != 0 )); then
+        printf '%s, curl exit %s' "$code" "$crc"
+        return 2
+    fi
     printf '%s' "$code"
     case "$code" in
         200) return 0 ;;
@@ -699,6 +734,16 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
 # gate can only ask GitHub about GitHub, and blocking every other host by
 # default needs an explicit trust record to go with it -- a separate change.
 #
+# curl is looked for HERE, at the moment there is a question to ask, and not in
+# cmd_push's require_tools line. The first version put it there, and review of
+# PR #1 found what that did: a machine with only a NAS or a pendrive
+# destination, which never asks GitHub anything, was refused its backup over a
+# tool it had no use for. Same rule as `verify` on a recovery tty
+# (bin/omabackup, "What this tool needs..."): the check belongs to the path
+# that needs the tool. With no curl the github destination fails on its own,
+# says what to install, and every other destination still gets its bundle.
+# "Could not ask" still never reads as "the answer was no".
+#
 # The detail names the repository. The slug is safe to print where the URL is
 # not: dest_github_slug only ever returns [A-Za-z0-9._-]+/[A-Za-z0-9._-]+.
 _push_github_gate() {
@@ -711,11 +756,15 @@ _push_github_gate() {
         case $rc in
             0) ;;
             1) continue ;;
-            *) printf 'push skipped: a GitHub push URL does not name exactly one owner/repo, so nobody can check whether it is public'
+            *) printf 'push skipped: a push URL of origin cannot be read as exactly one plain owner/repo address, so nobody can check whether it is public'
                return 1 ;;
         esac
         [[ "$seen" == *" ${slug,,} "* ]] && continue
         seen+="${slug,,} "
+        type -P curl >/dev/null 2>&1 || {
+            printf 'push skipped: curl is needed to ask whether github.com/%s is public -- install with: pacman -S curl' "$slug"
+            return 1
+        }
         code="$(dest_remote_visibility "$slug")"; rc=$?
         case $rc in
             0) printf 'refusing to push: github.com/%s is publicly readable (HTTP %s)' "$slug" "$code"
