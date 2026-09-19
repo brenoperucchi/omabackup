@@ -1792,7 +1792,7 @@ cmd_bundle() {
 # is what the timer calls. With an argument: that one, ignoring backoff, because
 # a human retrying on purpose should not serve out a penalty.
 cmd_push() {
-    require_tools jq git tar zstd timeout
+    require_tools jq git tar zstd timeout curl
     local repo="${OMABACKUP_REPO:-}" rc=0 id detail safe_detail bundle name
     local -a explicit=()
     while (($#)); do

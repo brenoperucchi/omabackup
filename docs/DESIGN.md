@@ -124,6 +124,27 @@ way for a pendrive as for a synced cloud folder — never over a network API.
 Revisit only if a real gap shows up in practice; a dedicated destination type
 is not worth building ahead of that need.
 
+**The `github` destination asks one question before it writes.** `commit +
+push` is now `commit + confirm the remote is not publicly readable + push`
+(PLAN.md Phase 1, T89). Immediately before `git push`, every origin push URL
+that names a GitHub repository is looked up anonymously at
+`https://api.github.com/repos/OWNER/REPO`: `200` means anyone can read it and
+the push is refused; `404` means it is not publicly readable at that URL and
+the push goes out; anything else (a rate limit, an outage, a redirect, no
+network) is no answer at all, and no answer never authorizes a push. The
+result is kept nowhere -- each push asks again. A refusal is an ordinary
+per-destination failure: `lastError`, backoff, a non-zero `push`, and every
+`dir` destination still receives its bundle.
+
+This does not contradict "no API-backed destination" above. That rule is about
+where backup BYTES travel, and they still travel over git and the filesystem
+only. The probe sends nothing and stores nothing remotely; it is a refusal
+gate, not a transport. It is also deliberately not `gh api`: an authenticated
+request answers `200` for the owner's own private repository, which would
+invert the gate. Scope, for now: only GitHub push URLs are checked, because
+GitHub is the only host this can be asked of. Refusing every other host by
+default needs an explicit trust record beside it, and is separate work.
+
 A removable drive is not a separate destination type — it is a `dir`
 destination whose `path` happens to be a mount point, triggered by udev instead
 of by the timer (§4) when that mount appears. Same driver, same retention,

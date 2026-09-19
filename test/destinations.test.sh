@@ -255,6 +255,210 @@ assert_eq "$(git -C "$DREMOTE" rev-list --all --count 2>/dev/null)" "1"
 it "and records the push in its state file"
 [[ -n "$(_state_of "$DH6" '.lastSuccess' github)" ]] && ok || fail "no lastSuccess for github"
 
+# ── the remote must not be publicly readable before anything is pushed ───────
+# docs/PLAN.md, "Phase 1 -- remote privacy and push decision gate" (T89). A
+# dotfiles repo created public by accident receives every commit this tool
+# makes, hourly, with nobody watching. The deny-list scanner cannot help: it
+# looks for credential SHAPES, and a hostname, a VPN endpoint or a client's
+# name in a config file has none. So `push` asks GitHub, anonymously, whether
+# the repository is publicly readable, and only an answer of "no" (HTTP 404)
+# lets the push go out.
+#
+# No spec here touches the network. `curl` is a PATH shim that records its own
+# argv and prints the status code the fixture chose; `git push` is a shim that
+# records that it was asked, so "nothing was pushed" is an observation and not
+# an inference. A push URL under /repos/leaky/ always answers 200, which is how
+# one fixture can hold a private fetch URL beside a public push URL.
+REAL_GIT="$(command -v git)"
+
+_gate_fixture() {  # _gate_fixture <home> <origin-url> <http-code> [curl-exit]
+    local h="$1" url="$2" code="$3" cexit="${4:-0}"
+    _dest_repo "$h/repo"
+    git -C "$h/repo" remote add origin "$url"
+    printf '{"schemaVersion":1,"destinations":[]}\n' >"$h/destinations.json"
+    mkdir -p "$h/fake-bin"
+    cat >"$h/fake-bin/curl" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >>"$h/curl.calls"
+if [[ "\$*" == */repos/leaky/* ]]; then printf '200'; exit 0; fi
+printf '%s' "$code"
+exit $cexit
+EOF
+    cat >"$h/fake-bin/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" push origin HEAD "* ]]; then
+    printf 'pushed\n' >>"$h/git.pushes"
+    exit 0
+fi
+exec "$REAL_GIT" "\$@"
+EOF
+    chmod +x "$h/fake-bin/curl" "$h/fake-bin/git"
+}
+
+_gate_push() {  # _gate_push <home> [push args...]
+    local h="$1"; shift
+    PATH="$h/fake-bin:$PATH" _dest_env "$h" "$h/repo" push "$@"
+}
+
+# public: HTTP 200 is the only proof there is, and it is proof of the wrong thing
+PG1="$(mktemp -d)"; _gate_fixture "$PG1" 'https://github.com/user/dotfiles.git' 200
+PG1_OUT="$(_gate_push "$PG1" github)"
+PG1_RC=$?
+
+it "a public GitHub remote (HTTP 200) is refused rather than pushed to"
+[[ $PG1_RC -ne 0 ]] && ok || fail "push exited 0 against a publicly readable repository"
+
+it "and git push is never invoked -- the refusal happens before the network write"
+[[ ! -e "$PG1/git.pushes" ]] && ok || fail "git push ran against a public repository"
+
+it "the wording says refusing, not warning"
+assert_contains "$PG1_OUT" "refusing"
+
+it "and the refusal is recorded as the github destination's own lastError"
+assert_contains "$(_state_of "$PG1" '.lastError.message // ""' github)" "public"
+
+it "and a refused push is never recorded as a success"
+assert_eq "$(_state_of "$PG1" '.lastSuccess // ""' github)" ""
+
+it "and it gets a backoff, so the hourly timer stops re-asking about a repo the user has to go fix"
+assert_contains "$(_gate_push "$PG1")" "backoff"
+
+# private or absent: HTTP 404 is the only answer that lets a push out
+PG2="$(mktemp -d)"; _gate_fixture "$PG2" 'https://github.com/user/dotfiles.git' 404
+_gate_push "$PG2" github >/dev/null
+PG2_RC=$?
+
+it "a remote that is not publicly readable (HTTP 404) is pushed to normally"
+[[ $PG2_RC -eq 0 && -e "$PG2/git.pushes" ]] && ok || fail "rc=$PG2_RC, pushed=$([[ -e "$PG2/git.pushes" ]] && echo yes || echo no)"
+
+it "and the push is recorded as a success with no error"
+[[ -n "$(_state_of "$PG2" '.lastSuccess // ""' github)" && "$(_state_of "$PG2" '.lastError // "none"' github)" == none ]] \
+    && ok || fail "state: $(cat "$PG2/.state/destinations/github.json" 2>/dev/null)"
+
+it "the question asked is about exactly this repository, at the canonical API URL"
+assert_contains "$(cat "$PG2/curl.calls" 2>/dev/null)" "https://api.github.com/repos/user/dotfiles"
+
+it "each push probes afresh -- a previous run's answer never authorizes a later one"
+sed -i "s/printf '%s' \"404\"/printf '%s' \"200\"/" "$PG2/fake-bin/curl"
+rm -f "$PG2/git.pushes"
+_gate_push "$PG2" github >/dev/null
+[[ ! -e "$PG2/git.pushes" ]] && ok || fail "the second push went out on the first push's answer"
+
+# inconclusive: anything else is not an answer, and no answer never authorizes a push
+for PG3_CASE in "403 0 rate-limited" "500 0 server-error" "301 0 redirected" "000 7 no-network"; do
+    read -r PG3_CODE PG3_EXIT PG3_NAME <<<"$PG3_CASE"
+    PG3="$(mktemp -d)"; _gate_fixture "$PG3" 'https://github.com/user/dotfiles.git' "$PG3_CODE" "$PG3_EXIT"
+    PG3_OUT="$(_gate_push "$PG3" github)"
+    PG3_RC=$?
+
+    it "an inconclusive probe ($PG3_NAME, HTTP $PG3_CODE) skips the push instead of guessing"
+    [[ $PG3_RC -ne 0 && ! -e "$PG3/git.pushes" ]] && ok || fail "rc=$PG3_RC, pushed=$([[ -e "$PG3/git.pushes" ]] && echo yes || echo no)"
+
+    it "and says skipped, so it cannot be mistaken for the public refusal ($PG3_NAME)"
+    [[ "$PG3_OUT" == *skipped* && "$PG3_OUT" != *refusing* ]] && ok || fail "got: $PG3_OUT"
+done
+
+it "curl printing 000 AND exiting non-zero is one answer, not the string 000000"
+assert_contains "$(_state_of "$PG3" '.lastError.message // ""' github)" "HTTP 000)"
+
+# a probe that hangs must not hang push: same bound, same reason, as git push's own
+PG4="$(mktemp -d)"; _gate_fixture "$PG4" 'https://github.com/user/dotfiles.git' 404
+printf '#!/bin/bash\nsleep 30\n' >"$PG4/fake-bin/curl"
+PG4_START=$(date +%s)
+PG4_OUT="$(OMABACKUP_REMOTE_PROBE_TIMEOUT_SEC=2 _gate_push "$PG4" github)"
+PG4_ELAPSED=$(( $(date +%s) - PG4_START ))
+
+it "a probe that hangs is killed by OMABACKUP_REMOTE_PROBE_TIMEOUT_SEC rather than hanging push itself"
+(( PG4_ELAPSED < 20 )) && ok || fail "push took ${PG4_ELAPSED}s behind a hung probe"
+
+it "and a killed probe is inconclusive -- nothing is pushed"
+[[ ! -e "$PG4/git.pushes" && "$PG4_OUT" == *skipped* ]] && ok || fail "got: $PG4_OUT"
+
+PG5="$(mktemp -d)"; _gate_fixture "$PG5" 'https://github.com/user/dotfiles.git' 404
+OMABACKUP_REMOTE_PROBE_TIMEOUT_SEC='ten' _gate_push "$PG5" github >/dev/null
+
+it "an OMABACKUP_REMOTE_PROBE_TIMEOUT_SEC that is not a positive decimal falls back to the safe default"
+assert_contains "$(cat "$PG5/curl.calls" 2>/dev/null)" "--max-time 10 "
+
+# the probe must be anonymous, or it answers the wrong question: an
+# authenticated request returns 200 for the owner's own PRIVATE repository
+it "the probe carries no Authorization header -- an authenticated 200 would invert the gate"
+assert_not_contains "$(cat "$PG5/curl.calls" 2>/dev/null)" "uthorization"
+
+it "and it does not read ~/.netrc, for the same reason"
+assert_contains "$(cat "$PG5/curl.calls" 2>/dev/null)" "--no-netrc"
+
+it "a proxy in the environment cannot answer the visibility question for us"
+assert_contains "$(cat "$PG5/curl.calls" 2>/dev/null)" "--noproxy *"
+
+it "a redirect is never followed -- a renamed repository is a different repository"
+assert_contains "$(cat "$PG5/curl.calls" 2>/dev/null)" "--max-redirs 0"
+
+# the origin URL is parsed, not trusted
+for PG6_URL in 'http://github.com/o/r' 'https://GitHub.com/o/r' 'https://user@github.com/o/r' \
+               'ssh://git@github.com:22/o/r' 'git@github.com:o/r.git' 'https://github.com./o/r/' \
+               'ssh://git@ssh.github.com:443/o/r.git'; do
+    PG6="$(mktemp -d)"; _gate_fixture "$PG6" "$PG6_URL" 404
+    _gate_push "$PG6" github >/dev/null
+
+    it "every spelling of a GitHub remote asks about the same owner/repo: $PG6_URL"
+    assert_eq "$(awk '{print $NF}' "$PG6/curl.calls" 2>/dev/null)" "https://api.github.com/repos/o/r"
+done
+
+PG7="$(mktemp -d)"; _gate_fixture "$PG7" 'https://breno:ghp_PROBE_TOKEN@github.com/user/dotfiles.git' 200
+PG7_OUT="$(_gate_push "$PG7" github)"
+
+it "a credential in the remote URL never reaches the probe, the terminal or the state file"
+[[ "$(cat "$PG7/curl.calls")" != *ghp_PROBE_TOKEN* && "$PG7_OUT" != *ghp_PROBE_TOKEN* \
+    && "$(cat "$PG7/.state/destinations/github.json")" != *ghp_PROBE_TOKEN* ]] && ok || fail "the token leaked"
+
+for PG8_URL in 'https://github.com/o/r/..' 'https://github.com//o/r' 'https://github.com/o'; do
+    PG8="$(mktemp -d)"; _gate_fixture "$PG8" "$PG8_URL" 404
+    PG8_OUT="$(_gate_push "$PG8" github)"
+
+    it "a GitHub remote that does not reduce to exactly owner/repo is never probed and never pushed to: $PG8_URL"
+    [[ ! -e "$PG8/curl.calls" && ! -e "$PG8/git.pushes" && "$PG8_OUT" == *skipped* ]] \
+        && ok || fail "probed=$([[ -e "$PG8/curl.calls" ]] && echo yes || echo no) out: $PG8_OUT"
+done
+
+# git push origin HEAD sends to EVERY push URL, so every one of them is asked about
+PG9="$(mktemp -d)"; _gate_fixture "$PG9" 'https://github.com/user/dotfiles.git' 404
+git -C "$PG9/repo" remote set-url --add --push origin 'https://github.com/user/dotfiles.git'
+git -C "$PG9/repo" remote set-url --add --push origin 'https://github.com/leaky/mirror.git'
+PG9_OUT="$(_gate_push "$PG9" github)"
+
+it "a second push URL that is public refuses the push, however private the first one is"
+[[ ! -e "$PG9/git.pushes" && "$PG9_OUT" == *refusing* ]] && ok || fail "got: $PG9_OUT"
+
+# the gate is scoped to GitHub, and to push
+PG10="$(mktemp -d)"; _gate_fixture "$PG10" 'https://github.com.attacker.net/o/r.git' 200
+_gate_push "$PG10" github >/dev/null
+
+it "a lookalike host (github.com.attacker.net) is not treated as GitHub -- nothing is asked about a repo that is not there"
+[[ ! -e "$PG10/curl.calls" ]] && ok || fail "probed: $(cat "$PG10/curl.calls")"
+
+PG11="$(mktemp -d)"; _gate_fixture "$PG11" "$PG11/remote.git" 200
+git init -q --bare "$PG11/remote.git"
+_gate_push "$PG11" github >/dev/null
+PG11_RC=$?
+
+it "a non-GitHub origin is pushed to unchanged -- no probe runs and curl is never invoked"
+[[ $PG11_RC -eq 0 && -e "$PG11/git.pushes" && ! -e "$PG11/curl.calls" ]] && ok \
+    || fail "rc=$PG11_RC pushed=$([[ -e "$PG11/git.pushes" ]] && echo yes || echo no) probed=$([[ -e "$PG11/curl.calls" ]] && echo yes || echo no)"
+
+PG12="$(mktemp -d)"; _gate_fixture "$PG12" 'https://github.com/user/dotfiles.git' 200
+cat >"$PG12/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$PG12/nas","keep":2}]}
+JSON
+_gate_push "$PG12" >/dev/null
+PG12_RC=$?
+
+it "a refused github remote does not stop a healthy dir destination from receiving its bundle"
+[[ -n "$(find "$PG12/nas" -name 'omabackup-*' 2>/dev/null)" ]] && ok || fail "the nas destination received nothing"
+
+it "and push still reports overall failure rather than a cheerful zero"
+[[ $PG12_RC -ne 0 ]] && ok || fail "push exited 0 with the github destination refused"
+
 # A remote URL may contain a credential, and a failed Git transport commonly
 # repeats that URL in stderr. `_push_github` captures stderr as its destination
 # detail, so this fixture makes sure the captured detail cannot become a
@@ -273,6 +477,10 @@ fi
 exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$GH_FAIL_BIN/git"
+# This origin is a github.com URL, so the privacy gate asks about it before git
+# push runs. Answer "not publicly readable" here: the spec is about what git's
+# own failure output does afterwards, and no spec may reach the real network.
+printf '#!/bin/bash\nprintf 404\n' >"$GH_FAIL_BIN/curl"; chmod +x "$GH_FAIL_BIN/curl"
 GH_ERROR_OUT="$(PATH="$GH_FAIL_BIN:$PATH" HOME="$DH6E" OMABACKUP_GROUPS="$PWD/groups.default.json" \
     OMABACKUP_STATE="$DH6E/.state" OMABACKUP_REPO="$DR6E" \
     OMABACKUP_DESTINATIONS="$DH6E/destinations.json" XDG_RUNTIME_DIR=/nonexistent \
@@ -292,6 +500,8 @@ fi
 exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$GH_CONTROL_BIN/git"
+# Same github.com origin, so the same stand-in answer from the privacy gate.
+cp "$GH_FAIL_BIN/curl" "$GH_CONTROL_BIN/curl"
 GH_CONTROL_OUT="$(PATH="$GH_CONTROL_BIN:$PATH" HOME="$DH6E" OMABACKUP_GROUPS="$PWD/groups.default.json" \
     OMABACKUP_STATE="$DH6E/.state-control" OMABACKUP_REPO="$DR6E" \
     OMABACKUP_DESTINATIONS="$DH6E/destinations.json" XDG_RUNTIME_DIR=/nonexistent \
