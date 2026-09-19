@@ -145,6 +145,17 @@ coverage only for the user's files. That is how
 Deliberate exclusions live in `excluded[]`, each with its reason versioned
 alongside. A checker born with a dozen warnings teaches you to ignore it.
 
+### Before a push
+
+`push` will not send your dotfiles to a GitHub repository that anyone can
+read. Right before `git push`, it asks GitHub anonymously about every origin
+push URL that names a GitHub repository. A public repository is refused; one
+that is not publicly readable is pushed to; and if GitHub cannot be asked
+(no network, a rate limit), that push is skipped and retried later rather than
+guessed at. The refusal shows up on the `github` destination in the panel and
+in `status --json`, and your other destinations still get their bundle. This
+needs `curl`, which every Arch install already has.
+
 ## Design
 
 [`docs/PLAN.md`](docs/PLAN.md) is the living status: where things stand, what's

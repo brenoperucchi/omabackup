@@ -60,6 +60,22 @@ else
     DEST_PUSH_OUTPUT_MAX_BYTES=8192
 fi
 
+# The visibility probe's own bound (docs/PLAN.md Phase 1, T89). Same lesson as
+# the push timeout above, from the same marketplace review: a subprocess that
+# talks to the network and has no timeout of its own can hold the hourly timer
+# for as long as the far end likes. 10s rather than the push's 120s because
+# this is one anonymous GET with the body thrown away, not a transfer -- the
+# same order of magnitude as a purely local read. Same canonical-positive-
+# -decimal validation as every other override here: an unvalidated value must
+# never widen into "unlimited." The probe's OUTPUT needs no byte cap of its
+# own: curl is told to discard the body and print only `%{http_code}`, so three
+# characters is all it can ever hand back, by construction.
+if [[ "${OMABACKUP_REMOTE_PROBE_TIMEOUT_SEC:-}" =~ ^[1-9][0-9]*$ ]]; then
+    DEST_PROBE_TIMEOUT_SEC="$OMABACKUP_REMOTE_PROBE_TIMEOUT_SEC"
+else
+    DEST_PROBE_TIMEOUT_SEC=10
+fi
+
 # ── config ───────────────────────────────────────────────────────────────────
 _dest_json() { [[ -f "$DESTINATIONS_FILE" ]] && cat "$DESTINATIONS_FILE" || printf '{"destinations":[]}'; }
 
@@ -199,6 +215,117 @@ dest_github_push_url() {
     url="$(git -C "$repo" remote get-url --push origin 2>/dev/null)" || return 1
     [[ -n "$url" ]] || return 1
     printf '%s' "$url" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@#\1#'
+}
+
+# Reduce a remote URL to the GitHub repository it names. Prints OWNER/REPO.
+#   0  a GitHub remote, and exactly one owner/repo
+#   1  not a GitHub remote at all (the caller leaves it alone)
+#   2  a GitHub host whose path does NOT reduce to exactly owner/repo
+#
+# One normaliser for every spelling, because the first version of this idea
+# (in huey-holdings-llc/omabackup, where it was ported from) matched four
+# literal prefixes instead: `http://github.com/o/r`, `https://GitHub.com/o/r`,
+# `https://user@github.com/o/r` and `ssh://git@github.com:22/o/r` all read as
+# "not GitHub", so no probe ever ran and a possibly public repository was
+# pushed to with the gate believing it had nothing to say. Scheme, userinfo,
+# port, case and the FQDN root dot are all stripped before the host is compared.
+#
+# The host must be EXACTLY github.com (or ssh.github.com, GitHub's own port-443
+# SSH endpoint). No suffix matching: `github.com.attacker.net` is somebody
+# else's machine, and asking api.github.com about the path on it would be
+# asking about a repository that has nothing to do with where the data goes.
+#
+# Status 2 exists because "unidentifiable" must never collapse into "not
+# GitHub". `https://github.com/o/r/..` once produced the slug `o/r/..`; curl
+# normalised the dot-segment before sending, the probe asked about a DIFFERENT
+# repository, and that repository's 404 was read as "private". A GitHub remote
+# this function cannot name is one the gate cannot clear, so the caller refuses
+# it. The slug is about to be interpolated into a URL, which is the other
+# reason the character set is anchored and `.`/`..` segments are rejected.
+#
+# Never prints its input: a remote URL may carry a token in its userinfo.
+dest_github_slug() {
+    local u="$1" rest auth path="" host
+    case "$u" in
+        http://*|https://*|ssh://*|git://*)
+            rest="${u#*://}"
+            auth="${rest%%/*}"
+            [[ "$rest" == */* ]] && path="${rest#*/}"
+            ;;
+        *://*) return 1 ;;
+        *:*)
+            # scp-like `[user@]host:path`. Git's own rule: a colon that comes
+            # after a slash belongs to a local path, not to a host.
+            auth="${u%%:*}"; path="${u#*:}"
+            [[ "$auth" == */* ]] && return 1
+            ;;
+        *) return 1 ;;
+    esac
+    auth="${auth##*@}"
+    host="${auth%%:*}"
+    host="${host,,}"
+    host="${host%.}"
+    case "$host" in
+        github.com|ssh.github.com) ;;
+        *) return 1 ;;
+    esac
+    path="${path%/}"
+    path="${path%.git}"
+    [[ "$path" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || return 2
+    case "/$path/" in */./*|*/../*) return 2 ;; esac
+    printf '%s' "$path"
+}
+
+# Ask GitHub, anonymously, whether OWNER/REPO is publicly readable. Prints the
+# HTTP status it got (000 when it got none).
+#   0  public           (200)
+#   1  not publicly readable (404) -- private, or not there at all
+#   2  inconclusive     (anything else: rate limit, outage, redirect, no network)
+# The tri-state return is probe_hypr_entry's idiom (lib/probes.sh), for the same
+# reason: "could not tell" is its own answer and must not be folded into either
+# of the other two.
+#
+# A 404 is NOT proof the repository is private, and nothing here says it is: it
+# means "not publicly readable at this exact URL". A repository that does not
+# exist yet answers the same way, and a push to it fails on its own.
+#
+# Every flag is load-bearing:
+#   -q                first, so no ~/.curlrc can add a header, a proxy or a
+#                     redirect policy behind this function's back
+#   no Authorization, --no-netrc
+#                     an AUTHENTICATED request returns 200 for the owner's own
+#                     private repository, which would invert the gate. This is
+#                     also why it is not `gh api`
+#   --proto '=https', --max-redirs 0
+#                     a rename or transfer answers 301; following it would be
+#                     asking about a different repository than the one git is
+#                     about to push to, so a redirect is inconclusive
+#   --noproxy '*'     an http(s)_proxy variable in a unit's environment must
+#                     not get to answer "is this public?" on GitHub's behalf
+#   --output /dev/null --write-out '%{http_code}'
+#                     bounds the output by construction (see DEST_PROBE_TIMEOUT_SEC)
+#   timeout AND --max-time
+#                     curl's own limit is the polite one; `timeout --kill-after`
+#                     is for a curl that has stopped listening
+#
+# curl prints `000` AND exits non-zero when it cannot connect. Its exit status
+# is deliberately not consulted: `code=$(curl ...) || code=000` concatenates
+# the two into "000000", which matches none of the arms below for the wrong
+# reason. The captured text is validated instead, and anything that is not
+# three digits (including the empty output of a killed curl) is 000.
+dest_remote_visibility() {
+    local slug="$1" code
+    code="$(timeout --kill-after=5s "${DEST_PROBE_TIMEOUT_SEC}s" \
+        curl -q --silent --proto '=https' --max-redirs 0 --no-netrc --noproxy '*' \
+            --max-time "$DEST_PROBE_TIMEOUT_SEC" --output /dev/null --write-out '%{http_code}' \
+            "https://api.github.com/repos/$slug" 2>/dev/null)"
+    [[ "$code" =~ ^[0-9]{3}$ ]] || code=000
+    printf '%s' "$code"
+    case "$code" in
+        200) return 0 ;;
+        404) return 1 ;;
+        *)   return 2 ;;
+    esac
 }
 
 # ── state ────────────────────────────────────────────────────────────────────
@@ -548,8 +675,62 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
 # left at all in the command that actually runs `git`, so its own `$?` is
 # the whole story, unconditionally, regardless of any shell's `pipefail`
 # setting.
+# The privacy gate (docs/PLAN.md Phase 1, T89): nothing is pushed to a GitHub
+# repository that is publicly readable, or to one this tool could not ask about.
+# Prints a refusal detail and returns 1, or prints nothing and returns 0.
+#
+# It lives HERE, as the first thing the github driver does, and not in cmd_push:
+# a public GitHub remote must not stop a healthy NAS from receiving its bundle
+# (docs/DESIGN.md §3, "One destination failing does not invalidate the others"),
+# and returning a detail string with a non-zero status is already this driver's
+# whole contract -- cmd_push records lastError, applies the backoff and carries
+# on to the next destination without learning anything new. That backoff is
+# also what keeps an hourly timer from asking GitHub the same question about a
+# repository only the user can fix: anonymous requests are limited to 60 an
+# hour per address.
+#
+# EVERY push URL is asked about, not the fetch URL: `git push origin HEAD`
+# sends to all of them (see dest_github_push_url), so a private first URL says
+# nothing about a public second one. Asked fresh on every push, and the answer
+# is kept nowhere: a verdict persisted from an earlier run never authorizes a
+# later one.
+#
+# Scope, deliberately: a push URL that is not GitHub is left alone here. This
+# gate can only ask GitHub about GitHub, and blocking every other host by
+# default needs an explicit trust record to go with it -- a separate change.
+#
+# The detail names the repository. The slug is safe to print where the URL is
+# not: dest_github_slug only ever returns [A-Za-z0-9._-]+/[A-Za-z0-9._-]+.
+_push_github_gate() {
+    local urls url slug code rc seen=" "
+    urls="$(git -C "$OMABACKUP_REPO" remote get-url --push --all origin 2>/dev/null)" \
+        || { printf 'push skipped: could not read the push URLs of origin'; return 1; }
+    while IFS= read -r url; do
+        [[ -n "$url" ]] || continue
+        slug="$(dest_github_slug "$url")"; rc=$?
+        case $rc in
+            0) ;;
+            1) continue ;;
+            *) printf 'push skipped: a GitHub push URL does not name exactly one owner/repo, so nobody can check whether it is public'
+               return 1 ;;
+        esac
+        [[ "$seen" == *" ${slug,,} "* ]] && continue
+        seen+="${slug,,} "
+        code="$(dest_remote_visibility "$slug")"; rc=$?
+        case $rc in
+            0) printf 'refusing to push: github.com/%s is publicly readable (HTTP %s)' "$slug" "$code"
+               return 1 ;;
+            1) ;;
+            *) printf 'push skipped: could not confirm that github.com/%s is not public (HTTP %s)' "$slug" "$code"
+               return 1 ;;
+        esac
+    done <<<"$urls"
+    return 0
+}
+
 _push_github() {
-    local tmpfile rc sz raw line
+    local tmpfile rc sz raw line gate
+    gate="$(_push_github_gate)" || { printf '%s' "$gate"; return 1; }
     tmpfile="$(mktemp)" || { printf 'push failed'; return 1; }
     timeout --kill-after=5s "${DEST_PUSH_TIMEOUT_SEC}s" \
         git -C "$OMABACKUP_REPO" push origin HEAD >"$tmpfile" 2>&1
