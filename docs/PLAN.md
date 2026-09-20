@@ -5081,8 +5081,8 @@ the review round below for `curl`): `lastError`, backoff, a non-zero `push`, `di
 destinations unaffected, and the panel shows it through the existing
 `lastError.message` path with no QML change. Nothing is persisted as an
 authorization; each push asks again. `sync --commit` still never touches the
-network. `manifest.json` goes to `0.4.5` (patch: a security gate, no new
-feature). DESIGN.md §3 and the README describe the behaviour.
+network. `manifest.json` went to `0.4.5` (historical; patch: a security gate,
+no new feature). DESIGN.md §3 and the README describe the behaviour.
 
 **Scope, and one deliberate difference from Phase 1 as written.** Item 2 of
 Phase 1 says to block non-GitHub remotes by default. This change does not:
@@ -5161,3 +5161,17 @@ destination specs and 2 new dependency specs failed there.
 Full suite — **1398 passed, 51 failed**, the same failing set as `main`'s
 **1340 passed, 51 failed** in the same network-less Arch container. Still not
 run on a live Omarchy session.
+
+#### Marketplace release `0.4.6` (2026-09-20)
+
+The post-merge tree is released as `0.4.6`. It includes the remote privacy
+gate and its follow-up rejection of every `ext::` transport before probing or
+pushing (`51bca0b` is the merge base; `717a6c9` is the transport-helper fix),
+plus the test-runtime correction that makes the real `systemd-analyze --user`
+checks work in the isolated suite. The complete suite passes **1450/0**.
+
+This is a patch-numbered security-hardening update. A GitHub repository that
+is publicly readable is now refused as a backup destination; the marketplace
+revalidation request must mention that behavior before users upgrade. The
+exact release source SHA is recorded in the follow-up comment on marketplace
+issue `#3968` after this commit is pushed.
