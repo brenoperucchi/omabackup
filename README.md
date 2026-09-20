@@ -183,6 +183,10 @@ practice, gathered from comparing notes with other Omarchy backup plugins
 **Suggestions for OmaBackup are welcome.** If you use it, or you looked at
 this and thought of something it should do, open an issue.
 
+## Changelog
+
+What changed in each release: [CHANGELOG.md](CHANGELOG.md).
+
 ## Related projects
 
 - [OmaSession](https://github.com/brenoperucchi/omasession) — restores live
