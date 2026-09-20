@@ -522,6 +522,80 @@ it "and no empty package list was staged in its place"
 [[ -z "$(find "$GEH/.state/staging" -type f 2>/dev/null)" ]] \
     && ok || fail "an empty generated list was staged despite the generator failing"
 
+# ── a machine with no foreign packages is not a failing generator ───────────
+# `pacman -Qqem` exits 1 when it has nothing to list, with nothing on stdout or
+# stderr -- the same status it uses for a database it could not read. The
+# refusal above treated the two alike, so collect aborted outright on any
+# machine without an AUR package (a fresh install, a container). Stubbed
+# here rather than left to the real pacman, so the answer does not depend on
+# what happens to be installed on the machine running the suite.
+# The status alone cannot tell the two cases apart, so the collector asks the
+# other two lists: foreign is explicit minus native, and an empty answer is
+# believed only when those two agree. The controls below are the point -- a
+# fix that simply tolerated exit 1 would pass the first three and fail these.
+_nofo_home() {  # _nofo_home <dir> <explicit> <native> <foreign-branch>
+    mkdir -p "$1/stub"
+    cat >"$1/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"packages","label":"Packages","mode":"gen","coupled":false,"critical":true,"generator":"packages"}]}
+JSON
+    { printf '#!/bin/bash\n'
+      printf 'case "$1" in\n'
+      printf '  -Qqe)  printf "%s" ;;\n' "$2"
+      printf '  -Qqen) printf "%s" ;;\n' "$3"
+      printf '  -Qqem) %s ;;\n' "$4"
+      printf '  *)     exit 2 ;;\n'
+      printf 'esac\n'
+    } >"$1/stub/pacman"; chmod +x "$1/stub/pacman"
+}
+_nofo_collect() {  # _nofo_collect <dir>
+    PATH="$1/stub:$PATH" HOME="$1" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$1/g.json" \
+        OMABACKUP_STATE="$1/.state" XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1
+}
+
+NF1="$(mktemp -d)"
+_nofo_home "$NF1" 'git\nneovim\n' 'git\nneovim\n' 'exit 1'
+
+it "collect succeeds on a machine with no foreign packages"
+_nofo_collect "$NF1" && ok || fail "collect aborted because pacman -Qqem had nothing to list"
+
+it "and stages the foreign list empty rather than leaving it out"
+[[ -f "$NF1/.state/staging/.generated/pkgs-aur.txt" && ! -s "$NF1/.state/staging/.generated/pkgs-aur.txt" ]] \
+    && ok || fail "pkgs-aur.txt is missing or not empty -- publish never deletes, so a missing list leaves the stale one in the repo"
+
+it "and the explicit and native lists are both staged intact"
+assert_eq "$(cat "$NF1/.state/staging/.generated/pkgs-explicit.txt" 2>/dev/null)|$(cat "$NF1/.state/staging/.generated/pkgs-arch.txt" 2>/dev/null)" \
+    "$(printf 'git\nneovim')|$(printf 'git\nneovim')"
+
+# Control 1: the same silent exit 1, but the explicit list names a package the
+# native list does not -- so a foreign package exists and pacman failed to say so.
+NF2="$(mktemp -d)"
+_nofo_home "$NF2" 'git\nneovim\nyay\n' 'git\nneovim\n' 'exit 1'
+
+it "collect still refuses a silent exit 1 when the other two lists show a foreign package"
+_nofo_collect "$NF2" \
+    && fail "believed an empty foreign list although explicit and native disagree" || ok
+
+it "and no empty foreign list was staged in its place"
+[[ ! -e "$NF2/.state/staging/.generated/pkgs-aur.txt" ]] \
+    && ok || fail "pkgs-aur.txt was left staged after the refusal"
+
+# Control 2: any status other than 1 is a failure whatever the lists say.
+NF3="$(mktemp -d)"
+_nofo_home "$NF3" 'git\nneovim\n' 'git\nneovim\n' 'exit 2'
+
+it "collect still refuses any other failing status from the foreign query"
+_nofo_collect "$NF3" \
+    && fail "reported success although pacman -Qqem exited 2" || ok
+
+# Control 3: exit 1 AFTER printing something is a listing that broke partway.
+NF4="$(mktemp -d)"
+_nofo_home "$NF4" 'git\nneovim\n' 'git\nneovim\n' '{ echo yay; exit 1; }'
+
+it "collect still refuses an exit 1 that arrives with a partial listing"
+_nofo_collect "$NF4" \
+    && fail "staged a partial foreign list as though it were complete" || ok
+
 # ── a plugin's local capture failing is refused, not counted as collected ───
 # _capture_local's own rsync copy was never checked by either of its two
 # callers in capture_plugin -- both discarded it via a compound
