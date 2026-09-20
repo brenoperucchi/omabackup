@@ -5175,3 +5175,36 @@ is publicly readable is now refused as a backup destination; the marketplace
 revalidation request must mention that behavior before users upgrade. The
 exact release source SHA is recorded in the follow-up comment on marketplace
 issue `#3968` after this commit is pushed.
+
+#### Changelog and GitHub Release `v0.4.6` (2026-09-20)
+
+`CHANGELOG.md` now exists at the repository root and records every published
+manifest version from `0.1.0` through `0.4.6`. The README gained a short
+`## Changelog` section linking to it, immediately before `## Related projects`;
+no release notes were inlined into the README.
+
+The `0.4.6` entry leads with the behaviour change rather than the version
+number: a publicly readable GitHub repository is refused as a backup
+destination, so a user whose backup repository is public loses `push` on
+upgrade until it is made private or `OMABACKUP_REPO` is repointed. The entry
+also records the complete pushurl set being probed, the closed remote
+spellings (scheme no longer consulted, `%` in a host refused rather than
+decoded), the `ext::` rejection in both its SSH-shaped and URL-shaped forms,
+the separated curl text/exit-status validation, `curl` moving out of `push`'s
+up-front `require_tools`, and the temporary `XDG_RUNTIME_DIR` correction in the
+installation specs. Corey Tyhurst (`@coreytyhurst`) is credited for PR #1.
+
+The annotated tag `v0.4.6` deliberately points at
+`ea45c165862d4315f1c23502492e1886cb1f98e5`, the exact source SHA submitted to
+marketplace issue `#7773`, not at the later documentation commit. The GitHub
+Release is published from that tag; its notes carry the same content as the
+changelog entry and link to `CHANGELOG.md` on `main` by absolute URL, because
+the changelog does not exist in the tagged tree. This is the project's first
+tag and first release — none existed before.
+
+The documentation commit is `c1366b4`, pushed to `origin/main`. The complete
+suite was run on that tree before the commit and reports **1450 passed, 0
+failed**, matching the release commit. The work was done in a throwaway
+worktree detached at `ea45c16`; the main checkout's pre-existing uncommitted
+`docs/PLAN.md` changes and untracked `docs/plans/` were left untouched, and
+this section is therefore absent from that working copy.
