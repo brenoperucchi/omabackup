@@ -276,3 +276,63 @@ ZOUT="$(PATH="$ZBIN" HOME="$ZH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$ZH/g.js
 
 it "but bundle says exactly what it needs"
 assert_contains "$ZOUT" "zstd"
+
+# ── curl is needed to ask GitHub, and only to ask GitHub ─────────────────────
+# `push` asks GitHub whether the remote is publicly readable before anything
+# leaves the machine (docs/PLAN.md Phase 1, T89). With no curl that question
+# cannot be asked, and "could not ask" must never read as "the answer was no".
+#
+# Found by review (PR #1): the first version added curl to cmd_push's own
+# require_tools line, so a machine with only a NAS or a pendrive destination --
+# which never asks GitHub anything -- was refused its backup over a tool it had
+# no use for. Same rule as "verify must work on a recovery tty" above: the
+# check belongs to the path that needs the tool. Without curl the github
+# destination fails on its own, names what is missing, and everything else
+# still receives its bundle.
+QH="$(mktemp -d)"; QBIN="$QH/bin"
+_only_path "$QBIN" bash jq rsync zstd tar timeout python3 sed awk gawk find sort grep cut wc tr head tail mktemp \
+    basename dirname mkdir rm mv cp cat chmod ln readlink realpath stat du date uname hostname sleep \
+    sha256sum xargs diff env printf test
+QREAL_GIT="$(type -P git)"
+cat >"$QBIN/git" <<EOF
+#!/bin/bash
+if [[ " \$* " == *" push origin HEAD "* ]]; then printf 'pushed\n' >>"$QH/git.pushes"; exit 0; fi
+exec "$QREAL_GIT" "\$@"
+EOF
+chmod +x "$QBIN/git"
+QR="$QH/repo"; mkdir -p "$QR"; "$QREAL_GIT" init -q "$QR"
+"$QREAL_GIT" -C "$QR" config user.email t@t; "$QREAL_GIT" -C "$QR" config user.name t
+printf 'x\n' >"$QR/f.txt"; "$QREAL_GIT" -C "$QR" add -A; "$QREAL_GIT" -C "$QR" commit -qm one
+"$QREAL_GIT" -C "$QR" remote add origin 'https://github.com/user/dotfiles.git'
+cat >"$QH/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$QH/nas","keep":2}]}
+JSON
+
+it "curl is genuinely absent from this fixture"
+PATH="$QBIN" command -v curl >/dev/null 2>&1 && fail "the fixture still has curl" || ok
+
+_q_push() {  # _q_push <state-dir> [push args...]
+    local st="$1"; shift
+    PATH="$QBIN" HOME="$QH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$YH/g.json" \
+        OMABACKUP_STATE="$st" OMABACKUP_REPO="$QR" OMABACKUP_DESTINATIONS="$QH/destinations.json" \
+        XDG_RUNTIME_DIR=/nonexistent "$OB" push "$@" 2>&1
+}
+QOUT="$(_q_push "$QH/.state")"
+QRC=$?
+
+it "without curl the github destination is refused rather than pushed to unchecked"
+[[ $QRC -ne 0 && ! -e "$QH/git.pushes" ]] && ok || fail "rc=$QRC pushed=$([[ -e "$QH/git.pushes" ]] && echo yes || echo no)"
+
+it "and the refusal names curl, with the package that provides it"
+[[ "$QOUT" == *curl* && "$QOUT" == *"pacman -S curl"* ]] && ok || fail "got: $QOUT"
+
+it "but a dir destination never asks GitHub anything, and still receives its bundle with no curl installed"
+[[ -n "$(find "$QH/nas" -name 'omabackup-*' 2>/dev/null)" ]] && ok || fail "the nas destination received nothing: $QOUT"
+
+"$QREAL_GIT" -C "$QR" remote set-url origin "$QH/remote.git"; "$QREAL_GIT" init -q --bare "$QH/remote.git"
+rm -f "$QH/git.pushes"
+_q_push "$QH/.state2" github >/dev/null
+Q2RC=$?
+
+it "and a non-GitHub origin needs no curl at all -- there is nobody to ask"
+[[ $Q2RC -eq 0 && -e "$QH/git.pushes" ]] && ok || fail "rc=$Q2RC pushed=$([[ -e "$QH/git.pushes" ]] && echo yes || echo no)"

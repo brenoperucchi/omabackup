@@ -149,6 +149,7 @@ it "and a path containing a space produces a quoted ExecStart systemd accepts"
 SH2="$(mktemp -d)"; SS2="$SH2/stub"; _stub_systemctl "$SS2" inactive
 SR2="$SH2/repo"; mkdir -p "$SR2"; git init -q "$SR2"
 SROOT2="$SH2/a b"; mkdir -p "$SROOT2"
+mkdir -p "$SH2/runtime"; chmod 700 "$SH2/runtime"
 cp -r bin lib systemd groups.default.json secrets.deny.json "$SROOT2/" 2>/dev/null
 HOME="$SH2" OMABACKUP_ROOT="$SROOT2" OMABACKUP_GROUPS="$SROOT2/groups.default.json" \
   OMABACKUP_STATE="$SH2/.state" OMABACKUP_SYSTEMCTL="$SS2/systemctl" \
@@ -161,7 +162,7 @@ it "and systemd itself accepts that unit, rather than splitting the path"
 # The question is what systemd does with it, so ask systemd. It is silent on a
 # unit it accepts; an unquoted path with a space resolves to the fragment before
 # the space, which does not exist, and it says so.
-SDOUT="$(systemd-analyze --user verify "$SH2/.config/systemd/user/omabackup-sync.service" 2>&1 \
+SDOUT="$(XDG_RUNTIME_DIR="$SH2/runtime" systemd-analyze --user verify "$SH2/.config/systemd/user/omabackup-sync.service" 2>&1 \
          | grep -v 'not found' || true)"
 assert_eq "$SDOUT" ""
 
@@ -172,7 +173,7 @@ SPLIT="$(mktemp -d)/split.service"
 { printf '[Unit]\nDescription=probe\n[Service]\nType=oneshot\n'
   printf 'ExecStart=%s/bin/omabackup sync\n' "$SROOT2"
 } >"$SPLIT"
-assert_contains "$(systemd-analyze --user verify "$SPLIT" 2>&1)" "not executable"
+assert_contains "$(XDG_RUNTIME_DIR="$SH2/runtime" systemd-analyze --user verify "$SPLIT" 2>&1)" "not executable"
 
 # ── an ExecStart line without arguments ────────────────────────────────────
 # _rewrite_execstart took the arguments with ${line##*/bin/omabackup }, which
@@ -185,6 +186,7 @@ it "a template line with no arguments does not produce a doubled ExecStart"
 TH="$(mktemp -d)"; TS="$TH/stub"; _stub_systemctl "$TS" inactive
 TR="$TH/repo"; mkdir -p "$TR"; git init -q "$TR"
 TROOT="$TH/tool"; mkdir -p "$TROOT/systemd"
+mkdir -p "$TH/runtime"; chmod 700 "$TH/runtime"
 cp -r bin lib groups.default.json secrets.deny.json "$TROOT/" 2>/dev/null
 for u in omabackup-sync.service omabackup-sync.timer omabackup-push.service omabackup-push.timer; do
   cp "systemd/$u" "$TROOT/systemd/$u"
@@ -200,6 +202,6 @@ grep -q '^ExecStart=.*ExecStart=' "$TH/.config/systemd/user/omabackup-sync.servi
     && fail "the ExecStart line was doubled" || ok
 
 it "and systemd accepts whatever it did write"
-SDOUT="$(systemd-analyze --user verify "$TH/.config/systemd/user/omabackup-sync.service" 2>&1 \
+SDOUT="$(XDG_RUNTIME_DIR="$TH/runtime" systemd-analyze --user verify "$TH/.config/systemd/user/omabackup-sync.service" 2>&1 \
          | grep -v 'not found' || true)"
 assert_eq "$SDOUT" ""
