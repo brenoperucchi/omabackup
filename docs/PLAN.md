@@ -5208,3 +5208,122 @@ failed**, matching the release commit. The work was done in a throwaway
 worktree detached at `ea45c16`; the main checkout's pre-existing uncommitted
 `docs/PLAN.md` changes and untracked `docs/plans/` were left untouched, and
 this section is therefore absent from that working copy.
+
+### `collect` no longer aborts on a machine with no foreign packages (2026-09-20)
+
+Contributed by Corey Tyhurst. First reported at the end of PR #1.
+
+**The bug.** `collect_generated` refuses when any of its three pacman queries
+exits non-zero, which is right for `-Qqe` and `-Qqen` and wrong for `-Qqem`:
+pacman exits 1 when a filter matches nothing, with nothing on stdout or
+stderr. A machine with no AUR package (a fresh Omarchy install, the Arch
+container the suite is trialled in) therefore could not `collect` at all, and
+with it could not `sync`. Measured on pacman 7.1.0: an empty match is
+`rc=1, stdout 0 bytes, stderr 0 bytes`; a database path it cannot resolve is
+also `rc=1`, with an `error:` line on stderr. The status alone does not
+separate them.
+
+**The fix.** Tolerating exit 1 would reopen the hole the refusal exists to
+close (a failing pacman staging an empty list that `sync --commit` then
+publishes over a real one). Instead the foreign query runs last and an empty
+answer has to be confirmed: status exactly 1, nothing written, and the
+explicit and native lists just staged identical, since foreign is explicit
+minus native by definition. Anything else is refused as before and the file
+removed. A package installed between the queries makes the lists disagree and
+is refused; the next run passes. The comparison is done in bash, so `collect`
+still requires only jq, git and rsync. stderr is deliberately not consulted:
+pacman's `error:` prefix is localized.
+
+**The empty list is staged, not skipped.** `publish_staging` never deletes, so
+a machine that removes its last AUR package needs an empty `lists/pkgs-aur.txt`
+to replace the stale one in the repository.
+
+**Specs.** Seven in `test/collect.test.sh`, written first. Three describe the
+bug and fail on `main`; four are controls that pass on `main` and must keep
+passing (the lists disagree, status 2, a partial listing, no file left
+behind). The existing "collect refuses when a generator's own command fails"
+pair is unchanged and still passes: `-Qqe` fails first there.
+
+`./test/run.sh collect` -- **54 passed, 0 failed**. Full suite in a
+network-less Arch container -- **1455 passed, 2 failed**, against `main`'s
+**1445 passed, 5 failed** at `ba59b3f` in the same container. The failing set
+is `main`'s minus three specs in `coverage.test.sh` that run the real pacman
+and hit this bug wherever no foreign package is installed. The two that remain
+are container-only: the title-row eliding probe (no display fonts) and the VM
+preflight spec (no QEMU). Not run on a live Omarchy session.
+
+No version bump and no `CHANGELOG.md` entry in this change: both are left to
+the release commit.
+
+#### Review of PR #2: the voucher needed the diagnostics (2026-09-22)
+
+Corey's fix was right about the bug and right to refuse a bare `exit 1`, but
+the voucher it leaned on -- explicit and native being identical proves nothing
+is foreign -- cannot see what the queries dropped. `local_db_populate` logs
+`error: invalid name for database entry ...` and **continues** when an entry
+fails to parse, and the query still exits 0. All three lists lose the same
+package at once, so the two survivors agree and `-Qqem` comes back empty with
+status 1: every condition of the exception held and collect published an empty
+`pkgs-aur.txt` over the real one. On `main` that same state aborted, so the PR
+converted a refusal into a silent wrong publication.
+
+Reproduced on pacman 7.1.0 against an isolated `--dbpath` copy of this
+machine's local database (nothing on the system touched): with the directories
+of all 37 foreign packages renamed to invalid names, `-Qqe` and `-Qqen` both
+returned 319 names, byte-identical, status 0, and `-Qqem` returned status 1
+with no output and 2838 bytes of `error:` lines on stderr.
+
+**Why "require empty stderr" was rejected.** It was the obvious remedy and it
+costs too much. Measured on the same isolated copy: a machine whose
+`pacman.conf` names a repo it has never synced emits a 77-byte
+`warning: database file for 'multilib' does not exist` on all three queries
+while `-Qqe` and `-Qqen` still return 0 and identical and `-Qqem` returns 1
+empty. An emptiness test refuses that machine -- which is this bug over again.
+The `omabackup-66` reviewer who proposed it had not measured the case, and the
+`omabackup-23` scout argued the case aborts earlier at `-Qqen`; direct
+measurement shows both first queries exit 0 there, so collect does reach the
+gate. Only the no-sync-database-at-all case dies at `-Qqen`.
+
+**The fix.** The three queries run as
+`LC_ALL=C LANGUAGE= pacman --color never`, their stderr is captured separately
+from their status, and an `error:`-prefixed line from any of them withdraws
+the empty-foreign exception. `warning:` does not. Only the class is read;
+nothing after the prefix is parsed. The locale is pinned because `error: ` is
+a translated string -- `msgunfmt` on the installed catalogs gives `Fehler: `
+and `erro: `. Measured in review: an environment that merely sets
+`LANGUAGE=pt_BR`, with no pinning, makes pacman print `erro: `, which this
+test would not recognise -- so the exception would be granted over a corrupt
+database on a large share of this plugin's audience. `LC_ALL=C` is what closes
+that; gettext ignores `LANGUAGE` under the C locale, so clearing it as well is
+cheap belt-and-braces rather than a second requirement. `--color never` is the
+same kind of insurance: pacman does not colour when stderr is not a tty, but
+`color = always` in `pacman.conf` makes it. The two corresponding mutants
+therefore measure the stub's stricter rule as much as the system's; the
+pinning they guard is real either way.
+
+**Specs.** Eight added to `test/collect.test.sh` on top of Corey's seven. Four
+failed against his tree and pass now: the corruption case, its staged-file
+assertion, and an `error:` on the explicit or the native query alone. Four are
+controls that already passed and must keep passing: the benign `warning:`
+machine still collects and still stages an empty list, and the `-Qqen` mirror
+of the exception is refused -- the tripwire for the day someone tidies the
+asymmetry away, since with no sync database explicit and foreign come out
+identical and a symmetric fix would stage an empty native list beside a
+foreign list holding the whole system.
+
+Three mutants confirm the specs are load-bearing, each caught: dropping
+`LC_ALL=C LANGUAGE=` (4 failures), dropping `--color never` (4), and narrowing
+the veto to the foreign query's own diagnostics (2). Corey's `_nofo_home` stub
+now finds the query flag by scanning rather than by position, since it is no
+longer `$1`.
+
+`./test/run.sh collect` -- **62 passed, 0 failed**. Full suite on a real
+Omarchy session -- **1465 passed, 0 failed**. The real invocation was checked
+on this machine: all three queries return 0 with no diagnostics.
+
+**Known gap, deliberately not closed here.** An `error:` with status 0 and a
+non-empty foreign list still publishes short lists, because the veto sits
+inside the empty-foreign exception rather than across the generator. That hole
+predates PR #2 and is not a regression it introduced; closing it changes when
+collect refuses on machines this PR never touched, and belongs to its own unit
+with its own specs.
