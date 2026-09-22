@@ -1236,12 +1236,18 @@ collect_generated() {
             # below cannot see what a query silently dropped. pacman logs
             # "error: invalid name for database entry ..." and CARRIES ON when
             # an entry fails to parse, still exiting 0, so a corrupted package
-            # vanishes from all three lists at once. LC_ALL/LANGUAGE are
-            # pinned and colour is off because only the CLASS of the line is
-            # read: "error: " is a translated string (the installed catalogs
-            # give "Fehler: " and "erro: ") and the formatter may colour it,
-            # so an unpinned prefix would be unrecognisable. Nothing after
-            # the prefix is parsed.
+            # vanishes from all three lists at once. Only the CLASS of the
+            # line is read, so the prefix has to be pinned: "error: " is a
+            # translated string (the installed catalogs give "Fehler: " and
+            # "erro: "), and a user whose environment merely sets
+            # LANGUAGE=pt_BR gets "erro: " -- which this test would not
+            # recognise, granting the exception over a corrupt database.
+            # LC_ALL=C is what fixes that; gettext ignores LANGUAGE under the
+            # C locale, so clearing it too is redundant belt-and-braces
+            # rather than a second requirement. --color never is the same
+            # kind of insurance: pacman does not colour when stderr is not a
+            # tty, but "color = always" in pacman.conf makes it. Nothing
+            # after the prefix is parsed.
             local pkg_diag_e pkg_diag_n pkg_diag_m pkg_rc=0
             pkg_diag_e=$({ LC_ALL=C LANGUAGE= pacman --color never -Qqe \
                 >"$STAGING/.generated/pkgs-explicit.txt"; } 2>&1) || pkg_rc=$?

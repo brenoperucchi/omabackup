@@ -5290,8 +5290,16 @@ from their status, and an `error:`-prefixed line from any of them withdraws
 the empty-foreign exception. `warning:` does not. Only the class is read;
 nothing after the prefix is parsed. The locale is pinned because `error: ` is
 a translated string -- `msgunfmt` on the installed catalogs gives `Fehler: `
-and `erro: ` -- and colour is turned off because the formatter can emit an
-escape sequence before the prefix. Both would make the prefix unrecognisable.
+and `erro: `. Measured in review: an environment that merely sets
+`LANGUAGE=pt_BR`, with no pinning, makes pacman print `erro: `, which this
+test would not recognise -- so the exception would be granted over a corrupt
+database on a large share of this plugin's audience. `LC_ALL=C` is what closes
+that; gettext ignores `LANGUAGE` under the C locale, so clearing it as well is
+cheap belt-and-braces rather than a second requirement. `--color never` is the
+same kind of insurance: pacman does not colour when stderr is not a tty, but
+`color = always` in `pacman.conf` makes it. The two corresponding mutants
+therefore measure the stub's stricter rule as much as the system's; the
+pinning they guard is real either way.
 
 **Specs.** Eight added to `test/collect.test.sh` on top of Corey's seven. Four
 failed against his tree and pass now: the corruption case, its staged-file
