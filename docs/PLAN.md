@@ -5254,3 +5254,68 @@ preflight spec (no QEMU). Not run on a live Omarchy session.
 
 No version bump and no `CHANGELOG.md` entry in this change: both are left to
 the release commit.
+
+#### Review of PR #2: the voucher needed the diagnostics (2026-09-22)
+
+Corey's fix was right about the bug and right to refuse a bare `exit 1`, but
+the voucher it leaned on -- explicit and native being identical proves nothing
+is foreign -- cannot see what the queries dropped. `local_db_populate` logs
+`error: invalid name for database entry ...` and **continues** when an entry
+fails to parse, and the query still exits 0. All three lists lose the same
+package at once, so the two survivors agree and `-Qqem` comes back empty with
+status 1: every condition of the exception held and collect published an empty
+`pkgs-aur.txt` over the real one. On `main` that same state aborted, so the PR
+converted a refusal into a silent wrong publication.
+
+Reproduced on pacman 7.1.0 against an isolated `--dbpath` copy of this
+machine's local database (nothing on the system touched): with the directories
+of all 37 foreign packages renamed to invalid names, `-Qqe` and `-Qqen` both
+returned 319 names, byte-identical, status 0, and `-Qqem` returned status 1
+with no output and 2838 bytes of `error:` lines on stderr.
+
+**Why "require empty stderr" was rejected.** It was the obvious remedy and it
+costs too much. Measured on the same isolated copy: a machine whose
+`pacman.conf` names a repo it has never synced emits a 77-byte
+`warning: database file for 'multilib' does not exist` on all three queries
+while `-Qqe` and `-Qqen` still return 0 and identical and `-Qqem` returns 1
+empty. An emptiness test refuses that machine -- which is this bug over again.
+The `omabackup-66` reviewer who proposed it had not measured the case, and the
+`omabackup-23` scout argued the case aborts earlier at `-Qqen`; direct
+measurement shows both first queries exit 0 there, so collect does reach the
+gate. Only the no-sync-database-at-all case dies at `-Qqen`.
+
+**The fix.** The three queries run as
+`LC_ALL=C LANGUAGE= pacman --color never`, their stderr is captured separately
+from their status, and an `error:`-prefixed line from any of them withdraws
+the empty-foreign exception. `warning:` does not. Only the class is read;
+nothing after the prefix is parsed. The locale is pinned because `error: ` is
+a translated string -- `msgunfmt` on the installed catalogs gives `Fehler: `
+and `erro: ` -- and colour is turned off because the formatter can emit an
+escape sequence before the prefix. Both would make the prefix unrecognisable.
+
+**Specs.** Eight added to `test/collect.test.sh` on top of Corey's seven. Four
+failed against his tree and pass now: the corruption case, its staged-file
+assertion, and an `error:` on the explicit or the native query alone. Four are
+controls that already passed and must keep passing: the benign `warning:`
+machine still collects and still stages an empty list, and the `-Qqen` mirror
+of the exception is refused -- the tripwire for the day someone tidies the
+asymmetry away, since with no sync database explicit and foreign come out
+identical and a symmetric fix would stage an empty native list beside a
+foreign list holding the whole system.
+
+Three mutants confirm the specs are load-bearing, each caught: dropping
+`LC_ALL=C LANGUAGE=` (4 failures), dropping `--color never` (4), and narrowing
+the veto to the foreign query's own diagnostics (2). Corey's `_nofo_home` stub
+now finds the query flag by scanning rather than by position, since it is no
+longer `$1`.
+
+`./test/run.sh collect` -- **62 passed, 0 failed**. Full suite on a real
+Omarchy session -- **1465 passed, 0 failed**. The real invocation was checked
+on this machine: all three queries return 0 with no diagnostics.
+
+**Known gap, deliberately not closed here.** An `error:` with status 0 and a
+non-empty foreign list still publishes short lists, because the veto sits
+inside the empty-foreign exception rather than across the generator. That hole
+predates PR #2 and is not a regression it introduced; closing it changes when
+collect refuses on machines this PR never touched, and belongs to its own unit
+with its own specs.

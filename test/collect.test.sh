@@ -539,8 +539,12 @@ _nofo_home() {  # _nofo_home <dir> <explicit> <native> <foreign-branch>
 {"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
  {"id":"packages","label":"Packages","mode":"gen","coupled":false,"critical":true,"generator":"packages"}]}
 JSON
+    # The query flag is found by scanning, not by position: collect pins the
+    # locale and turns colour off, so it no longer arrives as "$1".
     { printf '#!/bin/bash\n'
-      printf 'case "$1" in\n'
+      printf 'q=""\n'
+      printf 'while (( $# )); do case "$1" in -Qq*) q="$1"; shift ;; *) shift ;; esac; done\n'
+      printf 'case "$q" in\n'
       printf '  -Qqe)  printf "%s" ;;\n' "$2"
       printf '  -Qqen) printf "%s" ;;\n' "$3"
       printf '  -Qqem) %s ;;\n' "$4"
@@ -595,6 +599,138 @@ _nofo_home "$NF4" 'git\nneovim\n' 'git\nneovim\n' '{ echo yay; exit 1; }'
 it "collect still refuses an exit 1 that arrives with a partial listing"
 _nofo_collect "$NF4" \
     && fail "staged a partial foreign list as though it were complete" || ok
+
+# ── a diagnostic on stderr is not a healthy empty list ──────────────────────
+# The voucher above compares two projections of ONE database read, so it
+# cannot see what that read dropped. pacman logs `error: invalid name for
+# database entry ...` and CARRIES ON when an entry fails to parse, still
+# exiting 0: the bad package disappears from all three lists at once. With
+# the only foreign packages corrupted, explicit and native come out equal and
+# -Qqem exits 1 empty -- every condition of the exception holds, and collect
+# would publish an empty pkgs-aur.txt over the real one. Reproduced on pacman
+# 7.1.0 against an isolated copy of a real local DB: 37 foreign packages gone,
+# explicit and native both 319 and byte-identical, -Qqem rc=1 with 2838 bytes
+# of `error:` on stderr.
+#
+# So the diagnostics are consulted. Only the CLASS is read, never the text
+# after it: `error:` refuses, `warning:` does not. That distinction is what
+# keeps a machine whose pacman.conf lists a repo it has not synced yet -- a
+# 77-byte `warning: database file for 'x' does not exist` on all three queries
+# while they otherwise work -- from losing collect all over again, which is
+# the very bug this block exists to fix.
+#
+# The prefix is only trustworthy because the caller pins it. `error: ` is a
+# translated string (the installed catalogs give `Fehler: ` and `erro: `), and
+# pacman may colour it. The stub below therefore emits a TRANSLATED prefix
+# unless LC_ALL=C and LANGUAGE is empty, and prepends an ANSI sequence unless
+# --color never was passed -- either slip makes the refusal specs below fail.
+_diag_home() {  # _diag_home <dir> <qe-branch> <qen-branch> <qem-branch>
+    mkdir -p "$1/stub"
+    cat >"$1/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"packages","label":"Packages","mode":"gen","coupled":false,"critical":true,"generator":"packages"}]}
+JSON
+    cat >"$1/stub/pacman" <<'STUB'
+#!/bin/bash
+q=""; color="on"
+while (( $# )); do
+    case "$1" in
+        --color) [[ "${2:-}" == never ]] && color="off"; shift 2 ;;
+        -Qq*)    q="$1"; shift ;;
+        *)       shift ;;
+    esac
+done
+if [[ "${LC_ALL:-}" == C && -z "${LANGUAGE:-}" ]]; then P="error: "; else P="erro: "; fi
+[[ "$color" == on ]] && P=$'\033[1;31m'"$P"
+W="warning: "
+d="${BASH_SOURCE[0]%/*}"
+case "$q" in
+    -Qqe)  . "$d/qe.sh" ;;
+    -Qqen) . "$d/qen.sh" ;;
+    -Qqem) . "$d/qem.sh" ;;
+    *)     exit 2 ;;
+esac
+STUB
+    chmod +x "$1/stub/pacman"
+    printf '%s\n' "$2" >"$1/stub/qe.sh"
+    printf '%s\n' "$3" >"$1/stub/qen.sh"
+    printf '%s\n' "$4" >"$1/stub/qem.sh"
+}
+
+# The corrupted-database case itself: all three queries drop the same entries,
+# the two survivors agree, and the foreign query is empty. Refuse.
+DG1="$(mktemp -d)"
+_diag_home "$DG1" \
+    'printf "git\nneovim\n"; printf "%sinvalid name for database entry\n" "$P" >&2; exit 0' \
+    'printf "git\nneovim\n"; printf "%sinvalid name for database entry\n" "$P" >&2; exit 0' \
+    'printf "%sinvalid name for database entry\n" "$P" >&2; exit 1'
+
+it "collect refuses an empty foreign list when the queries reported an error"
+_nofo_collect "$DG1" \
+    && fail "published an empty foreign list although pacman reported a database error" || ok
+
+it "and removes the foreign list it refused to believe"
+[[ ! -e "$DG1/.state/staging/.generated/pkgs-aur.txt" ]] \
+    && ok || fail "pkgs-aur.txt was left staged after the refusal"
+
+# A benign warning is NOT an error. A repo named in pacman.conf that has never
+# been synced warns on every query while all three still answer correctly.
+# This machine genuinely has no foreign packages and must still collect.
+DG2="$(mktemp -d)"
+_diag_home "$DG2" \
+    'printf "git\nneovim\n"; printf "%sdatabase file for '\''extra'\'' does not exist\n" "$W" >&2; exit 0' \
+    'printf "git\nneovim\n"; printf "%sdatabase file for '\''extra'\'' does not exist\n" "$W" >&2; exit 0' \
+    'printf "%sdatabase file for '\''extra'\'' does not exist\n" "$W" >&2; exit 1'
+
+it "collect still accepts a truthfully empty foreign list despite a warning"
+_nofo_collect "$DG2" \
+    && ok || fail "a benign warning aborted collect -- the very bug this block fixes"
+
+it "and stages that foreign list empty"
+[[ -f "$DG2/.state/staging/.generated/pkgs-aur.txt" && ! -s "$DG2/.state/staging/.generated/pkgs-aur.txt" ]] \
+    && ok || fail "pkgs-aur.txt is missing or not empty after a benign warning"
+
+# An error on a query that SUCCEEDED is the same class of problem: the list it
+# returned is short. Each query is checked on its own account.
+DG3="$(mktemp -d)"
+_diag_home "$DG3" \
+    'printf "git\nneovim\n"; printf "%sinvalid name for database entry\n" "$P" >&2; exit 0' \
+    'printf "git\nneovim\n"; exit 0' \
+    'exit 1'
+
+it "collect refuses when only the explicit query reported an error"
+_nofo_collect "$DG3" \
+    && fail "accepted a short explicit list because its status was 0" || ok
+
+DG4="$(mktemp -d)"
+_diag_home "$DG4" \
+    'printf "git\nneovim\n"; exit 0' \
+    'printf "git\nneovim\n"; printf "%sinvalid name for database entry\n" "$P" >&2; exit 0' \
+    'exit 1'
+
+it "collect refuses when only the native query reported an error"
+_nofo_collect "$DG4" \
+    && fail "accepted a short native list because its status was 0" || ok
+
+# The mirror image of the exception, which must NEVER be granted. With no sync
+# database pacman calls every package foreign: -Qqen exits 1 empty while
+# explicit and foreign come out identical. A "symmetric" fix would pass its own
+# voucher and stage an empty native list beside a foreign list holding the whole
+# system, which sync --commit would then publish. Refusing is the answer, and
+# this spec is the tripwire for the day someone tidies the asymmetry away.
+DG5="$(mktemp -d)"
+_diag_home "$DG5" \
+    'printf "git\nneovim\n"; exit 0' \
+    'exit 1' \
+    'printf "git\nneovim\n"; exit 0'
+
+it "collect never extends the same benefit of the doubt to the native query"
+_nofo_collect "$DG5" \
+    && fail "staged an empty native list -- the whole system would be recorded as foreign" || ok
+
+it "and removes the native list it refused to believe"
+[[ ! -e "$DG5/.state/staging/.generated/pkgs-arch.txt" ]] \
+    && ok || fail "pkgs-arch.txt was left staged after the refusal"
 
 # ── a plugin's local capture failing is refused, not counted as collected ───
 # _capture_local's own rsync copy was never checked by either of its two
