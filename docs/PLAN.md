@@ -5208,3 +5208,38 @@ failed**, matching the release commit. The work was done in a throwaway
 worktree detached at `ea45c16`; the main checkout's pre-existing uncommitted
 `docs/PLAN.md` changes and untracked `docs/plans/` were left untouched, and
 this section is therefore absent from that working copy.
+
+### `sync` scans staging with the deny-list before publishing (2026-09-25)
+
+Contributed by Corey Tyhurst. Sits under Phase 2's first sentence, "a
+fail-closed gate before staging is published to the backup worktree", though it
+is the existing content scanner moved earlier, not the filename gate itself.
+
+**The gap.** `scan_files` ran only from `build_bundle`, and `report_secrets`
+only from `cmd_push`. `cmd_sync` collected, published and committed with no
+scan in between. `omabackup-sync.timer` runs `sync --commit` every fifteen
+minutes, so a private key in a collected directory reached the dotfiles
+worktree and local history on the next tick; the hourly push then refused it
+and told the user to rewrite that history.
+
+**The change.** In `cmd_sync`, after `cmd_collect` and before
+`tracked_path_map`: `assert_deny_understood`, then `scan_files "$STAGING"`.
+A hit prints the scanner's lines and refuses; a scan that cannot run refuses
+too. Both refusals clear staging through a small `_discard_staging` helper
+that checks nothing is left inside, the same measure `cmd_collect` uses at its
+top. The gate is before publish, not before commit, because a plain `sync`
+publishes as well. Same deny-list, same patterns as push, so nothing changes in
+what is accepted, only where it is refused.
+
+**Specs.** Eight in `test/sync.test.sh`, written first: refusal, no commit,
+nothing in the worktree, staging cleared, the scanner's `id<TAB>path` line in
+the output, a PATH-shim `grep` exiting 2 refuses rather than passing, nothing
+published from that unscanned staging, and a clean-staging control. Seven fail
+against `main`'s code; the control passes on both.
+
+`./test/run.sh sync` -- **40 passed, 0 failed**. Full suite in a network-less
+Arch container -- **1453 passed, 5 failed**, against `main`'s
+**1445 passed, 5 failed** at `ba59b3f`. The failing set is identical to main's: the three coverage.test.sh specs that hit the pacman -Qqem bug #2 fixes, the title-row eliding probe (no display fonts) and the VM preflight (no QEMU). Not run on a
+live Omarchy session.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.

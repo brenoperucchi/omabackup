@@ -349,3 +349,69 @@ printf 'new\n' >"$TS2H/.local/bin/tool"
 it "sync --commit publishes through a double-trailing-slash declared live path"
 _sync_env "$TS2H" "$TS2R" "$TS2G" sync --commit >/dev/null
 assert_eq "$(cat "$TS2R/scripts/local-bin/tool" 2>/dev/null)" "new"
+
+# ── a secret in staging is refused before it is published ────────────────────
+# The deny-list ran in exactly two places: over the bundle, and over every ref
+# of the repository right before `git push`. Nothing looked at staging, and
+# nothing looked at what `sync --commit` was about to publish and commit. The
+# fifteen-minute timer runs `sync --commit` unattended, so a private key that
+# lands in a collected directory was published into the dotfiles worktree and
+# committed to local history on the next tick, and the hourly push then refused
+# it with advice to rewrite that history. The scan now runs over staging before
+# publish, with the same deny-list, so the key never enters the worktree. It is
+# the same patterns push applies, so nothing push would have accepted is
+# refused here; the refusal just comes earlier, while it is still cheap.
+_scan_home() {  # _scan_home <home> [leaked content]
+    local h="$1"
+    mkdir -p "$h/.config/app"
+    printf 'ordinary config\n' >"$h/.config/app/fine.conf"
+    [[ -n "${2:-}" ]] && printf '%s\n' "$2" >"$h/.config/app/leaked.conf"
+    cat >"$h/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/app"]}]}
+JSON
+    _dest_repo "$h/repo"
+}
+
+SC="$(mktemp -d)"
+_scan_home "$SC" "-----BEGIN OPENSSH PRIVATE KEY-----"
+SCOUT="$(_sync_env "$SC" "$SC/repo" "$SC/g.json" sync --commit)"; SCRC=$?
+
+it "sync refuses to publish when the deny-list matches a staged file"
+(( SCRC != 0 )) && ok || fail "sync exited 0 with a private key in staging"
+
+it "and no commit was created"
+assert_eq "$(_commits "$SC/repo")" "1"
+
+it "and the file never reached the backup worktree"
+[[ ! -e "$SC/repo/configs/app/leaked.conf" && ! -e "$SC/repo/configs/app/fine.conf" ]] \
+    && ok || fail "publish wrote into the worktree before the scan refused"
+
+it "and staging was cleared so a later sync cannot republish it"
+[[ -z "$(find "$SC/.state/staging" -mindepth 1 -print -quit 2>/dev/null)" ]] \
+    && ok || fail "the refused staging was left in place"
+
+it "the refusal names the pattern and the file, so the user knows what to move"
+assert_contains "$SCOUT" "private-key-block"$'\t'".config/app/leaked.conf"
+
+# A scan that could not run is not a clean scan. grep is what scan_files
+# drives; a grep that fails outright must refuse the sync, not wave it on.
+SE="$(mktemp -d)"
+_scan_home "$SE"
+mkdir -p "$SE/stub"; printf '#!/bin/bash\nexit 2\n' >"$SE/stub/grep"; chmod +x "$SE/stub/grep"
+SEOUT="$(PATH="$SE/stub:$PATH" _sync_env "$SE" "$SE/repo" "$SE/g.json" sync --commit)"; SERC=$?
+
+it "a staging scan that cannot run refuses the sync rather than calling it clean"
+(( SERC != 0 )) && ok || fail "sync exited 0 although the scanner could not run"
+
+it "and publishes nothing from the unscanned staging"
+assert_eq "$(_commits "$SE/repo")" "1"
+
+# Control: a staging with nothing to hide is published and committed as before.
+SK="$(mktemp -d)"
+_scan_home "$SK"
+_sync_env "$SK" "$SK/repo" "$SK/g.json" sync --commit >/dev/null
+
+it "a clean staging still publishes and commits"
+assert_eq "$(_commits "$SK/repo")" "2"
