@@ -266,6 +266,10 @@ in `.bashrc`) go into a versioned exception allow-list, with justifications.
 Why blocking: a leak is irreversible, and "just warns" is precisely the failure
 mode of lesson #1 (a warning nobody reads).
 
+The same scanner also runs over staging before `sync` publishes anything into
+the worktree, so a credential caught there never reaches a commit; the
+push-time scan over every ref stays as the independent second layer.
+
 ---
 
 ## 7. Plugin robustness

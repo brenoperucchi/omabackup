@@ -1258,6 +1258,16 @@ collect_generated() {
     (( JSON )) || printf '  %s✓%s %s %s(generated)%s\n' "$GREEN" "$NC" "$id" "$DIM" "$NC"
 }
 
+# Clears staging after a refusal. rm's own status is not the measure, for the
+# reason given at the top of cmd_collect: it can fail on the directory itself
+# while having emptied it. What matters is that nothing is left inside for a
+# later sync to publish, and that is what is checked.
+_discard_staging() {
+    rm -rf "$STAGING" 2>/dev/null
+    [[ -z "$(find "$STAGING" -mindepth 1 -print -quit 2>/dev/null)" ]] \
+        || die "could not clear $(_tilde "$STAGING") after refusing it -- remove it by hand before the next sync"
+}
+
 # ── sync ─────────────────────────────────────────────────────────────────────
 # The four beats in one command: collect -> publish (staging into the repo
 # tree) -> verify -> commit only if the tree is actually dirty and verify
@@ -1279,6 +1289,31 @@ cmd_sync() {
     [[ -n "$repo" && -d "$repo/.git" ]] || die "OMABACKUP_REPO must point at a git repo (got: ${repo:-unset})"
 
     JSON=0 cmd_collect >/dev/null || die "collect failed -- refusing to publish whatever staging is left in"
+    # Staging is scanned with the push deny-list BEFORE anything is published.
+    # The scanner used to run in two places only, over the bundle and over
+    # every ref right before `git push`, and neither ever looked at what
+    # `sync` was about to write. The timer runs `sync --commit` unattended
+    # every fifteen minutes, so a private key that appeared in a collected
+    # directory was published into the worktree and committed to local
+    # history on the next tick, and the hourly push then refused it with
+    # advice to rewrite that history. Scanning staging first means the key
+    # never enters the worktree. The gate sits before publish rather than
+    # before commit because a plain `sync` without --commit publishes too.
+    # Same deny-list, same patterns, so nothing push would have accepted is
+    # refused here. On refusal staging is cleared, as it is at the top of
+    # collect: a file left behind is a file the next sync would republish.
+    assert_deny_understood "$SECRETS_DENY_FILE"
+    local hits
+    hits="$(scan_files "$STAGING" "$SECRETS_DENY_FILE" 2>&1)" || {
+        [[ -n "$hits" ]] && printf '%s\n' "$hits" >&2
+        _discard_staging
+        die "the secret scan could not run over staging -- refusing to publish unscanned"
+    }
+    if [[ -n "$hits" ]]; then
+        printf '%s\n' "$hits" >&2
+        _discard_staging
+        die "refusing to publish -- the deny-list matched a file in staging (docs/DESIGN.md §6)"
+    fi
     local list="$OMABACKUP_STATE/last-publish"
     local n tpm
     # Nested inside publish_staging's own argument list, $(tracked_path_map)'s
