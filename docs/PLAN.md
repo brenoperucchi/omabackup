@@ -5327,3 +5327,11 @@ inside the empty-foreign exception rather than across the generator. That hole
 predates PR #2 and is not a regression it introduced; closing it changes when
 collect refuses on machines this PR never touched, and belongs to its own unit
 with its own specs.
+
+#### Marketplace release `0.4.7` (2026-09-26)
+
+PR #2 merged as `1d440bf` (merge commit, pinned to the reviewed head
+`fa8c178`). Corey confirmed the locale and colour measurements on his machine
+and agreed to take the known gap (an `error:` at status 0 with a non-empty
+foreign list) as his next PR. This commit bumps `manifest.json` to `0.4.7` and
+adds the `CHANGELOG.md` entry. The tag `v0.4.7` points at this commit.

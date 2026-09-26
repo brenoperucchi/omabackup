@@ -7,6 +7,51 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 loosely while it is pre-1.0: patch releases may still change behaviour when the
 change closes a security hole, and such changes are always called out here.
 
+## [0.4.7] — 2026-09-26
+
+### Fixed
+
+- `collect` works on a machine with no foreign (AUR) packages. `pacman -Qqem`
+  exits 1 when it has nothing to list, and it uses the same status when it
+  cannot read its database, so a fresh install or a clean container could not
+  run `collect` or `sync`. OmaBackup now accepts an empty foreign list only
+  when the status is exactly 1, nothing was printed, the explicit and native
+  lists match, and none of the three queries reported an `error:`. The empty
+  list is staged, so a machine that removed its last AUR package overwrites
+  the old list in the repository.
+
+### Security
+
+- A corrupted local package database can no longer make an empty foreign list
+  look valid. pacman leaves out any entry it cannot parse, in every query, and
+  still exits 0, so the explicit and native lists can match while real
+  packages are missing. The queries now run as
+  `LC_ALL=C LANGUAGE= pacman --color never`, and an `error:` line from any of
+  them rejects the empty list. The pinned locale matters: with
+  `LANGUAGE=pt_BR`, pacman prints `erro:` instead. `warning:` lines are
+  allowed, for example when a repository in `pacman.conf` has not been synced
+  yet.
+- The native query does not get the same allowance. Without a sync database
+  pacman reports every package as foreign, and accepting an empty native list
+  would record the whole system as AUR.
+
+### Known gap
+
+- A query that exits 0 with an `error:` line and a non-empty foreign list can
+  still publish shortened lists. This existed before 0.4.7 and will be fixed
+  separately.
+
+### Testing
+
+- 15 new specs in `test/collect.test.sh`. Some of them fail a naive `|| true`
+  fix, and they also catch three mutants (locale pin, colour, veto scope).
+- Full suite on a real Omarchy session: 1465 passed, 0 failed.
+
+### Thanks
+
+- [Corey Tyhurst](https://github.com/coreytyhurst) found the bug and wrote the
+  fix and its specs in [PR #2](https://github.com/brenoperucchi/omabackup/pull/2).
+
 ## [0.4.6] — 2026-09-20
 
 Security hardening. A patch number, but it refuses something that used to be
@@ -137,4 +182,5 @@ allowed — read the first item before upgrading.
 
 - First release: the group manifest, `collect` and `verify`.
 
+[0.4.7]: https://github.com/brenoperucchi/omabackup/releases/tag/v0.4.7
 [0.4.6]: https://github.com/brenoperucchi/omabackup/releases/tag/v0.4.6
