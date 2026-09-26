@@ -1232,12 +1232,88 @@ collect_generated() {
     # run (or a careless glob) to mistake for real data.
     case "$gen" in
         packages)
-            pacman -Qqe >"$STAGING/.generated/pkgs-explicit.txt" 2>/dev/null \
+            # Diagnostics are captured, not discarded, because the voucher
+            # below cannot see what a query silently dropped. pacman logs
+            # "error: invalid name for database entry ..." and CARRIES ON when
+            # an entry fails to parse, still exiting 0, so a corrupted package
+            # vanishes from all three lists at once. Only the CLASS of the
+            # line is read, so the prefix has to be pinned: "error: " is a
+            # translated string (the installed catalogs give "Fehler: " and
+            # "erro: "), and a user whose environment merely sets
+            # LANGUAGE=pt_BR gets "erro: " -- which this test would not
+            # recognise, granting the exception over a corrupt database.
+            # LC_ALL=C is what fixes that; gettext ignores LANGUAGE under the
+            # C locale, so clearing it too is redundant belt-and-braces
+            # rather than a second requirement. --color never is the same
+            # kind of insurance: pacman does not colour when stderr is not a
+            # tty, but "color = always" in pacman.conf makes it. Nothing
+            # after the prefix is parsed.
+            local pkg_diag_e pkg_diag_n pkg_diag_m pkg_rc=0
+            pkg_diag_e=$({ LC_ALL=C LANGUAGE= pacman --color never -Qqe \
+                >"$STAGING/.generated/pkgs-explicit.txt"; } 2>&1) || pkg_rc=$?
+            (( pkg_rc == 0 )) \
                 || { rm -f "$STAGING/.generated/pkgs-explicit.txt"; die "could not list explicitly installed packages (pacman -Qqe failed)"; }
-            pacman -Qqem >"$STAGING/.generated/pkgs-aur.txt" 2>/dev/null \
-                || { rm -f "$STAGING/.generated/pkgs-aur.txt"; die "could not list foreign packages (pacman -Qqem failed)"; }
-            pacman -Qqen >"$STAGING/.generated/pkgs-arch.txt" 2>/dev/null \
-                || { rm -f "$STAGING/.generated/pkgs-arch.txt"; die "could not list native packages (pacman -Qqen failed)"; } ;;
+            pkg_rc=0
+            pkg_diag_n=$({ LC_ALL=C LANGUAGE= pacman --color never -Qqen \
+                >"$STAGING/.generated/pkgs-arch.txt"; } 2>&1) || pkg_rc=$?
+            (( pkg_rc == 0 )) \
+                || { rm -f "$STAGING/.generated/pkgs-arch.txt"; die "could not list native packages (pacman -Qqen failed)"; }
+            # The foreign list runs LAST, because it is the one query here
+            # whose status cannot be taken at face value: pacman exits 1 when
+            # a filter matches nothing, silently, and it exits 1 when it could
+            # not read its database too. A machine with no AUR package at all
+            # (a fresh Omarchy install, a container) is the first case, and
+            # refusing on it aborted the whole collect for a list that is
+            # truthfully empty. Accepting every exit 1 would reopen exactly
+            # what the comment above closed, so the other two lists have to
+            # vouch for it: foreign is explicit minus native, by definition,
+            # so "nothing foreign" is only believed when pacman said nothing
+            # AND the explicit and native lists just written are identical.
+            # A pacman that failed quietly cannot fake that -- but one that
+            # failed LOUDLY can, which is why the diagnostics are consulted
+            # too: equal lists are two projections of a single database read
+            # and omit together, so a dropped entry leaves them agreeing and
+            # the foreign query empty. An "error:" line from ANY of the three
+            # therefore withdraws the exception. A "warning:" line does not:
+            # a repo named in pacman.conf that has never been synced warns on
+            # every query while all three still answer correctly, and
+            # refusing that would be this very bug again.
+            #
+            # -Qqen is deliberately NOT given the same benefit of the doubt.
+            # With no sync database pacman calls every package foreign, so
+            # -Qqen exits 1 empty while explicit and foreign come out
+            # identical: the mirror voucher would pass and stage an empty
+            # native list beside a foreign list holding the whole system. A
+            # native list that matched nothing is a machine that cannot
+            # classify at all, and refusing is the answer.
+            #
+            # The comparison is bash on purpose: collect requires only jq,
+            # git and rsync, and cmp would add a fourth tool for one line.
+            # It ignores trailing newlines, which pacman's fixed one-name-
+            # per-line output makes immaterial. Three queries are not a
+            # transaction, so some interleavings of a concurrent install are
+            # caught by the comparison and others simply answer rc 0; the
+            # cases it does catch are refused, and the next run passes. The
+            # empty file STAYS staged: publish never deletes, so a machine
+            # that removed its last AUR package needs an empty list to
+            # overwrite the stale one in the repo.
+            local aur_rc=0
+            pkg_diag_m=$({ LC_ALL=C LANGUAGE= pacman --color never -Qqem \
+                >"$STAGING/.generated/pkgs-aur.txt"; } 2>&1) || aur_rc=$?
+            if (( aur_rc != 0 )); then
+                local pkg_diag_all
+                pkg_diag_all="$pkg_diag_e"$'\n'"$pkg_diag_n"$'\n'"$pkg_diag_m"
+                if (( aur_rc == 1 )) \
+                    && [[ ! -s "$STAGING/.generated/pkgs-aur.txt" ]] \
+                    && [[ -s "$STAGING/.generated/pkgs-explicit.txt" ]] \
+                    && [[ "$pkg_diag_all" != "error:"* && "$pkg_diag_all" != *$'\n'"error:"* ]] \
+                    && [[ "$(<"$STAGING/.generated/pkgs-explicit.txt")" == "$(<"$STAGING/.generated/pkgs-arch.txt")" ]]; then
+                    :   # nothing foreign on this machine; the empty list is the answer
+                else
+                    rm -f "$STAGING/.generated/pkgs-aur.txt"
+                    die "could not list foreign packages (pacman -Qqem failed with status $aur_rc)"
+                fi
+            fi ;;
         systemd)
             systemctl --user list-unit-files --state=enabled --no-legend 2>/dev/null \
                 | awk '{print $1}' >"$STAGING/.generated/systemd-user.txt"
