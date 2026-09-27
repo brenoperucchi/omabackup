@@ -5332,6 +5332,32 @@ with its own specs.
 
 PR #2 merged as `1d440bf` (merge commit, pinned to the reviewed head
 `fa8c178`). Corey confirmed the locale and colour measurements on his machine
-and agreed to take the known gap (an `error:` at status 0 with a non-empty
-foreign list) as his next PR. This commit bumps `manifest.json` to `0.4.7` and
-adds the `CHANGELOG.md` entry. The tag `v0.4.7` points at this commit.
+and offered to take the known gap (an `error:` at status 0 with a non-empty
+foreign list) as his next PR; the offer was accepted in the merge comment. The
+release commit `b4f49ce` bumps `manifest.json` to `0.4.7` and adds the
+`CHANGELOG.md` entry; the full suite passed **1465/0** on it. The annotated tag
+`v0.4.7` and the GitHub Release point at `b4f49ce`. The 0.4.7 changelog entry
+and the PR #2 description and merge comment were rewritten for plain prose
+(no dashes or decorative bold); no facts changed. The original PR description
+is not kept in the repository.
+
+**Marketplace.** Issue `#7773` (the 0.4.6 update request, target `ea45c16`)
+was still open with `validated`, `security-review-required` and
+`plugin-update` labels, so 0.4.6 was never published. Instead of opening a
+second request for a neighbouring commit, a comment on `#7773` asks the
+maintainers to move the target to
+`b4f49ce7686cb85b8dbde07a69a50c1db1ca2127`, links the release and the
+`v0.4.6...v0.4.7` diff, and offers to open a new issue if they prefer. The
+issue form itself still names `ea45c16`; only the bot or a maintainer can
+change the target.
+
+**Next.**
+1. Watch `#7773` for the maintainers' answer; open `[Verify]: OmaBackup 0.4.7`
+   in the same format if they ask for a new issue.
+2. Corey's follow-up PR for the known gap: the `error:` veto currently sits
+   inside the empty-foreign exception, not across the whole `packages`
+   generator.
+3. The main checkout at `~/Devs/omabackup` is still at `56785dc` with the
+   pre-existing uncommitted `docs/PLAN.md` edits and untracked `docs/plans/`.
+   It needs a manual reconcile with `origin/main` before any work is done
+   there; nothing was merged into it automatically.
