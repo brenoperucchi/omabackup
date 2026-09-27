@@ -5361,3 +5361,38 @@ change the target.
    pre-existing uncommitted `docs/PLAN.md` edits and untracked `docs/plans/`.
    It needs a manual reconcile with `origin/main` before any work is done
    there; nothing was merged into it automatically.
+
+### The `error:` veto covers every package list (2026-09-27)
+
+Contributed by Corey Tyhurst. The known gap named in the 0.4.7 changelog and
+in item 2 of the "Next" list above; asked for in the PR #2 merge comment.
+
+**The gap.** The `error:` test lived inside the empty-foreign exception, so it
+only ran when `-Qqem` exited 1. pacman drops an entry it cannot parse from
+every query and carries on at status 0. A corrupted native entry therefore
+leaves `-Qqe` and `-Qqen` short while `-Qqem` still lists the real foreign
+packages at status 0; no status is non-zero, the exception is never reached,
+and three short lists are staged and published.
+
+**The change.** The veto runs once, over the concatenated diagnostics of all
+three queries, before any status is judged. An `error:` from any query removes
+all three lists and refuses; `warning:` still passes. The clause inside the
+exception is gone, since the check above has already refused what it covered.
+The refusal takes all three files: pacman said the read was incomplete, so no
+member is worth keeping. On the existing corrupted-database case this now
+removes the explicit and native lists too, which the generator's opening
+comment promised.
+
+**Specs.** Five new in `test/collect.test.sh`, on the existing `_diag_home`
+stub: an error at status 0 on the explicit, the native or the foreign query
+with a non-empty foreign list refuses and leaves no list staged; a warning on
+all three with a foreign package present still collects all three (control);
+the corrupted-database case also loses its explicit and native lists. Five
+fail against `main`'s code; the control passes on both. `main`'s code is the
+mutant that keeps the check inside the exception.
+
+`./test/run.sh collect` -- **69 passed, 0 failed**. Full suite in a
+network-less Arch container -- **1470 passed, 2 failed**, against `main`'s
+**1463 passed, 2 failed** at `d2f22b3`. The failing set is identical to main's: the title-row eliding probe (no display fonts) and the VM preflight (no QEMU); the three coverage.test.sh specs that failed at ba59b3f pass now that #2 is merged. Not run on a live Omarchy session.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.

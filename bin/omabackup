@@ -1271,13 +1271,9 @@ collect_generated() {
             # AND the explicit and native lists just written are identical.
             # A pacman that failed quietly cannot fake that -- but one that
             # failed LOUDLY can, which is why the diagnostics are consulted
-            # too: equal lists are two projections of a single database read
-            # and omit together, so a dropped entry leaves them agreeing and
-            # the foreign query empty. An "error:" line from ANY of the three
-            # therefore withdraws the exception. A "warning:" line does not:
-            # a repo named in pacman.conf that has never been synced warns on
-            # every query while all three still answer correctly, and
-            # refusing that would be this very bug again.
+            # first, below: equal lists are two projections of a single
+            # database read and omit together, so a dropped entry leaves them
+            # agreeing and the foreign query empty.
             #
             # -Qqen is deliberately NOT given the same benefit of the doubt.
             # With no sync database pacman calls every package foreign, so
@@ -1300,13 +1296,31 @@ collect_generated() {
             local aur_rc=0
             pkg_diag_m=$({ LC_ALL=C LANGUAGE= pacman --color never -Qqem \
                 >"$STAGING/.generated/pkgs-aur.txt"; } 2>&1) || aur_rc=$?
+            # Every list is judged by the diagnostics before any status is,
+            # because pacman's carry-on does not care what the foreign query
+            # returned: a corrupted entry that happens to be native drops out
+            # of -Qqe and -Qqen while -Qqem still answers at status 0 with the
+            # real foreign packages, and 0.4.7 staged those three short lists
+            # (its changelog names this as the known gap). Only the CLASS of
+            # the line is read. An "error:" line from ANY of the three refuses
+            # the set: pacman said the read was incomplete, so no member is
+            # worth keeping, and a survivor would be the next run's "real
+            # data". A "warning:" line does not: a repo named in pacman.conf
+            # that has never been synced warns on every query while all three
+            # still answer correctly, and refusing that would be the empty-
+            # foreign bug all over again.
+            local pkg_diag_all
+            pkg_diag_all="$pkg_diag_e"$'\n'"$pkg_diag_n"$'\n'"$pkg_diag_m"
+            if [[ "$pkg_diag_all" == "error:"* || "$pkg_diag_all" == *$'\n'"error:"* ]]; then
+                rm -f "$STAGING/.generated/pkgs-explicit.txt" \
+                      "$STAGING/.generated/pkgs-arch.txt" \
+                      "$STAGING/.generated/pkgs-aur.txt"
+                die "could not trust the package lists (pacman reported an error while listing them)"
+            fi
             if (( aur_rc != 0 )); then
-                local pkg_diag_all
-                pkg_diag_all="$pkg_diag_e"$'\n'"$pkg_diag_n"$'\n'"$pkg_diag_m"
                 if (( aur_rc == 1 )) \
                     && [[ ! -s "$STAGING/.generated/pkgs-aur.txt" ]] \
                     && [[ -s "$STAGING/.generated/pkgs-explicit.txt" ]] \
-                    && [[ "$pkg_diag_all" != "error:"* && "$pkg_diag_all" != *$'\n'"error:"* ]] \
                     && [[ "$(<"$STAGING/.generated/pkgs-explicit.txt")" == "$(<"$STAGING/.generated/pkgs-arch.txt")" ]]; then
                     :   # nothing foreign on this machine; the empty list is the answer
                 else
