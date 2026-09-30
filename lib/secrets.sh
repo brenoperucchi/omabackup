@@ -744,6 +744,30 @@ scan_index() {
             done
         done
     done <"$work/entries"
+
+    # File NAMES too. The push scan reads every path in history, so a
+    # collected file whose name holds a token would pass a content-only scan,
+    # be committed, and block push for good. The name is not printed -- it is
+    # the secret -- only its position in the list of changed paths.
+    printf '%s\n' "$@" >"$work/names" || { printf '%somabackup: cannot scan the file names%s\n' "$RED" "$NC" >&2; rc=1; }
+    if [[ -f "$work/names" ]]; then
+        for i in "${!ids[@]}"; do
+            local -a nflags=(-a -n -E --color=never)
+            [[ "${cis[$i]}" == true ]] && nflags+=(-i)
+            grep "${nflags[@]}" -e "${res[$i]}" -- "$work/names" >"$work/hits"; g=$?
+            (( g == 1 )) && continue
+            if (( g > 1 )); then
+                printf '%somabackup: pattern %s could not be scanned over the file names%s\n' \
+                    "$RED" "${ids[$i]}" "$NC" >&2
+                rc=1; continue
+            fi
+            while IFS= read -r line; do
+                ln="${line%%:*}"; body="${line#*:}"
+                _still_matches "$body" "${res[$i]}" "${cis[$i]}" || continue
+                printf '%s\t(a file NAME, not shown: changed path #%s)\n' "${ids[$i]}" "$ln"
+            done <"$work/hits"
+        done
+    fi
     (( _had_pipefail )) || set +o pipefail
     return $rc
 }

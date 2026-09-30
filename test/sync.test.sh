@@ -769,3 +769,16 @@ _sync_env "$SW6" "$SW6/repo" "$SW6/g.json" sync --commit >/dev/null
 
 it "a failing config-defined hook does not stop the backup from committing"
 assert_eq "$(_commits "$SW6/repo")" "3"
+
+# The push scan reads every path name in history, not only contents. A file
+# whose NAME holds a token would pass a content-only scan here, be committed,
+# and then block push for good -- the pre-commit scan has to read names too.
+SN1="$(mktemp -d)"; _sec_env "$SN1"
+printf 'harmless\n' >"$SN1/.config/app/$_tok.txt"
+SN1_OUT="$(_sync_env "$SN1" "$SN1/repo" "$SN1/g.json" sync --commit)"; SN1_RC=$?
+
+it "a collected file whose name holds a token is refused"
+(( SN1_RC != 0 )) && ok || fail "a token in a file name was committed; push would then block for good"
+
+it "and the refusal does not print that name in full"
+assert_not_contains "$SN1_OUT" "$_tok"

@@ -5506,6 +5506,23 @@ full sync: 553 files, both Omarchy links, correct parent and reflog entry, no
 temporary files, clean status; 9.6 s against 6.5 s on `main`, in that worst
 case only.
 
+**Found while writing the scout question, after the last round.** The push
+scan reads every path name in history, not only contents, so a collected file
+whose NAME holds a token passed the content-only pre-commit scan, was
+committed, and would then block push for good -- breaking the PR's own
+invariant that the pre-commit scan is a superset of the push scan. `scan_index`
+now runs the patterns over the changed paths as well and reports a hit as the
+rule plus the path's position, never the name. The `git status` list that
+`sync --commit` prints before committing also named the file, so with
+`--commit` it is now printed only after the scan passes; review mode without
+`--commit` is unchanged. Two specs (refused; the name not printed), both
+failing before; a mutant without the name scan is caught. Full suite
+**1512/0**.
+
+The scout's third analysis could not be dispatched: `herdr-ask` refused
+because `omabackup-scout` reported `agent_status: unknown`, with a stray
+letter in its compose box. Nothing was sent to the pane.
+
 **Open, for their own PRs:** `report_secrets` and the bundle's
 `refusing to build` still print the matched line (journal); publishing into
 the worktree during a merge is refused only with `--commit`.

@@ -1347,7 +1347,7 @@ _sync_tmp_clean() {
     [[ -n "$_SYNC_TMPDIR" && -d "$_SYNC_TMPDIR" ]] || { _SYNC_TMPDIR=""; return 0; }
     rm -f "$_SYNC_TMPDIR/index" "$_SYNC_TMPDIR/index.lock" "$_SYNC_TMPDIR/list" \
           "$_SYNC_TMPDIR/entries" "$_SYNC_TMPDIR/raw" "$_SYNC_TMPDIR/blob" \
-          "$_SYNC_TMPDIR/blobn" "$_SYNC_TMPDIR/hits"
+          "$_SYNC_TMPDIR/blobn" "$_SYNC_TMPDIR/hits" "$_SYNC_TMPDIR/names"
     rmdir "$_SYNC_TMPDIR" 2>/dev/null
     _SYNC_TMPDIR=""
 }
@@ -1464,7 +1464,10 @@ cmd_sync() {
         return 0
     fi
 
-    printf '\n%s\n' "$dirty" | sed 's/^/  /'
+    # With --commit the list is printed only once the secret scan has passed:
+    # it names every changed file, and a file NAME can be the secret. The timer
+    # runs this, so it would reach the journal.
+    (( commit )) || printf '\n%s\n' "$dirty" | sed 's/^/  /'
 
     if (( ! commit )); then
         record_sync_success || printf '  %s!%s could not record this run; the next check may call it stale\n' "$YELLOW" "$NC"
@@ -1559,6 +1562,8 @@ cmd_sync() {
         fi
         return 1
     fi
+
+    printf '\n%s\n' "$dirty" | sed 's/^/  /'
 
     # Checked again right before the commit: the operation could have started
     # while this run was collecting and scanning.
