@@ -556,9 +556,21 @@ scan_secrets() {
 #
 # repo.bundle is skipped: it is a packfile, its contents were scanned as objects
 # a moment ago, and grepping compressed bytes finds nothing either way.
+#
+# scan_files <dir> <deny-file> <relpath>...
+# With paths after the deny-file, only those files under <dir> are scanned.
+# That is how sync scans exactly what a commit is about to take, before it
+# becomes history; the whole-directory form stays for the artefact.
 scan_files() {
     local dir="$1" file="$2" id re ci hit rc=0 patterns body
     [[ -d "$dir" && -f "$file" ]] || return 1
+    shift 2
+    local -a targets=("$dir")
+    if (( $# )); then
+        targets=()
+        local rel
+        for rel in "$@"; do targets+=("$dir/$rel"); done
+    fi
 
     local -a DENY_EXCEPTIONS=()
     mapfile -t DENY_EXCEPTIONS < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
@@ -602,7 +614,7 @@ scan_files() {
         # this one, so it is captured with `wait` on the substitution's own
         # PID instead of guessed at.
         local grc
-        local -a gflags=(-r -a -n -Z -E --exclude=repo.bundle)
+        local -a gflags=(-r -H -a -n -Z -E --exclude=repo.bundle)
         [[ "$ci" == true ]] && gflags+=(-i)
         local f rest
         while IFS= read -r -d '' f && IFS= read -r rest; do
@@ -610,7 +622,7 @@ scan_files() {
             body="${rest#*:}"
             _still_matches "$body" "$re" "$ci" || continue
             printf '%s\t%s\n' "$id" "${f#$dir/}:${rest:0:200}"
-        done < <(grep "${gflags[@]}" -e "$re" -- "$dir")
+        done < <(grep "${gflags[@]}" -e "$re" -- "${targets[@]}")
         wait "$!"; grc=$?
         if (( grc > 1 )); then
             printf '%somabackup: pattern %s could not be scanned over %s%s\n' \

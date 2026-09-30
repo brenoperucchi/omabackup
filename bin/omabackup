@@ -1457,6 +1457,43 @@ cmd_sync() {
         printf '  %sup to date%s -- nothing of ours left to commit\n' "$DIM" "$NC"
         return 0
     fi
+
+    # The deny-list runs HERE, over exactly what this commit adds, before it
+    # becomes history. It used to run only in push, after sync had committed:
+    # a token that reached a collected file was never refused, only committed,
+    # and from then on the history-wide scan blocked every push until someone
+    # rewrote the repository. Now a hit refuses one commit instead.
+    #
+    # Only the files this commit changes are scanned. A token already in
+    # history has already blocked push; refusing every sync over it as well
+    # would stop the local backup without protecting anything more. Deleted
+    # paths are left out because there is nothing left to read. On refusal the
+    # index is put back, so a later commit cannot sweep up what was refused.
+    local -a changed=()
+    mapfile -d '' -t changed < <(git -C "$repo" diff --cached --name-only -z \
+        --diff-filter=d -- "${written[@]}")
+    local sec_hits="" sec_rc=0
+    if (( ${#changed[@]} )); then
+        sec_hits="$(scan_files "$repo" "$SECRETS_DENY_FILE" "${changed[@]}")" || sec_rc=1
+    fi
+    if (( sec_rc )) || [[ -n "$sec_hits" ]]; then
+        git -C "$repo" reset -q -- "${written[@]}" 2>/dev/null
+        if (( sec_rc )); then
+            printf '\n%somabackup: not committing -- the secret scan could not complete%s\n' "$RED" "$NC" >&2
+            printf '  A gate that cannot run is not a gate (docs/DESIGN.md §6).\n' >&2
+        else
+            printf '\n%somabackup: not committing -- the deny-list matched what this commit would add%s\n' "$RED" "$NC" >&2
+            local sid srest
+            while IFS=$'\t' read -r sid srest; do
+                [[ -n "$sid" ]] || continue
+                printf '  %s%s%s  %s\n' "$YELLOW" "$sid" "$NC" "$(printf '%s' "$srest" | head -c 160)" >&2
+            done <<<"$sec_hits"
+            printf '\n  Nothing was committed, so the history is still clean. Remove the\n' >&2
+            printf '  credential from the live file (or exclude that file from its group),\n' >&2
+            printf '  or add a justified entry to %s.\n' "$(_tilde "$SECRETS_DENY_FILE")" >&2
+        fi
+        return 1
+    fi
     git -C "$repo" commit -q \
         -m "omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)" \
         -- "${written[@]}" \

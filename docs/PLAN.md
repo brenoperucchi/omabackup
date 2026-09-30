@@ -5361,3 +5361,39 @@ change the target.
    pre-existing uncommitted `docs/PLAN.md` edits and untracked `docs/plans/`.
    It needs a manual reconcile with `origin/main` before any work is done
    there; nothing was merged into it automatically.
+
+### Secret scan before the commit, not only before the push (2026-09-30)
+
+Prerequisite for the three new default groups (`audio`, systemd unit content,
+`agents`) agreed in the `omabackup-24` design consultation. Both consultants
+converged on the same blocker: the deny-list ran only in `cmd_push`, and push
+runs after `sync --commit` has already committed. A token that reached a
+collected file was therefore never refused. It was committed, and from then on
+the history-wide scan blocked every push until the repository was rewritten.
+That is why `agents` and unit content cannot be enabled by default yet.
+
+`cmd_sync` now runs `scan_files` over exactly the files this commit changes,
+after `git add` and before `git commit`. A hit, or a scan that cannot run,
+refuses the commit, resets the index for the written paths and names each rule
+and file. Only changed files are scanned: a token already in history has
+already blocked push, and refusing every sync over it would stop the local
+backup without protecting anything more. `scan_files` gained an optional file
+list and `-H`, because grep omits the file name when given a single file.
+
+Specs in `test/sync.test.sh`: 5 failed before the change (refusal, no commit,
+rule and file named, unreadable deny-list refused, no commit then either); the
+rest are controls that must keep passing (nothing left staged, an old leak in
+history does not block an unrelated change, an unrelated file in the repo
+holding a token does not block, sync without `--commit` still publishes). Two
+mutants are caught: dropping the index reset, and scanning every published file
+instead of only the changed ones. `./test/run.sh sync` 43/0; full suite
+**1476/0**.
+
+Decisions recorded from the same consultation, pending their own PRs:
+`audio` ships enabled (with `~/.local/state/wireplumber` excluded and the
+LADSPA dependency tested in the VM first); systemd unit content and `agents`
+ship `enabled:false` until this gate has been through a release; `agents` uses
+a per-file selection with a warning for unclassified entries, `copy` mode, and
+mixed files (`~/.claude.json`, Codex/Grok `config.toml`) excluded; restore
+reports which units to re-enable instead of enabling them. The `allowList`
+manifest field is read by no code and needs its own fix.

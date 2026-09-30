@@ -349,3 +349,87 @@ printf 'new\n' >"$TS2H/.local/bin/tool"
 it "sync --commit publishes through a double-trailing-slash declared live path"
 _sync_env "$TS2H" "$TS2R" "$TS2G" sync --commit >/dev/null
 assert_eq "$(cat "$TS2R/scripts/local-bin/tool" 2>/dev/null)" "new"
+
+# -- a secret is refused BEFORE it becomes history ----------------------------------
+# The deny-list used to run only in `push`, and push runs after sync has already
+# committed. So a token that reached a collected file was never refused: it was
+# committed, and from then on the history-wide scan blocked every push until
+# someone rewrote the repository. The scan now runs over exactly what this
+# commit would add, before `git add` makes it permanent, and a hit refuses the
+# commit instead of poisoning the history.
+#
+# The token is assembled at runtime so this file never holds one in the clear.
+_tok="gh""p_$(printf 'A%.0s' {1..36})"
+
+_sec_env() {  # _sec_env <dir> -- a home with one collected app file and a repo
+    mkdir -p "$1/.config/app"
+    printf 'x\n' >"$1/.config/app/f.txt"
+    _dest_repo "$1/repo"
+    cat >"$1/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/app"]}]}
+JSON
+}
+
+SC1="$(mktemp -d)"; _sec_env "$SC1"
+_sync_env "$SC1" "$SC1/repo" "$SC1/g.json" sync --commit >/dev/null
+printf 'token = %s\n' "$_tok" >"$SC1/.config/app/creds.txt"
+SC1_OUT="$(_sync_env "$SC1" "$SC1/repo" "$SC1/g.json" sync --commit)"; SC1_RC=$?
+
+it "sync --commit refuses when a collected file carries a known credential"
+(( SC1_RC != 0 )) && ok || fail "sync --commit exited 0 with a GitHub token in what it was about to commit"
+
+it "and creates no commit, so the history stays clean"
+assert_eq "$(_commits "$SC1/repo")" "2"
+
+it "and leaves nothing staged for a later commit to sweep up"
+assert_eq "$(git -C "$SC1/repo" diff --cached --name-only)" ""
+
+it "and names the rule and the file so the user can act on it"
+assert_contains "$SC1_OUT" "github-token"
+assert_contains "$SC1_OUT" "configs/app/creds.txt"
+
+# The scan covers what THIS commit adds, not the whole tree. A token already in
+# history has already blocked push; blocking sync as well would stop the local
+# backup altogether without protecting anything more.
+SC2="$(mktemp -d)"; _sec_env "$SC2"
+mkdir -p "$SC2/repo/configs/old"
+printf 'token = %s\n' "$_tok" >"$SC2/repo/configs/old/leaked.txt"
+git -C "$SC2/repo" add -A && git -C "$SC2/repo" commit -qm "old leak"
+_sync_env "$SC2" "$SC2/repo" "$SC2/g.json" sync --commit >/dev/null
+
+it "a token already in history does not block committing an unrelated clean change"
+assert_contains "$(git -C "$SC2/repo" log -1 --format=%s)" "omabackup: sync"
+
+# Nor does a file this run did not write. `commit -- written[]` never takes it,
+# so it is not ours to refuse.
+SC3="$(mktemp -d)"; _sec_env "$SC3"
+printf 'token = %s\n' "$_tok" >"$SC3/repo/scratch.txt"
+_sync_env "$SC3" "$SC3/repo" "$SC3/g.json" sync --commit >/dev/null
+
+it "an unrelated file in the repo holding a token does not block the sync"
+assert_contains "$(git -C "$SC3/repo" log -1 --format=%s)" "omabackup: sync"
+
+it "and that file is still left out of the commit"
+assert_not_contains "$(git -C "$SC3/repo" show --name-only --format= HEAD)" "scratch.txt"
+
+# A scan that cannot run is not a clean scan. An unreadable deny-list has to
+# refuse the commit, the same way push already refuses.
+SC4="$(mktemp -d)"; _sec_env "$SC4"
+SC4_OUT="$(OMABACKUP_SECRETS_DENY="$SC4/missing.json" _sync_env "$SC4" "$SC4/repo" "$SC4/g.json" sync --commit)"; SC4_RC=$?
+
+it "sync --commit refuses when the secret scan itself cannot run"
+(( SC4_RC != 0 )) && ok || fail "committed without a deny-list to scan against"
+
+it "and creates no commit in that case either"
+assert_eq "$(_commits "$SC4/repo")" "1"
+
+# Without --commit nothing becomes history, so the scan does not stand in the way
+# of reviewing what publish wrote.
+SC5="$(mktemp -d)"; _sec_env "$SC5"
+printf 'token = %s\n' "$_tok" >"$SC5/.config/app/creds.txt"
+_sync_env "$SC5" "$SC5/repo" "$SC5/g.json" sync >/dev/null; SC5_RC=$?
+
+it "sync without --commit still publishes for review"
+(( SC5_RC == 0 )) && ok || fail "sync without --commit failed"
