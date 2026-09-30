@@ -218,10 +218,18 @@ SH7="$(mktemp -d)"; SR7="$SH7/repo"; SG7="$SH7/g.json"
 mkdir -p "$SH7/.config/app"
 printf 'x\n' >"$SH7/.config/app/f.txt"
 _dest_repo "$SR7"
-printf '#!/bin/sh\nexit 1\n' >"$SR7/.git/hooks/pre-commit"
-chmod +x "$SR7/.git/hooks/pre-commit"
+# The failure is injected with a git shim, not a pre-commit hook: the backup's
+# own commit deliberately runs no hooks (review omabackup-69), so a hook can no
+# longer make it fail -- but a git that refuses still must not read as success.
+mkdir -p "$SH7/stub"
+cat >"$SH7/stub/git" <<SHIM
+#!/bin/bash
+for a in "\$@"; do [[ "\$a" == commit ]] && exit 1; done
+exec "$(command -v git)" "\$@"
+SHIM
+chmod +x "$SH7/stub/git"
 cp "$SG" "$SG7"
-OUT7="$(_sync_env "$SH7" "$SR7" "$SG7" sync --commit)"
+OUT7="$(PATH="$SH7/stub:$PATH" _sync_env "$SH7" "$SR7" "$SG7" sync --commit)"
 
 it "a git commit that fails is not announced as committed"
 assert_not_contains "$OUT7" "committed"
@@ -564,3 +572,117 @@ _sync_env "$SY9" "$SY9/repo" "$SY9/g.json" sync --commit >/dev/null
 
 it "a refusal leaves the user's own staging exactly as it was"
 assert_eq "$(git -C "$SY9/repo" ls-files -s -- notes.txt configs/app/f.txt)" "$SY9_BEFORE"
+
+# -- review round omabackup-69: the candidate had to be read, not grepped ---------
+# `git grep --cached` still interpreted the blob through the user's settings and
+# its own rules. Each case below read something other than the bytes committed.
+
+# A hook runs after the scan with GIT_INDEX_FILE pointing at the candidate, and
+# git re-reads the index after pre-commit on purpose. The backup's own commit
+# runs no hooks.
+SZ1="$(mktemp -d)"; _sec_env "$SZ1"
+_sync_env "$SZ1" "$SZ1/repo" "$SZ1/g.json" sync --commit >/dev/null
+cat >"$SZ1/repo/.git/hooks/pre-commit" <<HOOK
+#!/bin/bash
+printf 'token = %s\n' "$_tok" >>configs/app/f.txt
+git add configs/app/f.txt
+HOOK
+cat >"$SZ1/repo/.git/hooks/prepare-commit-msg" <<HOOK
+#!/bin/bash
+printf '\ntoken = %s\n' "$_tok" >>"\$1"
+HOOK
+chmod +x "$SZ1/repo/.git/hooks/pre-commit" "$SZ1/repo/.git/hooks/prepare-commit-msg"
+printf 'y\n' >"$SZ1/.config/app/f.txt"
+_sync_env "$SZ1" "$SZ1/repo" "$SZ1/g.json" sync --commit >/dev/null
+
+it "a hook cannot slip content or a message into the commit after the scan"
+assert_not_contains "$(git -C "$SZ1/repo" log -p --all 2>/dev/null)" "$_tok"
+
+# git grep skips symlink entries entirely, but git stores the link TEXT as a
+# blob. A link whose text is a token is a token in history.
+SZ2="$(mktemp -d)"; _sec_env "$SZ2"
+ln -s "$_tok" "$SZ2/.config/app/tlink"
+_sync_env "$SZ2" "$SZ2/repo" "$SZ2/g.json" sync --commit >/dev/null; SZ2_RC=$?
+
+it "a symlink whose own text is a token is refused"
+(( SZ2_RC != 0 )) && ok || fail "the link text was committed unscanned"
+
+# A NUL right before the token: bash dropped it when reading the line back, so
+# the second regex pass lost the word boundary and discarded a real hit.
+SZ3="$(mktemp -d)"; _sec_env "$SZ3"
+printf 'a\0%s\n' "$_tok" >"$SZ3/.config/app/bin.dat"
+_sync_env "$SZ3" "$SZ3/repo" "$SZ3/g.json" sync --commit >/dev/null; SZ3_RC=$?
+
+it "a token right after a NUL byte is refused"
+(( SZ3_RC != 0 )) && ok || fail "a NUL before the token hid it"
+
+# Display settings of the repo must not change the verdict.
+for _cfg in "color.ui always" "color.grep always" "grep.column true"; do
+    SZC="$(mktemp -d)"; _sec_env "$SZC"
+    git -C "$SZC/repo" config $_cfg
+    printf 'token = %s\n' "$_tok" >"$SZC/.config/app/creds.txt"
+    _sync_env "$SZC" "$SZC/repo" "$SZC/g.json" sync --commit >/dev/null; SZC_RC=$?
+    it "sync --commit still refuses a token with ${_cfg% *}=${_cfg#* }"
+    (( SZC_RC != 0 )) && ok || fail "${_cfg% *} let a token into the commit"
+done
+
+# git replace swaps what git SHOWS for an object. The candidate names the real
+# blob; reading it through a replacement judged different bytes.
+SZ4="$(mktemp -d)"; _sec_env "$SZ4"
+printf 'token = %s\n' "$_tok" >"$SZ4/.config/app/creds.txt"
+_bad="$(git -C "$SZ4/repo" hash-object -w "$SZ4/.config/app/creds.txt")"
+_good="$(printf 'clean\n' | git -C "$SZ4/repo" hash-object -w --stdin)"
+git -C "$SZ4/repo" replace "$_bad" "$_good"
+_sync_env "$SZ4" "$SZ4/repo" "$SZ4/g.json" sync --commit >/dev/null; SZ4_RC=$?
+
+it "a replacement object cannot stand in for the blob being committed"
+(( SZ4_RC != 0 )) && ok || fail "the scan read the replacement, the commit took the token"
+
+# A published name with glob characters is a literal path, not a pattern: it
+# must not sweep up a same-looking draft this run never wrote.
+SZ5="$(mktemp -d)"; _sec_env "$SZ5"
+_sync_env "$SZ5" "$SZ5/repo" "$SZ5/g.json" sync --commit >/dev/null
+printf 'draft\n' >"$SZ5/repo/configs/app/a1.txt"
+printf 'mine\n' >"$SZ5/.config/app/a[1].txt"
+_sync_env "$SZ5" "$SZ5/repo" "$SZ5/g.json" sync --commit >/dev/null
+
+it "a published file named with glob characters commits only itself"
+assert_not_contains "$(git -C "$SZ5/repo" show --name-only --format= HEAD)" "configs/app/a1.txt"
+
+# If refreshing the user's index after the commit fails, the advice must not
+# reset the WHOLE index and throw away what they staged elsewhere.
+SZ6="$(mktemp -d)"; _sec_env "$SZ6"; mkdir -p "$SZ6/stub"
+cat >"$SZ6/stub/git" <<SHIM
+#!/bin/bash
+if [[ -z "\${GIT_INDEX_FILE:-}" ]]; then
+    for a in "\$@"; do [[ "\$a" == reset ]] && exit 1; done
+fi
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SZ6/stub/git"
+SZ6_OUT="$(PATH="$SZ6/stub:$PATH" _sync_env "$SZ6" "$SZ6/repo" "$SZ6/g.json" sync --commit)"
+
+it "the recovery advice resets only the backed-up paths"
+assert_contains "$SZ6_OUT" "reset -q -- "
+
+# An interrupted sync leaves no candidate index -- nor any copy of a scanned
+# blob -- behind. The shim holds the scan open until the test signals it.
+SZ7="$(mktemp -d)"; _sec_env "$SZ7"; mkdir -p "$SZ7/stub"
+cat >"$SZ7/stub/git" <<SHIM
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == cat-file ]]; then : >"$SZ7/reached"; sleep 2; break; fi
+done
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SZ7/stub/git"
+printf 'z\n' >"$SZ7/.config/app/f.txt"
+PATH="$SZ7/stub:$PATH" HOME="$SZ7" OMABACKUP_GROUPS="$SZ7/g.json" OMABACKUP_STATE="$SZ7/.state" \
+    OMABACKUP_REPO="$SZ7/repo" XDG_RUNTIME_DIR=/nonexistent "$OB" sync --commit >/dev/null 2>&1 &
+SZ7_PID=$!
+for _ in $(seq 1 100); do [[ -e "$SZ7/reached" ]] && break; sleep 0.1; done
+kill -TERM "$SZ7_PID" 2>/dev/null; wait "$SZ7_PID" 2>/dev/null
+
+it "an interrupted sync leaves no candidate index or scanned copy behind"
+[[ -e "$SZ7/reached" && -z "$(ls -d "$SZ7/repo/.git"/omabackup-sync.* 2>/dev/null)" ]] \
+    && ok || fail "the scan was never reached, or its temporary files survived the signal"

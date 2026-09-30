@@ -5416,6 +5416,57 @@ clean. (The clone's two `configs/elephant/menus/*.lua` links were not
 recommitted because `~/.config/elephant/menus` no longer exists and no group
 collects it; they date from the repository's initial commit in April.)
 
+**Review round `omabackup-69` found the candidate index was right but the
+reading of it was not.** `git grep --cached` still judged something other than
+the committed blob, in five ways: it honours `color.ui`/`color.grep=always`
+even into a pipe, and the escape right before a match left the second regex
+pass no word boundary, so a token was committed (rev-2, and rev-1 for the
+column/colour class); it skips symlink entries, whose link text git stores as
+a blob (rev-1); it reads through `git replace` (rev-1); and bash drops a NUL
+when reading a line back, so a token right after one lost its boundary (rev-1).
+Both reviewers also found that hooks run after the scan with `GIT_INDEX_FILE`
+set and git re-reads the index after `pre-commit`, that a signal left the
+temporary files (with scanned bytes) behind, and rev-1 that the recovery
+advice reset the whole index. rev-2 found the colour bypass in the
+**existing** push gate too: with `color.ui=always`, `report_secrets` called a
+history holding a GitHub token clean, and only the bundle's filesystem scan
+stood in the way -- which covers `dir` destinations, not `github`. rev-2 also
+reported a pre-existing glob-pathspec issue: a published `a[1].txt` swept a
+draft `a1.txt` into the commit.
+
+**Fix.** `scan_index` no longer asks git to grep. It lists the candidate with
+`ls-files -s -z`, reads each regular or symlink blob by object id with
+`GIT_NO_REPLACE_OBJECTS=1`, turns NULs into newlines, and greps the bytes with
+GNU grep `--color=never` (one case-insensitive prefilter pass per file, exact
+passes only on files that hit). The commit runs with
+`-c core.hooksPath=/dev/null --no-verify`, so no hook can change the index or
+the message after the scan; hand-made commits keep their hooks. Every git call
+that takes `written[]` uses literal pathspecs. The temporary directory is
+registered in `_SYNC_TMPDIR` and removed by the global EXIT trap, which every
+signal handler ends in; it only ever holds fixed file names. The recovery
+advice now prints a reset limited to the backed-up paths, shell-quoted.
+`scan_secrets` passes `--no-color --no-column` to its `git grep`.
+
+The existing spec "a git commit that fails is not announced as committed"
+injected the failure with a `pre-commit` hook. Hooks are now off for the
+backup commit by design, so the injection moved to a git shim that refuses
+`commit`; the assertion is unchanged. A user who relied on a hook to veto
+backup commits loses that, deliberately.
+
+Specs: three in `test/secrets.test.sh` (the history scan with `color.ui`,
+`color.grep` and `grep.column`; the two colour cases failed before) and eleven
+in `test/sync.test.sh` (hooks, symlink text, NUL, the three display settings,
+`git replace`, glob name, recovery advice, and an interrupted sync leaving no
+temporary files); nine failed before. Four mutants are caught, one per new
+defence: hooks back on, no NUL translation, replacements honoured, EXIT trap
+without cleanup. `sync` 67/0, `secrets` 106/0, full suite **1503/0**.
+
+Checked on the real home again, into a throwaway clone of `omarchy-personal`
+with `configs/` and `state/` removed to simulate a first full sync: 553 files
+committed, both Omarchy symlinks included, no temporary directory left, clean
+status. The same sync took 7.7 s on this branch against 6.5 s on `main`;
+ordinary syncs only scan the few files that changed.
+
 Decisions recorded from the same consultation, pending their own PRs:
 `audio` ships enabled (with `~/.local/state/wireplumber` excluded and the
 LADSPA dependency tested in the VM first); systemd unit content and `agents`

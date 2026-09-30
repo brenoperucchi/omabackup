@@ -491,7 +491,12 @@ scan_secrets() {
         # as an empty line, so the two can never be confused -- which the plain
         # format could not promise, a path being free to contain colons and a
         # line free to begin with something shaped like a sha.
-        local -a gflags=(-a -n --break --heading -E)
+        # --no-color / --no-column: git grep honours color.ui=always even into
+        # a pipe, and the escape it puts right before a match left the second
+        # regex pass no word boundary before the token -- the push gate called
+        # a history holding a GitHub token clean (review omabackup-69). What
+        # the user likes on screen must not change what this gate reads.
+        local -a gflags=(-a -n --break --heading -E --no-color --no-column)
         [[ "$ci" == true ]] && gflags+=(-i)
         local out grc
         out="$(git -C "$repo" grep "${gflags[@]}" -e "$re" "${revs[@]}" 2>&1)"; grc=$?
@@ -622,22 +627,35 @@ scan_files() {
     return $rc
 }
 
-# scan_index <repo> <deny-file> <index-file> <path>...
-# The same patterns, over the BLOBS the given index holds for <path>...: what a
-# commit made from that index records, byte for byte. sync uses it before
-# committing. Reading the worktree instead diverged from what was committed:
-# grep followed symlinks git stores as link text (and failed outright on one
-# that dangles), a clean filter changes what is stored, and a file rewritten
-# between the scan and `git commit -- paths` was recorded unscanned.
+# scan_index <repo> <deny-file> <index-file> <workdir> <path>...
+# The same patterns, over the blobs the given index holds for <path>... -- what
+# a commit made from that index records. sync runs it before committing.
 #
-# Prints `<rule-id>\t<path>:<line>` per hit -- never the line itself: this
-# runs from a timer, and its report goes to the journal. Returns non-zero when
-# the scan could not be carried out.
+# Each blob is READ by its object id and grepped as bytes, rather than trusting
+# `git grep --cached` to report on it. Two review rounds found that grepping
+# through git judged something other than what was committed: it follows the
+# user's color.ui/grep.column settings into the output, it skips symlink
+# entries whose link TEXT is stored, and it reads through `git replace`. And the
+# worktree is not the commit either: grep follows symlinks git stores as text,
+# a clean filter changes what is stored, and a file can change between a scan
+# and `git commit -- paths`.
+#
+# NULs become newlines before the grep. Bash drops a NUL when it reads a line
+# back, so a token right after one lost its word boundary on the second regex
+# pass and a real hit was discarded. Splitting there can only expose a match.
+#
+# Every byte read lands in <workdir>, which the caller owns and removes on any
+# exit, signals included. Prints `<rule-id>\t<path>:<line>` per hit -- never
+# the line, because this runs from a timer whose output reaches the journal.
+# Returns non-zero when the scan could not be carried out.
 scan_index() {
-    local repo="$1" file="$2" idx="$3"; shift 3
-    local id re ci rc=0 patterns path ln body grc
-    [[ -f "$file" && -f "$idx" ]] || return 1
+    local repo="$1" file="$2" idx="$3" work="$4"; shift 4
+    local id re ci rc=0 patterns g i
+    [[ -f "$file" && -f "$idx" && -d "$work" ]] || return 1
     (( $# )) || return 0
+
+    local GIT_NO_REPLACE_OBJECTS=1 GIT_LITERAL_PATHSPECS=1
+    export GIT_NO_REPLACE_OBJECTS GIT_LITERAL_PATHSPECS
 
     local -a DENY_EXCEPTIONS=()
     mapfile -t DENY_EXCEPTIONS < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
@@ -649,31 +667,57 @@ scan_index() {
             "$RED" "$NC" >&2
         return 1
     fi
-
-    # The -z output carries NUL bytes, which a shell variable cannot hold, so
-    # it goes through a file. One git grep per pattern, its status kept: exit
-    # 1 is "no match", anything above is a scan that did not happen.
-    local out
-    out="$(mktemp "${TMPDIR:-/tmp}/omabackup-scan.XXXXXX")" || return 1
+    local -a ids=() res=() cis=() prefilter=()
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
-        local -a gflags=(-a -n -z -E)
-        [[ "$ci" == true ]] && gflags+=(-i)
-        GIT_INDEX_FILE="$idx" git -C "$repo" grep --cached "${gflags[@]}" \
-            -e "$re" -- "$@" >"$out" 2>/dev/null; grc=$?
-        if (( grc > 1 )); then
-            printf '%somabackup: pattern %s could not be scanned over the commit%s\n' \
-                "$RED" "$id" "$NC" >&2
-            rc=1
-            continue
-        fi
-        (( grc == 0 )) || continue
-        while IFS= read -r -d '' path && IFS= read -r -d '' ln && IFS= read -r body; do
-            _still_matches "$body" "$re" "$ci" || continue
-            printf '%s\t%s:%s\n' "$id" "$path" "$ln"
-        done <"$out"
+        ids+=("$id"); res+=("$re"); cis+=("$ci"); prefilter+=(-e "$re")
     done <<<"$patterns"
-    rm -f "$out"
+
+    if ! GIT_INDEX_FILE="$idx" git -C "$repo" ls-files -s -z -- "$@" >"$work/entries" 2>/dev/null; then
+        printf '%somabackup: cannot list the candidate commit -- refusing to call it clean%s\n' \
+            "$RED" "$NC" >&2
+        return 1
+    fi
+
+    local rec meta mode oid path line ln body
+    local _had_pipefail=0; [[ -o pipefail ]] && _had_pipefail=1
+    set -o pipefail
+    while IFS= read -r -d '' rec; do
+        meta="${rec%%$'\t'*}"; path="${rec#*$'\t'}"
+        read -r mode oid _ <<<"$meta"
+        # Regular files and symlinks are blobs; a gitlink (160000) names a
+        # commit in another repository and has no content here.
+        case "$mode" in 100644|100755|120000) ;; *) continue ;; esac
+        if ! git -C "$repo" cat-file blob "$oid" 2>/dev/null | tr '\0' '\n' >"$work/blob"; then
+            printf '%somabackup: cannot read %s from the candidate commit%s\n' "$RED" "$path" "$NC" >&2
+            rc=1; continue
+        fi
+        # One case-insensitive pass over every pattern first: a superset, so it
+        # can only let a file through to the exact passes below, never skip one.
+        grep -a -q -i -E --color=never "${prefilter[@]}" -- "$work/blob"; g=$?
+        (( g == 1 )) && continue
+        if (( g > 1 )); then
+            printf '%somabackup: cannot scan %s%s\n' "$RED" "$path" "$NC" >&2
+            rc=1; continue
+        fi
+        for i in "${!ids[@]}"; do
+            local -a gflags=(-a -n -E --color=never)
+            [[ "${cis[$i]}" == true ]] && gflags+=(-i)
+            grep "${gflags[@]}" -e "${res[$i]}" -- "$work/blob" >"$work/hits"; g=$?
+            (( g == 1 )) && continue
+            if (( g > 1 )); then
+                printf '%somabackup: pattern %s could not be scanned over %s%s\n' \
+                    "$RED" "${ids[$i]}" "$path" "$NC" >&2
+                rc=1; continue
+            fi
+            while IFS= read -r line; do
+                ln="${line%%:*}"; body="${line#*:}"
+                _still_matches "$body" "${res[$i]}" "${cis[$i]}" || continue
+                printf '%s\t%s:%s\n' "${ids[$i]}" "$path" "$ln"
+            done <"$work/hits"
+        done
+    done <"$work/entries"
+    (( _had_pipefail )) || set +o pipefail
     return $rc
 }
 

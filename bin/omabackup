@@ -1340,6 +1340,17 @@ collect_generated() {
 # passes. Same philosophy as sync.sh: publish never runs alone without a
 # human able to `git status`/`git diff` before anything is committed --
 # --commit is opt-in, everything else always leaves the tree for review.
+# The candidate index of a running sync and the scanned blob copies next to it.
+# Fixed names only, so nothing here removes a tree it did not create.
+_SYNC_TMPDIR=""
+_sync_tmp_clean() {
+    [[ -n "$_SYNC_TMPDIR" && -d "$_SYNC_TMPDIR" ]] || { _SYNC_TMPDIR=""; return 0; }
+    rm -f "$_SYNC_TMPDIR/index" "$_SYNC_TMPDIR/index.lock" "$_SYNC_TMPDIR/list" \
+          "$_SYNC_TMPDIR/entries" "$_SYNC_TMPDIR/blob" "$_SYNC_TMPDIR/hits"
+    rmdir "$_SYNC_TMPDIR" 2>/dev/null
+    _SYNC_TMPDIR=""
+}
+
 cmd_sync() {
     require_tools jq git rsync
     local repo="${OMABACKUP_REPO:-}" commit=0
@@ -1423,7 +1434,7 @@ cmd_sync() {
     # failure here became "up to date" and exit 0.
     local dirty=""
     if (( ${#written[@]} )); then
-        dirty="$(git -C "$repo" status --porcelain -- "${written[@]}")" \
+        dirty="$(GIT_LITERAL_PATHSPECS=1 git -C "$repo" status --porcelain -- "${written[@]}")" \
             || die "git status failed in $(_tilde "$repo")"
     fi
     if [[ -z "$dirty" ]]; then
@@ -1445,19 +1456,17 @@ cmd_sync() {
     # without -e, so an unchecked failure here fell straight through to
     # "committed" -- the one message a backup tool must never print falsely.
     #
-    # Both `add` and `commit` carry the pathspec. Scoping only the add was not
-    # enough: `git commit` with no pathspec commits the whole index, so anything
-    # the user had already staged rode along under this tool's message. With the
-    # pathspec, git builds the commit from HEAD plus these paths alone and
-    # leaves the rest of the index exactly as the user left it.
-    # The commit is built in a candidate index of its own, and that index is
-    # what gets scanned and then committed -- so the bytes judged are the bytes
-    # recorded. The first version of this gate grepped the worktree while
-    # `git commit -- paths` re-read the worktree a moment later, and the two
-    # diverged: grep followed symlinks git stores as link text (and failed on
-    # Omarchy's own theme link, which dangles once published, so a fresh
-    # install could never commit), a clean filter changed what was stored,
-    # and a write between the scan and the commit went in unscanned.
+    # The commit is built in a candidate index of its own: HEAD plus the
+    # written paths, nothing else. That keeps what the user staged by hand out
+    # of this tool's commit -- the reason `add` and `commit` once both carried
+    # a pathspec -- and it is also what makes the secret scan below honest: the
+    # candidate is what gets scanned and then committed, with no pathspec and
+    # no hooks, so the bytes judged are the bytes recorded. Scanning the
+    # worktree while `git commit -- paths` re-read it a moment later diverged
+    # (review omabackup-68): grep followed symlinks git stores as link text,
+    # and failed on Omarchy's own theme link, which dangles once published, so
+    # a fresh install could never commit; a clean filter changed what was
+    # stored; a write between the scan and the commit went in unscanned.
     #
     # The deny-list runs here, before history, not only in push: a token that
     # reached history used to block every push until the repository was
@@ -1471,8 +1480,13 @@ cmd_sync() {
     tdir="$(mktemp -d "$tdir/omabackup-sync.XXXXXX")" \
         || die "cannot create a candidate index in $(_tilde "$repo")"
     tidx="$tdir/index"
-    _sync_tmp_clean() { rm -f "$tidx" "$tidx.lock" "$tdir/list"; rmdir "$tdir" 2>/dev/null; }
-    _sync_idx() { GIT_INDEX_FILE="$tidx" git -C "$repo" "$@"; }
+    # Registered for the EXIT trap as well, which every signal handler of this
+    # CLI ends in: the directory holds copies of blobs that were scanned, so an
+    # interrupted sync must not leave them behind.
+    _SYNC_TMPDIR="$tdir"
+    # Literal pathspecs: a published name like `a[1].txt` is a path, not a glob
+    # that also matches a draft `a1.txt` this run never wrote.
+    _sync_idx() { GIT_LITERAL_PATHSPECS=1 GIT_INDEX_FILE="$tidx" git -C "$repo" "$@"; }
 
     if git -C "$repo" rev-parse -q --verify HEAD >/dev/null 2>&1; then
         _sync_idx read-tree HEAD
@@ -1501,7 +1515,7 @@ cmd_sync() {
 
     local sec_hits="" sec_rc=0
     if (( ${#changed[@]} )); then
-        sec_hits="$(scan_index "$repo" "$SECRETS_DENY_FILE" "$tidx" "${changed[@]}")" || sec_rc=1
+        sec_hits="$(scan_index "$repo" "$SECRETS_DENY_FILE" "$tidx" "$tdir" "${changed[@]}")" || sec_rc=1
     fi
     if (( sec_rc )) || [[ -n "$sec_hits" ]]; then
         _sync_tmp_clean
@@ -1525,16 +1539,25 @@ cmd_sync() {
         return 1
     fi
 
-    _sync_idx commit -q \
+    # No hooks. They run after the scan, inherit GIT_INDEX_FILE, and git
+    # re-reads the index after pre-commit on purpose -- so a hook could add a
+    # blob or a message line nothing ever scanned. --no-verify alone leaves
+    # prepare-commit-msg running; an empty hooks path silences all of them for
+    # this commit only. Hand-made commits keep their hooks.
+    _sync_idx -c core.hooksPath=/dev/null commit -q --no-verify \
         -m "omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)" \
         || { _sync_tmp_clean; die "git commit failed in $(_tilde "$repo")"; }
     _sync_tmp_clean
     # The user's index still holds the old blobs for these paths; left alone,
     # `git status` would show the commit being staged in reverse.
-    if ! git -C "$repo" reset -q -- "${written[@]}" 2>/dev/null; then
+    if ! GIT_LITERAL_PATHSPECS=1 git -C "$repo" reset -q -- "${written[@]}" 2>/dev/null; then
+        # Limited to the backed-up paths, like the reset that failed: a bare
+        # `git reset` would also drop whatever the user staged elsewhere.
         printf '  %s!%s committed, but could not refresh the index for the backed-up paths;\n' "$YELLOW" "$NC" >&2
-        printf '    run %sgit -C %s reset -q%s before committing anything by hand\n' \
-            "$CYAN" "$(_tilde "$repo")" "$NC" >&2
+        printf '    before committing anything by hand, run:\n' >&2
+        printf '    GIT_LITERAL_PATHSPECS=1 git -C %q reset -q --' "$repo" >&2
+        printf ' %q' "${written[@]}" >&2
+        printf '\n' >&2
     fi
     record_sync_success || printf '  %s!%s could not record this run; the next check may call it stale\n' "$YELLOW" "$NC"
     printf '  %scommitted%s\n' "$GREEN" "$NC"
@@ -3446,6 +3469,7 @@ _log_dispatch_signal=""
 _log_dispatch_start=$EPOCHSECONDS
 _log_dispatch_exit() {
     local rc="$1"
+    _sync_tmp_clean
     case "$LOG_POLICY" in
         always)  _log_run_always "$LOG_ACTION" "$rc" "$(( EPOCHSECONDS - _log_dispatch_start ))" "$_log_dispatch_signal" ;;
         failure) _log_run_on_failure "$LOG_ACTION" "$rc" "$_log_dispatch_signal" ;;

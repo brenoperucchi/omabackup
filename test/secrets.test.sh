@@ -1130,3 +1130,24 @@ ZQOUT="$(bash -c '
     assert_deny_understood "$denyfile"
 ' _ "$OB" "$ZQH/zerowidth.json" 2>&1)"
 assert_contains "$ZQOUT" "match the empty string"
+
+# -- the history scan must not depend on the user's git display settings ----------
+# `git grep` honours color.ui/color.grep=always even into a pipe. The escape
+# sequence lands right before the token, so the second pass of the regex found
+# no word boundary before `gh` and dropped the hit: push called a history
+# holding a GitHub token clean. Found in review round omabackup-69.
+_ctok="gh""p_$(printf 'B%.0s' {1..36})"
+for _cfg in color.ui color.grep; do
+    CR="$SH/color-$_cfg"
+    _sec_repo "$CR" "probe.conf" "token = $_ctok"
+    git -C "$CR" config "$_cfg" always
+    it "the history scan still finds a token with $_cfg=always"
+    [[ -n "$(scan_secrets "$CR" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+        && ok || fail "$_cfg=always hid a token from the push gate"
+done
+CC="$SH/column"
+_sec_repo "$CC" "probe.conf" "token = $_ctok"
+git -C "$CC" config grep.column true
+it "the history scan still finds a token with grep.column=true"
+[[ -n "$(scan_secrets "$CC" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "grep.column=true hid a token from the push gate"
