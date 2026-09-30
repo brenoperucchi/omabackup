@@ -224,7 +224,7 @@ _dest_repo "$SR7"
 mkdir -p "$SH7/stub"
 cat >"$SH7/stub/git" <<SHIM
 #!/bin/bash
-for a in "\$@"; do [[ "\$a" == commit ]] && exit 1; done
+for a in "\$@"; do [[ "\$a" == commit || "\$a" == commit-tree ]] && exit 1; done
 exec "$(command -v git)" "\$@"
 SHIM
 chmod +x "$SH7/stub/git"
@@ -686,3 +686,86 @@ kill -TERM "$SZ7_PID" 2>/dev/null; wait "$SZ7_PID" 2>/dev/null
 it "an interrupted sync leaves no candidate index or scanned copy behind"
 [[ -e "$SZ7/reached" && -z "$(ls -d "$SZ7/repo/.git"/omabackup-sync.* 2>/dev/null)" ]] \
     && ok || fail "the scan was never reached, or its temporary files survived the signal"
+
+# -- review round omabackup-70 ------------------------------------------------------
+# A merge (or cherry-pick) the user is still resolving lives in the git
+# directory, not in the index. A commit built from HEAD plus the backup paths
+# would move HEAD under that operation. The old `commit -- paths` was refused by
+# git in that state; the backup must refuse too and touch nothing.
+SW1="$(mktemp -d)"; _sec_env "$SW1"
+_sync_env "$SW1" "$SW1/repo" "$SW1/g.json" sync --commit >/dev/null
+git -C "$SW1/repo" checkout -q -b side
+printf 'side\n' >"$SW1/repo/README.md"; git -C "$SW1/repo" commit -qam side
+git -C "$SW1/repo" checkout -q -
+printf 'main\n' >"$SW1/repo/README.md"; git -C "$SW1/repo" commit -qam main
+git -C "$SW1/repo" merge -q side >/dev/null 2>&1
+SW1_HEAD="$(git -C "$SW1/repo" rev-parse HEAD)"
+printf 'changed\n' >"$SW1/.config/app/f.txt"
+_sync_env "$SW1" "$SW1/repo" "$SW1/g.json" sync --commit >/dev/null; SW1_RC=$?
+
+it "sync --commit refuses while a merge is in progress"
+(( SW1_RC != 0 )) && ok || fail "the backup committed in the middle of the user's merge"
+
+it "and leaves HEAD and the merge state untouched"
+[[ "$(git -C "$SW1/repo" rev-parse HEAD)" == "$SW1_HEAD" && -f "$SW1/repo/.git/MERGE_HEAD" ]] \
+    && ok || fail "HEAD moved or MERGE_HEAD was cleared"
+
+SW2="$(mktemp -d)"; _sec_env "$SW2"
+_sync_env "$SW2" "$SW2/repo" "$SW2/g.json" sync --commit >/dev/null
+git -C "$SW2/repo" checkout -q -b pick
+printf 'pick\n' >"$SW2/repo/README.md"; git -C "$SW2/repo" commit -qam pick
+git -C "$SW2/repo" checkout -q -
+printf 'here\n' >"$SW2/repo/README.md"; git -C "$SW2/repo" commit -qam here
+git -C "$SW2/repo" cherry-pick pick >/dev/null 2>&1
+printf 'changed\n' >"$SW2/.config/app/f.txt"
+_sync_env "$SW2" "$SW2/repo" "$SW2/g.json" sync --commit >/dev/null; SW2_RC=$?
+
+it "sync --commit refuses while a cherry-pick is in progress"
+(( SW2_RC != 0 )) && [[ -f "$SW2/repo/.git/CHERRY_PICK_HEAD" ]] \
+    && ok || fail "the backup committed in the middle of the user's cherry-pick"
+
+# A NUL INSIDE a quoted value: generic-assigned-secret's negated class crosses
+# the NUL, and the push scan (which drops NULs) sees the whole value. Splitting
+# the blob at NUL hid it, so the commit went in and push was blocked for good.
+SW3="$(mktemp -d)"; _sec_env "$SW3"
+printf 'pass''word = "abcdefgh\0ijklmnopqrstuv"\n' >"$SW3/.config/app/blob.bin"
+_sync_env "$SW3" "$SW3/repo" "$SW3/g.json" sync --commit >/dev/null; SW3_RC=$?
+
+it "a secret value with a NUL inside it is refused, as push would"
+(( SW3_RC != 0 )) && ok || fail "the pre-commit scan was more permissive than the push scan"
+
+# The prefilter must follow each rule's own case sensitivity: with -i, a
+# negated class like [^A] also excludes `a`, so a case-sensitive rule could be
+# skipped by the very pass meant to only save time.
+SW4="$(mktemp -d)"; _sec_env "$SW4"
+cat >"$SW4/deny.json" <<'JSON'
+{"schemaVersion":1,"patterns":[
+ {"id":"custom-cs","regex":"^secret=[^A]{16}$","reason":"test rule, case-sensitive"}]}
+JSON
+printf 'sec''ret=aaaaaaaaaaaaaaaa\n' >"$SW4/.config/app/c.txt"
+OMABACKUP_SECRETS_DENY="$SW4/deny.json" _sync_env "$SW4" "$SW4/repo" "$SW4/g.json" sync --commit >/dev/null; SW4_RC=$?
+
+it "the prefilter never skips what a case-sensitive rule would catch"
+(( SW4_RC != 0 )) && ok || fail "a case-insensitive prefilter hid a case-sensitive rule's hit"
+
+# Hooks defined in config (hook.<name>.event) are not files, so an empty hooks
+# path does not silence them, and --no-verify leaves prepare-commit-msg running.
+SW5="$(mktemp -d)"; _sec_env "$SW5"
+_sync_env "$SW5" "$SW5/repo" "$SW5/g.json" sync --commit >/dev/null
+git -C "$SW5/repo" config hook.leak.event prepare-commit-msg
+git -C "$SW5/repo" config hook.leak.command "printf 'token = %s\n' '$_tok' >>\"\$1\""
+printf 'changed\n' >"$SW5/.config/app/f.txt"
+_sync_env "$SW5" "$SW5/repo" "$SW5/g.json" sync --commit >/dev/null
+
+it "a config-defined hook cannot put anything into the backup's commit message"
+assert_not_contains "$(git -C "$SW5/repo" log -1 --format=%B)" "$_tok"
+
+SW6="$(mktemp -d)"; _sec_env "$SW6"
+_sync_env "$SW6" "$SW6/repo" "$SW6/g.json" sync --commit >/dev/null
+git -C "$SW6/repo" config hook.nope.event prepare-commit-msg
+git -C "$SW6/repo" config hook.nope.command "false"
+printf 'changed\n' >"$SW6/.config/app/f.txt"
+_sync_env "$SW6" "$SW6/repo" "$SW6/g.json" sync --commit >/dev/null
+
+it "a failing config-defined hook does not stop the backup from committing"
+assert_eq "$(_commits "$SW6/repo")" "3"

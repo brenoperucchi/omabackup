@@ -5467,6 +5467,49 @@ committed, both Omarchy symlinks included, no temporary directory left, clean
 status. The same sync took 7.7 s on this branch against 6.5 s on `main`;
 ordinary syncs only scan the few files that changed.
 
+**Review round `omabackup-70`, the last correction round, found five more.**
+rev-1: a merge, cherry-pick, revert or rebase the user is resolving lives in
+the git directory, so a commit built from HEAD would move HEAD under it (git
+itself refused `commit -- paths` there); under `-i` a negated class such as
+`[^A]` also excludes `a`, so the single case-insensitive prefilter could skip a
+case-sensitive rule's hit. Both: turning NULs into newlines hid a
+`generic-assigned-secret` value with a NUL inside it, which the push scan
+(which drops NULs) does see -- a commit accepted here would block push for
+good. rev-2: git 2.55 runs hooks defined in config (`hook.<name>.event`), which
+neither an empty hooks path nor `--no-verify` silences, so a
+`prepare-commit-msg` could put a token into the message after the scan or fail
+and stop every backup. rev-2 also noted, pre-existing and out of scope, that
+`report_secrets` and the bundle scan still print the matched line.
+
+My own spec for the config hook first passed against the unfixed code; the
+hook command I wrote did not reach the message file. With `>>"$1"` it injects
+even with `core.hooksPath=/dev/null --no-verify`, as rev-2 had measured.
+
+**Fix.** `sync --commit` refuses before publishing, and again right before
+committing, while any of `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`,
+`rebase-merge` or `rebase-apply` exists. The commit is plumbing:
+`write-tree` of the candidate, `commit-tree` with the tool's message (and `-S`
+when `commit.gpgSign` is true, as `git commit` did), `update-ref` with the old
+HEAD as compare-and-swap. No hook of any origin runs. A blob holding NULs is
+scanned twice, NULs deleted (exactly the push scan's text, so the pre-commit
+scan is a superset of it) and NULs as line breaks (a token right after a NUL
+keeps its boundary); a hit in either refuses. The prefilter runs one pass per
+case group.
+
+Specs: seven, all failing before (merge, its untouched state, cherry-pick,
+NUL inside a value, case-sensitive rule behind the prefilter, config hook in
+the message, failing config hook). The existing commit-failure spec's shim now
+refuses `commit-tree` as well. Five mutants caught: only-deleted NULs, only
+line-broken NULs, a single `-i` prefilter, no merge guard, `git commit` back.
+`sync` 74/0, full suite **1510/0**. Real home into a throwaway clone, first
+full sync: 553 files, both Omarchy links, correct parent and reflog entry, no
+temporary files, clean status; 9.6 s against 6.5 s on `main`, in that worst
+case only.
+
+**Open, for their own PRs:** `report_secrets` and the bundle's
+`refusing to build` still print the matched line (journal); publishing into
+the worktree during a merge is refused only with `--commit`.
+
 Decisions recorded from the same consultation, pending their own PRs:
 `audio` ships enabled (with `~/.local/state/wireplumber` excluded and the
 LADSPA dependency tested in the VM first); systemd unit content and `agents`

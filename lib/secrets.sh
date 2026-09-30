@@ -640,9 +640,13 @@ scan_files() {
 # a clean filter changes what is stored, and a file can change between a scan
 # and `git commit -- paths`.
 #
-# NULs become newlines before the grep. Bash drops a NUL when it reads a line
-# back, so a token right after one lost its word boundary on the second regex
-# pass and a real hit was discarded. Splitting there can only expose a match.
+# A blob holding NULs is judged twice, and a hit in either counts. With the
+# NULs deleted, it reads exactly as the push scan reads it (git grep matches
+# the raw bytes, then bash drops the NULs before the second pass), so nothing
+# the push gate would block can pass here -- a secret value with a NUL inside
+# it included (review omabackup-70). With each NUL turned into a line break,
+# a token right after a NUL keeps its word boundary, which deleting would take
+# away. Neither form alone covered both.
 #
 # Every byte read lands in <workdir>, which the caller owns and removes on any
 # exit, signals included. Prints `<rule-id>\t<path>:<line>` per hit -- never
@@ -667,10 +671,15 @@ scan_index() {
             "$RED" "$NC" >&2
         return 1
     fi
-    local -a ids=() res=() cis=() prefilter=()
+    # The prefilter is split by each rule's own case sensitivity. A single
+    # case-insensitive pass is not a superset: under -i a negated class such
+    # as [^A] also excludes `a`, so it could skip a file a case-sensitive
+    # rule matches (review omabackup-70).
+    local -a ids=() res=() cis=() pre_cs=() pre_ci=()
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
-        ids+=("$id"); res+=("$re"); cis+=("$ci"); prefilter+=(-e "$re")
+        ids+=("$id"); res+=("$re"); cis+=("$ci")
+        if [[ "$ci" == true ]]; then pre_ci+=(-e "$re"); else pre_cs+=(-e "$re"); fi
     done <<<"$patterns"
 
     if ! GIT_INDEX_FILE="$idx" git -C "$repo" ls-files -s -z -- "$@" >"$work/entries" 2>/dev/null; then
@@ -679,7 +688,7 @@ scan_index() {
         return 1
     fi
 
-    local rec meta mode oid path line ln body
+    local rec meta mode oid path line ln body view hit_any g2 rsz vsz
     local _had_pipefail=0; [[ -o pipefail ]] && _had_pipefail=1
     set -o pipefail
     while IFS= read -r -d '' rec; do
@@ -688,33 +697,51 @@ scan_index() {
         # Regular files and symlinks are blobs; a gitlink (160000) names a
         # commit in another repository and has no content here.
         case "$mode" in 100644|100755|120000) ;; *) continue ;; esac
-        if ! git -C "$repo" cat-file blob "$oid" 2>/dev/null | tr '\0' '\n' >"$work/blob"; then
+        if ! git -C "$repo" cat-file blob "$oid" >"$work/raw" 2>/dev/null \
+            || ! tr -d '\0' <"$work/raw" >"$work/blob"; then
             printf '%somabackup: cannot read %s from the candidate commit%s\n' "$RED" "$path" "$NC" >&2
             rc=1; continue
         fi
-        # One case-insensitive pass over every pattern first: a superset, so it
-        # can only let a file through to the exact passes below, never skip one.
-        grep -a -q -i -E --color=never "${prefilter[@]}" -- "$work/blob"; g=$?
-        (( g == 1 )) && continue
-        if (( g > 1 )); then
-            printf '%somabackup: cannot scan %s%s\n' "$RED" "$path" "$NC" >&2
-            rc=1; continue
-        fi
-        for i in "${!ids[@]}"; do
-            local -a gflags=(-a -n -E --color=never)
-            [[ "${cis[$i]}" == true ]] && gflags+=(-i)
-            grep "${gflags[@]}" -e "${res[$i]}" -- "$work/blob" >"$work/hits"; g=$?
-            (( g == 1 )) && continue
-            if (( g > 1 )); then
-                printf '%somabackup: pattern %s could not be scanned over %s%s\n' \
-                    "$RED" "${ids[$i]}" "$path" "$NC" >&2
+        local -a views=("$work/blob")
+        rsz="$(wc -c <"$work/raw")"; vsz="$(wc -c <"$work/blob")"
+        if [[ "$rsz" != "$vsz" ]]; then
+            if ! tr '\0' '\n' <"$work/raw" >"$work/blobn"; then
+                printf '%somabackup: cannot read %s from the candidate commit%s\n' "$RED" "$path" "$NC" >&2
                 rc=1; continue
             fi
-            while IFS= read -r line; do
-                ln="${line%%:*}"; body="${line#*:}"
-                _still_matches "$body" "${res[$i]}" "${cis[$i]}" || continue
-                printf '%s\t%s:%s\n' "${ids[$i]}" "$path" "$ln"
-            done <"$work/hits"
+            views+=("$work/blobn")
+        fi
+        for view in "${views[@]}"; do
+            # Prefilter: one pass per case group, so it can only let a file
+            # through to the exact passes, never skip one.
+            hit_any=0
+            if (( ${#pre_cs[@]} )); then
+                grep -a -q -E --color=never "${pre_cs[@]}" -- "$view"; g=$?
+                (( g > 1 )) && { printf '%somabackup: cannot scan %s%s\n' "$RED" "$path" "$NC" >&2; rc=1; continue; }
+                (( g == 0 )) && hit_any=1
+            fi
+            if (( ! hit_any && ${#pre_ci[@]} )); then
+                grep -a -q -i -E --color=never "${pre_ci[@]}" -- "$view"; g2=$?
+                (( g2 > 1 )) && { printf '%somabackup: cannot scan %s%s\n' "$RED" "$path" "$NC" >&2; rc=1; continue; }
+                (( g2 == 0 )) && hit_any=1
+            fi
+            (( hit_any )) || continue
+            for i in "${!ids[@]}"; do
+                local -a gflags=(-a -n -E --color=never)
+                [[ "${cis[$i]}" == true ]] && gflags+=(-i)
+                grep "${gflags[@]}" -e "${res[$i]}" -- "$view" >"$work/hits"; g=$?
+                (( g == 1 )) && continue
+                if (( g > 1 )); then
+                    printf '%somabackup: pattern %s could not be scanned over %s%s\n' \
+                        "$RED" "${ids[$i]}" "$path" "$NC" >&2
+                    rc=1; continue
+                fi
+                while IFS= read -r line; do
+                    ln="${line%%:*}"; body="${line#*:}"
+                    _still_matches "$body" "${res[$i]}" "${cis[$i]}" || continue
+                    printf '%s\t%s:%s\n' "${ids[$i]}" "$path" "$ln"
+                done <"$work/hits"
+            done
         done
     done <"$work/entries"
     (( _had_pipefail )) || set +o pipefail

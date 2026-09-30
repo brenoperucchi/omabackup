@@ -1346,9 +1346,25 @@ _SYNC_TMPDIR=""
 _sync_tmp_clean() {
     [[ -n "$_SYNC_TMPDIR" && -d "$_SYNC_TMPDIR" ]] || { _SYNC_TMPDIR=""; return 0; }
     rm -f "$_SYNC_TMPDIR/index" "$_SYNC_TMPDIR/index.lock" "$_SYNC_TMPDIR/list" \
-          "$_SYNC_TMPDIR/entries" "$_SYNC_TMPDIR/blob" "$_SYNC_TMPDIR/hits"
+          "$_SYNC_TMPDIR/entries" "$_SYNC_TMPDIR/raw" "$_SYNC_TMPDIR/blob" \
+          "$_SYNC_TMPDIR/blobn" "$_SYNC_TMPDIR/hits"
     rmdir "$_SYNC_TMPDIR" 2>/dev/null
     _SYNC_TMPDIR=""
+}
+
+# _sync_op_in_progress <repo> -- prints the operation the user is in the middle
+# of (merge, cherry-pick, revert, rebase), nothing when there is none. That
+# state lives in the git directory, not the index, so the candidate index does
+# not isolate the backup from it: a commit built from HEAD would move HEAD under
+# the user's operation. `git commit -- paths` used to be refused by git itself
+# there; the candidate commit has to refuse on its own (review omabackup-70).
+_sync_op_in_progress() {
+    local gd; gd="$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null)" || { printf 'unknown'; return 0; }
+    [[ -e "$gd/MERGE_HEAD" ]]       && { printf 'merge'; return 0; }
+    [[ -e "$gd/CHERRY_PICK_HEAD" ]] && { printf 'cherry-pick'; return 0; }
+    [[ -e "$gd/REVERT_HEAD" ]]      && { printf 'revert'; return 0; }
+    [[ -d "$gd/rebase-merge" || -d "$gd/rebase-apply" ]] && { printf 'rebase'; return 0; }
+    return 0
 }
 
 cmd_sync() {
@@ -1364,6 +1380,11 @@ cmd_sync() {
         esac
     done
     [[ -n "$repo" && -d "$repo/.git" ]] || die "OMABACKUP_REPO must point at a git repo (got: ${repo:-unset})"
+    local op
+    if (( commit )); then
+        op="$(_sync_op_in_progress "$repo")"
+        [[ -z "$op" ]] || die "a $op is in progress in $(_tilde "$repo") -- finish or abort it first; nothing was published or committed"
+    fi
 
     JSON=0 cmd_collect >/dev/null || die "collect failed -- refusing to publish whatever staging is left in"
     local list="$OMABACKUP_STATE/last-publish"
@@ -1539,14 +1560,40 @@ cmd_sync() {
         return 1
     fi
 
-    # No hooks. They run after the scan, inherit GIT_INDEX_FILE, and git
-    # re-reads the index after pre-commit on purpose -- so a hook could add a
-    # blob or a message line nothing ever scanned. --no-verify alone leaves
-    # prepare-commit-msg running; an empty hooks path silences all of them for
-    # this commit only. Hand-made commits keep their hooks.
-    _sync_idx -c core.hooksPath=/dev/null commit -q --no-verify \
-        -m "omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)" \
-        || { _sync_tmp_clean; die "git commit failed in $(_tilde "$repo")"; }
+    # Checked again right before the commit: the operation could have started
+    # while this run was collecting and scanning.
+    op="$(_sync_op_in_progress "$repo")"
+    if [[ -n "$op" ]]; then
+        _sync_tmp_clean
+        printf '\n%somabackup: not committing -- a %s started in %s; finish or abort it first%s\n' \
+            "$RED" "$op" "$(_tilde "$repo")" "$NC" >&2
+        return 1
+    fi
+
+    # Committed through plumbing: write-tree, commit-tree, update-ref. None of
+    # them runs a hook of any origin. `git commit` ran them even with an empty
+    # hooks path and --no-verify, because hooks can also be defined in config
+    # (hook.<name>.event), and a prepare-commit-msg could put a token into the
+    # message after the scan, or fail and stop every backup (review
+    # omabackup-70). The tree committed is the candidate's, the message is
+    # exactly this one, and update-ref compares-and-swaps HEAD, so a HEAD that
+    # moved meanwhile makes this refuse instead of overwrite. Signing follows
+    # commit.gpgSign as `git commit` did. Hand-made commits keep their hooks.
+    local tree old new msg sflag=()
+    msg="omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)"
+    [[ "$(git -C "$repo" config --bool commit.gpgSign 2>/dev/null)" == true ]] && sflag=(-S)
+    tree="$(_sync_idx write-tree)" \
+        || { _sync_tmp_clean; die "git write-tree failed in $(_tilde "$repo")"; }
+    if old="$(git -C "$repo" rev-parse -q --verify HEAD 2>/dev/null)"; then
+        new="$(git -C "$repo" commit-tree "${sflag[@]}" "$tree" -p "$old" -m "$msg")" \
+            || { _sync_tmp_clean; die "git commit failed in $(_tilde "$repo")"; }
+    else
+        old=""
+        new="$(git -C "$repo" commit-tree "${sflag[@]}" "$tree" -m "$msg")" \
+            || { _sync_tmp_clean; die "git commit failed in $(_tilde "$repo")"; }
+    fi
+    git -C "$repo" update-ref -m "$msg" HEAD "$new" "$old" \
+        || { _sync_tmp_clean; die "git commit failed in $(_tilde "$repo") -- HEAD moved during the sync"; }
     _sync_tmp_clean
     # The user's index still holds the old blobs for these paths; left alone,
     # `git status` would show the commit being staged in reverse.
