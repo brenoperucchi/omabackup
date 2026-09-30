@@ -5372,22 +5372,49 @@ collected file was therefore never refused. It was committed, and from then on
 the history-wide scan blocked every push until the repository was rewritten.
 That is why `agents` and unit content cannot be enabled by default yet.
 
-`cmd_sync` now runs `scan_files` over exactly the files this commit changes,
-after `git add` and before `git commit`. A hit, or a scan that cannot run,
-refuses the commit, resets the index for the written paths and names each rule
-and file. Only changed files are scanned: a token already in history has
-already blocked push, and refusing every sync over it would stop the local
-backup without protecting anything more. `scan_files` gained an optional file
-list and `-H`, because grep omits the file name when given a single file.
+**Review round `omabackup-68` rejected the first version**, and both reviewers
+reached the same root cause independently: it grepped the worktree while
+`git commit -- paths` recorded the worktree a moment later, so what was
+scanned and what was committed diverged. The consequence rev-2 measured was
+the worst: grep follows a symlink named on its command line and exits 2 on one
+that dangles, and Omarchy's own `~/.config/nvim/lua/plugins/theme.lua` is a
+relative link that dangles once published. Every fresh install would have been
+refused on its first commit, forever, with a message naming no file. The same
+divergence let a clean filter (git-crypt) refuse bytes that are never stored,
+let a write between scan and commit go in unscanned, and let a collected file
+named `repo.bundle` skip the scan through grep's `--exclude`. rev-1 also found
+an unchecked change-list status (a failed `git diff` meant "nothing to scan"),
+a rollback that reset the user's own staging to HEAD, and, with rev-2, the
+matched line (token included) printed to stderr -- which the timer sends to
+the journal.
 
-Specs in `test/sync.test.sh`: 5 failed before the change (refusal, no commit,
-rule and file named, unreadable deny-list refused, no commit then either); the
-rest are controls that must keep passing (nothing left staged, an old leak in
-history does not block an unrelated change, an unrelated file in the repo
-holding a token does not block, sync without `--commit` still publishes). Two
-mutants are caught: dropping the index reset, and scanning every published file
-instead of only the changed ones. `./test/run.sh sync` 43/0; full suite
-**1476/0**.
+**The fix builds the commit in a candidate index of its own.** `cmd_sync`
+creates it under the git directory, reads HEAD into it (or the empty tree),
+adds `written[]`, lists the changed paths with the status checked, and runs
+the new `scan_index` over those blobs with `git grep --cached`. Only a clean
+scan commits, and it commits that same index with no pathspec, so the tree
+recorded is the tree scanned. The user's index is never touched on refusal;
+after a commit it is refreshed for the backed-up paths, with a warning if that
+fails. A refusal names the rule, the path and the line number, never the line.
+`scan_files` is back to its original form; the artefact path is unchanged.
+
+Specs in `test/sync.test.sh`: the original five, plus twelve that failed
+against the first version -- the Omarchy-style relative link and a dangling
+link commit, a link to a file holding a token commits and never prints it, a
+write between scan and commit never reaches history, an unlistable change set
+refuses, `repo.bundle` is scanned, content a clean filter removes commits, the
+refusal never prints the token, and the user's own staging survives a refusal.
+Mutants caught: committing with a pathspec again (18 failures) and dropping the
+change-list status check (2). `./test/run.sh sync` 57/0; full suite
+**1490/0**.
+
+Checked against the real home as well: a `sync --commit` from this branch into
+a throwaway clone of `omarchy-personal`, with the real deny-list, after
+removing the clone's versioned symlinks. The Omarchy theme and background links
+were recommitted, no temporary index was left behind and `git status` was
+clean. (The clone's two `configs/elephant/menus/*.lua` links were not
+recommitted because `~/.config/elephant/menus` no longer exists and no group
+collects it; they date from the repository's initial commit in April.)
 
 Decisions recorded from the same consultation, pending their own PRs:
 `audio` ships enabled (with `~/.local/state/wireplumber` excluded and the

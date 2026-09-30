@@ -433,3 +433,134 @@ _sync_env "$SC5" "$SC5/repo" "$SC5/g.json" sync >/dev/null; SC5_RC=$?
 
 it "sync without --commit still publishes for review"
 (( SC5_RC == 0 )) && ok || fail "sync without --commit failed"
+
+# -- the scan reads the object git records, not the file in the worktree ----------
+# Review round omabackup-68: the first version grepped the worktree while
+# `git commit -- paths` recorded whatever the worktree held a moment later.
+# The two diverge in ways that matter, each pinned below.
+_REALGIT="$(command -v git)"
+
+# Omarchy keeps ~/.config/nvim/lua/plugins/theme.lua as a RELATIVE symlink into
+# ~/.local/state. Published into the repo it dangles, and grep given a dangling
+# link on its command line exits 2 -- so the first sync of every fresh install
+# was refused forever, with a message naming no file. git records the link
+# text, which holds no secret.
+SY1="$(mktemp -d)"; _sec_env "$SY1"
+mkdir -p "$SY1/.local/state/omarchy/theme" "$SY1/.config/app/lua"
+printf 'return {}\n' >"$SY1/.local/state/omarchy/theme/neovim.lua"
+ln -s ../../../.local/state/omarchy/theme/neovim.lua "$SY1/.config/app/lua/theme.lua"
+_sync_env "$SY1" "$SY1/repo" "$SY1/g.json" sync --commit >/dev/null; SY1_RC=$?
+
+it "a relative symlink that dangles once published does not block the commit"
+(( SY1_RC == 0 )) && ok || fail "sync --commit refused a harmless Omarchy-style theme link"
+
+it "and the link itself is committed"
+assert_contains "$(git -C "$SY1/repo" show --name-only --format= HEAD)" "configs/app/lua/theme.lua"
+
+SY2="$(mktemp -d)"; _sec_env "$SY2"
+ln -s "$SY2/nowhere/at/all" "$SY2/.config/app/gone"
+_sync_env "$SY2" "$SY2/repo" "$SY2/g.json" sync --commit >/dev/null; SY2_RC=$?
+
+it "a dangling symlink does not block the commit"
+(( SY2_RC == 0 )) && ok || fail "sync --commit refused a dangling symlink"
+
+# A link to a file holding a token: git stores the path of the target, not the
+# target, so there is nothing secret in what is committed.
+SY3="$(mktemp -d)"; _sec_env "$SY3"
+printf 'token = %s\n' "$_tok" >"$SY3/outside.txt"
+ln -s "$SY3/outside.txt" "$SY3/.config/app/link"
+SY3_OUT="$(_sync_env "$SY3" "$SY3/repo" "$SY3/g.json" sync --commit)"; SY3_RC=$?
+
+it "a symlink to a file holding a token commits, because the blob is the link text"
+(( SY3_RC == 0 )) && ok || fail "refused over content the commit would not carry"
+
+it "and the target's content is never printed"
+assert_not_contains "$SY3_OUT" "$_tok"
+
+# What is committed is what was scanned. A shim appends a token to a collected
+# file at the moment git is asked to commit: `commit -- paths` re-read the
+# worktree and recorded the token unscanned.
+SY4="$(mktemp -d)"; _sec_env "$SY4"; mkdir -p "$SY4/stub"
+cat >"$SY4/stub/git" <<SHIM
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == commit ]]; then
+        printf 'token = %s\n' "$_tok" >>"$SY4/repo/configs/app/f.txt"; break
+    fi
+done
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SY4/stub/git"
+PATH="$SY4/stub:$PATH" _sync_env "$SY4" "$SY4/repo" "$SY4/g.json" sync --commit >/dev/null
+
+it "a write that lands between the scan and the commit never reaches history"
+assert_not_contains "$(git -C "$SY4/repo" log -p --all 2>/dev/null)" "$_tok"
+
+# If the list of files to scan cannot be produced, nothing was scanned -- that is
+# not "nothing to scan".
+SY5="$(mktemp -d)"; _sec_env "$SY5"; mkdir -p "$SY5/stub"
+cat >"$SY5/stub/git" <<SHIM
+#!/bin/bash
+nm=0; df=0
+for a in "\$@"; do [[ "\$a" == --name-only ]] && nm=1; [[ "\$a" == diff ]] && df=1; done
+(( nm && df )) && exit 128
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SY5/stub/git"
+PATH="$SY5/stub:$PATH" _sync_env "$SY5" "$SY5/repo" "$SY5/g.json" sync --commit >/dev/null; SY5_RC=$?
+
+it "sync --commit refuses when it cannot list what the commit would change"
+(( SY5_RC != 0 )) && ok || fail "an unreadable change list was taken as nothing to scan"
+
+it "and creates no commit"
+assert_eq "$(_commits "$SY5/repo")" "1"
+
+# The artefact scan skips repo.bundle because it is a packfile already scanned
+# as objects. A collected file that happens to share the name is neither.
+SY6="$(mktemp -d)"; _sec_env "$SY6"
+printf 'token = %s\n' "$_tok" >"$SY6/.config/app/repo.bundle"
+_sync_env "$SY6" "$SY6/repo" "$SY6/g.json" sync --commit >/dev/null; SY6_RC=$?
+
+it "a collected file named repo.bundle is scanned like any other"
+(( SY6_RC != 0 )) && ok || fail "a token in a file named repo.bundle was committed"
+
+# A clean filter (git-crypt works this way) changes what is stored. The stored
+# blob is what history carries and what the push scan will read, so it is
+# what this scan judges.
+SY7="$(mktemp -d)"; _sec_env "$SY7"
+git -C "$SY7/repo" config filter.hide.clean "sed 's/gh[p]_[A-Za-z0-9]*/REDACTED/'"
+git -C "$SY7/repo" config filter.hide.smudge cat
+printf 'configs/app/creds.txt filter=hide\n' >"$SY7/repo/.git/info/attributes"
+printf 'token = %s\n' "$_tok" >"$SY7/.config/app/creds.txt"
+_sync_env "$SY7" "$SY7/repo" "$SY7/g.json" sync --commit >/dev/null; SY7_RC=$?
+
+it "content a clean filter removes before storage does not block the commit"
+(( SY7_RC == 0 )) && ok || fail "refused over bytes the repository would never store"
+
+it "and the stored blob is indeed clean"
+assert_not_contains "$(git -C "$SY7/repo" log -p --all 2>/dev/null)" "$_tok"
+
+# The refusal goes to the systemd journal when the timer runs it. It names the
+# rule, the file and the line -- never the line's content.
+SY8="$(mktemp -d)"; _sec_env "$SY8"
+printf 'token = %s\n' "$_tok" >"$SY8/.config/app/creds.txt"
+SY8_OUT="$(_sync_env "$SY8" "$SY8/repo" "$SY8/g.json" sync --commit)"
+
+it "the refusal never prints the credential itself"
+assert_not_contains "$SY8_OUT" "$_tok"
+
+it "but still points at the file and the line"
+assert_contains "$SY8_OUT" "configs/app/creds.txt:1"
+
+# A refusal must not touch what the user had staged by hand, on the same path
+# or on another one.
+SY9="$(mktemp -d)"; _sec_env "$SY9"
+_sync_env "$SY9" "$SY9/repo" "$SY9/g.json" sync --commit >/dev/null
+printf 'mine\n' >"$SY9/repo/notes.txt"; git -C "$SY9/repo" add notes.txt
+printf 'hand-staged\n' >"$SY9/repo/configs/app/f.txt"; git -C "$SY9/repo" add configs/app/f.txt
+SY9_BEFORE="$(git -C "$SY9/repo" ls-files -s -- notes.txt configs/app/f.txt)"
+printf 'token = %s\n' "$_tok" >"$SY9/.config/app/f.txt"
+_sync_env "$SY9" "$SY9/repo" "$SY9/g.json" sync --commit >/dev/null
+
+it "a refusal leaves the user's own staging exactly as it was"
+assert_eq "$(git -C "$SY9/repo" ls-files -s -- notes.txt configs/app/f.txt)" "$SY9_BEFORE"

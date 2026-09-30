@@ -556,21 +556,9 @@ scan_secrets() {
 #
 # repo.bundle is skipped: it is a packfile, its contents were scanned as objects
 # a moment ago, and grepping compressed bytes finds nothing either way.
-#
-# scan_files <dir> <deny-file> <relpath>...
-# With paths after the deny-file, only those files under <dir> are scanned.
-# That is how sync scans exactly what a commit is about to take, before it
-# becomes history; the whole-directory form stays for the artefact.
 scan_files() {
     local dir="$1" file="$2" id re ci hit rc=0 patterns body
     [[ -d "$dir" && -f "$file" ]] || return 1
-    shift 2
-    local -a targets=("$dir")
-    if (( $# )); then
-        targets=()
-        local rel
-        for rel in "$@"; do targets+=("$dir/$rel"); done
-    fi
 
     local -a DENY_EXCEPTIONS=()
     mapfile -t DENY_EXCEPTIONS < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
@@ -614,7 +602,7 @@ scan_files() {
         # this one, so it is captured with `wait` on the substitution's own
         # PID instead of guessed at.
         local grc
-        local -a gflags=(-r -H -a -n -Z -E --exclude=repo.bundle)
+        local -a gflags=(-r -a -n -Z -E --exclude=repo.bundle)
         [[ "$ci" == true ]] && gflags+=(-i)
         local f rest
         while IFS= read -r -d '' f && IFS= read -r rest; do
@@ -622,7 +610,7 @@ scan_files() {
             body="${rest#*:}"
             _still_matches "$body" "$re" "$ci" || continue
             printf '%s\t%s\n' "$id" "${f#$dir/}:${rest:0:200}"
-        done < <(grep "${gflags[@]}" -e "$re" -- "${targets[@]}")
+        done < <(grep "${gflags[@]}" -e "$re" -- "$dir")
         wait "$!"; grc=$?
         if (( grc > 1 )); then
             printf '%somabackup: pattern %s could not be scanned over %s%s\n' \
@@ -631,6 +619,61 @@ scan_files() {
             continue
         fi
     done <<<"$patterns"
+    return $rc
+}
+
+# scan_index <repo> <deny-file> <index-file> <path>...
+# The same patterns, over the BLOBS the given index holds for <path>...: what a
+# commit made from that index records, byte for byte. sync uses it before
+# committing. Reading the worktree instead diverged from what was committed:
+# grep followed symlinks git stores as link text (and failed outright on one
+# that dangles), a clean filter changes what is stored, and a file rewritten
+# between the scan and `git commit -- paths` was recorded unscanned.
+#
+# Prints `<rule-id>\t<path>:<line>` per hit -- never the line itself: this
+# runs from a timer, and its report goes to the journal. Returns non-zero when
+# the scan could not be carried out.
+scan_index() {
+    local repo="$1" file="$2" idx="$3"; shift 3
+    local id re ci rc=0 patterns path ln body grc
+    [[ -f "$file" && -f "$idx" ]] || return 1
+    (( $# )) || return 0
+
+    local -a DENY_EXCEPTIONS=()
+    mapfile -t DENY_EXCEPTIONS < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
+
+    patterns="$(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' \
+                "$file" 2>/dev/null)" || return 1
+    if [[ -z "$patterns" ]]; then
+        printf '%somabackup: the deny-list yielded no patterns -- refusing to call this clean%s\n' \
+            "$RED" "$NC" >&2
+        return 1
+    fi
+
+    # The -z output carries NUL bytes, which a shell variable cannot hold, so
+    # it goes through a file. One git grep per pattern, its status kept: exit
+    # 1 is "no match", anything above is a scan that did not happen.
+    local out
+    out="$(mktemp "${TMPDIR:-/tmp}/omabackup-scan.XXXXXX")" || return 1
+    while IFS=$'\t' read -r id re ci; do
+        [[ -n "$id" && -n "$re" ]] || continue
+        local -a gflags=(-a -n -z -E)
+        [[ "$ci" == true ]] && gflags+=(-i)
+        GIT_INDEX_FILE="$idx" git -C "$repo" grep --cached "${gflags[@]}" \
+            -e "$re" -- "$@" >"$out" 2>/dev/null; grc=$?
+        if (( grc > 1 )); then
+            printf '%somabackup: pattern %s could not be scanned over the commit%s\n' \
+                "$RED" "$id" "$NC" >&2
+            rc=1
+            continue
+        fi
+        (( grc == 0 )) || continue
+        while IFS= read -r -d '' path && IFS= read -r -d '' ln && IFS= read -r body; do
+            _still_matches "$body" "$re" "$ci" || continue
+            printf '%s\t%s:%s\n' "$id" "$path" "$ln"
+        done <"$out"
+    done <<<"$patterns"
+    rm -f "$out"
     return $rc
 }
 
