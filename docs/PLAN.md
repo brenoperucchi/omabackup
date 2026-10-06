@@ -5565,6 +5565,52 @@ name plus content). Four mutants caught, one per gap. `sync` 84/0, full suite
 Omarchy links, parent equal to the captured base, branch `main`, reflog entry,
 no temporary files, clean status; 10.9 s in that worst case.
 
+**Extra review round `omabackup-71` (authorized by Breno), both
+REQUEST_CHANGES, converging.** rev-2's blocking finding: `post-index-change`
+hooks (from a file or from config) and `core.fsmonitor` run while the
+candidate is BUILT, inherit `GIT_INDEX_FILE`, and could add an entry outside
+`written[]`; the scan listed only `written[]` but `write-tree` wrote the whole
+index, so a token reached history (reproduced for all three). rev-2 was stuck
+on a permission dialog for its own probe script during the round and wrote
+its verdict after it timed out; the exec reproduced the same class
+independently from the probe visible in the pane. Both reviewers also found
+that directory names were not judged (the push scan reads tree names; a
+custom rule anchored on a directory slipped through) and that the
+`repo-ignored` coverage warning printed a file name before any scan. rev-1:
+`commit-tree` errors can print the identity. rev-2 (P3): the commit-object
+block did not tell "matched" from "could not scan", and every `update-ref`
+failure read "HEAD moved".
+
+**Fix.** The tree is written right after the candidate is built, and
+everything after works on that object: the change list comes from
+`diff-tree` between the base and the tree, with no pathspec; `scan_tree`
+(replacing `scan_index`) lists the tree with `ls-tree` and judges file names,
+every directory above them, and the blobs; `commit-tree` commits that tree.
+The commit is refused when any path that changes was not written by this run,
+clean or not -- the defence that does not depend on switching each hook off.
+Hooks and fsmonitor are switched off for every git call of the chain as well.
+Directory hits mark every path below them as secret for reporting. The
+ignored-file warning gives a count and the `git status --ignored` command, no
+name. `commit-tree` stderr goes to a temporary file and a fixed message is
+printed. The two messages now say what happened.
+
+**Found by the exec while doing it.** `(( ${#dirs[@]} )) && printf` returned 1
+with no directory at all, so a root-level-only change read as a scan that could
+not run; `sync` never publishes at the root, so it was latent, and a unit spec
+in `test/secrets.test.sh` now pins it. Two new specs were vacuous as first
+written -- `(( rc != 0 )) && assert ...` records nothing when rc is 0 -- and one
+of them was hiding the still-open subset gap; both now fail explicitly. A
+root-level CLI spec that passed with and without the bug was replaced by the
+unit one. The existing change-list failure shim was retargeted to `diff-tree`.
+
+Specs: fourteen new across `sync` and `secrets`; every one failed before its
+fix. Mutants caught: change list limited to `written[]` with hooks on, no
+directory names, the name back in the ignored warning, `commit-tree` stderr
+uncaptured, no subset check. `sync` 96/0, full suite **1534/0**. Real home
+into a throwaway clone, first full sync: 562 files, both Omarchy links, parent
+equal to the captured base, no temporary files, clean status, 10.5 s; a second
+sync reports up to date.
+
 **Open, for their own PRs:** `report_secrets` and the bundle's
 `refusing to build` still print the matched line (journal); publishing into
 the worktree during a merge is refused only with `--commit`.

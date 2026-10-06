@@ -510,7 +510,8 @@ SY5="$(mktemp -d)"; _sec_env "$SY5"; mkdir -p "$SY5/stub"
 cat >"$SY5/stub/git" <<SHIM
 #!/bin/bash
 nm=0; df=0
-for a in "\$@"; do [[ "\$a" == --name-only ]] && nm=1; [[ "\$a" == diff ]] && df=1; done
+# diff or diff-tree: the change list now comes from diff-tree on the written tree.
+for a in "\$@"; do [[ "\$a" == --name-only ]] && nm=1; [[ "\$a" == diff || "\$a" == diff-tree ]] && df=1; done
 (( nm && df )) && exit 128
 exec "$_REALGIT" "\$@"
 SHIM
@@ -886,3 +887,138 @@ it "a file with a token in both its name and its content is refused"
 
 it "and neither the name nor the content is printed"
 assert_not_contains "$SX6_OUT" "$_tok"
+
+# -- review round omabackup-71 ------------------------------------------------------
+# The push scan judges every TREE name too (rev-list --objects lists
+# directories). A rule anchored on a directory's own path never matched the
+# full path of the file below it.
+SY71A="$(mktemp -d)"; _sec_env "$SY71A"
+_dirtok="AKIA$(printf 'A%.0s' {1..16})"
+cat >"$SY71A/deny.json" <<JSON
+{"schemaVersion":1,"patterns":[
+ {"id":"dir-anchored","regex":"^configs/app/AKIA[A-Z0-9]{16}\$","reason":"test rule anchored on a directory"}]}
+JSON
+mkdir -p "$SY71A/.config/app/$_dirtok"
+printf 'clean\n' >"$SY71A/.config/app/$_dirtok/clean.txt"
+SY71A_OUT="$(OMABACKUP_SECRETS_DENY="$SY71A/deny.json" _sync_env "$SY71A" "$SY71A/repo" "$SY71A/g.json" sync --commit)"; SY71A_RC=$?
+
+it "a directory whose own name the deny-list matches is refused"
+(( SY71A_RC != 0 )) && ok || fail "a directory name the push scan would block was committed"
+
+it "and the directory name is not printed"
+assert_not_contains "$SY71A_OUT" "$_dirtok"
+
+# The coverage warning about a published file the repo ignores named that file
+# before any scan ran -- and the name can be the secret.
+SY71B="$(mktemp -d)"; _sec_env "$SY71B"
+printf '%s*\n' "configs/app/gh" >"$SY71B/repo/.gitignore"
+git -C "$SY71B/repo" add .gitignore && git -C "$SY71B/repo" commit -qm ignore
+printf 'harmless\n' >"$SY71B/.config/app/$_tok.txt"
+printf 'token = %s\n' "$_tok" >"$SY71B/.config/app/creds.txt"
+SY71B_OUT="$(_sync_env "$SY71B" "$SY71B/repo" "$SY71B/g.json" sync --commit)"
+
+it "the ignored-file warning never prints a file name"
+assert_not_contains "$SY71B_OUT" "$_tok"
+
+it "but still warns that something was dropped"
+assert_contains "$SY71B_OUT" "repo ignores"
+
+# git puts the identity into some of its own errors. A failing commit-tree must
+# not print it.
+SY71C="$(mktemp -d)"; _sec_env "$SY71C"
+_sync_env "$SY71C" "$SY71C/repo" "$SY71C/g.json" sync --commit >/dev/null
+printf 'changed\n' >"$SY71C/.config/app/f.txt"
+SY71C_OUT="$(GIT_AUTHOR_NAME="" GIT_COMMITTER_NAME="" GIT_AUTHOR_EMAIL="$_tok@example.test" GIT_COMMITTER_EMAIL="$_tok@example.test" \
+    _sync_env "$SY71C" "$SY71C/repo" "$SY71C/g.json" sync --commit)"; SY71C_RC=$?
+
+it "a commit-tree that fails on the identity does not print it"
+if (( SY71C_RC != 0 )); then assert_not_contains "$SY71C_OUT" "$_tok"
+else fail "the commit went ahead with an identity git should have refused"; fi
+
+# Hooks that run while the candidate is being BUILT (post-index-change, from a
+# file or from config) and core.fsmonitor. The tree is written before the scan
+# and only that tree is committed, so nothing they do can slip in -- and they
+# are switched off besides.
+for _v in file config fsmonitor; do
+    SY71D="$(mktemp -d)"; _sec_env "$SY71D"
+    _sync_env "$SY71D" "$SY71D/repo" "$SY71D/g.json" sync --commit >/dev/null
+    cat >"$SY71D/inj.sh" <<INJ
+#!/bin/bash
+printf 'token = %s\n' "$_tok" >"$SY71D/repo/sneak.txt"
+git -C "$SY71D/repo" add sneak.txt >/dev/null 2>&1
+INJ
+    chmod +x "$SY71D/inj.sh"
+    case "$_v" in
+        file)      cp "$SY71D/inj.sh" "$SY71D/repo/.git/hooks/post-index-change" ;;
+        config)    git -C "$SY71D/repo" config hook.pic.event post-index-change
+                   git -C "$SY71D/repo" config hook.pic.command "$SY71D/inj.sh" ;;
+        fsmonitor) printf 'printf "/\\0"\n' >>"$SY71D/inj.sh"
+                   git -C "$SY71D/repo" config core.fsmonitor "$SY71D/inj.sh" ;;
+    esac
+    printf 'changed\n' >"$SY71D/.config/app/f.txt"
+    _sync_env "$SY71D" "$SY71D/repo" "$SY71D/g.json" sync --commit >/dev/null
+    it "a $_v hook running while the candidate is built never reaches history"
+    assert_not_contains "$(git -C "$SY71D/repo" log -p --all 2>/dev/null)" "$_tok"
+done
+
+# The commit may only carry what this run wrote. Anything else that reached the
+# candidate -- by any route, hook or not -- refuses the commit, even when clean.
+# A git shim injects the entry right after the candidate's own `add`.
+SY71F="$(mktemp -d)"; _sec_env "$SY71F"; mkdir -p "$SY71F/stub"
+_sync_env "$SY71F" "$SY71F/repo" "$SY71F/g.json" sync --commit >/dev/null
+cat >"$SY71F/stub/git" <<SHIM
+#!/bin/bash
+"$_REALGIT" "\$@"; rc=\$?
+if [[ -n "\${GIT_INDEX_FILE:-}" ]]; then
+    for a in "\$@"; do
+        if [[ "\$a" == add ]]; then
+            oid=\$(printf 'clean but unasked\n' | "$_REALGIT" -C "$SY71F/repo" hash-object -w --stdin)
+            "$_REALGIT" -C "$SY71F/repo" update-index --add --cacheinfo "100644,\$oid,extra.txt"
+            break
+        fi
+    done
+fi
+exit \$rc
+SHIM
+chmod +x "$SY71F/stub/git"
+printf 'changed\n' >"$SY71F/.config/app/f.txt"
+PATH="$SY71F/stub:$PATH" _sync_env "$SY71F" "$SY71F/repo" "$SY71F/g.json" sync --commit >/dev/null; SY71F_RC=$?
+
+it "a path this run did not write never rides into the backup's commit"
+if (( SY71F_RC != 0 )); then assert_not_contains "$(git -C "$SY71F/repo" ls-tree -r --name-only HEAD)" "extra.txt"
+else fail "a path this run never wrote was committed"; fi
+
+# A commit-object scan that could not run is not a match, and must not send the
+# user to check their identity.
+SY71G="$(mktemp -d)"; _sec_env "$SY71G"; mkdir -p "$SY71G/stub"
+_sync_env "$SY71G" "$SY71G/repo" "$SY71G/g.json" sync --commit >/dev/null
+cat >"$SY71G/stub/git" <<SHIM
+#!/bin/bash
+c=0; m=0
+for a in "\$@"; do [[ "\$a" == cat-file ]] && c=1; [[ "\$a" == commit ]] && m=1; done
+(( c && m )) && exit 1
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SY71G/stub/git"
+printf 'changed\n' >"$SY71G/.config/app/f.txt"
+SY71G_OUT="$(PATH="$SY71G/stub:$PATH" _sync_env "$SY71G" "$SY71G/repo" "$SY71G/g.json" sync --commit)"
+
+it "a commit-object scan that cannot run says so, without blaming the identity"
+assert_contains "$SY71G_OUT" "could not complete"
+assert_not_contains "$SY71G_OUT" "user.name"
+
+# Every update-ref failure used to read "HEAD moved during the sync", a busy
+# ref lock included.
+SY71H="$(mktemp -d)"; _sec_env "$SY71H"; mkdir -p "$SY71H/stub"
+_sync_env "$SY71H" "$SY71H/repo" "$SY71H/g.json" sync --commit >/dev/null
+cat >"$SY71H/stub/git" <<SHIM
+#!/bin/bash
+for a in "\$@"; do [[ "\$a" == update-ref ]] && exit 1; done
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SY71H/stub/git"
+printf 'changed\n' >"$SY71H/.config/app/f.txt"
+SY71H_OUT="$(PATH="$SY71H/stub:$PATH" _sync_env "$SY71H" "$SY71H/repo" "$SY71H/g.json" sync --commit)"
+
+it "a failed branch update does not claim that HEAD moved"
+assert_not_contains "$SY71H_OUT" "HEAD moved"

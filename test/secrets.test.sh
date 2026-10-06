@@ -1151,3 +1151,22 @@ git -C "$CC" config grep.column true
 it "the history scan still finds a token with grep.column=true"
 [[ -n "$(scan_secrets "$CC" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
     && ok || fail "grep.column=true hid a token from the push gate"
+
+# -- scan_tree: a change with no directory above it --------------------------------
+# The names list (files, then the directories above them) was built with
+# `(( ${#dirs[@]} )) && printf ...`, which returns 1 when there is no directory
+# at all -- so a tree whose only change sits at the root read as a scan that
+# could not run. sync never publishes at the root today; scan_tree must not
+# depend on that.
+RT="$SH/root-tree"; git init -q "$RT"
+printf 'clean\n' >"$RT/top.txt"; git -C "$RT" add top.txt
+RT_TREE="$(git -C "$RT" write-tree)"; RT_WORK="$(mktemp -d)"
+scan_tree "$RT" "$PWD/secrets.deny.json" "$RT_TREE" "$RT_WORK" top.txt >/dev/null 2>&1; RT_RC=$?
+it "scan_tree judges a root-level-only change instead of failing"
+(( RT_RC == 0 )) && ok || fail "a clean root-level file made the scan report that it could not run"
+
+printf 'token = %s\n' "$_ctok" >"$RT/top.txt"; git -C "$RT" add top.txt
+RT_TREE="$(git -C "$RT" write-tree)"
+it "and still finds a token in that root-level file"
+[[ -n "$(scan_tree "$RT" "$PWD/secrets.deny.json" "$RT_TREE" "$RT_WORK" top.txt 2>/dev/null)" ]] \
+    && ok || fail "a token in a root-level file was missed"

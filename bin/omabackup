@@ -1347,7 +1347,8 @@ _sync_tmp_clean() {
     [[ -n "$_SYNC_TMPDIR" && -d "$_SYNC_TMPDIR" ]] || { _SYNC_TMPDIR=""; return 0; }
     rm -f "$_SYNC_TMPDIR/index" "$_SYNC_TMPDIR/index.lock" "$_SYNC_TMPDIR/list" \
           "$_SYNC_TMPDIR/entries" "$_SYNC_TMPDIR/raw" "$_SYNC_TMPDIR/blob" \
-          "$_SYNC_TMPDIR/blobn" "$_SYNC_TMPDIR/hits" "$_SYNC_TMPDIR/names"
+          "$_SYNC_TMPDIR/blobn" "$_SYNC_TMPDIR/hits" "$_SYNC_TMPDIR/names" \
+          "$_SYNC_TMPDIR/err"
     rmdir "$_SYNC_TMPDIR" 2>/dev/null
     _SYNC_TMPDIR=""
 }
@@ -1426,9 +1427,11 @@ cmd_sync() {
         done
     fi
     if (( ${#ignored[@]} )); then
+        # No file name here: this prints before the secret scan, and a name can
+        # be the secret (review omabackup-71). `git status --ignored` lists them.
         finding warn publish repo-ignored \
-            "${#ignored[@]} published, then dropped because the repo ignores them (e.g. ${ignored[0]})" \
-            "${ignored[0]}"
+            "${#ignored[@]} published, then dropped because the repo ignores them (git -C $(_tilde "$repo") status --ignored lists them)" \
+            "$(_tilde "$repo")"
     fi
 
     # Verify runs on every sync, once, before any decision about committing.
@@ -1513,8 +1516,17 @@ cmd_sync() {
     # Replacements off for the whole chain, not only the scan: a replaced BASE
     # commit would change the tree the candidate starts from, outside the
     # written paths where nothing is scanned or compared (scout omabackup-25).
-    _sync_idx() { GIT_NO_REPLACE_OBJECTS=1 GIT_LITERAL_PATHSPECS=1 GIT_INDEX_FILE="$tidx" git -C "$repo" "$@"; }
-    _sync_git() { GIT_NO_REPLACE_OBJECTS=1 git -C "$repo" "$@"; }
+    # No hook and no fsmonitor runs on any git call of this chain: building
+    # the candidate fires post-index-change (from a file or from config) and
+    # core.fsmonitor, both arbitrary commands inheriting GIT_INDEX_FILE, and
+    # each could add a path nobody scanned (review omabackup-71). The tree is
+    # also written before the scan, so even a hook that did run could not
+    # change what is judged and committed.
+    local -a _sync_quiet=(-c core.hooksPath=/dev/null -c core.fsmonitor=false
+                          -c hook.post-index-change.enabled=false
+                          -c hook.reference-transaction.enabled=false)
+    _sync_idx() { GIT_NO_REPLACE_OBJECTS=1 GIT_LITERAL_PATHSPECS=1 GIT_INDEX_FILE="$tidx" git -C "$repo" "${_sync_quiet[@]}" "$@"; }
+    _sync_git() { GIT_NO_REPLACE_OBJECTS=1 git -C "$repo" "${_sync_quiet[@]}" "$@"; }
 
     # The base is captured ONCE, before the candidate exists, and used for
     # everything after it: the tree it starts from, the comparison, the parent
@@ -1554,17 +1566,52 @@ cmd_sync() {
     # A list that could not be produced is not an empty list: nothing would be
     # scanned and the commit would go ahead. Deletions are left out -- there is
     # no blob to read.
+    # The tree is written NOW and everything after works on that object: the
+    # list of what changes comes from diff-tree between the base and this tree
+    # -- every path that differs, not only the ones this run wrote -- and the
+    # scan and the commit both use this same tree.
+    local tree
+    tree="$(_sync_idx write-tree)" \
+        || { _sync_tmp_clean; die "git write-tree failed in $(_tilde "$repo")"; }
     local -a changed=()
-    if ! _sync_idx diff --cached --name-only -z --diff-filter=d "$base_tree" -- "${written[@]}" >"$tdir/list"; then
+    if ! _sync_git diff-tree -r -z --name-only --no-renames --diff-filter=d \
+            "$base_tree" "$tree" >"$tdir/list"; then
         _sync_tmp_clean
         printf '\n%somabackup: not committing -- could not list what this commit would change%s\n' "$RED" "$NC" >&2
         return 1
     fi
     mapfile -d '' -t changed <"$tdir/list"
 
+    # Only what this run wrote may change. Anything else that reached the
+    # candidate -- a hook, an fsmonitor, a shim, a future git behaviour --
+    # refuses the commit even when it is clean: it would ride in under the
+    # backup's name. This holds whatever route the entry took, so it does not
+    # depend on having switched every hook off (review omabackup-71). The
+    # paths are counted, not printed: a name can be the secret.
+    local -a all_changed=()
+    if ! _sync_git diff-tree -r -z --name-only --no-renames \
+            "$base_tree" "$tree" >"$tdir/list"; then
+        _sync_tmp_clean
+        printf '\n%somabackup: not committing -- could not list what this commit would change%s\n' "$RED" "$NC" >&2
+        return 1
+    fi
+    mapfile -d '' -t all_changed <"$tdir/list"
+    local -A ours=()
+    local w stray=0
+    for w in "${written[@]}"; do ours["$w"]=1; done
+    for w in "${all_changed[@]}"; do [[ -n "${ours[$w]:-}" ]] || stray=$((stray + 1)); done
+    if (( stray )); then
+        _sync_tmp_clean
+        printf '\n%somabackup: not committing -- %d path(s) this run did not write reached the commit%s\n' \
+            "$RED" "$stray" "$NC" >&2
+        printf '  Something changed the candidate while it was being built (a hook, an\n' >&2
+        printf '  fsmonitor, a wrapper around git). Nothing was committed.\n' >&2
+        return 1
+    fi
+
     local sec_hits="" sec_rc=0
     if (( ${#changed[@]} )); then
-        sec_hits="$(scan_index "$repo" "$SECRETS_DENY_FILE" "$tidx" "$tdir" "${changed[@]}")" || sec_rc=1
+        sec_hits="$(scan_tree "$repo" "$SECRETS_DENY_FILE" "$tree" "$tdir" "${changed[@]}")" || sec_rc=1
     fi
     if (( sec_rc )) || [[ -n "$sec_hits" ]]; then
         _sync_tmp_clean
@@ -1608,17 +1655,20 @@ cmd_sync() {
     # reference-transaction, from a file or from config, so that event is
     # switched off for this one call (scout omabackup-25). Signing follows
     # commit.gpgSign as `git commit` did. Hand-made commits keep their hooks.
-    local tree new msg sflag=() cref
+    local new msg sflag=() cref
     msg="omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)"
     [[ "$(_sync_git config --bool commit.gpgSign 2>/dev/null)" == true ]] && sflag=(-S)
-    tree="$(_sync_idx write-tree)" \
-        || { _sync_tmp_clean; die "git write-tree failed in $(_tilde "$repo")"; }
-    if [[ -n "$base" ]]; then
-        new="$(_sync_git commit-tree "${sflag[@]}" "$tree" -p "$base" -m "$msg")" \
-            || { _sync_tmp_clean; die "git commit failed in $(_tilde "$repo")"; }
-    else
-        new="$(_sync_git commit-tree "${sflag[@]}" "$tree" -m "$msg")" \
-            || { _sync_tmp_clean; die "git commit failed in $(_tilde "$repo")"; }
+    # commit-tree's own errors are kept out of the output: git puts the
+    # identity into some of them ("empty ident name (for <email>)"), and the
+    # identity is exactly what the object scan below exists to judge.
+    local -a parent=()
+    [[ -n "$base" ]] && parent=(-p "$base")
+    if ! new="$(_sync_git commit-tree "${sflag[@]}" "$tree" "${parent[@]}" -m "$msg" 2>"$tdir/err")"; then
+        _sync_tmp_clean
+        printf '\n%somabackup: not committing -- git could not build the commit%s\n' "$RED" "$NC" >&2
+        printf '  Usually the identity: check user.name and user.email (not shown here),\n' >&2
+        printf '  and any GIT_AUTHOR_* / GIT_COMMITTER_* variables, or commit signing.\n' >&2
+        return 1
     fi
 
     # The commit OBJECT is scanned before any ref moves: author, committer and
@@ -1627,13 +1677,18 @@ cmd_sync() {
     sec_hits="$(scan_commit_object "$repo" "$SECRETS_DENY_FILE" "$tdir" "$new")" || sec_rc=1
     if (( sec_rc )) || [[ -n "$sec_hits" ]]; then
         _sync_tmp_clean
-        printf '\n%somabackup: not committing -- the deny-list matched the commit itself%s\n' "$RED" "$NC" >&2
-        local sid swhere
-        while IFS=$'\t' read -r sid swhere; do
-            [[ -n "$sid" ]] || continue
-            printf '  %s%s%s  %s\n' "$YELLOW" "$sid" "$NC" "$swhere" >&2
-        done <<<"$sec_hits"
-        printf '\n  Check user.name, user.email and any GIT_AUTHOR_* / GIT_COMMITTER_* variables.\n' >&2
+        if (( sec_rc )); then
+            printf '\n%somabackup: not committing -- the secret scan of the commit could not complete%s\n' "$RED" "$NC" >&2
+            printf '  A gate that cannot run is not a gate (docs/DESIGN.md §6).\n' >&2
+        else
+            printf '\n%somabackup: not committing -- the deny-list matched the commit itself%s\n' "$RED" "$NC" >&2
+            local sid swhere
+            while IFS=$'\t' read -r sid swhere; do
+                [[ -n "$sid" ]] || continue
+                printf '  %s%s%s  %s\n' "$YELLOW" "$sid" "$NC" "$swhere" >&2
+            done <<<"$sec_hits"
+            printf '\n  Check user.name, user.email and any GIT_AUTHOR_* / GIT_COMMITTER_* variables.\n' >&2
+        fi
         return 1
     fi
 
@@ -1644,12 +1699,17 @@ cmd_sync() {
         printf '\n%somabackup: not committing -- the checked-out branch changed during the sync%s\n' "$RED" "$NC" >&2
         return 1
     fi
-    local -a rt_off=(-c hook.reference-transaction.enabled=false -c core.hooksPath=/dev/null)
+    local -a rt_off=()   # already in _sync_git's own flags
     if [[ -n "$ref" ]]; then
         _sync_git "${rt_off[@]}" update-ref -m "$msg" "$ref" "$new" "$base"
     else
         _sync_git "${rt_off[@]}" update-ref --no-deref -m "$msg" HEAD "$new" "$base"
-    fi || { _sync_tmp_clean; die "git commit failed in $(_tilde "$repo") -- HEAD moved during the sync"; }
+    fi || {
+        # Not "HEAD moved": a busy ref lock fails here too, and git's own
+        # message above says which it was.
+        _sync_tmp_clean
+        die "could not move the branch in $(_tilde "$repo"); nothing was committed"
+    }
     _sync_tmp_clean
     # The user's index still holds the old blobs for these paths; left alone,
     # `git status` would show the commit being staged in reverse.

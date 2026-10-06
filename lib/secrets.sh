@@ -695,10 +695,12 @@ _scan_bytes() {
     return $rc
 }
 
-# scan_index <repo> <deny-file> <index-file> <workdir> <path>...
-# The deny-list over what a commit made from <index-file> would add for
-# <path>...: each blob READ by its object id, and the paths themselves. sync
-# runs it before committing.
+# scan_tree <repo> <deny-file> <tree-oid> <workdir> <path>...
+# The deny-list over what a commit of <tree-oid> adds at <path>...: each blob
+# READ by its object id, the file names, and the name of every directory above
+# them. sync runs it on the tree it has already written, before committing that
+# same tree -- an object, so nothing running afterwards (a hook, an fsmonitor,
+# a concurrent writer) can change what was judged (review omabackup-71).
 #
 # Reading the blob by id, rather than asking `git grep --cached` or grepping the
 # worktree, is what keeps the bytes judged equal to the bytes committed: git
@@ -707,31 +709,44 @@ _scan_bytes() {
 # follows symlinks git stores as text, ignores clean filters, and can change
 # before the commit (review rounds omabackup-68/69).
 #
-# File NAMES are judged first. The push scan reads every path in history, so a
-# name holding a token must refuse; and a name that hits is never printed --
-# not by its own hit, and not by a hit on its content or an error reading it,
-# which use its position in the list instead (scout analysis omabackup-25).
-# Every byte read lands in <workdir>, which the caller owns and removes on any
-# exit, signals included. Returns non-zero when the scan could not run.
-scan_index() {
-    local repo="$1" file="$2" idx="$3" work="$4"; shift 4
+# Names are judged first -- files and directories, because the push scan reads
+# every path and every tree name in history. A path whose name or any of whose
+# directories hits is never printed: not by that hit, not by a hit on its
+# content, not by an error reading it. It is reported by its position in the
+# list instead (scout omabackup-25, review omabackup-71). Every byte read lands
+# in <workdir>, which the caller owns and removes on any exit, signals
+# included. Returns non-zero when the scan could not run.
+scan_tree() {
+    local repo="$1" file="$2" tree="$3" work="$4"; shift 4
     local rc=0 i g line ln body label
-    [[ -f "$file" && -f "$idx" && -d "$work" ]] || return 1
+    [[ -f "$file" && -n "$tree" && -d "$work" ]] || return 1
     (( $# )) || return 0
 
-    local GIT_NO_REPLACE_OBJECTS=1 GIT_LITERAL_PATHSPECS=1
-    export GIT_NO_REPLACE_OBJECTS GIT_LITERAL_PATHSPECS
+    local GIT_NO_REPLACE_OBJECTS=1; export GIT_NO_REPLACE_OBJECTS
     local -a DENY_EXCEPTIONS=() ids=() res=() cis=() pre_cs=() pre_ci=()
     _scan_load_patterns "$file" || return 1
 
-    local -A pos=() secret_name=()
-    local p k=0
+    # One line per path, then one per distinct directory above them, so a hit's
+    # line number names exactly one entry. A newline inside a name becomes a
+    # space: a token never holds a newline, so this cannot hide a match.
+    local -A pos=() secret_pos=() dir_line=()
+    local -a dirs=()
+    local p d k=0 n="$#"
     for p in "$@"; do k=$((k + 1)); pos["$p"]=$k; done
-
-    # One line per path, so a hit's line number IS the path's position. A
-    # newline inside a name becomes a space: a token never holds a newline, so
-    # this cannot hide a match, and it keeps every later position aligned.
-    printf '%s\n' "${@//$'\n'/ }" >"$work/names" || return 1
+    for p in "$@"; do
+        d="$p"
+        while [[ "$d" == */* ]]; do
+            d="${d%/*}"
+            [[ -n "${dir_line[$d]:-}" ]] && continue
+            dirs+=("$d"); dir_line["$d"]=$(( n + ${#dirs[@]} ))
+        done
+    done
+    # `if`, not `&&`: with no directory at all the && form returned 1 and
+    # made every root-level-only commit look like a scan that could not run.
+    {
+        printf '%s\n' "${@//$'\n'/ }"
+        if (( ${#dirs[@]} )); then printf '%s\n' "${dirs[@]//$'\n'/ }"; fi
+    } >"$work/names" || return 1
     for i in "${!ids[@]}"; do
         local -a nflags=(-a -n -E --color=never)
         [[ "${cis[$i]}" == true ]] && nflags+=(-i)
@@ -745,31 +760,43 @@ scan_index() {
         while IFS= read -r line; do
             ln="${line%%:*}"; body="${line#*:}"
             _still_matches "$body" "${res[$i]}" "${cis[$i]}" || continue
-            printf '%s\t(a file NAME, not shown: changed path #%s)\n' "${ids[$i]}" "$ln"
-            secret_name["$ln"]=1
+            if (( ln <= n )); then
+                printf '%s\t(a file NAME, not shown: changed path #%s)\n' "${ids[$i]}" "$ln"
+                secret_pos["$ln"]=1
+            else
+                printf '%s\t(a directory NAME, not shown)\n' "${ids[$i]}"
+                d="${dirs[$(( ln - n - 1 ))]}"
+                k=0
+                for p in "$@"; do
+                    k=$((k + 1))
+                    [[ "$p" == "$d"/* ]] && secret_pos["$k"]=1
+                done
+            fi
         done <"$work/hits"
     done
 
-    if ! GIT_INDEX_FILE="$idx" git -C "$repo" ls-files -s -z -- "$@" >"$work/entries" 2>/dev/null; then
-        printf '%somabackup: cannot list the candidate commit -- refusing to call it clean%s\n' \
+    # The tree's own entries, not an index: ls-tree on the written object.
+    if ! git -C "$repo" ls-tree -r -z --full-tree "$tree" >"$work/entries" 2>/dev/null; then
+        printf '%somabackup: cannot list the tree it built -- refusing to call it clean%s\n' \
             "$RED" "$NC" >&2
         return 1
     fi
-    local rec meta mode oid path
+    local rec meta mode type oid path
     while IFS= read -r -d '' rec; do
         meta="${rec%%$'\t'*}"; path="${rec#*$'\t'}"
-        read -r mode oid _ <<<"$meta"
-        # Regular files and symlinks are blobs; a gitlink (160000) names a
-        # commit in another repository and has no content here.
-        case "$mode" in 100644|100755|120000) ;; *) continue ;; esac
-        k="${pos[$path]:-?}"
-        if [[ -n "${secret_name[$k]:-}" || "$path" == *$'\n'* || "$k" == '?' ]]; then
+        [[ -n "${pos[$path]:-}" ]] || continue
+        read -r mode type oid <<<"$meta"
+        # Regular files and symlinks are blobs; a gitlink names a commit in
+        # another repository and has no content here.
+        [[ "$type" == blob ]] || continue
+        k="${pos[$path]}"
+        if [[ -n "${secret_pos[$k]:-}" || "$path" == *$'\n'* ]]; then
             label="changed path #$k"
         else
             label="$path"
         fi
         if ! git -C "$repo" cat-file blob "$oid" >"$work/raw" 2>/dev/null; then
-            printf '%somabackup: cannot read %s from the candidate commit%s\n' "$RED" "$label" "$NC" >&2
+            printf '%somabackup: cannot read %s from the tree it built%s\n' "$RED" "$label" "$NC" >&2
             rc=1; continue
         fi
         _scan_bytes "$work/raw" "$work" "$label" || {
