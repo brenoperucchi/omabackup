@@ -558,7 +558,7 @@ it "the refusal never prints the credential itself"
 assert_not_contains "$SY8_OUT" "$_tok"
 
 it "but still points at the file and the line"
-assert_contains "$SY8_OUT" "configs/app/creds.txt:1"
+assert_contains "$SY8_OUT" "configs/app/creds.txt, line 1"
 
 # A refusal must not touch what the user had staged by hand, on the same path
 # or on another one.
@@ -782,3 +782,107 @@ it "a collected file whose name holds a token is refused"
 
 it "and the refusal does not print that name in full"
 assert_not_contains "$SN1_OUT" "$_tok"
+
+# -- scout analysis omabackup-25 ------------------------------------------------------
+# A: the commit OBJECT carries author and committer, and the push scan reads raw
+# commit objects. A token in user.name passed every blob check and was written
+# into history by commit-tree.
+SX1="$(mktemp -d)"; _sec_env "$SX1"
+_sync_env "$SX1" "$SX1/repo" "$SX1/g.json" sync --commit >/dev/null
+SX1_HEAD="$(git -C "$SX1/repo" rev-parse HEAD)"
+printf 'changed\n' >"$SX1/.config/app/f.txt"
+SX1_OUT="$(GIT_AUTHOR_NAME="$_tok" GIT_COMMITTER_NAME="$_tok" _sync_env "$SX1" "$SX1/repo" "$SX1/g.json" sync --commit)"; SX1_RC=$?
+
+it "a token in the commit's author or committer is refused before any ref moves"
+(( SX1_RC != 0 )) && [[ "$(git -C "$SX1/repo" rev-parse HEAD)" == "$SX1_HEAD" ]] \
+    && ok || fail "commit-tree wrote a token into the commit header and HEAD moved"
+
+it "and the refusal does not print the header"
+assert_not_contains "$SX1_OUT" "$_tok"
+
+# B: the candidate is built from one HEAD; the commit must sit on that same HEAD.
+# A commit the user makes while the sync scans moved HEAD, the old code re-read
+# it as the parent, and the backup's tree -- built from the earlier HEAD --
+# silently reverted the user's change.
+SX2="$(mktemp -d)"; _sec_env "$SX2"; mkdir -p "$SX2/stub"
+_sync_env "$SX2" "$SX2/repo" "$SX2/g.json" sync --commit >/dev/null
+cat >"$SX2/stub/git" <<SHIM
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == cat-file && ! -e "$SX2/done" ]]; then
+        : >"$SX2/done"
+        printf 'user edit\n' >"$SX2/repo/README.md"
+        env -u GIT_INDEX_FILE "$_REALGIT" -C "$SX2/repo" commit -qam "user commit" >/dev/null 2>&1
+        break
+    fi
+done
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SX2/stub/git"
+printf 'changed\n' >"$SX2/.config/app/f.txt"
+PATH="$SX2/stub:$PATH" _sync_env "$SX2" "$SX2/repo" "$SX2/g.json" sync --commit >/dev/null
+
+it "a commit made during the sync is never reverted by the backup"
+assert_eq "$(git -C "$SX2/repo" show HEAD:README.md 2>/dev/null)" "user edit"
+
+# The branch is fixed too: switching to another branch at the same commit must
+# not land the backup on it.
+SX3="$(mktemp -d)"; _sec_env "$SX3"; mkdir -p "$SX3/stub"
+_sync_env "$SX3" "$SX3/repo" "$SX3/g.json" sync --commit >/dev/null
+SX3_BR="$(git -C "$SX3/repo" symbolic-ref --short HEAD)"
+cat >"$SX3/stub/git" <<SHIM
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == cat-file && ! -e "$SX3/done" ]]; then
+        : >"$SX3/done"
+        env -u GIT_INDEX_FILE "$_REALGIT" -C "$SX3/repo" checkout -q -b other >/dev/null 2>&1
+        break
+    fi
+done
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SX3/stub/git"
+printf 'changed\n' >"$SX3/.config/app/f.txt"
+PATH="$SX3/stub:$PATH" _sync_env "$SX3" "$SX3/repo" "$SX3/g.json" sync --commit >/dev/null
+
+it "a branch switched to during the sync does not receive the backup"
+assert_eq "$(git -C "$SX3/repo" rev-parse other)" "$(git -C "$SX3/repo" rev-parse "$SX3_BR")"
+
+# A replacement of the BASE commit would change the tree the candidate starts
+# from -- outside the written paths, where nothing is scanned or compared.
+SX4="$(mktemp -d)"; _sec_env "$SX4"
+_sync_env "$SX4" "$SX4/repo" "$SX4/g.json" sync --commit >/dev/null
+_empty="$(git -C "$SX4/repo" hash-object -t tree /dev/null)"
+_fake="$(git -C "$SX4/repo" commit-tree "$_empty" -m fake)"
+git -C "$SX4/repo" replace HEAD "$_fake"
+printf 'changed\n' >"$SX4/.config/app/f.txt"
+_sync_env "$SX4" "$SX4/repo" "$SX4/g.json" sync --commit >/dev/null
+
+it "a replaced base commit cannot drop files from the backup's commit"
+assert_contains "$(GIT_NO_REPLACE_OBJECTS=1 git -C "$SX4/repo" ls-tree -r --name-only HEAD)" "README.md"
+
+# C: update-ref runs reference-transaction, from a file or from config. A hook
+# that fails stopped every backup; one that prints reached the journal.
+SX5="$(mktemp -d)"; _sec_env "$SX5"
+_sync_env "$SX5" "$SX5/repo" "$SX5/g.json" sync --commit >/dev/null
+printf '#!/bin/sh\necho FILE >>%s/ran\nexit 1\n' "$SX5" >"$SX5/repo/.git/hooks/reference-transaction"
+chmod +x "$SX5/repo/.git/hooks/reference-transaction"
+git -C "$SX5/repo" config hook.rt.event reference-transaction
+git -C "$SX5/repo" config hook.rt.command "echo CFG >>$SX5/ran; exit 1"
+printf 'changed\n' >"$SX5/.config/app/f.txt"
+_sync_env "$SX5" "$SX5/repo" "$SX5/g.json" sync --commit >/dev/null
+
+it "no reference-transaction hook runs for the backup's commit"
+[[ ! -e "$SX5/ran" && "$(_commits "$SX5/repo")" == 3 ]] \
+    && ok || fail "a reference-transaction hook ran (or blocked the commit)"
+
+# D: a content hit printed the path, and the path itself can be the secret.
+SX6="$(mktemp -d)"; _sec_env "$SX6"
+printf 'token = %s\n' "$_tok" >"$SX6/.config/app/$_tok.conf"
+SX6_OUT="$(_sync_env "$SX6" "$SX6/repo" "$SX6/g.json" sync --commit)"; SX6_RC=$?
+
+it "a file with a token in both its name and its content is refused"
+(( SX6_RC != 0 )) && ok || fail "not refused"
+
+it "and neither the name nor the content is printed"
+assert_not_contains "$SX6_OUT" "$_tok"

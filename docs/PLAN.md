@@ -5523,6 +5523,48 @@ The scout's third analysis could not be dispatched: `herdr-ask` refused
 because `omabackup-scout` reported `agent_status: unknown`, with a stray
 letter in its compose box. Nothing was sent to the pane.
 
+**Scout analysis `omabackup-25` (third analysis) held the merge with four
+gaps and one contract question; Breno approved both the fixes and an extra
+review round on 2026-10-06, and chose to document the concurrency premise.**
+
+- **A, commit metadata.** The push scan reads raw commit objects; a token in
+  `user.name` or `GIT_AUTHOR_NAME` passed every blob check and commit-tree wrote
+  it into the header. `scan_commit_object` now scans the built commit, read with
+  replacements off, before any ref moves; a refused object stays unreferenced.
+- **B, late base.** The candidate was built from one HEAD but the parent and
+  the compare-and-swap re-read HEAD at the end, so a commit the user made during
+  the scan became the parent of a tree built from the earlier HEAD -- the
+  backup silently reverted their change. The base OID and the branch are now
+  captured once, before the candidate, and used for the tree, the comparison,
+  the parent and the swap; `update-ref` targets that branch explicitly, and a
+  branch switch refuses. Replacements are off for the whole chain, since a
+  replaced base commit would change the inherited tree.
+- **C, reference-transaction.** `update-ref` runs that hook, from a file or
+  config; it is switched off for this one call with
+  `-c hook.reference-transaction.enabled=false -c core.hooksPath=/dev/null`
+  (verified on git 2.55: without them both hooks run and abort; with them none
+  runs).
+- **D, path in a content hit.** A content hit or a read error printed the path,
+  and the path can be the secret. Names are now judged first, and any path
+  whose name hits is reported only by its position; a newline inside a name
+  becomes a space in the names list so positions stay aligned.
+- **Concurrency premise (Breno's choice).** sync assumes no git operation
+  starts in the repository during its last seconds. A HEAD or branch that moves
+  is caught by the fixed base and the swap; an operation that begins after the
+  last check without moving HEAD is not. Recorded in the code.
+
+The scanner was refactored so the index and the commit object share one
+pattern loader (`_scan_load_patterns`) and one byte judge (`_scan_bytes`).
+Hits now read `<rule> <label>, line <n>`; the one spec that asserted the old
+`path:line` form was updated to the new form, same intent.
+
+Specs: seven, six failing before (author/committer, a commit during the sync,
+a branch switch, a replaced base, reference-transaction file and config hooks,
+name plus content). Four mutants caught, one per gap. `sync` 84/0, full suite
+**1520/0**. Real home into a throwaway clone, first full sync: 562 files, both
+Omarchy links, parent equal to the captured base, branch `main`, reflog entry,
+no temporary files, clean status; 10.9 s in that worst case.
+
 **Open, for their own PRs:** `report_secrets` and the bundle's
 `refusing to build` still print the matched line (journal); publishing into
 the worktree during a merge is refused only with `--commit`.

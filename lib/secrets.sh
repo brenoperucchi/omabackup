@@ -627,43 +627,15 @@ scan_files() {
     return $rc
 }
 
-# scan_index <repo> <deny-file> <index-file> <workdir> <path>...
-# The same patterns, over the blobs the given index holds for <path>... -- what
-# a commit made from that index records. sync runs it before committing.
-#
-# Each blob is READ by its object id and grepped as bytes, rather than trusting
-# `git grep --cached` to report on it. Two review rounds found that grepping
-# through git judged something other than what was committed: it follows the
-# user's color.ui/grep.column settings into the output, it skips symlink
-# entries whose link TEXT is stored, and it reads through `git replace`. And the
-# worktree is not the commit either: grep follows symlinks git stores as text,
-# a clean filter changes what is stored, and a file can change between a scan
-# and `git commit -- paths`.
-#
-# A blob holding NULs is judged twice, and a hit in either counts. With the
-# NULs deleted, it reads exactly as the push scan reads it (git grep matches
-# the raw bytes, then bash drops the NULs before the second pass), so nothing
-# the push gate would block can pass here -- a secret value with a NUL inside
-# it included (review omabackup-70). With each NUL turned into a line break,
-# a token right after a NUL keeps its word boundary, which deleting would take
-# away. Neither form alone covered both.
-#
-# Every byte read lands in <workdir>, which the caller owns and removes on any
-# exit, signals included. Prints `<rule-id>\t<path>:<line>` per hit -- never
-# the line, because this runs from a timer whose output reaches the journal.
-# Returns non-zero when the scan could not be carried out.
-scan_index() {
-    local repo="$1" file="$2" idx="$3" work="$4"; shift 4
-    local id re ci rc=0 patterns g i
-    [[ -f "$file" && -f "$idx" && -d "$work" ]] || return 1
-    (( $# )) || return 0
-
-    local GIT_NO_REPLACE_OBJECTS=1 GIT_LITERAL_PATHSPECS=1
-    export GIT_NO_REPLACE_OBJECTS GIT_LITERAL_PATHSPECS
-
-    local -a DENY_EXCEPTIONS=()
+# _scan_load_patterns <deny-file>
+# Fills the CALLER's ids/res/cis/pre_cs/pre_ci arrays and DENY_EXCEPTIONS
+# (bash scopes dynamically). The prefilter is split by each rule's own case
+# sensitivity: under -i a negated class such as [^A] also excludes `a`, so one
+# case-insensitive pass is not a superset of the exact ones (review
+# omabackup-70).
+_scan_load_patterns() {
+    local file="$1" patterns id re ci
     mapfile -t DENY_EXCEPTIONS < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
-
     patterns="$(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' \
                 "$file" 2>/dev/null)" || return 1
     if [[ -z "$patterns" ]]; then
@@ -671,105 +643,162 @@ scan_index() {
             "$RED" "$NC" >&2
         return 1
     fi
-    # The prefilter is split by each rule's own case sensitivity. A single
-    # case-insensitive pass is not a superset: under -i a negated class such
-    # as [^A] also excludes `a`, so it could skip a file a case-sensitive
-    # rule matches (review omabackup-70).
-    local -a ids=() res=() cis=() pre_cs=() pre_ci=()
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
         ids+=("$id"); res+=("$re"); cis+=("$ci")
         if [[ "$ci" == true ]]; then pre_ci+=(-e "$re"); else pre_cs+=(-e "$re"); fi
     done <<<"$patterns"
+}
+
+# _scan_bytes <raw-file> <work> <label>
+# Judges one byte stream against the caller's loaded patterns and prints
+# `<rule-id>\t<label>, line <n>` per hit -- never the line. A stream holding
+# NULs is judged twice, and a hit in either counts: with the NULs deleted it
+# reads exactly as the push scan reads it (git grep matches the raw bytes, then
+# bash drops the NULs before the second pass), so nothing the push gate would
+# block can pass here; with each NUL as a line break, a token right after a NUL
+# keeps its word boundary. Returns non-zero when the scan could not run.
+_scan_bytes() {
+    local raw="$1" work="$2" label="$3" view i g hit_any line ln body rc=0
+    tr -d '\0' <"$raw" >"$work/blob" || return 1
+    local -a views=("$work/blob")
+    if [[ "$(wc -c <"$raw")" != "$(wc -c <"$work/blob")" ]]; then
+        tr '\0' '\n' <"$raw" >"$work/blobn" || return 1
+        views+=("$work/blobn")
+    fi
+    for view in "${views[@]}"; do
+        hit_any=0
+        if (( ${#pre_cs[@]} )); then
+            grep -a -q -E --color=never "${pre_cs[@]}" -- "$view"; g=$?
+            (( g > 1 )) && return 1
+            (( g == 0 )) && hit_any=1
+        fi
+        if (( ! hit_any && ${#pre_ci[@]} )); then
+            grep -a -q -i -E --color=never "${pre_ci[@]}" -- "$view"; g=$?
+            (( g > 1 )) && return 1
+            (( g == 0 )) && hit_any=1
+        fi
+        (( hit_any )) || continue
+        for i in "${!ids[@]}"; do
+            local -a gflags=(-a -n -E --color=never)
+            [[ "${cis[$i]}" == true ]] && gflags+=(-i)
+            grep "${gflags[@]}" -e "${res[$i]}" -- "$view" >"$work/hits"; g=$?
+            (( g == 1 )) && continue
+            (( g > 1 )) && { rc=1; continue; }
+            while IFS= read -r line; do
+                ln="${line%%:*}"; body="${line#*:}"
+                _still_matches "$body" "${res[$i]}" "${cis[$i]}" || continue
+                printf '%s\t%s, line %s\n' "${ids[$i]}" "$label" "$ln"
+            done <"$work/hits"
+        done
+    done
+    return $rc
+}
+
+# scan_index <repo> <deny-file> <index-file> <workdir> <path>...
+# The deny-list over what a commit made from <index-file> would add for
+# <path>...: each blob READ by its object id, and the paths themselves. sync
+# runs it before committing.
+#
+# Reading the blob by id, rather than asking `git grep --cached` or grepping the
+# worktree, is what keeps the bytes judged equal to the bytes committed: git
+# grep follows color.ui/grep.column into its output, skips symlink entries
+# (whose link TEXT is stored) and reads through `git replace`; the worktree
+# follows symlinks git stores as text, ignores clean filters, and can change
+# before the commit (review rounds omabackup-68/69).
+#
+# File NAMES are judged first. The push scan reads every path in history, so a
+# name holding a token must refuse; and a name that hits is never printed --
+# not by its own hit, and not by a hit on its content or an error reading it,
+# which use its position in the list instead (scout analysis omabackup-25).
+# Every byte read lands in <workdir>, which the caller owns and removes on any
+# exit, signals included. Returns non-zero when the scan could not run.
+scan_index() {
+    local repo="$1" file="$2" idx="$3" work="$4"; shift 4
+    local rc=0 i g line ln body label
+    [[ -f "$file" && -f "$idx" && -d "$work" ]] || return 1
+    (( $# )) || return 0
+
+    local GIT_NO_REPLACE_OBJECTS=1 GIT_LITERAL_PATHSPECS=1
+    export GIT_NO_REPLACE_OBJECTS GIT_LITERAL_PATHSPECS
+    local -a DENY_EXCEPTIONS=() ids=() res=() cis=() pre_cs=() pre_ci=()
+    _scan_load_patterns "$file" || return 1
+
+    local -A pos=() secret_name=()
+    local p k=0
+    for p in "$@"; do k=$((k + 1)); pos["$p"]=$k; done
+
+    # One line per path, so a hit's line number IS the path's position. A
+    # newline inside a name becomes a space: a token never holds a newline, so
+    # this cannot hide a match, and it keeps every later position aligned.
+    printf '%s\n' "${@//$'\n'/ }" >"$work/names" || return 1
+    for i in "${!ids[@]}"; do
+        local -a nflags=(-a -n -E --color=never)
+        [[ "${cis[$i]}" == true ]] && nflags+=(-i)
+        grep "${nflags[@]}" -e "${res[$i]}" -- "$work/names" >"$work/hits"; g=$?
+        (( g == 1 )) && continue
+        if (( g > 1 )); then
+            printf '%somabackup: pattern %s could not be scanned over the file names%s\n' \
+                "$RED" "${ids[$i]}" "$NC" >&2
+            rc=1; continue
+        fi
+        while IFS= read -r line; do
+            ln="${line%%:*}"; body="${line#*:}"
+            _still_matches "$body" "${res[$i]}" "${cis[$i]}" || continue
+            printf '%s\t(a file NAME, not shown: changed path #%s)\n' "${ids[$i]}" "$ln"
+            secret_name["$ln"]=1
+        done <"$work/hits"
+    done
 
     if ! GIT_INDEX_FILE="$idx" git -C "$repo" ls-files -s -z -- "$@" >"$work/entries" 2>/dev/null; then
         printf '%somabackup: cannot list the candidate commit -- refusing to call it clean%s\n' \
             "$RED" "$NC" >&2
         return 1
     fi
-
-    local rec meta mode oid path line ln body view hit_any g2 rsz vsz
-    local _had_pipefail=0; [[ -o pipefail ]] && _had_pipefail=1
-    set -o pipefail
+    local rec meta mode oid path
     while IFS= read -r -d '' rec; do
         meta="${rec%%$'\t'*}"; path="${rec#*$'\t'}"
         read -r mode oid _ <<<"$meta"
         # Regular files and symlinks are blobs; a gitlink (160000) names a
         # commit in another repository and has no content here.
         case "$mode" in 100644|100755|120000) ;; *) continue ;; esac
-        if ! git -C "$repo" cat-file blob "$oid" >"$work/raw" 2>/dev/null \
-            || ! tr -d '\0' <"$work/raw" >"$work/blob"; then
-            printf '%somabackup: cannot read %s from the candidate commit%s\n' "$RED" "$path" "$NC" >&2
+        k="${pos[$path]:-?}"
+        if [[ -n "${secret_name[$k]:-}" || "$path" == *$'\n'* || "$k" == '?' ]]; then
+            label="changed path #$k"
+        else
+            label="$path"
+        fi
+        if ! git -C "$repo" cat-file blob "$oid" >"$work/raw" 2>/dev/null; then
+            printf '%somabackup: cannot read %s from the candidate commit%s\n' "$RED" "$label" "$NC" >&2
             rc=1; continue
         fi
-        local -a views=("$work/blob")
-        rsz="$(wc -c <"$work/raw")"; vsz="$(wc -c <"$work/blob")"
-        if [[ "$rsz" != "$vsz" ]]; then
-            if ! tr '\0' '\n' <"$work/raw" >"$work/blobn"; then
-                printf '%somabackup: cannot read %s from the candidate commit%s\n' "$RED" "$path" "$NC" >&2
-                rc=1; continue
-            fi
-            views+=("$work/blobn")
-        fi
-        for view in "${views[@]}"; do
-            # Prefilter: one pass per case group, so it can only let a file
-            # through to the exact passes, never skip one.
-            hit_any=0
-            if (( ${#pre_cs[@]} )); then
-                grep -a -q -E --color=never "${pre_cs[@]}" -- "$view"; g=$?
-                (( g > 1 )) && { printf '%somabackup: cannot scan %s%s\n' "$RED" "$path" "$NC" >&2; rc=1; continue; }
-                (( g == 0 )) && hit_any=1
-            fi
-            if (( ! hit_any && ${#pre_ci[@]} )); then
-                grep -a -q -i -E --color=never "${pre_ci[@]}" -- "$view"; g2=$?
-                (( g2 > 1 )) && { printf '%somabackup: cannot scan %s%s\n' "$RED" "$path" "$NC" >&2; rc=1; continue; }
-                (( g2 == 0 )) && hit_any=1
-            fi
-            (( hit_any )) || continue
-            for i in "${!ids[@]}"; do
-                local -a gflags=(-a -n -E --color=never)
-                [[ "${cis[$i]}" == true ]] && gflags+=(-i)
-                grep "${gflags[@]}" -e "${res[$i]}" -- "$view" >"$work/hits"; g=$?
-                (( g == 1 )) && continue
-                if (( g > 1 )); then
-                    printf '%somabackup: pattern %s could not be scanned over %s%s\n' \
-                        "$RED" "${ids[$i]}" "$path" "$NC" >&2
-                    rc=1; continue
-                fi
-                while IFS= read -r line; do
-                    ln="${line%%:*}"; body="${line#*:}"
-                    _still_matches "$body" "${res[$i]}" "${cis[$i]}" || continue
-                    printf '%s\t%s:%s\n' "${ids[$i]}" "$path" "$ln"
-                done <"$work/hits"
-            done
-        done
+        _scan_bytes "$work/raw" "$work" "$label" || {
+            printf '%somabackup: cannot scan %s%s\n' "$RED" "$label" "$NC" >&2
+            rc=1
+        }
     done <"$work/entries"
-
-    # File NAMES too. The push scan reads every path in history, so a
-    # collected file whose name holds a token would pass a content-only scan,
-    # be committed, and block push for good. The name is not printed -- it is
-    # the secret -- only its position in the list of changed paths.
-    printf '%s\n' "$@" >"$work/names" || { printf '%somabackup: cannot scan the file names%s\n' "$RED" "$NC" >&2; rc=1; }
-    if [[ -f "$work/names" ]]; then
-        for i in "${!ids[@]}"; do
-            local -a nflags=(-a -n -E --color=never)
-            [[ "${cis[$i]}" == true ]] && nflags+=(-i)
-            grep "${nflags[@]}" -e "${res[$i]}" -- "$work/names" >"$work/hits"; g=$?
-            (( g == 1 )) && continue
-            if (( g > 1 )); then
-                printf '%somabackup: pattern %s could not be scanned over the file names%s\n' \
-                    "$RED" "${ids[$i]}" "$NC" >&2
-                rc=1; continue
-            fi
-            while IFS= read -r line; do
-                ln="${line%%:*}"; body="${line#*:}"
-                _still_matches "$body" "${res[$i]}" "${cis[$i]}" || continue
-                printf '%s\t(a file NAME, not shown: changed path #%s)\n' "${ids[$i]}" "$ln"
-            done <"$work/hits"
-        done
-    fi
-    (( _had_pipefail )) || set +o pipefail
     return $rc
+}
+
+# scan_commit_object <repo> <deny-file> <workdir> <commit-oid>
+# The deny-list over a commit object as git stores it -- author, committer,
+# every header and the message -- read with replacements off. The push scan
+# reads raw commit objects, so a token in user.name or GIT_AUTHOR_NAME passed
+# every blob check and was written by commit-tree (scout omabackup-25). sync
+# runs this on the commit it has built, BEFORE moving any ref. Hits name only
+# the line of the object; the header itself is never printed.
+scan_commit_object() {
+    local repo="$1" file="$2" work="$3" oid="$4"
+    [[ -f "$file" && -d "$work" && -n "$oid" ]] || return 1
+    local GIT_NO_REPLACE_OBJECTS=1; export GIT_NO_REPLACE_OBJECTS
+    local -a DENY_EXCEPTIONS=() ids=() res=() cis=() pre_cs=() pre_ci=()
+    _scan_load_patterns "$file" || return 1
+    git -C "$repo" cat-file commit "$oid" >"$work/raw" 2>/dev/null || {
+        printf '%somabackup: cannot read the commit it built -- refusing to call it clean%s\n' \
+            "$RED" "$NC" >&2
+        return 1
+    }
+    _scan_bytes "$work/raw" "$work" "the commit's own header or message"
 }
 
 report_secrets() {  # report_secrets <repo> <deny-file>

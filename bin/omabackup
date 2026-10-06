@@ -1510,16 +1510,41 @@ cmd_sync() {
     _SYNC_TMPDIR="$tdir"
     # Literal pathspecs: a published name like `a[1].txt` is a path, not a glob
     # that also matches a draft `a1.txt` this run never wrote.
-    _sync_idx() { GIT_LITERAL_PATHSPECS=1 GIT_INDEX_FILE="$tidx" git -C "$repo" "$@"; }
+    # Replacements off for the whole chain, not only the scan: a replaced BASE
+    # commit would change the tree the candidate starts from, outside the
+    # written paths where nothing is scanned or compared (scout omabackup-25).
+    _sync_idx() { GIT_NO_REPLACE_OBJECTS=1 GIT_LITERAL_PATHSPECS=1 GIT_INDEX_FILE="$tidx" git -C "$repo" "$@"; }
+    _sync_git() { GIT_NO_REPLACE_OBJECTS=1 git -C "$repo" "$@"; }
 
-    if git -C "$repo" rev-parse -q --verify HEAD >/dev/null 2>&1; then
-        _sync_idx read-tree HEAD
+    # The base is captured ONCE, before the candidate exists, and used for
+    # everything after it: the tree it starts from, the comparison, the parent
+    # and the compare-and-swap. Re-reading HEAD at the end let a commit the
+    # user made during the scan become the parent of a tree built from the
+    # earlier HEAD -- the backup silently reverted their change. The branch is
+    # fixed the same way, so switching branches mid-sync cannot land it there.
+    #
+    # Concurrency premise (decided 2026-10-06): sync assumes no git operation
+    # STARTS in the repository during its last seconds. A HEAD or branch that
+    # moves is caught here and by the compare-and-swap; an operation that
+    # begins after the last check without moving HEAD is not. A full lock that
+    # every manual git command would honour does not exist.
+    local base base_tree ref
+    if base="$(_sync_git rev-parse -q --verify HEAD 2>/dev/null)"; then
+        base_tree="$base"
+    else
+        base=""
+        base_tree="$(_sync_git hash-object -t tree /dev/null)" \
+            || { _sync_tmp_clean; die "cannot compute the empty tree in $(_tilde "$repo")"; }
+    fi
+    ref="$(_sync_git symbolic-ref -q HEAD 2>/dev/null)" || ref=""
+    if [[ -n "$base" ]]; then
+        _sync_idx read-tree "$base"
     else
         _sync_idx read-tree --empty
     fi || { _sync_tmp_clean; die "cannot build a candidate index in $(_tilde "$repo")"; }
     _sync_idx add -- "${written[@]}" \
         || { _sync_tmp_clean; die "git add failed in $(_tilde "$repo")"; }
-    if _sync_idx diff --cached --quiet -- "${written[@]}"; then
+    if _sync_idx diff --cached --quiet "$base_tree" -- "${written[@]}"; then
         _sync_tmp_clean
         record_sync_success || printf '  %s!%s could not record this run; the next check may call it stale\n' "$YELLOW" "$NC"
         printf '  %sup to date%s -- nothing of ours left to commit\n' "$DIM" "$NC"
@@ -1530,7 +1555,7 @@ cmd_sync() {
     # scanned and the commit would go ahead. Deletions are left out -- there is
     # no blob to read.
     local -a changed=()
-    if ! _sync_idx diff --cached --name-only -z --diff-filter=d -- "${written[@]}" >"$tdir/list"; then
+    if ! _sync_idx diff --cached --name-only -z --diff-filter=d "$base_tree" -- "${written[@]}" >"$tdir/list"; then
         _sync_tmp_clean
         printf '\n%somabackup: not committing -- could not list what this commit would change%s\n' "$RED" "$NC" >&2
         return 1
@@ -1575,30 +1600,56 @@ cmd_sync() {
         return 1
     fi
 
-    # Committed through plumbing: write-tree, commit-tree, update-ref. None of
-    # them runs a hook of any origin. `git commit` ran them even with an empty
-    # hooks path and --no-verify, because hooks can also be defined in config
-    # (hook.<name>.event), and a prepare-commit-msg could put a token into the
-    # message after the scan, or fail and stop every backup (review
-    # omabackup-70). The tree committed is the candidate's, the message is
-    # exactly this one, and update-ref compares-and-swaps HEAD, so a HEAD that
-    # moved meanwhile makes this refuse instead of overwrite. Signing follows
+    # Committed through plumbing: write-tree, commit-tree, update-ref. `git
+    # commit` ran hooks even with an empty hooks path and --no-verify, because
+    # hooks can also be defined in config (hook.<name>.event) -- a
+    # prepare-commit-msg could put a token into the message after the scan, or
+    # fail and stop every backup (review omabackup-70). update-ref still runs
+    # reference-transaction, from a file or from config, so that event is
+    # switched off for this one call (scout omabackup-25). Signing follows
     # commit.gpgSign as `git commit` did. Hand-made commits keep their hooks.
-    local tree old new msg sflag=()
+    local tree new msg sflag=() cref
     msg="omabackup: sync $(date -u '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo now)"
-    [[ "$(git -C "$repo" config --bool commit.gpgSign 2>/dev/null)" == true ]] && sflag=(-S)
+    [[ "$(_sync_git config --bool commit.gpgSign 2>/dev/null)" == true ]] && sflag=(-S)
     tree="$(_sync_idx write-tree)" \
         || { _sync_tmp_clean; die "git write-tree failed in $(_tilde "$repo")"; }
-    if old="$(git -C "$repo" rev-parse -q --verify HEAD 2>/dev/null)"; then
-        new="$(git -C "$repo" commit-tree "${sflag[@]}" "$tree" -p "$old" -m "$msg")" \
+    if [[ -n "$base" ]]; then
+        new="$(_sync_git commit-tree "${sflag[@]}" "$tree" -p "$base" -m "$msg")" \
             || { _sync_tmp_clean; die "git commit failed in $(_tilde "$repo")"; }
     else
-        old=""
-        new="$(git -C "$repo" commit-tree "${sflag[@]}" "$tree" -m "$msg")" \
+        new="$(_sync_git commit-tree "${sflag[@]}" "$tree" -m "$msg")" \
             || { _sync_tmp_clean; die "git commit failed in $(_tilde "$repo")"; }
     fi
-    git -C "$repo" update-ref -m "$msg" HEAD "$new" "$old" \
-        || { _sync_tmp_clean; die "git commit failed in $(_tilde "$repo") -- HEAD moved during the sync"; }
+
+    # The commit OBJECT is scanned before any ref moves: author, committer and
+    # every header land in history, and the push scan reads raw commit objects.
+    # A refused object stays unreferenced; it never reaches a push or a bundle.
+    sec_hits="$(scan_commit_object "$repo" "$SECRETS_DENY_FILE" "$tdir" "$new")" || sec_rc=1
+    if (( sec_rc )) || [[ -n "$sec_hits" ]]; then
+        _sync_tmp_clean
+        printf '\n%somabackup: not committing -- the deny-list matched the commit itself%s\n' "$RED" "$NC" >&2
+        local sid swhere
+        while IFS=$'\t' read -r sid swhere; do
+            [[ -n "$sid" ]] || continue
+            printf '  %s%s%s  %s\n' "$YELLOW" "$sid" "$NC" "$swhere" >&2
+        done <<<"$sec_hits"
+        printf '\n  Check user.name, user.email and any GIT_AUTHOR_* / GIT_COMMITTER_* variables.\n' >&2
+        return 1
+    fi
+
+    # The branch must still be the one the candidate was built for.
+    cref="$(_sync_git symbolic-ref -q HEAD 2>/dev/null)" || cref=""
+    if [[ "$cref" != "$ref" ]]; then
+        _sync_tmp_clean
+        printf '\n%somabackup: not committing -- the checked-out branch changed during the sync%s\n' "$RED" "$NC" >&2
+        return 1
+    fi
+    local -a rt_off=(-c hook.reference-transaction.enabled=false -c core.hooksPath=/dev/null)
+    if [[ -n "$ref" ]]; then
+        _sync_git "${rt_off[@]}" update-ref -m "$msg" "$ref" "$new" "$base"
+    else
+        _sync_git "${rt_off[@]}" update-ref --no-deref -m "$msg" HEAD "$new" "$base"
+    fi || { _sync_tmp_clean; die "git commit failed in $(_tilde "$repo") -- HEAD moved during the sync"; }
     _sync_tmp_clean
     # The user's index still holds the old blobs for these paths; left alone,
     # `git status` would show the commit being staged in reverse.
