@@ -1022,3 +1022,11 @@ SY71H_OUT="$(PATH="$SY71H/stub:$PATH" _sync_env "$SY71H" "$SY71H/repo" "$SY71H/g
 
 it "a failed branch update does not claim that HEAD moved"
 assert_not_contains "$SY71H_OUT" "HEAD moved"
+
+# The timer runs under the systemd user manager's locale (LANG=en_US.UTF-8 on
+# the development machine). The pre-commit gate must hold there too.
+SU8="$(mktemp -d)"; _sec_env "$SU8"
+printf '\xff%s\n' "$_tok" >"$SU8/.config/app/bin.dat"
+LC_ALL=C.UTF-8 _sync_env "$SU8" "$SU8/repo" "$SU8/g.json" sync --commit >/dev/null; SU8_RC=$?
+it "sync --commit refuses a token after an invalid UTF-8 byte under a UTF-8 locale"
+(( SU8_RC != 0 )) && ok || fail "a UTF-8 locale let a token into the commit"

@@ -1170,3 +1170,16 @@ RT_TREE="$(git -C "$RT" write-tree)"
 it "and still finds a token in that root-level file"
 [[ -n "$(scan_tree "$RT" "$PWD/secrets.deny.json" "$RT_TREE" "$RT_WORK" top.txt 2>/dev/null)" ]] \
     && ok || fail "a token in a root-level file was missed"
+
+# -- scan_tree judges bytes, whatever the session's locale -----------------------
+# Same class as the staging and push scans (review omabackup-73): under a UTF-8
+# locale an invalid byte right before a token takes the word boundary away from
+# GNU grep and from bash's =~, and the token read as clean.
+_ztok="gh""p_$(printf 'F%.0s' {1..36})"
+ZT="$SH/utf8-tree"; git init -q "$ZT"
+printf '\xff%s\n' "$_ztok" >"$ZT/bin.dat"; git -C "$ZT" add bin.dat
+ZT_TREE="$(git -C "$ZT" write-tree)"; ZT_WORK="$(mktemp -d)"
+it "scan_tree finds a token after an invalid UTF-8 byte under a UTF-8 locale"
+[[ -n "$(LC_ALL=C.UTF-8 bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+         scan_tree "$1" "$2" "$3" "$4" bin.dat' _ "$ZT" "$PWD/secrets.deny.json" "$ZT_TREE" "$ZT_WORK" 2>/dev/null)" ]] \
+    && ok || fail "a UTF-8 locale hid the token from the pre-commit scan"

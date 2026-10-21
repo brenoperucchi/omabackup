@@ -722,6 +722,9 @@ scan_tree() {
     [[ -f "$file" && -n "$tree" && -d "$work" ]] || return 1
     (( $# )) || return 0
 
+    # Bytes, not characters: under a UTF-8 locale an invalid byte right before
+    # a token hid it from GNU grep and from bash's =~ (review omabackup-73).
+    local LC_ALL=C; export LC_ALL
     local GIT_NO_REPLACE_OBJECTS=1; export GIT_NO_REPLACE_OBJECTS
     local -a DENY_EXCEPTIONS=() ids=() res=() cis=() pre_cs=() pre_ci=()
     _scan_load_patterns "$file" || return 1
@@ -817,6 +820,9 @@ scan_tree() {
 scan_commit_object() {
     local repo="$1" file="$2" work="$3" oid="$4"
     [[ -f "$file" && -d "$work" && -n "$oid" ]] || return 1
+    # Bytes, not characters: under a UTF-8 locale an invalid byte right before
+    # a token hid it from GNU grep and from bash's =~ (review omabackup-73).
+    local LC_ALL=C; export LC_ALL
     local GIT_NO_REPLACE_OBJECTS=1; export GIT_NO_REPLACE_OBJECTS
     local -a DENY_EXCEPTIONS=() ids=() res=() cis=() pre_cs=() pre_ci=()
     _scan_load_patterns "$file" || return 1
