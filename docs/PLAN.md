@@ -5393,6 +5393,22 @@ mutant that keeps the check inside the exception.
 
 `./test/run.sh collect` -- **69 passed, 0 failed**. Full suite in a
 network-less Arch container -- **1470 passed, 2 failed**, against `main`'s
-**1463 passed, 2 failed** at `d2f22b3`. The failing set is identical to main's: the title-row eliding probe (no display fonts) and the VM preflight (no QEMU); the three coverage.test.sh specs that failed at ba59b3f pass now that #2 is merged. Not run on a live Omarchy session.
+**1463 passed, 2 failed** at `d2f22b3`. The failing set is identical to main's: the title-row eliding probe (no display fonts) and the VM preflight (no QEMU); the three coverage.test.sh specs that failed at ba59b3f pass now that #2 is merged. Run on a live Omarchy session during review: **1472 passed, 0 failed**.
+
+**Review round `omabackup-72`.** rev-1 approved. rev-2 measured, on pacman 7.1.0,
+that some `error:` lines describe the configuration rather than the database:
+a repo section named twice in `pacman.conf` (an `Include` repeating `[core]`)
+makes every query print `could not register 'core' database (database already
+registered)` at status 0 while all three lists come out byte-identical to the
+normal ones. 0.4.7 collected such a machine when it had foreign packages; with
+this change collect refuses on it, for every group, until `pacman.conf` is
+fixed. Breno chose to keep the refusal (option 1): only the class of the line
+is judged, and an exception for that string would tie the gate to pacman's
+wording. The refusal now shows pacman's first `error:` line, clipped to 200
+characters and stripped of control bytes, so the user can find the cause. Spec
+DG10 (configuration error on all three, foreign present): the message check
+failed before, passes now. The release notes must say collect can refuse cases
+0.4.7 accepted. rev-2's other P3 (a refusal by status still leaves sibling
+lists staged) predates this change and stays open. `collect` 72/0.
 
 No version bump and no `CHANGELOG.md` entry: left to the release commit.

@@ -984,3 +984,29 @@ it "collect refuses a mode:gen group whose generator field names nothing this to
 HOME="$UGH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$UGH/g.json" \
     OMABACKUP_STATE="$UGH/.state" XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
     && fail "reported success for a generator this tool does not recognize" || ok
+
+# An `error:` that pacman prints for its CONFIGURATION, not for the database:
+# a repo section named twice in pacman.conf (an Include repeating [core], say)
+# makes every query print "could not register 'core' database (database
+# already registered)" at status 0 while all three lists come out correct.
+# The veto still refuses -- only the class of the line is read, and a string
+# exception would tie the gate to pacman's wording -- but the refusal has to
+# show the line, or the user has no way to the pacman.conf that caused it.
+# Measured on pacman 7.1.0 by review round omabackup-72.
+DG10="$(mktemp -d)"
+_diag_home "$DG10" \
+    'printf "git\nneovim\nyay\n"; printf "%scould not register '\''core'\'' database (database already registered)\n" "$P" >&2; exit 0' \
+    'printf "git\nneovim\n"; printf "%scould not register '\''core'\'' database (database already registered)\n" "$P" >&2; exit 0' \
+    'printf "yay\n"; printf "%scould not register '\''core'\'' database (database already registered)\n" "$P" >&2; exit 0'
+DG10_OUT="$(PATH="$DG10/stub:$PATH" HOME="$DG10" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$DG10/g.json" \
+    OMABACKUP_STATE="$DG10/.state" XDG_RUNTIME_DIR=/nonexistent "$OB" collect 2>&1)"; DG10_RC=$?
+
+it "collect still refuses when pacman reports a configuration error"
+(( DG10_RC != 0 )) && ok || fail "an error: line from pacman was let through"
+
+it "and the refusal shows pacman's own line, so the user can find the cause"
+assert_contains "$DG10_OUT" "could not register 'core' database (database already registered)"
+
+it "and stages none of the three package lists"
+[[ -z "$(find "$DG10/.state/staging/.generated" -name 'pkgs-*.txt' 2>/dev/null)" ]] \
+    && ok || fail "a package list was left staged after the refusal"

@@ -1315,7 +1315,21 @@ collect_generated() {
                 rm -f "$STAGING/.generated/pkgs-explicit.txt" \
                       "$STAGING/.generated/pkgs-arch.txt" \
                       "$STAGING/.generated/pkgs-aur.txt"
-                die "could not trust the package lists (pacman reported an error while listing them)"
+                # The refusal names pacman's own first error line. Some of
+                # these come from the configuration, not the database -- a
+                # repo section named twice in pacman.conf prints "could not
+                # register 'core' database (database already registered)" on
+                # every query while all three lists are correct -- and without
+                # the line the user has no way to the file that caused it
+                # (review omabackup-72). Still refused: only the class is
+                # judged; the text is shown, never interpreted. Clipped and
+                # stripped of control bytes before it reaches the journal.
+                local pkg_err_line="" pkg_l
+                while IFS= read -r pkg_l; do
+                    [[ "$pkg_l" == "error:"* ]] && { pkg_err_line="${pkg_l#error: }"; break; }
+                done <<<"$pkg_diag_all"
+                pkg_err_line="$(printf '%s' "$pkg_err_line" | tr -d '[:cntrl:]' | cut -c1-200)"
+                die "could not trust the package lists (pacman: ${pkg_err_line:-reported an error while listing them})"
             fi
             if (( aur_rc != 0 )); then
                 if (( aur_rc == 1 )) \
