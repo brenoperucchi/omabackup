@@ -1065,8 +1065,11 @@ NLOUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.s
 it "a filename holding a literal newline is still matched"
 assert_contains "$NLOUT" "anchored"
 
+# Control bytes in a name are shown as "?": a name is free to hold ESC or CR,
+# and printing them raw lets a filename drive the terminal or the journal
+# (review omabackup-75). The newline is one of them.
 it "and the full name is in the report, not truncated at the embedded newline"
-assert_contains "$NLOUT" "$NLNAME"
+assert_contains "$NLOUT" "a?b.txt"
 
 # ── the zero-width-pattern check cannot pass by failing to run at all ───────
 # Its own jq query fed `< <(jq ...)` straight into the while loop with no
@@ -1177,3 +1180,88 @@ it "a file named repo.bundle is scanned unless the caller excludes it"
 [[ -n "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
          scan_files "$1" "$2"' _ "$UB/stage" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
     && ok || fail "a user file named repo.bundle was skipped"
+
+# -- review round omabackup-75: the staging scan's names pass ---------------------
+_v5tok="gh""p_$(printf 'G%.0s' {1..36})"
+_scanf() {  # _scanf <dir> [PATH prefix] -- scan_files with the shipped deny-list
+    PATH="${2:+$2:}$PATH" bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+        scan_files "$1" "$2"' _ "$1" "$PWD/secrets.deny.json" 2>&1
+}
+
+# The names pass called grep once per file per pattern -- 12 s on a real
+# 667-file staging, against 0.03 s before it. It must cost a pass per pattern,
+# whatever the number of files. Counted, not timed.
+V5P="$SH/v5-perf"; mkdir -p "$V5P/stage" "$V5P/stub"
+for i in $(seq 1 300); do : >"$V5P/stage/f$i.conf"; done
+cat >"$V5P/stub/grep" <<SHIM
+#!/bin/bash
+echo x >>"$V5P/calls"
+exec /usr/bin/grep "\$@"
+SHIM
+chmod +x "$V5P/stub/grep"
+_scanf "$V5P/stage" "$V5P/stub" >/dev/null
+it "the names pass costs a grep per pattern, not per file"
+(( $(wc -l <"$V5P/calls" 2>/dev/null || echo 99999) < 100 )) && ok \
+    || fail "$(wc -l <"$V5P/calls") grep calls for 300 clean files"
+
+# A grep that fails to open a file prints that file's path -- and the name can
+# be the token the scan just decided to hide.
+V5E="$SH/v5-err"; mkdir -p "$V5E/stage" "$V5E/stub"
+printf 'x\n' >"$V5E/stage/$_v5tok.conf"
+cat >"$V5E/stub/grep" <<'SHIM'
+#!/bin/bash
+for a in "$@"; do
+    if [[ "$a" == -r ]]; then
+        f="$(find "${@: -1}" -type f | head -1)"
+        echo "grep: $f: Input/output error" >&2; exit 2
+    fi
+done
+exec /usr/bin/grep "$@"
+SHIM
+chmod +x "$V5E/stub/grep"
+V5E_OUT="$(_scanf "$V5E/stage" "$V5E/stub")"
+it "a grep error never prints a file name the scan hid"
+assert_not_contains "$V5E_OUT" "$_v5tok"
+
+# Control bytes from a name never reach the output raw.
+V5C="$SH/v5-ctrl"; mkdir -p "$V5C/stage"
+printf 'token = %s\n' "$_v5tok" >"$V5C/stage/$(printf 'x\033[2Jy.conf')"
+V5C_OUT="$(_scanf "$V5C/stage")"
+it "a hit in a file whose name holds control bytes prints none of them"
+[[ -n "$V5C_OUT" && "$V5C_OUT" != *$'\033'* ]] && ok || fail "no hit, or an ESC from the name reached the output"
+
+# Symlinks: git commits the link's NAME and its TARGET text as a blob, so both
+# are judged; neither is printed.
+V5L="$SH/v5-link"; mkdir -p "$V5L/stage"
+printf 'fine\n' >"$V5L/stage/fine.conf"
+ln -s fine.conf "$V5L/stage/$_v5tok"
+ln -s "$_v5tok" "$V5L/stage/pointer"
+V5L_OUT="$(_scanf "$V5L/stage")"
+it "a symlink whose name holds a token is found"
+assert_contains "$V5L_OUT" "(a file NAME, not shown)"
+it "a symlink whose target holds a token is found"
+assert_contains "$V5L_OUT" "symlink target"
+it "and neither the name nor the target is printed"
+assert_not_contains "$V5L_OUT" "$_v5tok"
+
+# A hidden name still says where to look, when the directory is clean.
+V5H="$SH/v5-hint"; mkdir -p "$V5H/stage/app"
+printf 'x\n' >"$V5H/stage/app/$_v5tok.conf"
+V5H_OUT="$(_scanf "$V5H/stage")"
+it "a hidden file name still names the directory it is in"
+assert_contains "$V5H_OUT" "in app/"
+
+# _discard_staging is the proof that a refused staging is gone. A walk that
+# could not run printed nothing and passed as "empty".
+# The real function, extracted from the CLI; rm and find are PATH shims that
+# fail without touching anything. The helper before review returned 0 here.
+V5D="$SH/v5-discard"; mkdir -p "$V5D/staging" "$V5D/stub"; : >"$V5D/staging/left.conf"
+printf '#!/bin/sh\nexit 1\n' >"$V5D/stub/find"; cp "$V5D/stub/find" "$V5D/stub/rm"
+chmod +x "$V5D/stub/find" "$V5D/stub/rm"
+V5D_OUT="$(STAGING="$V5D/staging" STUB="$V5D/stub" bash -c '
+    die() { echo "DIE: $*"; exit 1; }; _tilde() { printf %s "$1"; }
+    source <(sed -n "/^_discard_staging() {/,/^}/p" bin/omabackup)
+    PATH="$STUB:$PATH"
+    _discard_staging; echo "returned $?"' 2>&1)"
+it "_discard_staging refuses when it cannot prove the staging is empty"
+assert_contains "$V5D_OUT" "DIE: could not clear"

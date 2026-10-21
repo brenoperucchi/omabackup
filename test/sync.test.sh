@@ -451,3 +451,15 @@ it "and clears the unscanned staging"
 
 it "and does not speak of a push"
 assert_not_contains "$R73C_OUT" "refusing to push"
+
+# -- review round omabackup-75: symlinks reach git as a name and a target text ---
+R75="$(mktemp -d)"; _scan_home "$R75"
+ln -s fine.conf "$R75/.config/app/$_r73tok"
+ln -s "$_r73tok" "$R75/.config/app/pointer"
+R75_OUT="$(_sync_env "$R75" "$R75/repo" "$R75/g.json" sync --commit)"; R75_RC=$?
+it "a symlink with a token in its name or target is refused before publish"
+if (( R75_RC != 0 )); then assert_not_contains "$R75_OUT" "$_r73tok"
+else fail "a token in a symlink reached the worktree"; fi
+
+it "and nothing was published"
+assert_eq "$(_commits "$R75/repo")" "1"

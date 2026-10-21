@@ -564,6 +564,24 @@ scan_secrets() {
 #
 # repo.bundle is skipped: it is a packfile, its contents were scanned as objects
 # a moment ago, and grepping compressed bytes finds nothing either way.
+# _scan_safe <text> -- control bytes shown as "?", so a file name cannot drive
+# the terminal or the journal it is printed to (review omabackup-75).
+_scan_safe() { local x="$1"; printf '%s' "${x//[[:cntrl:]]/?}"; }
+
+# _scan_dir_hint <rel-path> <patterns> -- " in <dir>/" for a hidden name, so the
+# user knows where to look, unless the directory itself matches a pattern; then
+# nothing. Only runs on hits, so its per-pattern cost does not matter.
+_scan_dir_hint() {
+    local rel="$1" pats="$2" d id re ci
+    [[ "$rel" == */* ]] || { printf ' at the top'; return 0; }
+    d="${rel%/*}"
+    while IFS=$'\t' read -r id re ci; do
+        [[ -n "$id" && -n "$re" ]] || continue
+        _still_matches "${d//$'\n'/ }" "$re" "$ci" && return 0
+    done <<<"$pats"
+    printf ' in %s/' "$(_scan_safe "$d")"
+}
+
 scan_files() {
     local dir="$1" file="$2" id re ci hit rc=0 patterns body
     [[ -d "$dir" && -f "$file" ]] || return 1
@@ -592,29 +610,83 @@ scan_files() {
         return 1
     fi
 
-    # File NAMES first. The push scan reads every path in history, so a name
-    # holding a token must refuse here too; and a name that hits is never
-    # printed, not by its own hit and not by a hit on its content below.
-    local -A secret_name=()
-    local rel nm f2 frc
-    while IFS= read -r -d '' f2; do
-        rel="${f2#$dir/}"
-        nm="${rel//$'\n'/ }"
-        while IFS=$'\t' read -r id re ci; do
-            [[ -n "$id" && -n "$re" ]] || continue
-            if _still_matches "$nm" "$re" "$ci"; then
-                [[ -n "${secret_name[$rel]:-}" ]] \
-                    || printf '%s\t(a file NAME, not shown)\n' "$id"
-                secret_name["$rel"]=1
-            fi
-        done <<<"$patterns"
-    done < <(find "$dir" -type f -print0 2>/dev/null)
-    wait "$!"; frc=$?
-    if (( frc != 0 )); then
+    # File NAMES first, and symlink TARGETS. The push scan reads every path in
+    # history, and git commits a symlink as its name plus its target text, so
+    # all three are judged; a name or a target that hits is never printed, not
+    # by its own hit and not by a hit on its content below.
+    #
+    # One grep per pattern over the whole NUL-separated list, never one per
+    # file: _still_matches per file per pattern cost 12 s on a real 667-file
+    # staging against 0.03 s before it (review omabackup-75). grep only selects
+    # candidates; _still_matches still decides, exceptions included.
+    local names links ltargets
+    names="$(mktemp "${TMPDIR:-/tmp}/omabackup-names.XXXXXX")" || return 1
+    links="$(mktemp "${TMPDIR:-/tmp}/omabackup-links.XXXXXX")" || { rm -f "$names"; return 1; }
+    ltargets="$(mktemp "${TMPDIR:-/tmp}/omabackup-targets.XXXXXX")" || { rm -f "$names" "$links"; return 1; }
+    _scan_files_clean() { rm -f "$names" "$links" "$ltargets" "$names.hits"; }
+    if ! find "$dir" \( -type f -o -type l \) -printf '%P\0' >"$names" 2>/dev/null \
+       || ! find "$dir" -type l -printf '%P\0%l\0' >"$links" 2>/dev/null; then
+        _scan_files_clean
         printf '%somabackup: cannot list the files of %s -- refusing to call it clean%s\n' \
             "$RED" "$(_tilde "$dir")" "$NC" >&2
         return 1
     fi
+    local -a all_names=() link_path=() link_target=()
+    mapfile -d '' -t all_names <"$names"
+    local lp lt
+    while IFS= read -r -d '' lp && IFS= read -r -d '' lt; do
+        link_path+=("$lp"); link_target+=("$lt")
+    done <"$links"
+    if (( ${#link_target[@]} )); then printf '%s\0' "${link_target[@]}" >"$ltargets"; fi
+
+    local -A secret_name=() name_said=()
+    local rel nm rec n g
+    while IFS=$'\t' read -r id re ci; do
+        [[ -n "$id" && -n "$re" ]] || continue
+        local -a zf=(-z -n -a -E --color=never)
+        [[ "$ci" == true ]] && zf+=(-i)
+        grep "${zf[@]}" -e "$re" -- "$names" >"$names.hits" 2>/dev/null; g=$?
+        if (( g > 1 )); then
+            _scan_files_clean
+            printf '%somabackup: pattern %s could not be scanned over the file names%s\n' "$RED" "$id" "$NC" >&2
+            return 1
+        fi
+        while IFS= read -r -d '' rec; do
+            n="${rec%%:*}"; rel="${all_names[$((n - 1))]}"
+            nm="${rel//$'\n'/ }"
+            _still_matches "$nm" "$re" "$ci" || continue
+            secret_name["$rel"]=1
+            if [[ -z "${name_said[$rel]:-}" ]]; then
+                name_said["$rel"]=1
+                printf '%s\t(a file NAME, not shown)%s\n' "$id" "$(_scan_dir_hint "$rel" "$patterns")"
+            fi
+        done <"$names.hits"
+    done <<<"$patterns"
+
+    if (( ${#link_target[@]} )); then
+        while IFS=$'\t' read -r id re ci; do
+            [[ -n "$id" && -n "$re" ]] || continue
+            local -a tf=(-z -n -a -E --color=never)
+            [[ "$ci" == true ]] && tf+=(-i)
+            grep "${tf[@]}" -e "$re" -- "$ltargets" >"$names.hits" 2>/dev/null; g=$?
+            if (( g > 1 )); then
+                _scan_files_clean
+                printf '%somabackup: pattern %s could not be scanned over the symlink targets%s\n' "$RED" "$id" "$NC" >&2
+                return 1
+            fi
+            while IFS= read -r -d '' rec; do
+                n="${rec%%:*}"; lt="${link_target[$((n - 1))]}"; lp="${link_path[$((n - 1))]}"
+                _still_matches "${lt//$'\n'/ }" "$re" "$ci" || continue
+                if [[ -n "${secret_name[$lp]:-}" ]]; then
+                    printf '%s\t(a symlink target, not shown, of a link whose NAME is not shown)%s\n' \
+                        "$id" "$(_scan_dir_hint "$lp" "$patterns")"
+                else
+                    printf '%s\t%s (symlink target, not shown)\n' "$id" "$(_scan_safe "$lp")"
+                fi
+            done <"$names.hits"
+        done <<<"$patterns"
+    fi
+    _scan_files_clean
 
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
@@ -661,11 +733,15 @@ scan_files() {
             # output is the journal (review omabackup-73).
             rel="${f#$dir/}"
             if [[ -n "${secret_name[$rel]:-}" ]]; then
-                printf '%s\t(content of a file whose NAME is not shown), line %s\n' "$id" "${rest%%:*}"
+                printf '%s\t(content of a file whose NAME is not shown)%s, line %s\n' \
+                    "$id" "$(_scan_dir_hint "$rel" "$patterns")" "${rest%%:*}"
             else
-                printf '%s\t%s:%s\n' "$id" "$rel" "${rest%%:*}"
+                printf '%s\t%s:%s\n' "$id" "$(_scan_safe "$rel")" "${rest%%:*}"
             fi
-        done < <(grep "${gflags[@]}" -e "$re" -- "$dir")
+        # grep's own stderr is dropped: its diagnostics print the path, and the
+        # name can be the token hidden above (review omabackup-75). Its status
+        # is kept and reported below without a path.
+        done < <(grep "${gflags[@]}" -e "$re" -- "$dir" 2>/dev/null)
         wait "$!"; grc=$?
         if (( grc > 1 )); then
             printf '%somabackup: pattern %s could not be scanned over %s%s\n' \

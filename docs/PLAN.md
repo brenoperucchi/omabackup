@@ -5434,4 +5434,33 @@ fix has no spec: making `rm` and `find` both fail under the CLI would also
 break the collect that runs before it. Mutants: no locale pin in each scanner,
 `repo.bundle` always skipped, validator outside the subshell.
 
+**Verification round `omabackup-75`.** Both reviewers confirmed the #4 fix
+and, on #3, the locale pin, the `repo.bundle` option, the validator subshell
+and the `_discard_staging` behaviour. Both found that the new names pass
+called `_still_matches` once per file per pattern, about 18 grep processes per
+file: on the real 669-entry staging the scan went from 0.03 s to 11.4 s, and
+from about 2,500 files it alone would exceed the panel's 45 s busy timeout.
+rev-1 also found that a grep error printed the path of a file the scan had
+hidden, and that control bytes in a name reached the output raw. rev-2 found
+that symlinks escaped the names pass and their target text was read by no
+part of the scan, although git commits both; and that a hidden name gave no
+hint where to look. rev-1 showed how to give `_discard_staging` its spec.
+
+**Fix.** The names pass lists files and symlinks once with `find -printf
+'%P\0'` and runs one `grep -z -n` per pattern over the whole list; only
+candidates reach `_still_matches`. Symlink targets are judged the same way and
+never printed. The content grep's stderr is dropped, its status kept and
+reported without a path. Printed paths show control bytes as `?`, and a hidden
+name says the directory it is in when that directory is clean. The
+`_discard_staging` spec extracts the real function and uses PATH shims for
+`rm` and `find`; it fails on the helper before review and passes now. The
+names list lives in three `mktemp` files (mode 600) removed at the end of the
+scan; a signal mid-scan can leave them in `$TMPDIR`.
+
+Specs: eight new in `test/secrets.test.sh` and two in `test/sync.test.sh`,
+every one failing before its fix; the grep count for 300 clean files is the
+regression for the cost. The existing newline-name spec now expects `a?b.txt`.
+Measured on the real staging: 0.03 s before #3, 11.40 s at `c4d22f1`, 0.05 s
+now.
+
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
