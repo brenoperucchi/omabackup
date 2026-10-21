@@ -5463,4 +5463,53 @@ regression for the cost. The existing newline-name spec now expects `a?b.txt`.
 Measured on the real staging: 0.03 s before #3, 11.40 s at `c4d22f1`, 0.05 s
 now.
 
+### The `error:` veto covers every package list (2026-09-27)
+
+Contributed by Corey Tyhurst. The known gap named in the 0.4.7 changelog and
+in item 2 of the "Next" list above; asked for in the PR #2 merge comment.
+
+**The gap.** The `error:` test lived inside the empty-foreign exception, so it
+only ran when `-Qqem` exited 1. pacman drops an entry it cannot parse from
+every query and carries on at status 0. A corrupted native entry therefore
+leaves `-Qqe` and `-Qqen` short while `-Qqem` still lists the real foreign
+packages at status 0; no status is non-zero, the exception is never reached,
+and three short lists are staged and published.
+
+**The change.** The veto runs once, over the concatenated diagnostics of all
+three queries, before any status is judged. An `error:` from any query removes
+all three lists and refuses; `warning:` still passes. The clause inside the
+exception is gone, since the check above has already refused what it covered.
+The refusal takes all three files: pacman said the read was incomplete, so no
+member is worth keeping. On the existing corrupted-database case this now
+removes the explicit and native lists too, which the generator's opening
+comment promised.
+
+**Specs.** Five new in `test/collect.test.sh`, on the existing `_diag_home`
+stub: an error at status 0 on the explicit, the native or the foreign query
+with a non-empty foreign list refuses and leaves no list staged; a warning on
+all three with a foreign package present still collects all three (control);
+the corrupted-database case also loses its explicit and native lists. Five
+fail against `main`'s code; the control passes on both. `main`'s code is the
+mutant that keeps the check inside the exception.
+
+`./test/run.sh collect` -- **69 passed, 0 failed**. Full suite in a
+network-less Arch container -- **1470 passed, 2 failed**, against `main`'s
+**1463 passed, 2 failed** at `d2f22b3`. The failing set is identical to main's: the title-row eliding probe (no display fonts) and the VM preflight (no QEMU); the three coverage.test.sh specs that failed at ba59b3f pass now that #2 is merged. Run on a live Omarchy session during review: **1472 passed, 0 failed**.
+
+**Review round `omabackup-72`.** rev-1 approved. rev-2 measured, on pacman 7.1.0,
+that some `error:` lines describe the configuration rather than the database:
+a repo section named twice in `pacman.conf` (an `Include` repeating `[core]`)
+makes every query print `could not register 'core' database (database already
+registered)` at status 0 while all three lists come out byte-identical to the
+normal ones. 0.4.7 collected such a machine when it had foreign packages; with
+this change collect refuses on it, for every group, until `pacman.conf` is
+fixed. Breno chose to keep the refusal (option 1): only the class of the line
+is judged, and an exception for that string would tie the gate to pacman's
+wording. The refusal now shows pacman's first `error:` line, clipped to 200
+characters and stripped of control bytes, so the user can find the cause. Spec
+DG10 (configuration error on all three, foreign present): the message check
+failed before, passes now. The release notes must say collect can refuse cases
+0.4.7 accepted. rev-2's other P3 (a refusal by status still leaves sibling
+lists staged) predates this change and stays open. `collect` 72/0.
+
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
