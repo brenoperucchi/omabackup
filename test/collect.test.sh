@@ -673,6 +673,11 @@ it "and removes the foreign list it refused to believe"
 [[ ! -e "$DG1/.state/staging/.generated/pkgs-aur.txt" ]] \
     && ok || fail "pkgs-aur.txt was left staged after the refusal"
 
+it "and removes the explicit and native lists with it"
+[[ ! -e "$DG1/.state/staging/.generated/pkgs-explicit.txt" \
+   && ! -e "$DG1/.state/staging/.generated/pkgs-arch.txt" ]] \
+    && ok || fail "the explicit or native list was left staged beside the refused foreign one"
+
 # A benign warning is NOT an error. A repo named in pacman.conf that has never
 # been synced warns on every query while all three still answer correctly.
 # This machine genuinely has no foreign packages and must still collect.
@@ -731,6 +736,73 @@ _nofo_collect "$DG5" \
 it "and removes the native list it refused to believe"
 [[ ! -e "$DG5/.state/staging/.generated/pkgs-arch.txt" ]] \
     && ok || fail "pkgs-arch.txt was left staged after the refusal"
+
+# ── an error at status 0 refuses every list, not only an empty foreign one ──
+# The veto above was born inside the empty-foreign exception, so it only
+# spoke when -Qqem exited 1. pacman's carry-on behaviour does not depend on
+# what the foreign query returns: a corrupted entry that happens to be native
+# drops out of -Qqe and -Qqen while -Qqem still lists the real foreign
+# packages at status 0, every condition collect checked was met, and three
+# lists short by the same entries were staged and published. 0.4.7 shipped
+# with this as a known gap. The check now runs over the three diagnostics
+# before the exception is even considered, whatever the statuses were, and
+# refuses the lists as a set: a set pacman said was incomplete has no member
+# worth keeping, and a stray survivor would be the next run's "real data".
+DG6="$(mktemp -d)"
+_diag_home "$DG6" \
+    'printf "git\nneovim\n"; printf "%sinvalid name for database entry\n" "$P" >&2; exit 0' \
+    'printf "git\nneovim\n"; exit 0' \
+    'printf "yay\n"; exit 0'
+
+it "collect refuses a non-empty foreign list when the explicit query reported an error"
+_nofo_collect "$DG6" \
+    && fail "staged three package lists although pacman reported a database error" || ok
+
+it "and stages none of the three package lists"
+[[ ! -e "$DG6/.state/staging/.generated/pkgs-explicit.txt" \
+   && ! -e "$DG6/.state/staging/.generated/pkgs-arch.txt" \
+   && ! -e "$DG6/.state/staging/.generated/pkgs-aur.txt" ]] \
+    && ok || fail "a package list was left staged after the refusal"
+
+DG7="$(mktemp -d)"
+_diag_home "$DG7" \
+    'printf "git\nneovim\n"; exit 0' \
+    'printf "git\nneovim\n"; printf "%sinvalid name for database entry\n" "$P" >&2; exit 0' \
+    'printf "yay\n"; exit 0'
+
+it "collect refuses a non-empty foreign list when the native query reported an error"
+_nofo_collect "$DG7" \
+    && fail "staged three package lists although the native query reported an error" || ok
+
+# The foreign query can be the one that speaks, too: a list AND an error at
+# status 0 is a list pacman itself said was short.
+DG8="$(mktemp -d)"
+_diag_home "$DG8" \
+    'printf "git\nneovim\n"; exit 0' \
+    'printf "git\nneovim\n"; exit 0' \
+    'printf "yay\n"; printf "%sinvalid name for database entry\n" "$P" >&2; exit 0'
+
+it "collect refuses a foreign list that pacman itself said was short"
+_nofo_collect "$DG8" \
+    && fail "staged a foreign list that came with a database error" || ok
+
+# And the control: the same benign warning as DG2, on a machine that does
+# have a foreign package. Nothing here may refuse it.
+DG9="$(mktemp -d)"
+_diag_home "$DG9" \
+    'printf "git\nneovim\nyay\n"; printf "%sdatabase file for '\''extra'\'' does not exist\n" "$W" >&2; exit 0' \
+    'printf "git\nneovim\n"; printf "%sdatabase file for '\''extra'\'' does not exist\n" "$W" >&2; exit 0' \
+    'printf "yay\n"; printf "%sdatabase file for '\''extra'\'' does not exist\n" "$W" >&2; exit 0'
+
+it "collect still accepts a non-empty foreign list despite a warning"
+_nofo_collect "$DG9" \
+    && ok || fail "a benign warning refused a healthy set of package lists"
+
+it "and stages all three lists, the foreign one holding that package"
+[[ -s "$DG9/.state/staging/.generated/pkgs-explicit.txt" \
+   && -s "$DG9/.state/staging/.generated/pkgs-arch.txt" \
+   && "$(<"$DG9/.state/staging/.generated/pkgs-aur.txt")" == "yay" ]] \
+    && ok || fail "the package lists were not all staged, or the foreign one lost its package"
 
 # ── a plugin's local capture failing is refused, not counted as collected ───
 # _capture_local's own rsync copy was never checked by either of its two
@@ -912,3 +984,29 @@ it "collect refuses a mode:gen group whose generator field names nothing this to
 HOME="$UGH" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$UGH/g.json" \
     OMABACKUP_STATE="$UGH/.state" XDG_RUNTIME_DIR=/nonexistent "$OB" collect >/dev/null 2>&1 \
     && fail "reported success for a generator this tool does not recognize" || ok
+
+# An `error:` that pacman prints for its CONFIGURATION, not for the database:
+# a repo section named twice in pacman.conf (an Include repeating [core], say)
+# makes every query print "could not register 'core' database (database
+# already registered)" at status 0 while all three lists come out correct.
+# The veto still refuses -- only the class of the line is read, and a string
+# exception would tie the gate to pacman's wording -- but the refusal has to
+# show the line, or the user has no way to the pacman.conf that caused it.
+# Measured on pacman 7.1.0 by review round omabackup-72.
+DG10="$(mktemp -d)"
+_diag_home "$DG10" \
+    'printf "git\nneovim\nyay\n"; printf "%scould not register '\''core'\'' database (database already registered)\n" "$P" >&2; exit 0' \
+    'printf "git\nneovim\n"; printf "%scould not register '\''core'\'' database (database already registered)\n" "$P" >&2; exit 0' \
+    'printf "yay\n"; printf "%scould not register '\''core'\'' database (database already registered)\n" "$P" >&2; exit 0'
+DG10_OUT="$(PATH="$DG10/stub:$PATH" HOME="$DG10" OMABACKUP_ROOT="$PWD" OMABACKUP_GROUPS="$DG10/g.json" \
+    OMABACKUP_STATE="$DG10/.state" XDG_RUNTIME_DIR=/nonexistent "$OB" collect 2>&1)"; DG10_RC=$?
+
+it "collect still refuses when pacman reports a configuration error"
+(( DG10_RC != 0 )) && ok || fail "an error: line from pacman was let through"
+
+it "and the refusal shows pacman's own line, so the user can find the cause"
+assert_contains "$DG10_OUT" "could not register 'core' database (database already registered)"
+
+it "and stages none of the three package lists"
+[[ -z "$(find "$DG10/.state/staging/.generated" -name 'pkgs-*.txt' 2>/dev/null)" ]] \
+    && ok || fail "a package list was left staged after the refusal"
