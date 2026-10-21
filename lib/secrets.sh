@@ -571,10 +571,25 @@ _scan_safe() { local x="$1"; printf '%s' "${x//[[:cntrl:]]/?}"; }
 # _scan_dir_hint <rel-path> <patterns> -- " in <dir>/" for a hidden name, so the
 # user knows where to look, unless the directory itself matches a pattern; then
 # nothing. Only runs on hits, so its per-pattern cost does not matter.
+#
+# The path is cut before the first match of any pattern first, then at the last
+# "/": a value free to hold a "/" otherwise printed its own first part as the
+# directory (review omabackup-76). A grep that cannot answer gives no hint.
 _scan_dir_hint() {
-    local rel="$1" pats="$2" d id re ci
+    local rel="$1" pats="$2" flat="${1//$'\n'/ }" pre d id re ci m s
+    pre="$rel"
+    while IFS=$'\t' read -r id re ci; do
+        [[ -n "$id" && -n "$re" ]] || continue
+        local -a of=(-o -b -a -E --color=never)
+        [[ "$ci" == true ]] && of+=(-i)
+        m="$(printf '%s' "$flat" | grep "${of[@]}" -e "$re" 2>/dev/null)"; s=$?
+        (( s > 1 )) && return 0
+        m="${m%%$'\n'*}"; m="${m%%:*}"
+        [[ -n "$m" ]] && (( m < ${#pre} )) && pre="${rel:0:m}"
+    done <<<"$pats"
     [[ "$rel" == */* ]] || { printf ' at the top'; return 0; }
-    d="${rel%/*}"
+    [[ "$pre" == */* ]] || return 0
+    d="${pre%/*}"
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
         _still_matches "${d//$'\n'/ }" "$re" "$ci" && return 0
@@ -618,13 +633,20 @@ scan_files() {
     # One grep per pattern over the whole NUL-separated list, never one per
     # file: _still_matches per file per pattern cost 12 s on a real 667-file
     # staging against 0.03 s before it (review omabackup-75). grep only selects
-    # candidates; _still_matches still decides, exceptions included.
-    local names links ltargets
-    names="$(mktemp "${TMPDIR:-/tmp}/omabackup-names.XXXXXX")" || return 1
-    links="$(mktemp "${TMPDIR:-/tmp}/omabackup-links.XXXXXX")" || { rm -f "$names"; return 1; }
-    ltargets="$(mktemp "${TMPDIR:-/tmp}/omabackup-targets.XXXXXX")" || { rm -f "$names" "$links"; return 1; }
-    _scan_files_clean() { rm -f "$names" "$links" "$ltargets" "$names.hits"; }
-    if ! find "$dir" \( -type f -o -type l \) -printf '%P\0' >"$names" 2>/dev/null \
+    # candidates; _still_matches still decides, exceptions included. grep reads
+    # the list with newlines as spaces, the same text _still_matches is given,
+    # or a name that only matches with the space never became a candidate.
+    #
+    # The hits hold the full name or target that matched, so every temporary
+    # lives in a private mktemp -d directory, never beside a predictable name
+    # in a shared /tmp; and one that cannot be written refuses, because a
+    # redirect that fails exits 1, grep's "no match" (review omabackup-76).
+    local tmpd
+    tmpd="$(mktemp -d "${TMPDIR:-/tmp}/omabackup-scan.XXXXXX")" || return 1
+    local names="$tmpd/names" links="$tmpd/links" flat="$tmpd/flat" hits="$tmpd/hits"
+    _scan_files_clean() { rm -f "$names" "$links" "$flat" "$hits"; rmdir "$tmpd" 2>/dev/null; }
+    if ! : >"$hits" 2>/dev/null \
+       || ! find "$dir" \( -type f -o -type l \) -printf '%P\0' >"$names" 2>/dev/null \
        || ! find "$dir" -type l -printf '%P\0%l\0' >"$links" 2>/dev/null; then
         _scan_files_clean
         printf '%somabackup: cannot list the files of %s -- refusing to call it clean%s\n' \
@@ -637,38 +659,49 @@ scan_files() {
     while IFS= read -r -d '' lp && IFS= read -r -d '' lt; do
         link_path+=("$lp"); link_target+=("$lt")
     done <"$links"
-    if (( ${#link_target[@]} )); then printf '%s\0' "${link_target[@]}" >"$ltargets"; fi
+    if (( ${#all_names[@]} )) && ! printf '%s\0' "${all_names[@]//$'\n'/ }" >"$flat" 2>/dev/null; then
+        _scan_files_clean
+        printf '%somabackup: cannot write the scan'\''s temporaries -- refusing to call it clean%s\n' "$RED" "$NC" >&2
+        return 1
+    fi
 
     local -A secret_name=() name_said=()
     local rel nm rec n g
-    while IFS=$'\t' read -r id re ci; do
-        [[ -n "$id" && -n "$re" ]] || continue
-        local -a zf=(-z -n -a -E --color=never)
-        [[ "$ci" == true ]] && zf+=(-i)
-        grep "${zf[@]}" -e "$re" -- "$names" >"$names.hits" 2>/dev/null; g=$?
-        if (( g > 1 )); then
-            _scan_files_clean
-            printf '%somabackup: pattern %s could not be scanned over the file names%s\n' "$RED" "$id" "$NC" >&2
-            return 1
-        fi
-        while IFS= read -r -d '' rec; do
-            n="${rec%%:*}"; rel="${all_names[$((n - 1))]}"
-            nm="${rel//$'\n'/ }"
-            _still_matches "$nm" "$re" "$ci" || continue
-            secret_name["$rel"]=1
-            if [[ -z "${name_said[$rel]:-}" ]]; then
-                name_said["$rel"]=1
-                printf '%s\t(a file NAME, not shown)%s\n' "$id" "$(_scan_dir_hint "$rel" "$patterns")"
+    if (( ${#all_names[@]} )); then
+        while IFS=$'\t' read -r id re ci; do
+            [[ -n "$id" && -n "$re" ]] || continue
+            local -a zf=(-z -n -a -E --color=never)
+            [[ "$ci" == true ]] && zf+=(-i)
+            grep "${zf[@]}" -e "$re" -- "$flat" >"$hits" 2>/dev/null; g=$?
+            if (( g > 1 )); then
+                _scan_files_clean
+                printf '%somabackup: pattern %s could not be scanned over the file names%s\n' "$RED" "$id" "$NC" >&2
+                return 1
             fi
-        done <"$names.hits"
-    done <<<"$patterns"
+            while IFS= read -r -d '' rec; do
+                n="${rec%%:*}"; rel="${all_names[$((n - 1))]}"
+                nm="${rel//$'\n'/ }"
+                _still_matches "$nm" "$re" "$ci" || continue
+                secret_name["$rel"]=1
+                if [[ -z "${name_said[$rel]:-}" ]]; then
+                    name_said["$rel"]=1
+                    printf '%s\t(a file NAME, not shown)%s\n' "$id" "$(_scan_dir_hint "$rel" "$patterns")"
+                fi
+            done <"$hits"
+        done <<<"$patterns"
+    fi
 
     if (( ${#link_target[@]} )); then
+        if ! printf '%s\0' "${link_target[@]//$'\n'/ }" >"$flat" 2>/dev/null; then
+            _scan_files_clean
+            printf '%somabackup: cannot write the scan'\''s temporaries -- refusing to call it clean%s\n' "$RED" "$NC" >&2
+            return 1
+        fi
         while IFS=$'\t' read -r id re ci; do
             [[ -n "$id" && -n "$re" ]] || continue
             local -a tf=(-z -n -a -E --color=never)
             [[ "$ci" == true ]] && tf+=(-i)
-            grep "${tf[@]}" -e "$re" -- "$ltargets" >"$names.hits" 2>/dev/null; g=$?
+            grep "${tf[@]}" -e "$re" -- "$flat" >"$hits" 2>/dev/null; g=$?
             if (( g > 1 )); then
                 _scan_files_clean
                 printf '%somabackup: pattern %s could not be scanned over the symlink targets%s\n' "$RED" "$id" "$NC" >&2
@@ -683,7 +716,7 @@ scan_files() {
                 else
                     printf '%s\t%s (symlink target, not shown)\n' "$id" "$(_scan_safe "$lp")"
                 fi
-            done <"$names.hits"
+            done <"$hits"
         done <<<"$patterns"
     fi
     _scan_files_clean

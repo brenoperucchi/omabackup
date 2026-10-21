@@ -1265,3 +1265,90 @@ V5D_OUT="$(STAGING="$V5D/staging" STUB="$V5D/stub" bash -c '
     _discard_staging; echo "returned $?"' 2>&1)"
 it "_discard_staging refuses when it cannot prove the staging is empty"
 assert_contains "$V5D_OUT" "DIE: could not clear"
+
+# -- review round omabackup-76 ----------------------------------------------------
+# The grep hits of the names pass hold the full name or target that matched,
+# token and all. They were written to "$names.hits", a predictable file made
+# by a plain redirect: 0644 under umask 022 in a shared /tmp. Whatever holds
+# them must be unreadable by others from the moment it exists.
+V6P="$SH/v6-perm"; mkdir -p "$V6P/stage" "$V6P/stub" "$V6P/tmp"; chmod 1777 "$V6P/tmp"
+: >"$V6P/stage/$_v5tok.conf"
+cat >"$V6P/stub/grep" <<SHIM
+#!/bin/bash
+if [[ " \$* " == *" -z "* ]]; then
+    o="\$(readlink /proc/\$\$/fd/1)"
+    echo "\$(stat -c %a "\$o") \$(stat -c %a "\$(dirname "\$o")")" >>"$V6P/modes"
+fi
+exec /usr/bin/grep "\$@"
+SHIM
+chmod +x "$V6P/stub/grep"
+(umask 022; TMPDIR="$V6P/tmp" _scanf "$V6P/stage" "$V6P/stub" >/dev/null)
+it "the names pass keeps its grep hits where no other user can read them"
+if [[ -s "$V6P/modes" ]] && ! awk '$1 !~ /00$/ && $2 !~ /00$/ {bad=1} END {exit !bad}' "$V6P/modes"; then
+    ok
+else
+    fail "file/dir modes of the hits: $(tr '\n' ' ' <"$V6P/modes" 2>/dev/null)"
+fi
+it "and leaves nothing behind in TMPDIR"
+[[ -z "$(ls -A "$V6P/tmp")" ]] && ok || fail "left in TMPDIR: $(ls -A "$V6P/tmp")"
+
+# A temporary the scan cannot write is a scan that did not run. The redirect
+# into the hits file failed with status 1 -- grep's "no match" -- and a name
+# carrying a token came back clean. mktemp is a shim that hands out paths the
+# scan cannot write to: a read-only directory for -d, and for plain files a
+# path whose ".hits" sibling is a directory.
+V6W="$SH/v6-write"; mkdir -p "$V6W/stage" "$V6W/stub" "$V6W/tmp"
+: >"$V6W/stage/$_v5tok.conf"
+cat >"$V6W/stub/mktemp" <<SHIM
+#!/bin/bash
+n=\$(ls "$V6W/tmp" | wc -l)
+if [[ "\$1" == -d ]]; then
+    d="$V6W/tmp/d\$n"; mkdir "\$d"; chmod 500 "\$d"; echo "\$d"
+else
+    f="$V6W/tmp/f\$n"; : >"\$f"; mkdir -p "\$f.hits"; echo "\$f"
+fi
+SHIM
+chmod +x "$V6W/stub/mktemp"
+PATH="$V6W/stub:$PATH" bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_files "$1" "$2"' _ "$V6W/stage" "$PWD/secrets.deny.json" >/dev/null 2>&1; V6W_RC=$?
+chmod -R u+w "$V6W/tmp" 2>/dev/null
+it "a names pass whose temporaries cannot be written refuses instead of calling it clean"
+(( V6W_RC != 0 )) && ok || fail "scan_files returned 0 with a token in a file name"
+
+# The prefilter read the raw name and _still_matches the name with newlines as
+# spaces, so a name that only matches with the space -- a key header split by
+# a newline -- never reached the check that would have caught it.
+V6N="$SH/v6-newline"; mkdir -p "$V6N/stage/keys"
+: >"$V6N/stage/keys/$(printf -- '-----BEGIN RSA\nPRIVATE KEY-----')"
+V6N_OUT="$(_scanf "$V6N/stage")"
+it "a key header split by a newline in a file name is found"
+assert_contains "$V6N_OUT" "private-key-block"
+V6T="$SH/v6-newline-target"; mkdir -p "$V6T/stage"
+ln -s -- "$(printf -- '-----BEGIN RSA\nPRIVATE KEY-----')" "$V6T/stage/pointer"
+V6T_OUT="$(_scanf "$V6T/stage")"
+it "a key header split by a newline in a symlink target is found"
+assert_contains "$V6T_OUT" "private-key-block"
+
+# The directory hint was cut at the last "/", so a secret whose value crosses
+# a "/" printed its first part as the directory.
+# Split so the fixture itself is not a credential to a scanner reading this file.
+_v6kv="pass""word=\"abcdefgh"
+V6H="$SH/v6-hint"; mkdir -p "$V6H/stage/cfg/$_v6kv"
+: >"$V6H/stage/cfg/$_v6kv/ijklmnopqrstu\""
+V6H_OUT="$(_scanf "$V6H/stage")"
+it "a directory hint stops before the secret starts"
+assert_not_contains "$V6H_OUT" "abcdefgh"
+it "and still names the clean directory before it"
+assert_contains "$V6H_OUT" "in cfg/"
+
+# "at the top" means the file is at the top. A match in the first directory
+# left no "/" before it and printed "at the top" for a file two levels down.
+V6U="$SH/v6-top"; mkdir -p "$V6U/stage/$_v5tok/sub"
+: >"$V6U/stage/$_v5tok/sub/f.conf"
+V6U_OUT="$(_scanf "$V6U/stage")"
+it "a hidden name below a matching first directory is not said to be at the top"
+[[ -n "$V6U_OUT" && "$V6U_OUT" != *"at the top"* && "$V6U_OUT" != *"$_v5tok"* ]] && ok \
+    || fail "no hit, or a wrong hint: $V6U_OUT"
+V6R="$SH/v6-root"; mkdir -p "$V6R/stage"; : >"$V6R/stage/$_v5tok.conf"
+it "and a hidden name at the top still says so"
+assert_contains "$(_scanf "$V6R/stage")" "at the top"

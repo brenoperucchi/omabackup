@@ -5454,14 +5454,46 @@ reported without a path. Printed paths show control bytes as `?`, and a hidden
 name says the directory it is in when that directory is clean. The
 `_discard_staging` spec extracts the real function and uses PATH shims for
 `rm` and `find`; it fails on the helper before review and passes now. The
-names list lives in three `mktemp` files (mode 600) removed at the end of the
-scan; a signal mid-scan can leave them in `$TMPDIR`.
+names list lived in three `mktemp` files (mode 600) removed at the end of the
+scan; a signal mid-scan can leave them in `$TMPDIR` (round 76 below moved them
+into one private directory).
 
 Specs: eight new in `test/secrets.test.sh` and two in `test/sync.test.sh`,
 every one failing before its fix; the grep count for 300 clean files is the
 regression for the cost. The existing newline-name spec now expects `a?b.txt`.
 Measured on the real staging: 0.03 s before #3, 11.40 s at `c4d22f1`, 0.05 s
 now.
+
+**Round omabackup-76 (verification of `ab3d67e`).** Both closed every round-75
+finding. rev-1 requested changes over one new P1: the grep hits of the names
+pass hold the full name or target that matched, and they went to
+`"$names.hits"`, a fourth file made by a plain redirect, so 0644 under umask
+022 in a shared `/tmp`. rev-2 approved with three P3, one the same file seen
+from the other side: a redirect that cannot open its target exits 1, grep's
+"no match", so a pre-created `.hits` turned a token in a name into rc 0 (sync
+still refused, only because the bash error text made the output non-empty).
+The other two: the prefilter grep read raw names while `_still_matches` reads
+them with newlines as spaces, so a key header split by a newline in a name or
+target was no longer caught; and the directory hint, cut at the last `/`,
+printed the first part of a `generic-assigned-secret` value that crosses a
+`/`.
+
+**Fix.** Every temporary of the names pass lives in one `mktemp -d` directory
+(0700), the hits file is created up front and a failed write refuses. grep
+reads a copy of the lists with newlines as spaces, the same text
+`_still_matches` judges. `_scan_dir_hint` cuts the path before the first match
+of any pattern, then at the last `/`, and gives no hint when grep cannot
+answer. Six new specs, five failing on `ab3d67e` (hits readable by others,
+unwritable temporaries called clean, newline-split header in a name and in a
+target, hint carrying part of the value) and one for an empty `$TMPDIR` after
+the scan. The signal case is still open and goes with PR zero.
+
+Round omabackup-77 verified those fixes uncommitted: both approved, every
+round-76 finding closed. rev-2 added an optional P3, fixed here: with the match
+in the first directory nothing was left before a `/`, and the hint said "at
+the top" for a file two levels down. "at the top" now depends only on the path
+having no `/`; a cut that leaves no directory gives no hint. Two specs, the
+first failing before the fix.
 
 ### The `error:` veto covers every package list (2026-09-27)
 
