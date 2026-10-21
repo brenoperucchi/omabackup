@@ -27,11 +27,13 @@ KNOWN_EXCEPTION_FIELDS='["id","match","reason"]'
 # Same invariant as the group manifest: a rule declared and silently ignored is
 # worse than no rule, because it reads as protection.
 assert_deny_understood() {
-    local file="$1" bad line
+    # The second argument names what is being refused; it used to be "push"
+    # everywhere, which read wrong once sync called this too.
+    local file="$1" what="${2:-push}" bad line
     [[ -f "$file" ]] \
-        || die "no deny-list at $(_tilde "$file"): refusing to push without a secret scan (docs/DESIGN.md §6)"
+        || die "no deny-list at $(_tilde "$file"): refusing to $what without a secret scan (docs/DESIGN.md §6)"
     jq -e . "$file" >/dev/null 2>&1 \
-        || die "the deny-list at $(_tilde "$file") is not valid JSON: refusing to push unscanned"
+        || die "the deny-list at $(_tilde "$file") is not valid JSON: refusing to $what unscanned"
     bad="$(jq -r --argjson p "$KNOWN_DENY_FIELDS" --argjson e "$KNOWN_EXCEPTION_FIELDS" '
         [ ((.patterns // [])[] | . as $r | (keys[] | select(. as $f | $p | index($f) | not))
             | "unknown field \(.) in pattern \($r.id // "?")")
@@ -44,7 +46,7 @@ assert_deny_understood() {
         , ((.exceptions // [])[] | select((.match // "") == "" or (.reason // "") == "")
             | "exception \(.id // "?") needs both match and reason")
         ] | .[]' "$file" 2>/dev/null)" \
-        || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
+        || die "the deny-list at $(_tilde "$file") could not be read: refusing to $what unscanned"
     # There is deliberately no rule against an exception that matches a pattern.
     # That guard existed for the old cut-and-retest semantics, where an
     # exception overlapping a secret erased it. With equality an exception
@@ -93,7 +95,7 @@ assert_deny_understood() {
     # wasn't.
     local pid3 pre3 zwrc pats
     pats="$(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)"' "$file" 2>/dev/null)" \
-        || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
+        || die "the deny-list at $(_tilde "$file") could not be read: refusing to $what unscanned"
     while IFS=$'\t' read -r pid3 pre3; do
         [[ -n "$pid3" && -n "$pre3" ]] || continue
         ( [[ "" =~ $pre3 ]] ) 2>/dev/null; zwrc=$?
@@ -107,9 +109,9 @@ assert_deny_understood() {
 
     local exid2 exm2 reach pats2 excs
     pats2="$(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' "$file" 2>/dev/null)" \
-        || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
+        || die "the deny-list at $(_tilde "$file") could not be read: refusing to $what unscanned"
     excs="$(jq -r '(.exceptions // [])[] | "\(.id)\t\(.match)"' "$file" 2>/dev/null)" \
-        || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
+        || die "the deny-list at $(_tilde "$file") could not be read: refusing to $what unscanned"
     while IFS=$'\t' read -r exid2 exm2; do
         [[ -n "$exm2" ]] || continue
         reach=0
@@ -225,6 +227,12 @@ _still_matches() {
 scan_secrets() {
     local repo="$1" file="$2" id re ci hit rc=0
     [[ -f "$file" ]] || return 1
+
+    # Bytes, not characters: under a UTF-8 locale an invalid byte right before
+    # a token hid it from git grep and from bash's =~ alike, and this push
+    # gate called a history holding a token clean. The systemd user manager
+    # runs with LANG=en_US.UTF-8 (review omabackup-73, measured).
+    local LC_ALL=C; export LC_ALL
 
     # Replacements off, for every git command below. `git replace` rewrites what
     # git SHOWS you: point refs/replace/<oid> at a clean commit and rev-list,
@@ -559,6 +567,19 @@ scan_secrets() {
 scan_files() {
     local dir="$1" file="$2" id re ci hit rc=0 patterns body
     [[ -d "$dir" && -f "$file" ]] || return 1
+    shift 2
+    # Basenames to skip, given by the caller and only by the caller. The
+    # artefact build passes repo.bundle, its own packfile, whose objects were
+    # already scanned; sync's staging scan passes nothing, so a user file of
+    # that name is read like any other (review omabackup-73).
+    local -a skip=("$@")
+
+    # Bytes, not characters. Under a UTF-8 locale a byte that is not valid
+    # UTF-8 right before a token takes the word boundary away from GNU grep
+    # reading a file and from bash's =~ in _still_matches, and the token was
+    # called clean. The systemd user manager runs with LANG=en_US.UTF-8, so
+    # the timer was exposed (review omabackup-73, measured).
+    local LC_ALL=C; export LC_ALL
 
     local -a DENY_EXCEPTIONS=()
     mapfile -t DENY_EXCEPTIONS < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
@@ -568,6 +589,30 @@ scan_files() {
     if [[ -z "$patterns" ]]; then
         printf '%somabackup: the deny-list yielded no patterns -- refusing to call this clean%s\n' \
             "$RED" "$NC" >&2
+        return 1
+    fi
+
+    # File NAMES first. The push scan reads every path in history, so a name
+    # holding a token must refuse here too; and a name that hits is never
+    # printed, not by its own hit and not by a hit on its content below.
+    local -A secret_name=()
+    local rel nm f2 frc
+    while IFS= read -r -d '' f2; do
+        rel="${f2#$dir/}"
+        nm="${rel//$'\n'/ }"
+        while IFS=$'\t' read -r id re ci; do
+            [[ -n "$id" && -n "$re" ]] || continue
+            if _still_matches "$nm" "$re" "$ci"; then
+                [[ -n "${secret_name[$rel]:-}" ]] \
+                    || printf '%s\t(a file NAME, not shown)\n' "$id"
+                secret_name["$rel"]=1
+            fi
+        done <<<"$patterns"
+    done < <(find "$dir" -type f -print0 2>/dev/null)
+    wait "$!"; frc=$?
+    if (( frc != 0 )); then
+        printf '%somabackup: cannot list the files of %s -- refusing to call it clean%s\n' \
+            "$RED" "$(_tilde "$dir")" "$NC" >&2
         return 1
     fi
 
@@ -602,14 +647,24 @@ scan_files() {
         # this one, so it is captured with `wait` on the substitution's own
         # PID instead of guessed at.
         local grc
-        local -a gflags=(-r -a -n -Z -E --exclude=repo.bundle)
+        local -a gflags=(-r -a -n -Z -E --color=never)
+        local sk
+        for sk in "${skip[@]}"; do gflags+=("--exclude=$sk"); done
         [[ "$ci" == true ]] && gflags+=(-i)
         local f rest
         while IFS= read -r -d '' f && IFS= read -r rest; do
             [[ -n "$f" ]] || continue
             body="${rest#*:}"
             _still_matches "$body" "$re" "$ci" || continue
-            printf '%s\t%s\n' "$id" "${f#$dir/}:${rest:0:200}"
+            # Where, never what: the rule, the file and the line number. The
+            # line itself is not printed -- sync runs from a timer whose
+            # output is the journal (review omabackup-73).
+            rel="${f#$dir/}"
+            if [[ -n "${secret_name[$rel]:-}" ]]; then
+                printf '%s\t(content of a file whose NAME is not shown), line %s\n' "$id" "${rest%%:*}"
+            else
+                printf '%s\t%s:%s\n' "$id" "$rel" "${rest%%:*}"
+            fi
         done < <(grep "${gflags[@]}" -e "$re" -- "$dir")
         wait "$!"; grc=$?
         if (( grc > 1 )); then

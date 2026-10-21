@@ -1340,7 +1340,13 @@ collect_generated() {
 # later sync to publish, and that is what is checked.
 _discard_staging() {
     rm -rf "$STAGING" 2>/dev/null
-    [[ -z "$(find "$STAGING" -mindepth 1 -print -quit 2>/dev/null)" ]] \
+    # Gone is gone. If it is still there, an empty listing only proves it is
+    # empty when find itself succeeded: a walk that could not read the
+    # directory also prints nothing (review omabackup-73).
+    [[ -e "$STAGING" ]] || return 0
+    local left frc
+    left="$(find "$STAGING" -mindepth 1 -print -quit 2>/dev/null)"; frc=$?
+    (( frc == 0 )) && [[ -z "$left" ]] \
         || die "could not clear $(_tilde "$STAGING") after refusing it -- remove it by hand before the next sync"
 }
 
@@ -1378,7 +1384,12 @@ cmd_sync() {
     # Same deny-list, same patterns, so nothing push would have accepted is
     # refused here. On refusal staging is cleared, as it is at the top of
     # collect: a file left behind is a file the next sync would republish.
-    assert_deny_understood "$SECRETS_DENY_FILE"
+    # The validator exits through die. Run apart, so an unreadable deny-list
+    # still clears the staging it was meant to judge (review omabackup-73).
+    if ! ( assert_deny_understood "$SECRETS_DENY_FILE" publish ); then
+        _discard_staging
+        die "the deny-list cannot be used -- nothing was published"
+    fi
     local hits
     hits="$(scan_files "$STAGING" "$SECRETS_DENY_FILE" 2>&1)" || {
         [[ -n "$hits" ]] && printf '%s\n' "$hits" >&2
@@ -1388,6 +1399,11 @@ cmd_sync() {
     if [[ -n "$hits" ]]; then
         printf '%s\n' "$hits" >&2
         _discard_staging
+        # The whole local backup now stops on a hit, not only the push, so the
+        # refusal says how to get out of it (review omabackup-73).
+        printf '  Remove the credential from the live file, or exclude that file in its\n' >&2
+        printf '  group, or add a justified exception to %s. Nothing\n' "$(_tilde "$SECRETS_DENY_FILE")" >&2
+        printf '  was published; the next sync tries again.\n' >&2
         die "refusing to publish -- the deny-list matched a file in staging (docs/DESIGN.md §6)"
     fi
     local list="$OMABACKUP_STATE/last-publish"

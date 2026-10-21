@@ -415,3 +415,39 @@ _sync_env "$SK" "$SK/repo" "$SK/g.json" sync --commit >/dev/null
 
 it "a clean staging still publishes and commits"
 assert_eq "$(_commits "$SK/repo")" "2"
+
+# -- review round omabackup-73 ------------------------------------------------------
+_r73tok="gh""p_$(printf 'E%.0s' {1..36})"
+
+# The refusal prints where the hit is, never the line: the timer's output is
+# the journal, and it would repeat the secret there every fifteen minutes.
+R73A="$(mktemp -d)"; _scan_home "$R73A" "token = $_r73tok"
+R73A_OUT="$(_sync_env "$R73A" "$R73A/repo" "$R73A/g.json" sync)"; R73A_RC=$?
+it "the staging refusal never prints the matched line"
+if (( R73A_RC != 0 )); then assert_not_contains "$R73A_OUT" "$_r73tok"
+else fail "sync did not refuse a token in staging"; fi
+
+it "and says how to get out of it"
+assert_contains "$R73A_OUT" "exclude"
+
+# A file NAME can be the secret; it is not printed either.
+R73B="$(mktemp -d)"; _scan_home "$R73B"
+printf 'token = %s\n' "$_r73tok" >"$R73B/.config/app/$_r73tok.conf"
+R73B_OUT="$(_sync_env "$R73B" "$R73B/repo" "$R73B/g.json" sync)"; R73B_RC=$?
+it "a file whose name holds a token is refused without printing the name"
+if (( R73B_RC != 0 )); then assert_not_contains "$R73B_OUT" "$_r73tok"
+else fail "sync did not refuse"; fi
+
+# An unreadable deny-list exits through its own validator; staging must still
+# be cleared, and the message is about sync, not push.
+R73C="$(mktemp -d)"; _scan_home "$R73C"
+R73C_OUT="$(OMABACKUP_SECRETS_DENY="$R73C/missing.json" _sync_env "$R73C" "$R73C/repo" "$R73C/g.json" sync)"; R73C_RC=$?
+it "a missing deny-list refuses the sync"
+(( R73C_RC != 0 )) && ok || fail "sync ran with no deny-list"
+
+it "and clears the unscanned staging"
+[[ -z "$(find "$R73C/.state/staging" -mindepth 1 -print -quit 2>/dev/null)" ]] \
+    && ok || fail "unscanned staging was left on disk"
+
+it "and does not speak of a push"
+assert_not_contains "$R73C_OUT" "refusing to push"

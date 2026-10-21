@@ -934,10 +934,12 @@ STGH="$(mktemp -d)"; mkdir -p "$STGH/stage/tool"
 printf '{"paths":["~/AKIA6666666666666666"]}\n' >"$STGH/stage/tool/groups.default.json"
 printf 'nothing here\n' >"$STGH/stage/RESTORE.md"
 
+# Asserted on the file, not the key: the report names where a hit is and never
+# prints the line, because sync runs from a timer whose output is the journal.
 it "a key in a file assembly added is found by the directory scan"
 assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
                             scan_files "$1" "$2"' _ "$STGH/stage" "$PWD/secrets.deny.json" 2>&1)" \
-    "AKIA6666666666666666"
+    "tool/groups.default.json"
 
 it "and a clean staging directory reports nothing"
 rm -f "$STGH/stage/tool/groups.default.json"
@@ -1034,10 +1036,11 @@ bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
     && fail "an unreadable subdirectory read as nothing to find" || ok
 chmod 755 "$SFFH/stage/locked"
 
+# Asserted on the rule and the file: the report never prints the key itself.
 it "and a readable staging directory still finds a key when everything is fine"
 assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
                             scan_files "$1" "$2"' _ "$SFFH/stage" "$SFFH/anchored.json" 2>&1)" \
-    "AKIA1234567890ABCDEF"
+    "anchored"$'\t'"open/a.txt:1"
 
 # ── the path/content boundary needs no substitute byte at all ───────────────
 # The first version of the colon-safe rewrite piped grep's -Z output through
@@ -1060,7 +1063,7 @@ NLOUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.s
                   scan_files "$1" "$2"' _ "$NLH/stage" "$NLH/anchored.json" 2>&1)"
 
 it "a filename holding a literal newline is still matched"
-assert_contains "$NLOUT" "AKIA1234567890ABCDEF"
+assert_contains "$NLOUT" "anchored"
 
 it "and the full name is in the report, not truncated at the embedded newline"
 assert_contains "$NLOUT" "$NLNAME"
@@ -1130,3 +1133,47 @@ ZQOUT="$(bash -c '
     assert_deny_understood "$denyfile"
 ' _ "$OB" "$ZQH/zerowidth.json" 2>&1)"
 assert_contains "$ZQOUT" "match the empty string"
+
+# -- the scanners judge bytes, whatever the session's locale ---------------------
+# Under a UTF-8 locale a byte that is not valid UTF-8 right before a token takes
+# away the word boundary for GNU grep reading a file and for bash's own =~, so
+# both scan_files and the push scan called a token clean. The systemd user
+# manager on this machine runs with LANG=en_US.UTF-8, so the timer was exposed.
+# Found in review round omabackup-73, measured here: LC_ALL=C finds it,
+# C.UTF-8 does not.
+_utok="gh""p_$(printf 'D%.0s' {1..36})"
+UL="$SH/utf8"; mkdir -p "$UL/stage"
+printf '\xff%s\n' "$_utok" >"$UL/stage/bin.dat"
+
+it "scan_files finds a token after an invalid UTF-8 byte under a UTF-8 locale"
+[[ -n "$(LC_ALL=C.UTF-8 bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+         scan_files "$1" "$2"' _ "$UL/stage" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "a UTF-8 locale hid the token from the directory scan"
+
+UR="$SH/utf8-repo"; git init -q "$UR"
+printf '\xff%s\n' "$_utok" >"$UR/bin.dat"
+git -C "$UR" add bin.dat && git -C "$UR" -c user.email=t@t -c user.name=t commit -qm x
+
+it "the push scan finds a token after an invalid UTF-8 byte under a UTF-8 locale"
+[[ -n "$(LC_ALL=C.UTF-8 bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+         scan_secrets "$1" "$2"' _ "$UR" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "a UTF-8 locale hid the token from the push scan"
+
+UP="$SH/plain-line"; mkdir -p "$UP/stage"
+printf 'token = %s\n' "$_utok" >"$UP/stage/creds.txt"
+UP_OUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+          scan_files "$1" "$2"' _ "$UP/stage" "$PWD/secrets.deny.json" 2>&1)"
+it "the directory scan names the file and line of a hit"
+assert_contains "$UP_OUT" "creds.txt:1"
+
+it "but never prints the line it matched"
+assert_not_contains "$UP_OUT" "$_utok"
+
+# repo.bundle is skipped only where the caller says so: the artefact's own
+# packfile was scanned as objects before. Anywhere else it is a file like any.
+UB="$SH/bundle-name"; mkdir -p "$UB/stage/app"
+printf '%s\n' "$_utok" >"$UB/stage/app/repo.bundle"
+it "a file named repo.bundle is scanned unless the caller excludes it"
+[[ -n "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+         scan_files "$1" "$2"' _ "$UB/stage" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "a user file named repo.bundle was skipped"

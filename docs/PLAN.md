@@ -5392,7 +5392,46 @@ against `main`'s code; the control passes on both.
 
 `./test/run.sh sync` -- **40 passed, 0 failed**. Full suite in a network-less
 Arch container -- **1453 passed, 5 failed**, against `main`'s
-**1445 passed, 5 failed** at `ba59b3f`. The failing set is identical to main's: the three coverage.test.sh specs that hit the pacman -Qqem bug #2 fixes, the title-row eliding probe (no display fonts) and the VM preflight (no QEMU). Not run on a
-live Omarchy session.
+**1445 passed, 5 failed** at `ba59b3f`. The failing set is identical to main's: the three coverage.test.sh specs that hit the pacman -Qqem bug #2 fixes, the title-row eliding probe (no display fonts) and the VM preflight (no QEMU). Run on a live
+Omarchy session during review, after merging `main` into the branch (only `docs/PLAN.md`
+conflicted): **1473 passed, 0 failed**.
+
+**Review round `omabackup-73`, both REQUEST_CHANGES.** Both reviewers: the
+refusal printed `scan_files`' own report, which carries the matched line, so a
+token went to the journal on every timer tick; and `assert_deny_understood`
+exits through `die`, so an unreadable deny-list left the unscanned staging on
+disk and said "refusing to push" from `sync`. rev-1: `scan_files` always
+skipped files named `repo.bundle`, an exception that only makes sense for the
+artefact's own packfile; under a UTF-8 locale a byte that is not valid UTF-8
+right before a token hides it from GNU grep reading a file and from bash's
+`=~` in `_still_matches`; and `_discard_staging` ignored `find`'s status.
+rev-2: the refusal did not say how to get out of it, now that a hit stops the
+whole local backup.
+
+The locale finding reaches past this PR. Measured on this machine: with the
+byte `0xff` before a GitHub token, `scan_files` and the shipped push scan
+(`scan_secrets`) both find it under `LC_ALL=C` and report clean under
+`C.UTF-8`, and the systemd user manager runs with `LANG=en_US.UTF-8`, so the
+push gate released in 0.4.6 and 0.4.7 was exposed on the timer. Fixed here too.
+
+**Fixes, made on this branch by the maintainer.** `scan_files` and
+`scan_secrets` pin `LC_ALL=C`, which covers grep and `_still_matches`.
+`scan_files` takes the basenames to skip from its caller: the bundle passes
+`repo.bundle`, sync passes nothing. It reports `rule<TAB>path:line`, never the
+line, and judges file names first: a name that matches refuses on its own and
+is never printed, not even for a hit on that file's content.
+`assert_deny_understood` takes the verb for its messages (default `push`); sync
+runs it in a subshell with `publish` and clears staging when it fails.
+`_discard_staging` accepts a staging that is gone, and otherwise requires
+`find` to succeed and list nothing. The refusal says how to get out of it.
+
+Specs: eleven, every new one failing before (the UTF-8 cases for both
+scanners, the line not printed, `repo.bundle`, and in `sync` the line and the
+name not printed, the exit advice, a missing deny-list clearing staging and not
+saying push). Three existing specs asserted the matched key in the scanner's
+output; they now assert the rule and the file. The `_discard_staging` status
+fix has no spec: making `rm` and `find` both fail under the CLI would also
+break the collect that runs before it. Mutants: no locale pin in each scanner,
+`repo.bundle` always skipped, validator outside the subshell.
 
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
