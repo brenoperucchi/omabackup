@@ -1687,7 +1687,10 @@ cmd_sync() {
     for w in "${written[@]}"; do ours["$w"]=1; done
     for (( i = 0; i + 1 < ${#all_changed[@]}; i += 2 )); do
         st="${all_changed[i]}"; cp="${all_changed[i + 1]}"
-        [[ -n "${ours[$cp]:-}" ]] && continue
+        # A written path is ours unless it was deleted: publish just wrote it
+        # and git add recorded it, so only something else removed it (review
+        # omabackup-79).
+        [[ -n "${ours[$cp]:-}" && "$st" != D ]] && continue
         implied=0
         if [[ "$st" == D ]]; then
             for w in "${written[@]}"; do

@@ -1272,3 +1272,42 @@ it "a file name matched only on its repository path is refused before the commit
 it "by the pre-commit gate, without printing the name"
 assert_contains "$R78E_OUT" "changed path #"
 assert_not_contains "$R78E_OUT" "$_r78tok"
+
+# -- review round omabackup-79 ------------------------------------------------------
+# A path this run wrote can only leave the candidate if something else removed
+# it; that was accepted, and the backup lost the file in silence.
+R79A="$(mktemp -d)"; _sec_env "$R79A"; mkdir -p "$R79A/stub"
+_sync_env "$R79A" "$R79A/repo" "$R79A/g.json" sync --commit >/dev/null
+cat >"$R79A/stub/git" <<SHIM
+#!/bin/bash
+"$_REALGIT" "\$@"; rc=\$?
+if [[ -n "\${GIT_INDEX_FILE:-}" ]]; then
+    for a in "\$@"; do
+        if [[ "\$a" == add ]]; then
+            "$_REALGIT" -C "$R79A/repo" update-index --force-remove configs/app/f.txt
+            break
+        fi
+    done
+fi
+exit \$rc
+SHIM
+chmod +x "$R79A/stub/git"
+printf 'another\n' >"$R79A/.config/app/g.txt"
+PATH="$R79A/stub:$PATH" _sync_env "$R79A" "$R79A/repo" "$R79A/g.json" sync --commit >/dev/null; R79A_RC=$?
+it "a deletion of a path this run wrote refuses the commit"
+if (( R79A_RC != 0 )); then assert_contains "$(git -C "$R79A/repo" ls-tree -r --name-only HEAD)" "configs/app/f.txt"
+else fail "a written path was dropped from the backup's commit"; fi
+
+# End to end: the refusal for a directory hidden by its piece before a newline
+# does not print it.
+R79B="$(mktemp -d)"; _sec_env "$R79B"
+cat >"$R79B/deny.json" <<'JSON'
+{"schemaVersion":1,"patterns":[
+ {"id":"custom-end","regex":"secret=[a-z]{16}$","reason":"test rule anchored at the end"}]}
+JSON
+mkdir -p "$R79B/.config/app/sec""ret=abcdefghijklmnop"$'\n'"x"
+printf 'clean\n' >"$R79B/.config/app/sec""ret=abcdefghijklmnop"$'\n'"x/f.txt"
+R79B_OUT="$(OMABACKUP_SECRETS_DENY="$R79B/deny.json" _sync_env "$R79B" "$R79B/repo" "$R79B/g.json" sync --commit)"; R79B_RC=$?
+it "a directory hidden by its piece before a newline is refused without being printed"
+if (( R79B_RC != 0 )); then assert_not_contains "$R79B_OUT" "abcdefghijklmnop"
+else fail "committed a directory name push would refuse"; fi

@@ -1467,3 +1467,14 @@ it "and a symlink target the same way"
 assert_contains "$V8S_OUT" "symlink target"
 it "printing neither"
 assert_not_contains "$V8S_OUT" "$_v8nm"
+
+# -- review round omabackup-79 ----------------------------------------------------
+# A directory matched only in its piece before a newline: the hint looked for
+# the match on the joined name, found none, and printed the directory.
+V9S="$SH/v9-stage"; mkdir -p "$V9S/cfg/$_v8nm"$'\n'"suffix"
+: >"$V9S/cfg/$_v8nm"$'\n'"suffix/leaf.txt"
+V9S_OUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_files "$1" "$2"' _ "$V9S" "$V8D" 2>&1)"
+it "a name hidden by a piece before a newline gets no hint that prints it"
+assert_contains "$V9S_OUT" "(a file NAME, not shown)"
+assert_not_contains "$V9S_OUT" "abcdefghijklmnop"

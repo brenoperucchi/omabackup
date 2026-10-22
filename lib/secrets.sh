@@ -579,9 +579,12 @@ _scan_safe() { local x="$1"; printf '%s' "${x//[[:cntrl:]]/?}"; }
 #
 # The path is cut before the first match of any pattern first, then at the last
 # "/": a value free to hold a "/" otherwise printed its own first part as the
-# directory (review omabackup-76). A grep that cannot answer gives no hint.
+# directory (review omabackup-76). A grep that cannot answer gives no hint, and
+# neither does a path with a newline: the name may have been hidden by a piece
+# between newlines that this cut never looks at (review omabackup-79).
 _scan_dir_hint() {
     local rel="$1" pats="$2" flat="${1//$'\n'/ }" pre d id re ci m s
+    [[ "$rel" == *$'\n'* ]] && return 0
     pre="$rel"
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
@@ -687,7 +690,7 @@ scan_files() {
     _scan_views name_view name_of "${all_names[@]}"
     _scan_views tgt_view tgt_of "${link_target[@]}"
 
-    local -A secret_name=() name_said=()
+    local -A secret_name=() name_said=() target_said=()
     local rel nm rec n g lp lt
     if (( ${#all_names[@]} )); then
         while IFS=$'\t' read -r id re ci; do
@@ -721,8 +724,8 @@ scan_files() {
                 n="${rec%%:*}"; k="${tgt_of[$((n - 1))]}"
                 lt="${link_target[k]}"; lp="${link_path[k]}"
                 _still_matches "${tgt_view[$((n - 1))]}" "$re" "$ci" || continue
-                [[ -n "${name_said[$id:link:$k]:-}" ]] && continue
-                name_said["$id:link:$k"]=1
+                [[ -n "${target_said[$id:$k]:-}" ]] && continue
+                target_said["$id:$k"]=1
                 if [[ -n "${secret_name[$lp]:-}" ]]; then
                     printf '%s\t(a symlink target, not shown, of a link whose NAME is not shown)%s\n' \
                         "$id" "$(_scan_dir_hint "$lp" "$patterns")"

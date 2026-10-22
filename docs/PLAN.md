@@ -5864,3 +5864,15 @@ accepts every deletion fails it), a name with a newline under a `$` rule is
 refused end to end and by `scan_tree`, `scan_files` and a symlink target
 directly (fail on `9703505`), and a file name matched only on its repository
 path is refused by this gate (`changed path #`).
+
+**Round omabackup-79 (verification of `3517e5a`).** Both closed the round-78
+findings. Both found the same new exposure (rev-1 P2, rev-2 P3): a directory
+hidden by its piece before a newline got a hint, and `_scan_dir_hint` looks for
+the match only on the joined name, so it printed the directory it had just
+hidden (the value itself, right after `in cfg/`). rev-2 P3, from `26a0434`: a
+written path was accepted whatever its status, so a hook or wrapper deleting
+it from the candidate dropped it from the backup in silence. **Fix:** no hint
+for a path with a newline; a written path deleted from the candidate refuses
+(the type-change deletion is never of a written path, so it still passes); the
+symlink-target dedupe has its own array. Three specs, each failing on
+`3517e5a`.
