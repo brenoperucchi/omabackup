@@ -1336,3 +1336,22 @@ PATH="$PBH/stub:$PATH" bash -c '
     prune_bundles "$1" myhost 1 >/dev/null
 ' _ "$PBH" \
     && fail "prune_bundles reported success despite rm failing" || ok
+
+# ── a dir destination receives the bundle readable by its owner only ────────
+# cp gives a new file the source's mode filtered by the umask. A 0644 bundle
+# under the usual 022 landed 0644 in a NAS mount or a removable drive, where
+# other local users can read the whole dotfiles history (marketplace review on
+# 55c0314). The copy is created private, not tightened after it exists.
+PMD="$(mktemp -d)"
+mkdir -p "$PMD/dir"
+printf 'bundle-content\n' >"$PMD/bundle.tar.zst"; chmod 644 "$PMD/bundle.tar.zst"
+cat >"$PMD/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$PMD/dir","keep":5}]}
+JSON
+(umask 022; DESTINATIONS_FILE="$PMD/destinations.json" bash -c '
+    source lib/bundle.sh; source lib/destinations.sh
+    _push_dir "nas" "$1" "omabackup-mode-bundle.tar.zst"
+' _ "$PMD/bundle.tar.zst" >/dev/null 2>&1)
+
+it "_push_dir lands a 0644 bundle as 0600 under a 022 umask"
+assert_eq "$(stat -c %a "$PMD/dir/omabackup-mode-bundle.tar.zst" 2>/dev/null)" "600"

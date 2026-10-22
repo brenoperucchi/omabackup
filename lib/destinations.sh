@@ -601,7 +601,13 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
     # final name one filesystem entry. Without it, a final name changed into
     # a directory (or a symlink to one) between copy and rename receives the
     # temp file inside it instead of being replaced.
-    cp --remove-destination "$bundle" "$dir/$name.tmp" 2>/dev/null && mv -T -- "$dir/$name.tmp" "$dir/$name" 2>/dev/null \
+    # umask 077: cp gives the new file the bundle's mode filtered by the umask,
+    # and a bundle is the whole dotfiles history in the clear. A NAS mount or a
+    # removable drive is where other local users can reach it, so the copy is
+    # created 0600 rather than tightened after it exists (marketplace review on
+    # 55c0314). No chmod afterwards: on a vfat drive it fails, and the mount's
+    # own options decide the mode there anyway.
+    ( umask 077; cp --remove-destination "$bundle" "$dir/$name.tmp" ) 2>/dev/null && mv -T -- "$dir/$name.tmp" "$dir/$name" 2>/dev/null \
         || { rm -f "$dir/$name.tmp" 2>/dev/null; printf 'cannot write into %s' "$dir"; return 1; }
     # The stamp is what lets retention delete here, so it can only be granted to
     # a directory this tool actually owns: empty, or holding nothing but its own

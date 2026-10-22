@@ -310,6 +310,9 @@ build_bundle() {
     # is internally consistent by construction, same as every other artifact-
     # tampering PoC in this file.
     if [[ -f "$out" ]]; then
+        # An entry an older version left 0644 is not served at that mode: the
+        # dir destinations copy it, and the copy starts from the source's mode.
+        chmod 600 -- "$out" 2>/dev/null || return 1
         _verify_cache_entry "$out" && { printf '%s\treused' "$out"; return 0; }
         printf 'omabackup: the cached bundle at %s failed its own restore check -- rebuilding\n' \
             "$(_tilde "$out")" >&2
@@ -382,7 +385,12 @@ build_bundle() {
     # check should not be left to a downstream safety net to notice instead.
     local _had_pf=0; [[ -o pipefail ]] && _had_pf=1
     set -o pipefail
-    tar -C "$stage" -cf - . 2>/dev/null | zstd -q -19 -T0 -o "$out.tmp" 2>/dev/null
+    # The artifact is the whole dotfiles history in the clear. zstd creates its
+    # output 0666 filtered by the umask, the systemd units set none, and under
+    # the usual 022 the cache and every dir destination held it 0644
+    # (marketplace review on 55c0314). Created private, so it is never readable
+    # by anyone else, not even for the moment a later chmod would take.
+    ( umask 077; tar -C "$stage" -cf - . 2>/dev/null | zstd -q -19 -T0 -o "$out.tmp" 2>/dev/null )
     local comprc=$?
     (( _had_pf )) || set +o pipefail
     (( comprc == 0 )) || { rm -rf "$stage" "$out.tmp"; return 1; }

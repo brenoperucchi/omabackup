@@ -1037,3 +1037,25 @@ LGX="$(mktemp -d)"; tar -C "$LGX" -xf <(zstd -dc "$LGART")
 # tool and worktree/restore metadata add a handful more entries, so this
 # counts the "configs/" ones specifically rather than the array's raw length.
 assert_eq "$(jq '[.contents[] | select(.path | startswith("worktree/configs/"))] | length' "$LGX/manifest.json")" "1200"
+
+# ── the artifact is readable by its owner only ──────────────────────────────
+# The bundle is the whole dotfiles history in the clear. zstd writing to -o
+# creates the file 0666 filtered by the umask, and the systemd units set none,
+# so under the usual 022 the cache held 0644 artifacts that _push_dir then
+# copied, mode and all, into a destination outside the home directory (marketplace
+# review on 55c0314). A cache entry left at 0644 by an older version must not be
+# served at that mode either.
+PMH="$(mktemp -d)"; PMR="$PMH/repo"
+_bundle_repo "$PMR"
+PMOUT="$(umask 022; _bundle_env "$PMH" "$PMR" bundle --json)"
+PMART="$(printf '%s' "$PMOUT" | jq -r '.path // empty' 2>/dev/null)"
+
+it "bundle writes the artifact 0600 under a 022 umask"
+[[ -n "$PMART" ]] && assert_eq "$(stat -c %a "$PMART")" "600" \
+    || fail "no bundle produced: $PMOUT"
+
+chmod 644 "$PMART" 2>/dev/null
+PMOUT2="$(umask 022; _bundle_env "$PMH" "$PMR" bundle --json)"
+
+it "a cached artifact left at 0644 is 0600 once bundle reuses it"
+assert_eq "$(printf '%s' "$PMOUT2" | jq -r '.path // empty' 2>/dev/null):$(stat -c %a "$PMART")" "$PMART:600"
