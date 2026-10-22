@@ -5807,3 +5807,34 @@ a per-file selection with a warning for unclassified entries, `copy` mode, and
 mixed files (`~/.claude.json`, Codex/Grok `config.toml`) excluded; restore
 reports which units to re-enable instead of enabling them. The `allowList`
 manifest field is read by no code and needs its own fix.
+
+**Merged with #3 and #4 (2026-10-21).** `origin/main` (with Corey's #3 staging
+scan and #4 veto) merged into this branch. Code merged clean; `docs/PLAN.md`,
+`test/secrets.test.sh` and `test/sync.test.sh` conflicted only because both
+sides appended blocks at the same point, rebuilt as main's block then this
+one's. The suite then had five failures, all the same cause: #3's staging scan
+refuses before publish, so these specs never reached the pre-commit gate.
+Adapted: SC1 and SY8 assert the common `app/creds.txt` (the staging refusal
+prints the staging path); SC5 now asserts that `sync` without `--commit`
+refuses a token too and publishes nothing, #3's intended policy; SY71B checks
+the ignored-file warning with an ordinary ignored file, since a token in a
+name is refused before the warning exists. SY7, the clean filter that removes
+a token (git-crypt): this gate alone judged the stored blob and let it
+through, as push does; #3 refuses the plaintext in staging. Breno decided for
+0.4.8: refuse and document in the release notes (the user excludes the file or
+adds an exception). New SYI covers the case only this gate sees, a clean filter
+that ADDS a token to a clean staging file: refused, history clean, the refusal
+names `configs/app/creds.txt, line 1` and not the token.
+
+**`scan_files` keeps nothing on disk.** The open note from #3 (a signal
+mid-scan leaves the names lists in `$TMPDIR`) was first planned as a trap that
+saves and restores the caller's. Measured: inside `$(...)`, both callers' form,
+`trap -p` reports the parent's handler although it is not active there, so
+restoring it would have installed the CLI's dispatch logger in the subshell.
+The names pass now feeds the lists to grep through a pipe and reads the hits
+from a process substitution, each status read with `wait "$!"` as the content
+pass does; no file, so no mode, no failed redirect read as "no match", nothing
+for a signal to leave. Specs: grep's stdout on the names pass is a pipe and
+TMPDIR is empty while it runs (fails on the previous code), a failing names
+grep refuses, a TERM mid-scan ends with 143 and an empty TMPDIR, the caller's
+traps are untouched. Real staging (669 entries): 0.058 s.

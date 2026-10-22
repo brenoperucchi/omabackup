@@ -508,9 +508,11 @@ assert_eq "$(_commits "$SC1/repo")" "2"
 it "and leaves nothing staged for a later commit to sweep up"
 assert_eq "$(git -C "$SC1/repo" diff --cached --name-only)" ""
 
+# The staging scan (#3) refuses this one before publish, under the staging
+# path; the pre-commit gate names the repo path. Either names the file.
 it "and names the rule and the file so the user can act on it"
 assert_contains "$SC1_OUT" "github-token"
-assert_contains "$SC1_OUT" "configs/app/creds.txt"
+assert_contains "$SC1_OUT" "app/creds.txt"
 
 # The scan covers what THIS commit adds, not the whole tree. A token already in
 # history has already blocked push; blocking sync as well would stop the local
@@ -547,14 +549,18 @@ it "sync --commit refuses when the secret scan itself cannot run"
 it "and creates no commit in that case either"
 assert_eq "$(_commits "$SC4/repo")" "1"
 
-# Without --commit nothing becomes history, so the scan does not stand in the way
-# of reviewing what publish wrote.
+# Without --commit nothing becomes history, and this gate used to let publish
+# write the file for review. The staging scan (#3) now refuses before publish
+# in both modes, so the token never reaches the worktree at all.
 SC5="$(mktemp -d)"; _sec_env "$SC5"
 printf 'token = %s\n' "$_tok" >"$SC5/.config/app/creds.txt"
 _sync_env "$SC5" "$SC5/repo" "$SC5/g.json" sync >/dev/null; SC5_RC=$?
 
-it "sync without --commit still publishes for review"
-(( SC5_RC == 0 )) && ok || fail "sync without --commit failed"
+it "sync without --commit refuses a token too, before publish"
+(( SC5_RC != 0 )) && ok || fail "sync without --commit published a token"
+
+it "and the token never reached the worktree"
+[[ ! -e "$SC5/repo/configs/app/creds.txt" ]] && ok || fail "creds.txt was published"
 
 # -- the scan reads the object git records, not the file in the worktree ----------
 # Review round omabackup-68: the first version grepped the worktree while
@@ -647,9 +653,11 @@ _sync_env "$SY6" "$SY6/repo" "$SY6/g.json" sync --commit >/dev/null; SY6_RC=$?
 it "a collected file named repo.bundle is scanned like any other"
 (( SY6_RC != 0 )) && ok || fail "a token in a file named repo.bundle was committed"
 
-# A clean filter (git-crypt works this way) changes what is stored. The stored
-# blob is what history carries and what the push scan will read, so it is
-# what this scan judges.
+# A clean filter (git-crypt works this way) changes what is stored. This gate
+# judges the stored blob, and alone it let a token the filter removes through.
+# The staging scan (#3) reads the plaintext before publish and refuses it
+# anyway: decided for 0.4.8 to refuse and document, the user excludes the file
+# or adds an exception.
 SY7="$(mktemp -d)"; _sec_env "$SY7"
 git -C "$SY7/repo" config filter.hide.clean "sed 's/gh[p]_[A-Za-z0-9]*/REDACTED/'"
 git -C "$SY7/repo" config filter.hide.smudge cat
@@ -657,11 +665,32 @@ printf 'configs/app/creds.txt filter=hide\n' >"$SY7/repo/.git/info/attributes"
 printf 'token = %s\n' "$_tok" >"$SY7/.config/app/creds.txt"
 _sync_env "$SY7" "$SY7/repo" "$SY7/g.json" sync --commit >/dev/null; SY7_RC=$?
 
-it "content a clean filter removes before storage does not block the commit"
-(( SY7_RC == 0 )) && ok || fail "refused over bytes the repository would never store"
+it "a token a clean filter would remove is still refused before publish"
+(( SY7_RC != 0 )) && ok || fail "a plaintext token behind a clean filter was published"
 
-it "and the stored blob is indeed clean"
+it "and nothing holds it, stored or published"
 assert_not_contains "$(git -C "$SY7/repo" log -p --all 2>/dev/null)" "$_tok"
+[[ ! -e "$SY7/repo/configs/app/creds.txt" ]] && ok || fail "creds.txt was published"
+
+# The other way round only this gate can see: staging is clean and the clean
+# filter puts the token into the stored blob. The refusal names the repo path
+# and the line, never the content.
+SYI="$(mktemp -d)"; _sec_env "$SYI"
+git -C "$SYI/repo" config filter.leak.clean "sed 's/PLACEHOLDER/$_tok/'"
+git -C "$SYI/repo" config filter.leak.smudge cat
+printf 'configs/app/creds.txt filter=leak\n' >"$SYI/repo/.git/info/attributes"
+printf 'token = PLACEHOLDER\n' >"$SYI/.config/app/creds.txt"
+SYI_OUT="$(_sync_env "$SYI" "$SYI/repo" "$SYI/g.json" sync --commit)"; SYI_RC=$?
+
+it "a token a clean filter adds is refused before the commit"
+(( SYI_RC != 0 )) && ok || fail "the stored blob carried a token and was committed"
+
+it "and the history stays clean"
+assert_not_contains "$(git -C "$SYI/repo" log -p --all 2>/dev/null)" "$_tok"
+
+it "and the refusal names the repo path and the line, not the content"
+assert_contains "$SYI_OUT" "configs/app/creds.txt, line 1"
+assert_not_contains "$SYI_OUT" "$_tok"
 
 # The refusal goes to the systemd journal when the timer runs it. It names the
 # rule, the file and the line -- never the line's content.
@@ -672,8 +701,10 @@ SY8_OUT="$(_sync_env "$SY8" "$SY8/repo" "$SY8/g.json" sync --commit)"
 it "the refusal never prints the credential itself"
 assert_not_contains "$SY8_OUT" "$_tok"
 
+# The staging scan (#3) refuses first, as "<staging path>:<line>"; the
+# pre-commit form "<repo path>, line N" is covered by the clean-filter case.
 it "but still points at the file and the line"
-assert_contains "$SY8_OUT" "configs/app/creds.txt, line 1"
+assert_contains "$SY8_OUT" "app/creds.txt:1"
 
 # A refusal must not touch what the user had staged by hand, on the same path
 # or on another one.
@@ -1034,8 +1065,19 @@ SY71B_OUT="$(_sync_env "$SY71B" "$SY71B/repo" "$SY71B/g.json" sync --commit)"
 it "the ignored-file warning never prints a file name"
 assert_not_contains "$SY71B_OUT" "$_tok"
 
+# A token in the name is now refused by the staging scan before the warning
+# exists, so the warning itself is checked with an ordinary ignored file.
+SY71W="$(mktemp -d)"; _sec_env "$SY71W"
+printf 'configs/app/dropped*\n' >"$SY71W/repo/.gitignore"
+git -C "$SY71W/repo" add .gitignore && git -C "$SY71W/repo" commit -qm ignore
+printf 'harmless\n' >"$SY71W/.config/app/dropped-file.txt"
+SY71W_OUT="$(_sync_env "$SY71W" "$SY71W/repo" "$SY71W/g.json" sync --commit)"
+
 it "but still warns that something was dropped"
-assert_contains "$SY71B_OUT" "repo ignores"
+assert_contains "$SY71W_OUT" "repo ignores"
+
+it "without naming the dropped file"
+assert_not_contains "$SY71W_OUT" "dropped-file"
 
 # git puts the identity into some of its own errors. A failing commit-tree must
 # not print it.

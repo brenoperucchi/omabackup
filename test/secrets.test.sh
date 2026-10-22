@@ -1269,51 +1269,46 @@ assert_contains "$V5D_OUT" "DIE: could not clear"
 # -- review round omabackup-76 ----------------------------------------------------
 # The grep hits of the names pass hold the full name or target that matched,
 # token and all. They were written to "$names.hits", a predictable file made
-# by a plain redirect: 0644 under umask 022 in a shared /tmp. Whatever holds
-# them must be unreadable by others from the moment it exists.
+# by a plain redirect: 0644 under umask 022 in a shared /tmp; a redirect that
+# failed read as "no match"; a signal left the lists behind. The names pass
+# keeps nothing on disk now: each grep writes into a pipe, and TMPDIR is empty
+# while it runs.
 V6P="$SH/v6-perm"; mkdir -p "$V6P/stage" "$V6P/stub" "$V6P/tmp"; chmod 1777 "$V6P/tmp"
 : >"$V6P/stage/$_v5tok.conf"
 cat >"$V6P/stub/grep" <<SHIM
 #!/bin/bash
 if [[ " \$* " == *" -z "* ]]; then
-    o="\$(readlink /proc/\$\$/fd/1)"
-    echo "\$(stat -c %a "\$o") \$(stat -c %a "\$(dirname "\$o")")" >>"$V6P/modes"
+    echo "\$(readlink /proc/\$\$/fd/1) [\$(ls -A "$V6P/tmp" | tr '\n' ' ')]" >>"$V6P/seen"
 fi
 exec /usr/bin/grep "\$@"
 SHIM
 chmod +x "$V6P/stub/grep"
-(umask 022; TMPDIR="$V6P/tmp" _scanf "$V6P/stage" "$V6P/stub" >/dev/null)
-it "the names pass keeps its grep hits where no other user can read them"
-if [[ -s "$V6P/modes" ]] && ! awk '$1 !~ /00$/ && $2 !~ /00$/ {bad=1} END {exit !bad}' "$V6P/modes"; then
+V6P_OUT="$(umask 022; TMPDIR="$V6P/tmp" _scanf "$V6P/stage" "$V6P/stub")"
+it "the names pass keeps its grep hits off the disk"
+if [[ -s "$V6P/seen" ]] && ! command grep -qv '^pipe:\[[0-9]*\] \[\]$' "$V6P/seen"; then
     ok
 else
-    fail "file/dir modes of the hits: $(tr '\n' ' ' <"$V6P/modes" 2>/dev/null)"
+    fail "grep stdout / TMPDIR during the names pass: $(tr '\n' ' ' <"$V6P/seen" 2>/dev/null)"
 fi
+it "and still finds the name"
+assert_contains "$V6P_OUT" "(a file NAME, not shown)"
 it "and leaves nothing behind in TMPDIR"
 [[ -z "$(ls -A "$V6P/tmp")" ]] && ok || fail "left in TMPDIR: $(ls -A "$V6P/tmp")"
 
-# A temporary the scan cannot write is a scan that did not run. The redirect
-# into the hits file failed with status 1 -- grep's "no match" -- and a name
-# carrying a token came back clean. mktemp is a shim that hands out paths the
-# scan cannot write to: a read-only directory for -d, and for plain files a
-# path whose ".hits" sibling is a directory.
-V6W="$SH/v6-write"; mkdir -p "$V6W/stage" "$V6W/stub" "$V6W/tmp"
+# A names pass that cannot run is not a clean one: a grep that fails on the
+# list refuses, its status read through the process substitution.
+V6W="$SH/v6-write"; mkdir -p "$V6W/stage" "$V6W/stub"
 : >"$V6W/stage/$_v5tok.conf"
-cat >"$V6W/stub/mktemp" <<SHIM
+cat >"$V6W/stub/grep" <<'SHIM'
 #!/bin/bash
-n=\$(ls "$V6W/tmp" | wc -l)
-if [[ "\$1" == -d ]]; then
-    d="$V6W/tmp/d\$n"; mkdir "\$d"; chmod 500 "\$d"; echo "\$d"
-else
-    f="$V6W/tmp/f\$n"; : >"\$f"; mkdir -p "\$f.hits"; echo "\$f"
-fi
+[[ " $* " == *" -z "* ]] && { cat >/dev/null; exit 2; }
+exec /usr/bin/grep "$@"
 SHIM
-chmod +x "$V6W/stub/mktemp"
+chmod +x "$V6W/stub/grep"
 PATH="$V6W/stub:$PATH" bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
     scan_files "$1" "$2"' _ "$V6W/stage" "$PWD/secrets.deny.json" >/dev/null 2>&1; V6W_RC=$?
-chmod -R u+w "$V6W/tmp" 2>/dev/null
-it "a names pass whose temporaries cannot be written refuses instead of calling it clean"
-(( V6W_RC != 0 )) && ok || fail "scan_files returned 0 with a token in a file name"
+it "a names pass whose grep fails refuses instead of calling it clean"
+(( V6W_RC != 0 )) && ok || fail "scan_files returned 0 when the names grep failed"
 
 # The prefilter read the raw name and _still_matches the name with newlines as
 # spaces, so a name that only matches with the space -- a key header split by
@@ -1405,3 +1400,31 @@ it "scan_tree finds a token after an invalid UTF-8 byte under a UTF-8 locale"
 [[ -n "$(LC_ALL=C.UTF-8 bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
          scan_tree "$1" "$2" "$3" "$4" bin.dat' _ "$ZT" "$PWD/secrets.deny.json" "$ZT_TREE" "$ZT_WORK" 2>/dev/null)" ]] \
     && ok || fail "a UTF-8 locale hid the token from the pre-commit scan"
+
+# A signal mid-scan (the timer's stop, a ^C) left the scan's private directory
+# behind, and its lists hold the names that matched. The handler clears it,
+# then the signal goes on to whatever the caller had set, or kills as before.
+# grep is a shim that sends TERM to the scanning shell on the names pass. The
+# lists live in pipes now, so there is nothing to clear.
+V6S="$SH/v6-signal"; mkdir -p "$V6S/stage" "$V6S/stub" "$V6S/tmp"
+: >"$V6S/stage/$_v5tok.conf"
+cat >"$V6S/stub/grep" <<'SHIM'
+#!/bin/bash
+[[ " $* " == *" -z "* ]] && kill -TERM "$SCAN_PID"
+exec /usr/bin/grep "$@"
+SHIM
+chmod +x "$V6S/stub/grep"
+TMPDIR="$V6S/tmp" PATH="$V6S/stub:$PATH" bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    export SCAN_PID=$$; scan_files "$1" "$2"; echo "survived the signal"' _ "$V6S/stage" "$PWD/secrets.deny.json" >"$V6S/out" 2>&1; V6S_RC=$?
+it "a TERM mid-scan still ends the scan with the signal's status"
+(( V6S_RC == 143 )) && ok || fail "status $V6S_RC: $(cat "$V6S/out")"
+it "and leaves nothing behind in TMPDIR"
+[[ -z "$(ls -A "$V6S/tmp")" ]] && ok || fail "left in TMPDIR: $(ls -A "$V6S/tmp")"
+
+# The caller's own handler still runs, and its traps come back after a scan.
+V6K="$(TMPDIR="$V6S/tmp" bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    trap "echo caller-handler" HUP
+    scan_files "$1" "$2" >/dev/null 2>&1
+    trap -p HUP' _ "$V6S/stage" "$PWD/secrets.deny.json" 2>&1)"
+it "a scan gives the caller its traps back"
+assert_contains "$V6K" "echo caller-handler"
