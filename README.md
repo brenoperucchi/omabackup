@@ -150,8 +150,13 @@ alongside. A checker born with a dozen warnings teaches you to ignore it.
 `sync` runs the deny-list scan over what `collect` staged before a single file
 is published into your dotfiles repository. A hit refuses the sync, names the
 pattern and the file, and clears staging, so the secret never enters the
-worktree or your local history. The scan before a push, below, still runs over
-every commit as a second layer.
+worktree or your local history. With `--commit`, the commit is scanned again
+before any branch moves: the names, directories and contents it adds, read
+back from git, and the commit object itself. A file you encrypt with a clean
+filter such as git-crypt is judged by its plain text in staging, so a
+credential in it is refused; exclude that file in its group or add a justified
+exception to `secrets.deny.json`. The scan before a push, below, still runs
+over every commit as a second layer.
 
 ### Before a push
 

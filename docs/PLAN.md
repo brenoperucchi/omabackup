@@ -5876,3 +5876,40 @@ for a path with a newline; a written path deleted from the candidate refuses
 (the type-change deletion is never of a written path, so it still passes); the
 symlink-target dedupe has its own array. Three specs, each failing on
 `3517e5a`.
+
+**Round omabackup-80 (verification of `e57fd06`).** Both reviewers approved,
+with no open finding. Before the push, the test literals shaped like
+credentials (`password = "…"`, `secret=…`) were split in every commit of the
+branch, the way GitGuardian forced on #3; commit messages, authors and dates
+are unchanged and the branch head became `e904992`. Full suite on it:
+**1617 passed, 0 failed**. Opened as PR #5, GitGuardian green on the first
+run, merged as `f9c2bac` (merge commit, pinned to `e904992`).
+
+#### Marketplace release `0.4.8` (2026-10-22)
+
+Ships #3 (staging scan before publish, Corey), #4 (`error:` veto across every
+package list, Corey) and #5 (scan before the sync commit). The release commit
+bumps `manifest.json` to `0.4.8`, adds the `CHANGELOG.md` entry with a "Read
+before upgrading" section, and extends the README's "Before a sync publishes"
+paragraph with the commit scan and the clean-filter case. As decided for this
+release, a file encrypted by a clean filter (git-crypt) is refused when its
+plain text in staging matches the deny-list; the user excludes the file or adds
+an exception. The annotated tag `v0.4.8` and the GitHub Release point at the
+release commit.
+
+**Marketplace.** Issue `#7773` is closed: the maintainers published
+`d2f22b3` (0.4.7 plus its docs commit) on 2026-10-03, after HANCORE-linux asked
+for the target to be the default branch HEAD. 0.4.8 goes through a new
+`[Verify]: OmaBackup 0.4.8` issue whose target is the release commit, which
+must still be `main`'s HEAD when it is opened and validated.
+
+**Next.**
+1. Keep `main` at the release commit until the marketplace validates it, or
+   update the issue's target after any later commit.
+2. Mark GitGuardian incidents 38833297 and 38833298 (the test literals flagged on #3)
+   as false positives.
+3. Design for per-user custom paths (`herdr-ask`), then the `audio`, systemd
+   unit and `agents` groups, which this release unblocks.
+4. The main checkout at `~/Devs/omabackup` is still at `56785dc` with the
+   uncommitted `docs/PLAN.md` edits and untracked `docs/plans/`; reconcile it
+   with `origin/main` by hand before working there.

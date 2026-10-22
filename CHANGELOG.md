@@ -7,6 +7,75 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 loosely while it is pre-1.0: patch releases may still change behaviour when the
 change closes a security hole, and such changes are always called out here.
 
+## [0.4.8] — 2026-10-22
+
+Secrets are now refused before they reach your local backup, not only before a
+push. `sync` can stop in cases where 0.4.7 went through, so read the first
+section before upgrading.
+
+### Read before upgrading
+
+- `sync` scans what `collect` staged before publishing it, with or without
+  `--commit`. A file that matches the deny-list stops the sync: nothing is
+  published or committed, staging is cleared, and every timer run refuses
+  again until you remove the credential from the live file, exclude that file
+  in its group, or add a justified exception to `secrets.deny.json`. In 0.4.7
+  the same file was committed to local history and only `push` refused it.
+- A file you encrypt with a git clean filter, such as git-crypt, is refused
+  too when its plain text matches a pattern. The scan reads staging, before
+  git runs the filter, so it sees the plain text. Exclude the file in its
+  group or add an exception for it.
+- `sync --commit` refuses while a merge, cherry-pick, revert or rebase is in
+  progress in the backup repository. It also refuses when something other than
+  the sync changed the commit it was building, for example a git hook, an
+  fsmonitor or a wrapper around git.
+- `collect` refuses the package lists whenever any pacman query prints an
+  `error:` line, whatever its exit status. That includes configuration errors
+  that leave the lists intact, such as a repository section declared twice in
+  `pacman.conf`, which 0.4.7 collected. The refusal shows pacman's first
+  `error:` line so you can find the cause.
+
+### Security
+
+- `sync --commit` scans the commit before any branch moves. It builds the
+  commit in its own index, writes the tree and scans what that tree adds: file
+  names, the directories above them, the file contents read back from git by
+  object id, and the commit object itself. A hit, or a scan that cannot run,
+  refuses the commit and leaves your index and branch as they were. This
+  catches what the staging scan cannot see, such as a clean filter that adds a
+  credential. The commit is made with `write-tree`, `commit-tree` and a
+  compare-and-swap `update-ref`, with hooks and fsmonitor turned off.
+- Every scanner runs under the C locale. Under a UTF-8 locale, a byte that is
+  not valid UTF-8 right before a token hid it from grep, and the systemd user
+  manager runs with a UTF-8 `LANG`. The push scan in 0.4.6 and 0.4.7 had this
+  gap on the timer.
+- The push scan passes `--no-color` to git. With `color.ui=always` in git's
+  config, the colour codes hid a token from it.
+- A refusal names the rule, the file and the line number, and never prints the
+  matched line, so a credential does not end up in the journal. A file name
+  that matches is not printed either.
+- File names are also judged piece by piece between newlines, the way `push`
+  reads them, so a rule that matches a piece in `push` matches it in `sync`
+  too.
+
+### Fixed
+
+- An `error:` from any of the three pacman queries now refuses `collect`
+  whatever their exit status, so a corrupted native package entry can no
+  longer publish three shortened lists. This closes the known gap listed in
+  0.4.7.
+
+### Testing
+
+- Full suite on a real Omarchy session: 1617 passed, 0 failed.
+
+### Thanks
+
+- [Corey Tyhurst](https://github.com/coreytyhurst) wrote the staging scan in
+  [PR #3](https://github.com/brenoperucchi/omabackup/pull/3) and moved the
+  `error:` check across every package list in
+  [PR #4](https://github.com/brenoperucchi/omabackup/pull/4).
+
 ## [0.4.7] — 2026-09-26
 
 ### Fixed
