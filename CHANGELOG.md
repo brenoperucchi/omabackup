@@ -7,6 +7,60 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 loosely while it is pre-1.0: patch releases may still change behaviour when the
 change closes a security hole, and such changes are always called out here.
 
+## [0.4.9] — 2026-10-22
+
+Backups are now readable by their owner only. Earlier versions wrote every
+bundle, and its copy in a `dir` destination, readable by any local user who
+could reach the directory. Read the first section to close the copies that
+already exist.
+
+### Read before upgrading
+
+- Under the usual 022 umask, bundles written by 0.4.8 and earlier are mode
+  0644. OmaBackup closes the ones it can reach. The state directory, which
+  holds the bundle cache, loses group and other access on the next sync, and a
+  push tightens its own older bundles in a destination it owns, one holding a
+  `.omabackup-destination` stamp. In a destination without the stamp, close
+  them yourself. `--no-dereference` matters on a shared destination, where
+  someone else could have left a symlink under a bundle's name:
+
+  ```
+  chmod --no-dereference 600 -- /path/to/destination/omabackup-*.tar.zst
+  ```
+
+- OmaBackup cannot promise owner-only access where the filesystem decides
+  otherwise. A drive formatted vfat or exFAT has no per-file permissions, so
+  its mount options decide who can read a bundle there. A default ACL can also
+  grant access the umask does not control. A bundle in the cache stays 0600
+  only while the state directory carries no default ACL that opens it, and its
+  copy in a destination keeps that mode. In a stamped destination, the
+  `chmod 600` on older bundles removes access an ACL had granted to those
+  files.
+- If you set `OMABACKUP_STATE` to a directory of your own, `collect` now
+  removes group and other access from it. Point it at a directory only
+  OmaBackup uses.
+
+### Security
+
+- The bundle is created 0600, and so is its copy in a `dir` destination,
+  whatever the umask (see the ACL note above). zstd and cp created them 0644
+  under the usual 022 umask, and the shipped services set none. Found in the
+  marketplace maintainer's review of 0.4.8.
+- The state directory (`~/.local/state/omabackup`) and the bundle cache lose
+  group and other access on every collect and build. That also covers staging,
+  plugin patches and the generated package lists.
+- `restore --into` creates its target 0700, and so does `omabackup config`
+  when it offers to create the backup repository.
+- A JSON file whose keys are sorted on publish keeps its source's mode. A 0600
+  `shell.json` used to be published 0644.
+- Both systemd services run with `UMask=0077`. Run `omabackup reload` once
+  after updating so the installed units pick it up (it also restarts the
+  shell); `omarchy plugin update` alone does not rewrite them.
+
+### Testing
+
+- Full suite on a real Omarchy session: 1631 passed, 0 failed.
+
 ## [0.4.8] — 2026-10-22
 
 Secrets are now refused before they reach your local backup, not only before a

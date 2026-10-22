@@ -5913,3 +5913,55 @@ must still be `main`'s HEAD when it is opened and validated.
 4. The main checkout at `~/Devs/omabackup` is still at `56785dc` with the
    uncommitted `docs/PLAN.md` edits and untracked `docs/plans/`; reconcile it
    with `origin/main` by hand before working there.
+
+### Bundles and state readable by their owner only (0.4.9, 2026-10-22)
+
+**The finding.** HANCORE-linux, reviewing `55c0314` on marketplace issue
+`#12564`: the bundle is the whole dotfiles history in the clear, zstd created
+it 0666 filtered by the umask, `_push_dir` copied it mode and all, and the
+shipped services set no `UMask`. Under the usual 022 every bundle in the cache
+and in a `dir` destination was 0644, so a NAS mount or a removable drive
+exposed it to other local users. Measured here: all 448 cache entries 0644 in
+a 0755 directory, protected only by the 0700 home. The gap predates 0.4.8.
+
+**Round omabackup-81 on the first fix** (`cf94f56`: umask 077 around zstd and
+cp, chmod on a cache hit). rev-2 approved; rev-1 asked for changes. Both
+showed the cache-hit chmod never meets an older version's entry, since the key
+carries the tool's fingerprint and nothing prunes the cache, and that copies
+already in a destination stay 0644. rev-1 also found the same class in
+staging, the JSON normalization, the repository the config assistant creates
+and `restore --into`, plus default ACLs. Breno chose to fix everything cheap
+in 0.4.9 and to document default ACLs on a destination as a limitation.
+
+**The fix** (`8f0d911`, then `--no-dereference` from round 82). The state
+directory and the cache lose group and other access on every collect and
+build (`go-rwx`, not 700: 700 re-granted the owner's write bit and broke a
+coverage spec that makes the state read-only). A push tightens its own older
+bundles in a stamped destination, best effort, with `chmod --no-dereference`
+because rev-1 showed in round 82 that find chooses the entry and chmod
+resolves the name again, so a shared destination could swap it for a symlink
+in between. `restore --into`, the assistant's new repository and the sorted
+JSON temp file are created under umask 077, the JSON then taking its source's
+mode. Both units run with `UMask=0077`, which reaches an installed unit only
+through `omabackup reload` or `install`: round 83 (rev-2) found that
+`omarchy plugin update` only fast-forwards the checkout, revalidates and
+rescans, and never calls `reload`, contrary to what an older entry above and
+a comment in `cmd_reload` said. The 0.4.9 notes tell the user to run
+`omabackup reload`; having the CLI refresh its own units is a possible later
+change. Fourteen specs, each failing before its fix except the three
+controls (a foreign file untouched, a failing chmod, the push landing).
+
+Round 83 also corrected two lines of the draft notes (rev-1): the manual
+`chmod` for unstamped destinations now carries `--no-dereference`, and the ACL
+note no longer claims the migration leaves ACL-granted access alone.
+
+**Not done here.** Cache pruning (unbounded growth, 448 entries here). Existing
+dotfiles repositories keep their modes. Destinations without the stamp need
+the manual `chmod --no-dereference 600` the 0.4.9 notes give; on vfat or exFAT
+drives only the mount options (`fmask`, `uid`) decide who can read a bundle.
+A default ACL on the state directory could still open a new cache file, since
+zstd asks for 0666 and a default ACL replaces the umask; documented, not
+handled (round 84, rev-1).
+
+**Marketplace.** `#12564` keeps its number; its target moves to the 0.4.9
+release commit, which must stay `main`'s HEAD until the maintainers verify it.

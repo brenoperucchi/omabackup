@@ -2072,8 +2072,9 @@ cmd_reload() {
 
     # `.service` files only, never `.timer` -- found by review (round
     # omabackup-22): `cmd_install` is the only thing that ever writes these
-    # units, so an instance updated the supported way (`reload`, or
-    # `omarchy plugin update`, which calls this) kept running its
+    # units, so an instance updated the supported way (`reload`; note that
+    # `omarchy plugin update` only fast-forwards the plugin checkout and
+    # never calls this, review omabackup-83) kept running its
     # pre-OMABACKUP_LOG_SKIP=1 units indefinitely, duplicating the journal
     # and the file log on every timer-triggered run. Re-running `install`
     # by hand already picks up the new template, but that is not the
