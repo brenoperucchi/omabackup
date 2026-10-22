@@ -145,6 +145,14 @@ coverage only for the user's files. That is how
 Deliberate exclusions live in `excluded[]`, each with its reason versioned
 alongside. A checker born with a dozen warnings teaches you to ignore it.
 
+### Before a sync publishes
+
+`sync` runs the deny-list scan over what `collect` staged before a single file
+is published into your dotfiles repository. A hit refuses the sync, names the
+pattern and the file, and clears staging, so the secret never enters the
+worktree or your local history. The scan before a push, below, still runs over
+every commit as a second layer.
+
 ### Before a push
 
 `push` will not send your dotfiles to a GitHub repository that anyone can

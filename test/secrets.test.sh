@@ -934,10 +934,12 @@ STGH="$(mktemp -d)"; mkdir -p "$STGH/stage/tool"
 printf '{"paths":["~/AKIA6666666666666666"]}\n' >"$STGH/stage/tool/groups.default.json"
 printf 'nothing here\n' >"$STGH/stage/RESTORE.md"
 
+# Asserted on the file, not the key: the report names where a hit is and never
+# prints the line, because sync runs from a timer whose output is the journal.
 it "a key in a file assembly added is found by the directory scan"
 assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
                             scan_files "$1" "$2"' _ "$STGH/stage" "$PWD/secrets.deny.json" 2>&1)" \
-    "AKIA6666666666666666"
+    "tool/groups.default.json"
 
 it "and a clean staging directory reports nothing"
 rm -f "$STGH/stage/tool/groups.default.json"
@@ -1034,10 +1036,11 @@ bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
     && fail "an unreadable subdirectory read as nothing to find" || ok
 chmod 755 "$SFFH/stage/locked"
 
+# Asserted on the rule and the file: the report never prints the key itself.
 it "and a readable staging directory still finds a key when everything is fine"
 assert_contains "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
                             scan_files "$1" "$2"' _ "$SFFH/stage" "$SFFH/anchored.json" 2>&1)" \
-    "AKIA1234567890ABCDEF"
+    "anchored"$'\t'"open/a.txt:1"
 
 # ── the path/content boundary needs no substitute byte at all ───────────────
 # The first version of the colon-safe rewrite piped grep's -Z output through
@@ -1060,10 +1063,13 @@ NLOUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.s
                   scan_files "$1" "$2"' _ "$NLH/stage" "$NLH/anchored.json" 2>&1)"
 
 it "a filename holding a literal newline is still matched"
-assert_contains "$NLOUT" "AKIA1234567890ABCDEF"
+assert_contains "$NLOUT" "anchored"
 
+# Control bytes in a name are shown as "?": a name is free to hold ESC or CR,
+# and printing them raw lets a filename drive the terminal or the journal
+# (review omabackup-75). The newline is one of them.
 it "and the full name is in the report, not truncated at the embedded newline"
-assert_contains "$NLOUT" "$NLNAME"
+assert_contains "$NLOUT" "a?b.txt"
 
 # ── the zero-width-pattern check cannot pass by failing to run at all ───────
 # Its own jq query fed `< <(jq ...)` straight into the while loop with no
@@ -1130,3 +1136,219 @@ ZQOUT="$(bash -c '
     assert_deny_understood "$denyfile"
 ' _ "$OB" "$ZQH/zerowidth.json" 2>&1)"
 assert_contains "$ZQOUT" "match the empty string"
+
+# -- the scanners judge bytes, whatever the session's locale ---------------------
+# Under a UTF-8 locale a byte that is not valid UTF-8 right before a token takes
+# away the word boundary for GNU grep reading a file and for bash's own =~, so
+# both scan_files and the push scan called a token clean. The systemd user
+# manager on this machine runs with LANG=en_US.UTF-8, so the timer was exposed.
+# Found in review round omabackup-73, measured here: LC_ALL=C finds it,
+# C.UTF-8 does not.
+_utok="gh""p_$(printf 'D%.0s' {1..36})"
+UL="$SH/utf8"; mkdir -p "$UL/stage"
+printf '\xff%s\n' "$_utok" >"$UL/stage/bin.dat"
+
+it "scan_files finds a token after an invalid UTF-8 byte under a UTF-8 locale"
+[[ -n "$(LC_ALL=C.UTF-8 bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+         scan_files "$1" "$2"' _ "$UL/stage" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "a UTF-8 locale hid the token from the directory scan"
+
+UR="$SH/utf8-repo"; git init -q "$UR"
+printf '\xff%s\n' "$_utok" >"$UR/bin.dat"
+git -C "$UR" add bin.dat && git -C "$UR" -c user.email=t@t -c user.name=t commit -qm x
+
+it "the push scan finds a token after an invalid UTF-8 byte under a UTF-8 locale"
+[[ -n "$(LC_ALL=C.UTF-8 bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+         scan_secrets "$1" "$2"' _ "$UR" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "a UTF-8 locale hid the token from the push scan"
+
+UP="$SH/plain-line"; mkdir -p "$UP/stage"
+printf 'token = %s\n' "$_utok" >"$UP/stage/creds.txt"
+UP_OUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+          scan_files "$1" "$2"' _ "$UP/stage" "$PWD/secrets.deny.json" 2>&1)"
+it "the directory scan names the file and line of a hit"
+assert_contains "$UP_OUT" "creds.txt:1"
+
+it "but never prints the line it matched"
+assert_not_contains "$UP_OUT" "$_utok"
+
+# repo.bundle is skipped only where the caller says so: the artefact's own
+# packfile was scanned as objects before. Anywhere else it is a file like any.
+UB="$SH/bundle-name"; mkdir -p "$UB/stage/app"
+printf '%s\n' "$_utok" >"$UB/stage/app/repo.bundle"
+it "a file named repo.bundle is scanned unless the caller excludes it"
+[[ -n "$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+         scan_files "$1" "$2"' _ "$UB/stage" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "a user file named repo.bundle was skipped"
+
+# -- review round omabackup-75: the staging scan's names pass ---------------------
+_v5tok="gh""p_$(printf 'G%.0s' {1..36})"
+_scanf() {  # _scanf <dir> [PATH prefix] -- scan_files with the shipped deny-list
+    PATH="${2:+$2:}$PATH" bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+        scan_files "$1" "$2"' _ "$1" "$PWD/secrets.deny.json" 2>&1
+}
+
+# The names pass called grep once per file per pattern -- 12 s on a real
+# 667-file staging, against 0.03 s before it. It must cost a pass per pattern,
+# whatever the number of files. Counted, not timed.
+V5P="$SH/v5-perf"; mkdir -p "$V5P/stage" "$V5P/stub"
+for i in $(seq 1 300); do : >"$V5P/stage/f$i.conf"; done
+cat >"$V5P/stub/grep" <<SHIM
+#!/bin/bash
+echo x >>"$V5P/calls"
+exec /usr/bin/grep "\$@"
+SHIM
+chmod +x "$V5P/stub/grep"
+_scanf "$V5P/stage" "$V5P/stub" >/dev/null
+it "the names pass costs a grep per pattern, not per file"
+(( $(wc -l <"$V5P/calls" 2>/dev/null || echo 99999) < 100 )) && ok \
+    || fail "$(wc -l <"$V5P/calls") grep calls for 300 clean files"
+
+# A grep that fails to open a file prints that file's path -- and the name can
+# be the token the scan just decided to hide.
+V5E="$SH/v5-err"; mkdir -p "$V5E/stage" "$V5E/stub"
+printf 'x\n' >"$V5E/stage/$_v5tok.conf"
+cat >"$V5E/stub/grep" <<'SHIM'
+#!/bin/bash
+for a in "$@"; do
+    if [[ "$a" == -r ]]; then
+        f="$(find "${@: -1}" -type f | head -1)"
+        echo "grep: $f: Input/output error" >&2; exit 2
+    fi
+done
+exec /usr/bin/grep "$@"
+SHIM
+chmod +x "$V5E/stub/grep"
+V5E_OUT="$(_scanf "$V5E/stage" "$V5E/stub")"
+it "a grep error never prints a file name the scan hid"
+assert_not_contains "$V5E_OUT" "$_v5tok"
+
+# Control bytes from a name never reach the output raw.
+V5C="$SH/v5-ctrl"; mkdir -p "$V5C/stage"
+printf 'token = %s\n' "$_v5tok" >"$V5C/stage/$(printf 'x\033[2Jy.conf')"
+V5C_OUT="$(_scanf "$V5C/stage")"
+it "a hit in a file whose name holds control bytes prints none of them"
+[[ -n "$V5C_OUT" && "$V5C_OUT" != *$'\033'* ]] && ok || fail "no hit, or an ESC from the name reached the output"
+
+# Symlinks: git commits the link's NAME and its TARGET text as a blob, so both
+# are judged; neither is printed.
+V5L="$SH/v5-link"; mkdir -p "$V5L/stage"
+printf 'fine\n' >"$V5L/stage/fine.conf"
+ln -s fine.conf "$V5L/stage/$_v5tok"
+ln -s "$_v5tok" "$V5L/stage/pointer"
+V5L_OUT="$(_scanf "$V5L/stage")"
+it "a symlink whose name holds a token is found"
+assert_contains "$V5L_OUT" "(a file NAME, not shown)"
+it "a symlink whose target holds a token is found"
+assert_contains "$V5L_OUT" "symlink target"
+it "and neither the name nor the target is printed"
+assert_not_contains "$V5L_OUT" "$_v5tok"
+
+# A hidden name still says where to look, when the directory is clean.
+V5H="$SH/v5-hint"; mkdir -p "$V5H/stage/app"
+printf 'x\n' >"$V5H/stage/app/$_v5tok.conf"
+V5H_OUT="$(_scanf "$V5H/stage")"
+it "a hidden file name still names the directory it is in"
+assert_contains "$V5H_OUT" "in app/"
+
+# _discard_staging is the proof that a refused staging is gone. A walk that
+# could not run printed nothing and passed as "empty".
+# The real function, extracted from the CLI; rm and find are PATH shims that
+# fail without touching anything. The helper before review returned 0 here.
+V5D="$SH/v5-discard"; mkdir -p "$V5D/staging" "$V5D/stub"; : >"$V5D/staging/left.conf"
+printf '#!/bin/sh\nexit 1\n' >"$V5D/stub/find"; cp "$V5D/stub/find" "$V5D/stub/rm"
+chmod +x "$V5D/stub/find" "$V5D/stub/rm"
+V5D_OUT="$(STAGING="$V5D/staging" STUB="$V5D/stub" bash -c '
+    die() { echo "DIE: $*"; exit 1; }; _tilde() { printf %s "$1"; }
+    source <(sed -n "/^_discard_staging() {/,/^}/p" bin/omabackup)
+    PATH="$STUB:$PATH"
+    _discard_staging; echo "returned $?"' 2>&1)"
+it "_discard_staging refuses when it cannot prove the staging is empty"
+assert_contains "$V5D_OUT" "DIE: could not clear"
+
+# -- review round omabackup-76 ----------------------------------------------------
+# The grep hits of the names pass hold the full name or target that matched,
+# token and all. They were written to "$names.hits", a predictable file made
+# by a plain redirect: 0644 under umask 022 in a shared /tmp. Whatever holds
+# them must be unreadable by others from the moment it exists.
+V6P="$SH/v6-perm"; mkdir -p "$V6P/stage" "$V6P/stub" "$V6P/tmp"; chmod 1777 "$V6P/tmp"
+: >"$V6P/stage/$_v5tok.conf"
+cat >"$V6P/stub/grep" <<SHIM
+#!/bin/bash
+if [[ " \$* " == *" -z "* ]]; then
+    o="\$(readlink /proc/\$\$/fd/1)"
+    echo "\$(stat -c %a "\$o") \$(stat -c %a "\$(dirname "\$o")")" >>"$V6P/modes"
+fi
+exec /usr/bin/grep "\$@"
+SHIM
+chmod +x "$V6P/stub/grep"
+(umask 022; TMPDIR="$V6P/tmp" _scanf "$V6P/stage" "$V6P/stub" >/dev/null)
+it "the names pass keeps its grep hits where no other user can read them"
+if [[ -s "$V6P/modes" ]] && ! awk '$1 !~ /00$/ && $2 !~ /00$/ {bad=1} END {exit !bad}' "$V6P/modes"; then
+    ok
+else
+    fail "file/dir modes of the hits: $(tr '\n' ' ' <"$V6P/modes" 2>/dev/null)"
+fi
+it "and leaves nothing behind in TMPDIR"
+[[ -z "$(ls -A "$V6P/tmp")" ]] && ok || fail "left in TMPDIR: $(ls -A "$V6P/tmp")"
+
+# A temporary the scan cannot write is a scan that did not run. The redirect
+# into the hits file failed with status 1 -- grep's "no match" -- and a name
+# carrying a token came back clean. mktemp is a shim that hands out paths the
+# scan cannot write to: a read-only directory for -d, and for plain files a
+# path whose ".hits" sibling is a directory.
+V6W="$SH/v6-write"; mkdir -p "$V6W/stage" "$V6W/stub" "$V6W/tmp"
+: >"$V6W/stage/$_v5tok.conf"
+cat >"$V6W/stub/mktemp" <<SHIM
+#!/bin/bash
+n=\$(ls "$V6W/tmp" | wc -l)
+if [[ "\$1" == -d ]]; then
+    d="$V6W/tmp/d\$n"; mkdir "\$d"; chmod 500 "\$d"; echo "\$d"
+else
+    f="$V6W/tmp/f\$n"; : >"\$f"; mkdir -p "\$f.hits"; echo "\$f"
+fi
+SHIM
+chmod +x "$V6W/stub/mktemp"
+PATH="$V6W/stub:$PATH" bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_files "$1" "$2"' _ "$V6W/stage" "$PWD/secrets.deny.json" >/dev/null 2>&1; V6W_RC=$?
+chmod -R u+w "$V6W/tmp" 2>/dev/null
+it "a names pass whose temporaries cannot be written refuses instead of calling it clean"
+(( V6W_RC != 0 )) && ok || fail "scan_files returned 0 with a token in a file name"
+
+# The prefilter read the raw name and _still_matches the name with newlines as
+# spaces, so a name that only matches with the space -- a key header split by
+# a newline -- never reached the check that would have caught it.
+V6N="$SH/v6-newline"; mkdir -p "$V6N/stage/keys"
+: >"$V6N/stage/keys/$(printf -- '-----BEGIN RSA\nPRIVATE KEY-----')"
+V6N_OUT="$(_scanf "$V6N/stage")"
+it "a key header split by a newline in a file name is found"
+assert_contains "$V6N_OUT" "private-key-block"
+V6T="$SH/v6-newline-target"; mkdir -p "$V6T/stage"
+ln -s -- "$(printf -- '-----BEGIN RSA\nPRIVATE KEY-----')" "$V6T/stage/pointer"
+V6T_OUT="$(_scanf "$V6T/stage")"
+it "a key header split by a newline in a symlink target is found"
+assert_contains "$V6T_OUT" "private-key-block"
+
+# The directory hint was cut at the last "/", so a secret whose value crosses
+# a "/" printed its first part as the directory.
+# Split so the fixture itself is not a credential to a scanner reading this file.
+_v6kv="pass""word=\"abcdefgh"
+V6H="$SH/v6-hint"; mkdir -p "$V6H/stage/cfg/$_v6kv"
+: >"$V6H/stage/cfg/$_v6kv/ijklmnopqrstu\""
+V6H_OUT="$(_scanf "$V6H/stage")"
+it "a directory hint stops before the secret starts"
+assert_not_contains "$V6H_OUT" "abcdefgh"
+it "and still names the clean directory before it"
+assert_contains "$V6H_OUT" "in cfg/"
+
+# "at the top" means the file is at the top. A match in the first directory
+# left no "/" before it and printed "at the top" for a file two levels down.
+V6U="$SH/v6-top"; mkdir -p "$V6U/stage/$_v5tok/sub"
+: >"$V6U/stage/$_v5tok/sub/f.conf"
+V6U_OUT="$(_scanf "$V6U/stage")"
+it "a hidden name below a matching first directory is not said to be at the top"
+[[ -n "$V6U_OUT" && "$V6U_OUT" != *"at the top"* && "$V6U_OUT" != *"$_v5tok"* ]] && ok \
+    || fail "no hit, or a wrong hint: $V6U_OUT"
+V6R="$SH/v6-root"; mkdir -p "$V6R/stage"; : >"$V6R/stage/$_v5tok.conf"
+it "and a hidden name at the top still says so"
+assert_contains "$(_scanf "$V6R/stage")" "at the top"

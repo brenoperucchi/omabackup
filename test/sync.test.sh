@@ -349,3 +349,117 @@ printf 'new\n' >"$TS2H/.local/bin/tool"
 it "sync --commit publishes through a double-trailing-slash declared live path"
 _sync_env "$TS2H" "$TS2R" "$TS2G" sync --commit >/dev/null
 assert_eq "$(cat "$TS2R/scripts/local-bin/tool" 2>/dev/null)" "new"
+
+# ── a secret in staging is refused before it is published ────────────────────
+# The deny-list ran in exactly two places: over the bundle, and over every ref
+# of the repository right before `git push`. Nothing looked at staging, and
+# nothing looked at what `sync --commit` was about to publish and commit. The
+# fifteen-minute timer runs `sync --commit` unattended, so a private key that
+# lands in a collected directory was published into the dotfiles worktree and
+# committed to local history on the next tick, and the hourly push then refused
+# it with advice to rewrite that history. The scan now runs over staging before
+# publish, with the same deny-list, so the key never enters the worktree. It is
+# the same patterns push applies, so nothing push would have accepted is
+# refused here; the refusal just comes earlier, while it is still cheap.
+_scan_home() {  # _scan_home <home> [leaked content]
+    local h="$1"
+    mkdir -p "$h/.config/app"
+    printf 'ordinary config\n' >"$h/.config/app/fine.conf"
+    [[ -n "${2:-}" ]] && printf '%s\n' "$2" >"$h/.config/app/leaked.conf"
+    cat >"$h/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/app"]}]}
+JSON
+    _dest_repo "$h/repo"
+}
+
+SC="$(mktemp -d)"
+_scan_home "$SC" "-----BEGIN OPENSSH PRIVATE KEY-----"
+SCOUT="$(_sync_env "$SC" "$SC/repo" "$SC/g.json" sync --commit)"; SCRC=$?
+
+it "sync refuses to publish when the deny-list matches a staged file"
+(( SCRC != 0 )) && ok || fail "sync exited 0 with a private key in staging"
+
+it "and no commit was created"
+assert_eq "$(_commits "$SC/repo")" "1"
+
+it "and the file never reached the backup worktree"
+[[ ! -e "$SC/repo/configs/app/leaked.conf" && ! -e "$SC/repo/configs/app/fine.conf" ]] \
+    && ok || fail "publish wrote into the worktree before the scan refused"
+
+it "and staging was cleared so a later sync cannot republish it"
+[[ -z "$(find "$SC/.state/staging" -mindepth 1 -print -quit 2>/dev/null)" ]] \
+    && ok || fail "the refused staging was left in place"
+
+it "the refusal names the pattern and the file, so the user knows what to move"
+assert_contains "$SCOUT" "private-key-block"$'\t'".config/app/leaked.conf"
+
+# A scan that could not run is not a clean scan. grep is what scan_files
+# drives; a grep that fails outright must refuse the sync, not wave it on.
+SE="$(mktemp -d)"
+_scan_home "$SE"
+mkdir -p "$SE/stub"; printf '#!/bin/bash\nexit 2\n' >"$SE/stub/grep"; chmod +x "$SE/stub/grep"
+SEOUT="$(PATH="$SE/stub:$PATH" _sync_env "$SE" "$SE/repo" "$SE/g.json" sync --commit)"; SERC=$?
+
+it "a staging scan that cannot run refuses the sync rather than calling it clean"
+(( SERC != 0 )) && ok || fail "sync exited 0 although the scanner could not run"
+
+it "and publishes nothing from the unscanned staging"
+assert_eq "$(_commits "$SE/repo")" "1"
+
+# Control: a staging with nothing to hide is published and committed as before.
+SK="$(mktemp -d)"
+_scan_home "$SK"
+_sync_env "$SK" "$SK/repo" "$SK/g.json" sync --commit >/dev/null
+
+it "a clean staging still publishes and commits"
+assert_eq "$(_commits "$SK/repo")" "2"
+
+# -- review round omabackup-73 ------------------------------------------------------
+_r73tok="gh""p_$(printf 'E%.0s' {1..36})"
+
+# The refusal prints where the hit is, never the line: the timer's output is
+# the journal, and it would repeat the secret there every fifteen minutes.
+R73A="$(mktemp -d)"; _scan_home "$R73A" "token = $_r73tok"
+R73A_OUT="$(_sync_env "$R73A" "$R73A/repo" "$R73A/g.json" sync)"; R73A_RC=$?
+it "the staging refusal never prints the matched line"
+if (( R73A_RC != 0 )); then assert_not_contains "$R73A_OUT" "$_r73tok"
+else fail "sync did not refuse a token in staging"; fi
+
+it "and says how to get out of it"
+assert_contains "$R73A_OUT" "exclude"
+
+# A file NAME can be the secret; it is not printed either.
+R73B="$(mktemp -d)"; _scan_home "$R73B"
+printf 'token = %s\n' "$_r73tok" >"$R73B/.config/app/$_r73tok.conf"
+R73B_OUT="$(_sync_env "$R73B" "$R73B/repo" "$R73B/g.json" sync)"; R73B_RC=$?
+it "a file whose name holds a token is refused without printing the name"
+if (( R73B_RC != 0 )); then assert_not_contains "$R73B_OUT" "$_r73tok"
+else fail "sync did not refuse"; fi
+
+# An unreadable deny-list exits through its own validator; staging must still
+# be cleared, and the message is about sync, not push.
+R73C="$(mktemp -d)"; _scan_home "$R73C"
+R73C_OUT="$(OMABACKUP_SECRETS_DENY="$R73C/missing.json" _sync_env "$R73C" "$R73C/repo" "$R73C/g.json" sync)"; R73C_RC=$?
+it "a missing deny-list refuses the sync"
+(( R73C_RC != 0 )) && ok || fail "sync ran with no deny-list"
+
+it "and clears the unscanned staging"
+[[ -z "$(find "$R73C/.state/staging" -mindepth 1 -print -quit 2>/dev/null)" ]] \
+    && ok || fail "unscanned staging was left on disk"
+
+it "and does not speak of a push"
+assert_not_contains "$R73C_OUT" "refusing to push"
+
+# -- review round omabackup-75: symlinks reach git as a name and a target text ---
+R75="$(mktemp -d)"; _scan_home "$R75"
+ln -s fine.conf "$R75/.config/app/$_r73tok"
+ln -s "$_r73tok" "$R75/.config/app/pointer"
+R75_OUT="$(_sync_env "$R75" "$R75/repo" "$R75/g.json" sync --commit)"; R75_RC=$?
+it "a symlink with a token in its name or target is refused before publish"
+if (( R75_RC != 0 )); then assert_not_contains "$R75_OUT" "$_r73tok"
+else fail "a token in a symlink reached the worktree"; fi
+
+it "and nothing was published"
+assert_eq "$(_commits "$R75/repo")" "1"

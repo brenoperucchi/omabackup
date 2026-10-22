@@ -27,11 +27,13 @@ KNOWN_EXCEPTION_FIELDS='["id","match","reason"]'
 # Same invariant as the group manifest: a rule declared and silently ignored is
 # worse than no rule, because it reads as protection.
 assert_deny_understood() {
-    local file="$1" bad line
+    # The second argument names what is being refused; it used to be "push"
+    # everywhere, which read wrong once sync called this too.
+    local file="$1" what="${2:-push}" bad line
     [[ -f "$file" ]] \
-        || die "no deny-list at $(_tilde "$file"): refusing to push without a secret scan (docs/DESIGN.md §6)"
+        || die "no deny-list at $(_tilde "$file"): refusing to $what without a secret scan (docs/DESIGN.md §6)"
     jq -e . "$file" >/dev/null 2>&1 \
-        || die "the deny-list at $(_tilde "$file") is not valid JSON: refusing to push unscanned"
+        || die "the deny-list at $(_tilde "$file") is not valid JSON: refusing to $what unscanned"
     bad="$(jq -r --argjson p "$KNOWN_DENY_FIELDS" --argjson e "$KNOWN_EXCEPTION_FIELDS" '
         [ ((.patterns // [])[] | . as $r | (keys[] | select(. as $f | $p | index($f) | not))
             | "unknown field \(.) in pattern \($r.id // "?")")
@@ -44,7 +46,7 @@ assert_deny_understood() {
         , ((.exceptions // [])[] | select((.match // "") == "" or (.reason // "") == "")
             | "exception \(.id // "?") needs both match and reason")
         ] | .[]' "$file" 2>/dev/null)" \
-        || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
+        || die "the deny-list at $(_tilde "$file") could not be read: refusing to $what unscanned"
     # There is deliberately no rule against an exception that matches a pattern.
     # That guard existed for the old cut-and-retest semantics, where an
     # exception overlapping a secret erased it. With equality an exception
@@ -93,7 +95,7 @@ assert_deny_understood() {
     # wasn't.
     local pid3 pre3 zwrc pats
     pats="$(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)"' "$file" 2>/dev/null)" \
-        || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
+        || die "the deny-list at $(_tilde "$file") could not be read: refusing to $what unscanned"
     while IFS=$'\t' read -r pid3 pre3; do
         [[ -n "$pid3" && -n "$pre3" ]] || continue
         ( [[ "" =~ $pre3 ]] ) 2>/dev/null; zwrc=$?
@@ -107,9 +109,9 @@ assert_deny_understood() {
 
     local exid2 exm2 reach pats2 excs
     pats2="$(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' "$file" 2>/dev/null)" \
-        || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
+        || die "the deny-list at $(_tilde "$file") could not be read: refusing to $what unscanned"
     excs="$(jq -r '(.exceptions // [])[] | "\(.id)\t\(.match)"' "$file" 2>/dev/null)" \
-        || die "the deny-list at $(_tilde "$file") could not be read: refusing to push unscanned"
+        || die "the deny-list at $(_tilde "$file") could not be read: refusing to $what unscanned"
     while IFS=$'\t' read -r exid2 exm2; do
         [[ -n "$exm2" ]] || continue
         reach=0
@@ -225,6 +227,12 @@ _still_matches() {
 scan_secrets() {
     local repo="$1" file="$2" id re ci hit rc=0
     [[ -f "$file" ]] || return 1
+
+    # Bytes, not characters: under a UTF-8 locale an invalid byte right before
+    # a token hid it from git grep and from bash's =~ alike, and this push
+    # gate called a history holding a token clean. The systemd user manager
+    # runs with LANG=en_US.UTF-8 (review omabackup-73, measured).
+    local LC_ALL=C; export LC_ALL
 
     # Replacements off, for every git command below. `git replace` rewrites what
     # git SHOWS you: point refs/replace/<oid> at a clean commit and rev-list,
@@ -556,9 +564,55 @@ scan_secrets() {
 #
 # repo.bundle is skipped: it is a packfile, its contents were scanned as objects
 # a moment ago, and grepping compressed bytes finds nothing either way.
+# _scan_safe <text> -- control bytes shown as "?", so a file name cannot drive
+# the terminal or the journal it is printed to (review omabackup-75).
+_scan_safe() { local x="$1"; printf '%s' "${x//[[:cntrl:]]/?}"; }
+
+# _scan_dir_hint <rel-path> <patterns> -- " in <dir>/" for a hidden name, so the
+# user knows where to look, unless the directory itself matches a pattern; then
+# nothing. Only runs on hits, so its per-pattern cost does not matter.
+#
+# The path is cut before the first match of any pattern first, then at the last
+# "/": a value free to hold a "/" otherwise printed its own first part as the
+# directory (review omabackup-76). A grep that cannot answer gives no hint.
+_scan_dir_hint() {
+    local rel="$1" pats="$2" flat="${1//$'\n'/ }" pre d id re ci m s
+    pre="$rel"
+    while IFS=$'\t' read -r id re ci; do
+        [[ -n "$id" && -n "$re" ]] || continue
+        local -a of=(-o -b -a -E --color=never)
+        [[ "$ci" == true ]] && of+=(-i)
+        m="$(printf '%s' "$flat" | grep "${of[@]}" -e "$re" 2>/dev/null)"; s=$?
+        (( s > 1 )) && return 0
+        m="${m%%$'\n'*}"; m="${m%%:*}"
+        [[ -n "$m" ]] && (( m < ${#pre} )) && pre="${rel:0:m}"
+    done <<<"$pats"
+    [[ "$rel" == */* ]] || { printf ' at the top'; return 0; }
+    [[ "$pre" == */* ]] || return 0
+    d="${pre%/*}"
+    while IFS=$'\t' read -r id re ci; do
+        [[ -n "$id" && -n "$re" ]] || continue
+        _still_matches "${d//$'\n'/ }" "$re" "$ci" && return 0
+    done <<<"$pats"
+    printf ' in %s/' "$(_scan_safe "$d")"
+}
+
 scan_files() {
     local dir="$1" file="$2" id re ci hit rc=0 patterns body
     [[ -d "$dir" && -f "$file" ]] || return 1
+    shift 2
+    # Basenames to skip, given by the caller and only by the caller. The
+    # artefact build passes repo.bundle, its own packfile, whose objects were
+    # already scanned; sync's staging scan passes nothing, so a user file of
+    # that name is read like any other (review omabackup-73).
+    local -a skip=("$@")
+
+    # Bytes, not characters. Under a UTF-8 locale a byte that is not valid
+    # UTF-8 right before a token takes the word boundary away from GNU grep
+    # reading a file and from bash's =~ in _still_matches, and the token was
+    # called clean. The systemd user manager runs with LANG=en_US.UTF-8, so
+    # the timer was exposed (review omabackup-73, measured).
+    local LC_ALL=C; export LC_ALL
 
     local -a DENY_EXCEPTIONS=()
     mapfile -t DENY_EXCEPTIONS < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
@@ -570,6 +624,102 @@ scan_files() {
             "$RED" "$NC" >&2
         return 1
     fi
+
+    # File NAMES first, and symlink TARGETS. The push scan reads every path in
+    # history, and git commits a symlink as its name plus its target text, so
+    # all three are judged; a name or a target that hits is never printed, not
+    # by its own hit and not by a hit on its content below.
+    #
+    # One grep per pattern over the whole NUL-separated list, never one per
+    # file: _still_matches per file per pattern cost 12 s on a real 667-file
+    # staging against 0.03 s before it (review omabackup-75). grep only selects
+    # candidates; _still_matches still decides, exceptions included. grep reads
+    # the list with newlines as spaces, the same text _still_matches is given,
+    # or a name that only matches with the space never became a candidate.
+    #
+    # The hits hold the full name or target that matched, so every temporary
+    # lives in a private mktemp -d directory, never beside a predictable name
+    # in a shared /tmp; and one that cannot be written refuses, because a
+    # redirect that fails exits 1, grep's "no match" (review omabackup-76).
+    local tmpd
+    tmpd="$(mktemp -d "${TMPDIR:-/tmp}/omabackup-scan.XXXXXX")" || return 1
+    local names="$tmpd/names" links="$tmpd/links" flat="$tmpd/flat" hits="$tmpd/hits"
+    _scan_files_clean() { rm -f "$names" "$links" "$flat" "$hits"; rmdir "$tmpd" 2>/dev/null; }
+    if ! : >"$hits" 2>/dev/null \
+       || ! find "$dir" \( -type f -o -type l \) -printf '%P\0' >"$names" 2>/dev/null \
+       || ! find "$dir" -type l -printf '%P\0%l\0' >"$links" 2>/dev/null; then
+        _scan_files_clean
+        printf '%somabackup: cannot list the files of %s -- refusing to call it clean%s\n' \
+            "$RED" "$(_tilde "$dir")" "$NC" >&2
+        return 1
+    fi
+    local -a all_names=() link_path=() link_target=()
+    mapfile -d '' -t all_names <"$names"
+    local lp lt
+    while IFS= read -r -d '' lp && IFS= read -r -d '' lt; do
+        link_path+=("$lp"); link_target+=("$lt")
+    done <"$links"
+    if (( ${#all_names[@]} )) && ! printf '%s\0' "${all_names[@]//$'\n'/ }" >"$flat" 2>/dev/null; then
+        _scan_files_clean
+        printf '%somabackup: cannot write the scan'\''s temporaries -- refusing to call it clean%s\n' "$RED" "$NC" >&2
+        return 1
+    fi
+
+    local -A secret_name=() name_said=()
+    local rel nm rec n g
+    if (( ${#all_names[@]} )); then
+        while IFS=$'\t' read -r id re ci; do
+            [[ -n "$id" && -n "$re" ]] || continue
+            local -a zf=(-z -n -a -E --color=never)
+            [[ "$ci" == true ]] && zf+=(-i)
+            grep "${zf[@]}" -e "$re" -- "$flat" >"$hits" 2>/dev/null; g=$?
+            if (( g > 1 )); then
+                _scan_files_clean
+                printf '%somabackup: pattern %s could not be scanned over the file names%s\n' "$RED" "$id" "$NC" >&2
+                return 1
+            fi
+            while IFS= read -r -d '' rec; do
+                n="${rec%%:*}"; rel="${all_names[$((n - 1))]}"
+                nm="${rel//$'\n'/ }"
+                _still_matches "$nm" "$re" "$ci" || continue
+                secret_name["$rel"]=1
+                if [[ -z "${name_said[$rel]:-}" ]]; then
+                    name_said["$rel"]=1
+                    printf '%s\t(a file NAME, not shown)%s\n' "$id" "$(_scan_dir_hint "$rel" "$patterns")"
+                fi
+            done <"$hits"
+        done <<<"$patterns"
+    fi
+
+    if (( ${#link_target[@]} )); then
+        if ! printf '%s\0' "${link_target[@]//$'\n'/ }" >"$flat" 2>/dev/null; then
+            _scan_files_clean
+            printf '%somabackup: cannot write the scan'\''s temporaries -- refusing to call it clean%s\n' "$RED" "$NC" >&2
+            return 1
+        fi
+        while IFS=$'\t' read -r id re ci; do
+            [[ -n "$id" && -n "$re" ]] || continue
+            local -a tf=(-z -n -a -E --color=never)
+            [[ "$ci" == true ]] && tf+=(-i)
+            grep "${tf[@]}" -e "$re" -- "$flat" >"$hits" 2>/dev/null; g=$?
+            if (( g > 1 )); then
+                _scan_files_clean
+                printf '%somabackup: pattern %s could not be scanned over the symlink targets%s\n' "$RED" "$id" "$NC" >&2
+                return 1
+            fi
+            while IFS= read -r -d '' rec; do
+                n="${rec%%:*}"; lt="${link_target[$((n - 1))]}"; lp="${link_path[$((n - 1))]}"
+                _still_matches "${lt//$'\n'/ }" "$re" "$ci" || continue
+                if [[ -n "${secret_name[$lp]:-}" ]]; then
+                    printf '%s\t(a symlink target, not shown, of a link whose NAME is not shown)%s\n' \
+                        "$id" "$(_scan_dir_hint "$lp" "$patterns")"
+                else
+                    printf '%s\t%s (symlink target, not shown)\n' "$id" "$(_scan_safe "$lp")"
+                fi
+            done <"$hits"
+        done <<<"$patterns"
+    fi
+    _scan_files_clean
 
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
@@ -602,15 +752,29 @@ scan_files() {
         # this one, so it is captured with `wait` on the substitution's own
         # PID instead of guessed at.
         local grc
-        local -a gflags=(-r -a -n -Z -E --exclude=repo.bundle)
+        local -a gflags=(-r -a -n -Z -E --color=never)
+        local sk
+        for sk in "${skip[@]}"; do gflags+=("--exclude=$sk"); done
         [[ "$ci" == true ]] && gflags+=(-i)
         local f rest
         while IFS= read -r -d '' f && IFS= read -r rest; do
             [[ -n "$f" ]] || continue
             body="${rest#*:}"
             _still_matches "$body" "$re" "$ci" || continue
-            printf '%s\t%s\n' "$id" "${f#$dir/}:${rest:0:200}"
-        done < <(grep "${gflags[@]}" -e "$re" -- "$dir")
+            # Where, never what: the rule, the file and the line number. The
+            # line itself is not printed -- sync runs from a timer whose
+            # output is the journal (review omabackup-73).
+            rel="${f#$dir/}"
+            if [[ -n "${secret_name[$rel]:-}" ]]; then
+                printf '%s\t(content of a file whose NAME is not shown)%s, line %s\n' \
+                    "$id" "$(_scan_dir_hint "$rel" "$patterns")" "${rest%%:*}"
+            else
+                printf '%s\t%s:%s\n' "$id" "$(_scan_safe "$rel")" "${rest%%:*}"
+            fi
+        # grep's own stderr is dropped: its diagnostics print the path, and the
+        # name can be the token hidden above (review omabackup-75). Its status
+        # is kept and reported below without a path.
+        done < <(grep "${gflags[@]}" -e "$re" -- "$dir" 2>/dev/null)
         wait "$!"; grc=$?
         if (( grc > 1 )); then
             printf '%somabackup: pattern %s could not be scanned over %s%s\n' \

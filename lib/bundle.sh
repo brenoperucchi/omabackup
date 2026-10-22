@@ -356,7 +356,9 @@ build_bundle() {
     # progress elsewhere in this codebase.
     assert_deny_understood "$SECRETS_DENY_FILE"
     local extra
-    extra="$(scan_files "$stage" "$SECRETS_DENY_FILE" 2>&1)" || {
+    # repo.bundle is the artefact's own packfile, whose objects the history
+    # scan already read; nothing else under the stage is skipped.
+    extra="$(scan_files "$stage" "$SECRETS_DENY_FILE" repo.bundle 2>&1)" || {
         printf '%somabackup: the secret scan could not run over the staged artefact%s\n' \
             "${RED:-}" "${NC:-}" >&2
         rm -rf "$stage"; return 1
