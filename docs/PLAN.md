@@ -5545,3 +5545,334 @@ failed before, passes now. The release notes must say collect can refuse cases
 lists staged) predates this change and stays open. `collect` 72/0.
 
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
+
+### Secret scan before the commit, not only before the push (2026-09-30)
+
+Prerequisite for the three new default groups (`audio`, systemd unit content,
+`agents`) agreed in the `omabackup-24` design consultation. Both consultants
+converged on the same blocker: the deny-list ran only in `cmd_push`, and push
+runs after `sync --commit` has already committed. A token that reached a
+collected file was therefore never refused. It was committed, and from then on
+the history-wide scan blocked every push until the repository was rewritten.
+That is why `agents` and unit content cannot be enabled by default yet.
+
+**Review round `omabackup-68` rejected the first version**, and both reviewers
+reached the same root cause independently: it grepped the worktree while
+`git commit -- paths` recorded the worktree a moment later, so what was
+scanned and what was committed diverged. The consequence rev-2 measured was
+the worst: grep follows a symlink named on its command line and exits 2 on one
+that dangles, and Omarchy's own `~/.config/nvim/lua/plugins/theme.lua` is a
+relative link that dangles once published. Every fresh install would have been
+refused on its first commit, forever, with a message naming no file. The same
+divergence let a clean filter (git-crypt) refuse bytes that are never stored,
+let a write between scan and commit go in unscanned, and let a collected file
+named `repo.bundle` skip the scan through grep's `--exclude`. rev-1 also found
+an unchecked change-list status (a failed `git diff` meant "nothing to scan"),
+a rollback that reset the user's own staging to HEAD, and, with rev-2, the
+matched line (token included) printed to stderr -- which the timer sends to
+the journal.
+
+**The fix builds the commit in a candidate index of its own.** `cmd_sync`
+creates it under the git directory, reads HEAD into it (or the empty tree),
+adds `written[]`, lists the changed paths with the status checked, and runs
+the new `scan_index` over those blobs with `git grep --cached`. Only a clean
+scan commits, and it commits that same index with no pathspec, so the tree
+recorded is the tree scanned. The user's index is never touched on refusal;
+after a commit it is refreshed for the backed-up paths, with a warning if that
+fails. A refusal names the rule, the path and the line number, never the line.
+`scan_files` is back to its original form; the artefact path is unchanged.
+
+Specs in `test/sync.test.sh`: the original five, plus twelve that failed
+against the first version -- the Omarchy-style relative link and a dangling
+link commit, a link to a file holding a token commits and never prints it, a
+write between scan and commit never reaches history, an unlistable change set
+refuses, `repo.bundle` is scanned, content a clean filter removes commits, the
+refusal never prints the token, and the user's own staging survives a refusal.
+Mutants caught: committing with a pathspec again (18 failures) and dropping the
+change-list status check (2). `./test/run.sh sync` 57/0; full suite
+**1490/0**.
+
+Checked against the real home as well: a `sync --commit` from this branch into
+a throwaway clone of `omarchy-personal`, with the real deny-list, after
+removing the clone's versioned symlinks. The Omarchy theme and background links
+were recommitted, no temporary index was left behind and `git status` was
+clean. (The clone's two `configs/elephant/menus/*.lua` links were not
+recommitted because `~/.config/elephant/menus` no longer exists and no group
+collects it; they date from the repository's initial commit in April.)
+
+**Review round `omabackup-69` found the candidate index was right but the
+reading of it was not.** `git grep --cached` still judged something other than
+the committed blob, in five ways: it honours `color.ui`/`color.grep=always`
+even into a pipe, and the escape right before a match left the second regex
+pass no word boundary, so a token was committed (rev-2, and rev-1 for the
+column/colour class); it skips symlink entries, whose link text git stores as
+a blob (rev-1); it reads through `git replace` (rev-1); and bash drops a NUL
+when reading a line back, so a token right after one lost its boundary (rev-1).
+Both reviewers also found that hooks run after the scan with `GIT_INDEX_FILE`
+set and git re-reads the index after `pre-commit`, that a signal left the
+temporary files (with scanned bytes) behind, and rev-1 that the recovery
+advice reset the whole index. rev-2 found the colour bypass in the
+**existing** push gate too: with `color.ui=always`, `report_secrets` called a
+history holding a GitHub token clean, and only the bundle's filesystem scan
+stood in the way -- which covers `dir` destinations, not `github`. rev-2 also
+reported a pre-existing glob-pathspec issue: a published `a[1].txt` swept a
+draft `a1.txt` into the commit.
+
+**Fix.** `scan_index` no longer asks git to grep. It lists the candidate with
+`ls-files -s -z`, reads each regular or symlink blob by object id with
+`GIT_NO_REPLACE_OBJECTS=1`, turns NULs into newlines, and greps the bytes with
+GNU grep `--color=never` (one case-insensitive prefilter pass per file, exact
+passes only on files that hit). The commit runs with
+`-c core.hooksPath=/dev/null --no-verify`, so no hook can change the index or
+the message after the scan; hand-made commits keep their hooks. Every git call
+that takes `written[]` uses literal pathspecs. The temporary directory is
+registered in `_SYNC_TMPDIR` and removed by the global EXIT trap, which every
+signal handler ends in; it only ever holds fixed file names. The recovery
+advice now prints a reset limited to the backed-up paths, shell-quoted.
+`scan_secrets` passes `--no-color --no-column` to its `git grep`.
+
+The existing spec "a git commit that fails is not announced as committed"
+injected the failure with a `pre-commit` hook. Hooks are now off for the
+backup commit by design, so the injection moved to a git shim that refuses
+`commit`; the assertion is unchanged. A user who relied on a hook to veto
+backup commits loses that, deliberately.
+
+Specs: three in `test/secrets.test.sh` (the history scan with `color.ui`,
+`color.grep` and `grep.column`; the two colour cases failed before) and eleven
+in `test/sync.test.sh` (hooks, symlink text, NUL, the three display settings,
+`git replace`, glob name, recovery advice, and an interrupted sync leaving no
+temporary files); nine failed before. Four mutants are caught, one per new
+defence: hooks back on, no NUL translation, replacements honoured, EXIT trap
+without cleanup. `sync` 67/0, `secrets` 106/0, full suite **1503/0**.
+
+Checked on the real home again, into a throwaway clone of `omarchy-personal`
+with `configs/` and `state/` removed to simulate a first full sync: 553 files
+committed, both Omarchy symlinks included, no temporary directory left, clean
+status. The same sync took 7.7 s on this branch against 6.5 s on `main`;
+ordinary syncs only scan the few files that changed.
+
+**Review round `omabackup-70`, the last correction round, found five more.**
+rev-1: a merge, cherry-pick, revert or rebase the user is resolving lives in
+the git directory, so a commit built from HEAD would move HEAD under it (git
+itself refused `commit -- paths` there); under `-i` a negated class such as
+`[^A]` also excludes `a`, so the single case-insensitive prefilter could skip a
+case-sensitive rule's hit. Both: turning NULs into newlines hid a
+`generic-assigned-secret` value with a NUL inside it, which the push scan
+(which drops NULs) does see -- a commit accepted here would block push for
+good. rev-2: git 2.55 runs hooks defined in config (`hook.<name>.event`), which
+neither an empty hooks path nor `--no-verify` silences, so a
+`prepare-commit-msg` could put a token into the message after the scan or fail
+and stop every backup. rev-2 also noted, pre-existing and out of scope, that
+`report_secrets` and the bundle scan still print the matched line.
+
+My own spec for the config hook first passed against the unfixed code; the
+hook command I wrote did not reach the message file. With `>>"$1"` it injects
+even with `core.hooksPath=/dev/null --no-verify`, as rev-2 had measured.
+
+**Fix.** `sync --commit` refuses before publishing, and again right before
+committing, while any of `MERGE_HEAD`, `CHERRY_PICK_HEAD`, `REVERT_HEAD`,
+`rebase-merge` or `rebase-apply` exists. The commit is plumbing:
+`write-tree` of the candidate, `commit-tree` with the tool's message (and `-S`
+when `commit.gpgSign` is true, as `git commit` did), `update-ref` with the old
+HEAD as compare-and-swap. No hook of any origin runs. A blob holding NULs is
+scanned twice, NULs deleted (exactly the push scan's text, so the pre-commit
+scan is a superset of it) and NULs as line breaks (a token right after a NUL
+keeps its boundary); a hit in either refuses. The prefilter runs one pass per
+case group.
+
+Specs: seven, all failing before (merge, its untouched state, cherry-pick,
+NUL inside a value, case-sensitive rule behind the prefilter, config hook in
+the message, failing config hook). The existing commit-failure spec's shim now
+refuses `commit-tree` as well. Five mutants caught: only-deleted NULs, only
+line-broken NULs, a single `-i` prefilter, no merge guard, `git commit` back.
+`sync` 74/0, full suite **1510/0**. Real home into a throwaway clone, first
+full sync: 553 files, both Omarchy links, correct parent and reflog entry, no
+temporary files, clean status; 9.6 s against 6.5 s on `main`, in that worst
+case only.
+
+**Found while writing the scout question, after the last round.** The push
+scan reads every path name in history, not only contents, so a collected file
+whose NAME holds a token passed the content-only pre-commit scan, was
+committed, and would then block push for good -- breaking the PR's own
+invariant that the pre-commit scan is a superset of the push scan. `scan_index`
+now runs the patterns over the changed paths as well and reports a hit as the
+rule plus the path's position, never the name. The `git status` list that
+`sync --commit` prints before committing also named the file, so with
+`--commit` it is now printed only after the scan passes; review mode without
+`--commit` is unchanged. Two specs (refused; the name not printed), both
+failing before; a mutant without the name scan is caught. Full suite
+**1512/0**.
+
+The scout's third analysis could not be dispatched: `herdr-ask` refused
+because `omabackup-scout` reported `agent_status: unknown`, with a stray
+letter in its compose box. Nothing was sent to the pane.
+
+**Scout analysis `omabackup-25` (third analysis) held the merge with four
+gaps and one contract question; Breno approved both the fixes and an extra
+review round on 2026-10-06, and chose to document the concurrency premise.**
+
+- **A, commit metadata.** The push scan reads raw commit objects; a token in
+  `user.name` or `GIT_AUTHOR_NAME` passed every blob check and commit-tree wrote
+  it into the header. `scan_commit_object` now scans the built commit, read with
+  replacements off, before any ref moves; a refused object stays unreferenced.
+- **B, late base.** The candidate was built from one HEAD but the parent and
+  the compare-and-swap re-read HEAD at the end, so a commit the user made during
+  the scan became the parent of a tree built from the earlier HEAD -- the
+  backup silently reverted their change. The base OID and the branch are now
+  captured once, before the candidate, and used for the tree, the comparison,
+  the parent and the swap; `update-ref` targets that branch explicitly, and a
+  branch switch refuses. Replacements are off for the whole chain, since a
+  replaced base commit would change the inherited tree.
+- **C, reference-transaction.** `update-ref` runs that hook, from a file or
+  config; it is switched off for this one call with
+  `-c hook.reference-transaction.enabled=false -c core.hooksPath=/dev/null`
+  (verified on git 2.55: without them both hooks run and abort; with them none
+  runs).
+- **D, path in a content hit.** A content hit or a read error printed the path,
+  and the path can be the secret. Names are now judged first, and any path
+  whose name hits is reported only by its position; a newline inside a name
+  becomes a space in the names list so positions stay aligned.
+- **Concurrency premise (Breno's choice).** sync assumes no git operation
+  starts in the repository during its last seconds. A HEAD or branch that moves
+  is caught by the fixed base and the swap; an operation that begins after the
+  last check without moving HEAD is not. Recorded in the code.
+
+The scanner was refactored so the index and the commit object share one
+pattern loader (`_scan_load_patterns`) and one byte judge (`_scan_bytes`).
+Hits now read `<rule> <label>, line <n>`; the one spec that asserted the old
+`path:line` form was updated to the new form, same intent.
+
+Specs: seven, six failing before (author/committer, a commit during the sync,
+a branch switch, a replaced base, reference-transaction file and config hooks,
+name plus content). Four mutants caught, one per gap. `sync` 84/0, full suite
+**1520/0**. Real home into a throwaway clone, first full sync: 562 files, both
+Omarchy links, parent equal to the captured base, branch `main`, reflog entry,
+no temporary files, clean status; 10.9 s in that worst case.
+
+**Extra review round `omabackup-71` (authorized by Breno), both
+REQUEST_CHANGES, converging.** rev-2's blocking finding: `post-index-change`
+hooks (from a file or from config) and `core.fsmonitor` run while the
+candidate is BUILT, inherit `GIT_INDEX_FILE`, and could add an entry outside
+`written[]`; the scan listed only `written[]` but `write-tree` wrote the whole
+index, so a token reached history (reproduced for all three). rev-2 was stuck
+on a permission dialog for its own probe script during the round and wrote
+its verdict after it timed out; the exec reproduced the same class
+independently from the probe visible in the pane. Both reviewers also found
+that directory names were not judged (the push scan reads tree names; a
+custom rule anchored on a directory slipped through) and that the
+`repo-ignored` coverage warning printed a file name before any scan. rev-1:
+`commit-tree` errors can print the identity. rev-2 (P3): the commit-object
+block did not tell "matched" from "could not scan", and every `update-ref`
+failure read "HEAD moved".
+
+**Fix.** The tree is written right after the candidate is built, and
+everything after works on that object: the change list comes from
+`diff-tree` between the base and the tree, with no pathspec; `scan_tree`
+(replacing `scan_index`) lists the tree with `ls-tree` and judges file names,
+every directory above them, and the blobs; `commit-tree` commits that tree.
+The commit is refused when any path that changes was not written by this run,
+clean or not -- the defence that does not depend on switching each hook off.
+Hooks and fsmonitor are switched off for every git call of the chain as well.
+Directory hits mark every path below them as secret for reporting. The
+ignored-file warning gives a count and the `git status --ignored` command, no
+name. `commit-tree` stderr goes to a temporary file and a fixed message is
+printed. The two messages now say what happened.
+
+**Found by the exec while doing it.** `(( ${#dirs[@]} )) && printf` returned 1
+with no directory at all, so a root-level-only change read as a scan that could
+not run; `sync` never publishes at the root, so it was latent, and a unit spec
+in `test/secrets.test.sh` now pins it. Two new specs were vacuous as first
+written -- `(( rc != 0 )) && assert ...` records nothing when rc is 0 -- and one
+of them was hiding the still-open subset gap; both now fail explicitly. A
+root-level CLI spec that passed with and without the bug was replaced by the
+unit one. The existing change-list failure shim was retargeted to `diff-tree`.
+
+Specs: fourteen new across `sync` and `secrets`; every one failed before its
+fix. Mutants caught: change list limited to `written[]` with hooks on, no
+directory names, the name back in the ignored warning, `commit-tree` stderr
+uncaptured, no subset check. `sync` 96/0, full suite **1534/0**. Real home
+into a throwaway clone, first full sync: 562 files, both Omarchy links, parent
+equal to the captured base, no temporary files, clean status, 10.5 s; a second
+sync reports up to date.
+
+**Open, for their own PRs:** `report_secrets` and the bundle's
+`refusing to build` still print the matched line (journal); publishing into
+the worktree during a merge is refused only with `--commit`.
+
+Decisions recorded from the same consultation, pending their own PRs:
+`audio` ships enabled (with `~/.local/state/wireplumber` excluded and the
+LADSPA dependency tested in the VM first); systemd unit content and `agents`
+ship `enabled:false` until this gate has been through a release; `agents` uses
+a per-file selection with a warning for unclassified entries, `copy` mode, and
+mixed files (`~/.claude.json`, Codex/Grok `config.toml`) excluded; restore
+reports which units to re-enable instead of enabling them. The `allowList`
+manifest field is read by no code and needs its own fix.
+
+**Merged with #3 and #4 (2026-10-21).** `origin/main` (with Corey's #3 staging
+scan and #4 veto) merged into this branch. Code merged clean; `docs/PLAN.md`,
+`test/secrets.test.sh` and `test/sync.test.sh` conflicted only because both
+sides appended blocks at the same point, rebuilt as main's block then this
+one's. The suite then had five failures, all the same cause: #3's staging scan
+refuses before publish, so these specs never reached the pre-commit gate.
+Adapted: SC1 and SY8 assert the common `app/creds.txt` (the staging refusal
+prints the staging path); SC5 now asserts that `sync` without `--commit`
+refuses a token too and publishes nothing, #3's intended policy; SY71B checks
+the ignored-file warning with an ordinary ignored file, since a token in a
+name is refused before the warning exists. SY7, the clean filter that removes
+a token (git-crypt): this gate alone judged the stored blob and let it
+through, as push does; #3 refuses the plaintext in staging. Breno decided for
+0.4.8: refuse and document in the release notes (the user excludes the file or
+adds an exception). New SYI covers the case only this gate sees, a clean filter
+that ADDS a token to a clean staging file: refused, history clean, the refusal
+names `configs/app/creds.txt, line 1` and not the token.
+
+**`scan_files` keeps nothing on disk.** The open note from #3 (a signal
+mid-scan leaves the names lists in `$TMPDIR`) was first planned as a trap that
+saves and restores the caller's. Measured: inside `$(...)`, both callers' form,
+`trap -p` reports the parent's handler although it is not active there, so
+restoring it would have installed the CLI's dispatch logger in the subshell.
+The names pass now feeds the lists to grep through a pipe and reads the hits
+from a process substitution, each status read with `wait "$!"` as the content
+pass does; no file, so no mode, no failed redirect read as "no match", nothing
+for a signal to leave. Specs: grep's stdout on the names pass is a pipe and
+TMPDIR is empty while it runs (fails on the previous code), a failing names
+grep refuses, a TERM mid-scan ends with 143 and an empty TMPDIR, the caller's
+traps are untouched. Real staging (669 entries): 0.058 s.
+
+**Round omabackup-78 (verification of the round-71 fixes, the merge and
+`9703505`).** Both closed every round-71 finding but one half, and the locale
+finding of round 73 at this gate; merge and `9703505` approved. Open:
+rev-2 P2, introduced by `26a0434`: a path that changes type (file `foo` to
+`foo/bar`, or `dd/x` to file `dd`) makes `git add` drop the old entry, the
+check for paths this run did not write counted that deletion, and every sync
+of the repository refused from then on, blaming a hook; `c515b0c` committed
+it. P3 from both (the open half of round-71 rev-2 #2): push reads names from
+`rev-list --objects`, which ends a name at its first newline, so a rule
+anchored with `$` matched that piece in push and not the joined name here or
+in staging. rev-2 also asked for a CLI spec only this gate sees for a file
+name.
+
+**Fix.** The check reads `diff-tree --name-status` and accepts a deletion only
+when a written path implies it (`w` below the deleted path, or the deleted
+path below `w`); any other deletion or change still refuses, and the message
+no longer presumes a hook. `scan_tree` adds, after the joined names and
+directories, one line per piece between newlines, each mapped back to its
+entry and reported once per rule; `scan_files` does the same for names and
+symlink targets. Specs: file to directory and directory to file commit (fail
+on `9703505`), an injected unrelated deletion still refuses (a mutant that
+accepts every deletion fails it), a name with a newline under a `$` rule is
+refused end to end and by `scan_tree`, `scan_files` and a symlink target
+directly (fail on `9703505`), and a file name matched only on its repository
+path is refused by this gate (`changed path #`).
+
+**Round omabackup-79 (verification of `3517e5a`).** Both closed the round-78
+findings. Both found the same new exposure (rev-1 P2, rev-2 P3): a directory
+hidden by its piece before a newline got a hint, and `_scan_dir_hint` looks for
+the match only on the joined name, so it printed the directory it had just
+hidden (the value itself, right after `in cfg/`). rev-2 P3, from `26a0434`: a
+written path was accepted whatever its status, so a hook or wrapper deleting
+it from the candidate dropped it from the backup in silence. **Fix:** no hint
+for a path with a newline; a written path deleted from the candidate refuses
+(the type-change deletion is never of a written path, so it still passes); the
+symlink-target dedupe has its own array. Three specs, each failing on
+`3517e5a`.

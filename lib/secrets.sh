@@ -499,7 +499,12 @@ scan_secrets() {
         # as an empty line, so the two can never be confused -- which the plain
         # format could not promise, a path being free to contain colons and a
         # line free to begin with something shaped like a sha.
-        local -a gflags=(-a -n --break --heading -E)
+        # --no-color / --no-column: git grep honours color.ui=always even into
+        # a pipe, and the escape it puts right before a match left the second
+        # regex pass no word boundary before the token -- the push gate called
+        # a history holding a GitHub token clean (review omabackup-69). What
+        # the user likes on screen must not change what this gate reads.
+        local -a gflags=(-a -n --break --heading -E --no-color --no-column)
         [[ "$ci" == true ]] && gflags+=(-i)
         local out grc
         out="$(git -C "$repo" grep "${gflags[@]}" -e "$re" "${revs[@]}" 2>&1)"; grc=$?
@@ -574,9 +579,12 @@ _scan_safe() { local x="$1"; printf '%s' "${x//[[:cntrl:]]/?}"; }
 #
 # The path is cut before the first match of any pattern first, then at the last
 # "/": a value free to hold a "/" otherwise printed its own first part as the
-# directory (review omabackup-76). A grep that cannot answer gives no hint.
+# directory (review omabackup-76). A grep that cannot answer gives no hint, and
+# neither does a path with a newline: the name may have been hidden by a piece
+# between newlines that this cut never looks at (review omabackup-79).
 _scan_dir_hint() {
     local rel="$1" pats="$2" flat="${1//$'\n'/ }" pre d id re ci m s
+    [[ "$rel" == *$'\n'* ]] && return 0
     pre="$rel"
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
@@ -637,89 +645,101 @@ scan_files() {
     # the list with newlines as spaces, the same text _still_matches is given,
     # or a name that only matches with the space never became a candidate.
     #
-    # The hits hold the full name or target that matched, so every temporary
-    # lives in a private mktemp -d directory, never beside a predictable name
-    # in a shared /tmp; and one that cannot be written refuses, because a
-    # redirect that fails exits 1, grep's "no match" (review omabackup-76).
-    local tmpd
-    tmpd="$(mktemp -d "${TMPDIR:-/tmp}/omabackup-scan.XXXXXX")" || return 1
-    local names="$tmpd/names" links="$tmpd/links" flat="$tmpd/flat" hits="$tmpd/hits"
-    _scan_files_clean() { rm -f "$names" "$links" "$flat" "$hits"; rmdir "$tmpd" 2>/dev/null; }
-    if ! : >"$hits" 2>/dev/null \
-       || ! find "$dir" \( -type f -o -type l \) -printf '%P\0' >"$names" 2>/dev/null \
-       || ! find "$dir" -type l -printf '%P\0%l\0' >"$links" 2>/dev/null; then
-        _scan_files_clean
+    # No temporary files. The lists hold every name, the hits hold the ones
+    # that matched, token and all: on disk they were readable by others in a
+    # shared /tmp (review omabackup-76), a failed redirect read as "no match",
+    # and a signal mid-scan left them behind. Pipes and process substitutions
+    # carry them instead, and each status is read with `wait` on the
+    # substitution's own PID, as the content pass below does.
+    local -a all_names=() link_path=() link_target=() link_raw=()
+    local fs1 fs2
+    mapfile -d '' -t all_names < <(find "$dir" \( -type f -o -type l \) -printf '%P\0' 2>/dev/null)
+    wait "$!"; fs1=$?
+    mapfile -d '' -t link_raw < <(find "$dir" -type l -printf '%P\0%l\0' 2>/dev/null)
+    wait "$!"; fs2=$?
+    if (( fs1 || fs2 )); then
         printf '%somabackup: cannot list the files of %s -- refusing to call it clean%s\n' \
             "$RED" "$(_tilde "$dir")" "$NC" >&2
         return 1
     fi
-    local -a all_names=() link_path=() link_target=()
-    mapfile -d '' -t all_names <"$names"
-    local lp lt
-    while IFS= read -r -d '' lp && IFS= read -r -d '' lt; do
-        link_path+=("$lp"); link_target+=("$lt")
-    done <"$links"
-    if (( ${#all_names[@]} )) && ! printf '%s\0' "${all_names[@]//$'\n'/ }" >"$flat" 2>/dev/null; then
-        _scan_files_clean
-        printf '%somabackup: cannot write the scan'\''s temporaries -- refusing to call it clean%s\n' "$RED" "$NC" >&2
-        return 1
-    fi
+    local k
+    for (( k = 0; k + 1 < ${#link_raw[@]}; k += 2 )); do
+        link_path+=("${link_raw[k]}"); link_target+=("${link_raw[k + 1]}")
+    done
 
-    local -A secret_name=() name_said=()
-    local rel nm rec n g
+    # What grep reads: each name with newlines as spaces, then each piece
+    # between newlines of a name that has them, each view pointing back at its
+    # entry. The push scan ends a name at its first newline (rev-list
+    # --objects), so a rule anchored with $ matched there and not on the
+    # joined name (review omabackup-78). Targets the same way.
+    local -a name_view=() name_of=() tgt_view=() tgt_of=() seg
+    _scan_views() {  # _scan_views <view-array> <of-array> <entries...>
+        local -n _v="$1" _o="$2"; shift 2
+        local _e _i=0 _s
+        _v=("${@//$'\n'/ }"); _o=()
+        for (( _i = 0; _i < $#; _i++ )); do _o+=("$_i"); done
+        _i=0
+        for _e in "$@"; do
+            if [[ "$_e" == *$'\n'* ]]; then
+                mapfile -t seg <<<"$_e"
+                for _s in "${seg[@]}"; do _v+=("$_s"); _o+=("$_i"); done
+            fi
+            _i=$((_i + 1))
+        done
+    }
+    _scan_views name_view name_of "${all_names[@]}"
+    _scan_views tgt_view tgt_of "${link_target[@]}"
+
+    local -A secret_name=() name_said=() target_said=()
+    local rel nm rec n g lp lt
     if (( ${#all_names[@]} )); then
         while IFS=$'\t' read -r id re ci; do
             [[ -n "$id" && -n "$re" ]] || continue
             local -a zf=(-z -n -a -E --color=never)
             [[ "$ci" == true ]] && zf+=(-i)
-            grep "${zf[@]}" -e "$re" -- "$flat" >"$hits" 2>/dev/null; g=$?
-            if (( g > 1 )); then
-                _scan_files_clean
-                printf '%somabackup: pattern %s could not be scanned over the file names%s\n' "$RED" "$id" "$NC" >&2
-                return 1
-            fi
             while IFS= read -r -d '' rec; do
-                n="${rec%%:*}"; rel="${all_names[$((n - 1))]}"
-                nm="${rel//$'\n'/ }"
+                n="${rec%%:*}"; rel="${all_names[${name_of[$((n - 1))]}]}"
+                nm="${name_view[$((n - 1))]}"
                 _still_matches "$nm" "$re" "$ci" || continue
                 secret_name["$rel"]=1
                 if [[ -z "${name_said[$rel]:-}" ]]; then
                     name_said["$rel"]=1
                     printf '%s\t(a file NAME, not shown)%s\n' "$id" "$(_scan_dir_hint "$rel" "$patterns")"
                 fi
-            done <"$hits"
+            done < <(printf '%s\0' "${name_view[@]}" | grep "${zf[@]}" -e "$re" 2>/dev/null)
+            wait "$!"; g=$?
+            if (( g > 1 )); then
+                printf '%somabackup: pattern %s could not be scanned over the file names%s\n' "$RED" "$id" "$NC" >&2
+                return 1
+            fi
         done <<<"$patterns"
     fi
 
     if (( ${#link_target[@]} )); then
-        if ! printf '%s\0' "${link_target[@]//$'\n'/ }" >"$flat" 2>/dev/null; then
-            _scan_files_clean
-            printf '%somabackup: cannot write the scan'\''s temporaries -- refusing to call it clean%s\n' "$RED" "$NC" >&2
-            return 1
-        fi
         while IFS=$'\t' read -r id re ci; do
             [[ -n "$id" && -n "$re" ]] || continue
             local -a tf=(-z -n -a -E --color=never)
             [[ "$ci" == true ]] && tf+=(-i)
-            grep "${tf[@]}" -e "$re" -- "$flat" >"$hits" 2>/dev/null; g=$?
-            if (( g > 1 )); then
-                _scan_files_clean
-                printf '%somabackup: pattern %s could not be scanned over the symlink targets%s\n' "$RED" "$id" "$NC" >&2
-                return 1
-            fi
             while IFS= read -r -d '' rec; do
-                n="${rec%%:*}"; lt="${link_target[$((n - 1))]}"; lp="${link_path[$((n - 1))]}"
-                _still_matches "${lt//$'\n'/ }" "$re" "$ci" || continue
+                n="${rec%%:*}"; k="${tgt_of[$((n - 1))]}"
+                lt="${link_target[k]}"; lp="${link_path[k]}"
+                _still_matches "${tgt_view[$((n - 1))]}" "$re" "$ci" || continue
+                [[ -n "${target_said[$id:$k]:-}" ]] && continue
+                target_said["$id:$k"]=1
                 if [[ -n "${secret_name[$lp]:-}" ]]; then
                     printf '%s\t(a symlink target, not shown, of a link whose NAME is not shown)%s\n' \
                         "$id" "$(_scan_dir_hint "$lp" "$patterns")"
                 else
                     printf '%s\t%s (symlink target, not shown)\n' "$id" "$(_scan_safe "$lp")"
                 fi
-            done <"$hits"
+            done < <(printf '%s\0' "${tgt_view[@]}" | grep "${tf[@]}" -e "$re" 2>/dev/null)
+            wait "$!"; g=$?
+            if (( g > 1 )); then
+                printf '%somabackup: pattern %s could not be scanned over the symlink targets%s\n' "$RED" "$id" "$NC" >&2
+                return 1
+            fi
         done <<<"$patterns"
     fi
-    _scan_files_clean
 
     while IFS=$'\t' read -r id re ci; do
         [[ -n "$id" && -n "$re" ]] || continue
@@ -784,6 +804,230 @@ scan_files() {
         fi
     done <<<"$patterns"
     return $rc
+}
+
+# _scan_load_patterns <deny-file>
+# Fills the CALLER's ids/res/cis/pre_cs/pre_ci arrays and DENY_EXCEPTIONS
+# (bash scopes dynamically). The prefilter is split by each rule's own case
+# sensitivity: under -i a negated class such as [^A] also excludes `a`, so one
+# case-insensitive pass is not a superset of the exact ones (review
+# omabackup-70).
+_scan_load_patterns() {
+    local file="$1" patterns id re ci
+    mapfile -t DENY_EXCEPTIONS < <(jq -r '(.exceptions // [])[].match' "$file" 2>/dev/null)
+    patterns="$(jq -r '(.patterns // [])[] | "\(.id)\t\(.regex)\t\(.ignoreCase // false)"' \
+                "$file" 2>/dev/null)" || return 1
+    if [[ -z "$patterns" ]]; then
+        printf '%somabackup: the deny-list yielded no patterns -- refusing to call this clean%s\n' \
+            "$RED" "$NC" >&2
+        return 1
+    fi
+    while IFS=$'\t' read -r id re ci; do
+        [[ -n "$id" && -n "$re" ]] || continue
+        ids+=("$id"); res+=("$re"); cis+=("$ci")
+        if [[ "$ci" == true ]]; then pre_ci+=(-e "$re"); else pre_cs+=(-e "$re"); fi
+    done <<<"$patterns"
+}
+
+# _scan_bytes <raw-file> <work> <label>
+# Judges one byte stream against the caller's loaded patterns and prints
+# `<rule-id>\t<label>, line <n>` per hit -- never the line. A stream holding
+# NULs is judged twice, and a hit in either counts: with the NULs deleted it
+# reads exactly as the push scan reads it (git grep matches the raw bytes, then
+# bash drops the NULs before the second pass), so nothing the push gate would
+# block can pass here; with each NUL as a line break, a token right after a NUL
+# keeps its word boundary. Returns non-zero when the scan could not run.
+_scan_bytes() {
+    local raw="$1" work="$2" label="$3" view i g hit_any line ln body rc=0
+    tr -d '\0' <"$raw" >"$work/blob" || return 1
+    local -a views=("$work/blob")
+    if [[ "$(wc -c <"$raw")" != "$(wc -c <"$work/blob")" ]]; then
+        tr '\0' '\n' <"$raw" >"$work/blobn" || return 1
+        views+=("$work/blobn")
+    fi
+    for view in "${views[@]}"; do
+        hit_any=0
+        if (( ${#pre_cs[@]} )); then
+            grep -a -q -E --color=never "${pre_cs[@]}" -- "$view"; g=$?
+            (( g > 1 )) && return 1
+            (( g == 0 )) && hit_any=1
+        fi
+        if (( ! hit_any && ${#pre_ci[@]} )); then
+            grep -a -q -i -E --color=never "${pre_ci[@]}" -- "$view"; g=$?
+            (( g > 1 )) && return 1
+            (( g == 0 )) && hit_any=1
+        fi
+        (( hit_any )) || continue
+        for i in "${!ids[@]}"; do
+            local -a gflags=(-a -n -E --color=never)
+            [[ "${cis[$i]}" == true ]] && gflags+=(-i)
+            grep "${gflags[@]}" -e "${res[$i]}" -- "$view" >"$work/hits"; g=$?
+            (( g == 1 )) && continue
+            (( g > 1 )) && { rc=1; continue; }
+            while IFS= read -r line; do
+                ln="${line%%:*}"; body="${line#*:}"
+                _still_matches "$body" "${res[$i]}" "${cis[$i]}" || continue
+                printf '%s\t%s, line %s\n' "${ids[$i]}" "$label" "$ln"
+            done <"$work/hits"
+        done
+    done
+    return $rc
+}
+
+# scan_tree <repo> <deny-file> <tree-oid> <workdir> <path>...
+# The deny-list over what a commit of <tree-oid> adds at <path>...: each blob
+# READ by its object id, the file names, and the name of every directory above
+# them. sync runs it on the tree it has already written, before committing that
+# same tree -- an object, so nothing running afterwards (a hook, an fsmonitor,
+# a concurrent writer) can change what was judged (review omabackup-71).
+#
+# Reading the blob by id, rather than asking `git grep --cached` or grepping the
+# worktree, is what keeps the bytes judged equal to the bytes committed: git
+# grep follows color.ui/grep.column into its output, skips symlink entries
+# (whose link TEXT is stored) and reads through `git replace`; the worktree
+# follows symlinks git stores as text, ignores clean filters, and can change
+# before the commit (review rounds omabackup-68/69).
+#
+# Names are judged first -- files and directories, because the push scan reads
+# every path and every tree name in history. A path whose name or any of whose
+# directories hits is never printed: not by that hit, not by a hit on its
+# content, not by an error reading it. It is reported by its position in the
+# list instead (scout omabackup-25, review omabackup-71). Every byte read lands
+# in <workdir>, which the caller owns and removes on any exit, signals
+# included. Returns non-zero when the scan could not run.
+scan_tree() {
+    local repo="$1" file="$2" tree="$3" work="$4"; shift 4
+    local rc=0 i g line ln body label
+    [[ -f "$file" && -n "$tree" && -d "$work" ]] || return 1
+    (( $# )) || return 0
+
+    # Bytes, not characters: under a UTF-8 locale an invalid byte right before
+    # a token hid it from GNU grep and from bash's =~ (review omabackup-73).
+    local LC_ALL=C; export LC_ALL
+    local GIT_NO_REPLACE_OBJECTS=1; export GIT_NO_REPLACE_OBJECTS
+    local -a DENY_EXCEPTIONS=() ids=() res=() cis=() pre_cs=() pre_ci=()
+    _scan_load_patterns "$file" || return 1
+
+    # One line per path, then one per distinct directory above them, so a hit's
+    # line number names exactly one entry. A newline inside a name becomes a
+    # space, and each piece between newlines gets a line of its own after
+    # those, pointing back at its entry: the push scan reads names from
+    # rev-list --objects, which ends a name at its first newline, so a rule
+    # anchored with $ matched there and not here (review omabackup-78).
+    local -A pos=() secret_pos=() dir_line=()
+    local -a dirs=()
+    local p d k=0 n="$#"
+    for p in "$@"; do k=$((k + 1)); pos["$p"]=$k; done
+    for p in "$@"; do
+        d="$p"
+        while [[ "$d" == */* ]]; do
+            d="${d%/*}"
+            [[ -n "${dir_line[$d]:-}" ]] && continue
+            dirs+=("$d"); dir_line["$d"]=$(( n + ${#dirs[@]} ))
+        done
+    done
+    # `if`, not `&&`: with no directory at all the && form returned 1 and
+    # made every root-level-only commit look like a scan that could not run.
+    local -a pieces=() piece_of=() seg
+    local e=0
+    for p in "$@" "${dirs[@]}"; do
+        e=$((e + 1))
+        [[ "$p" == *$'\n'* ]] || continue
+        mapfile -t seg <<<"$p"
+        for d in "${seg[@]}"; do pieces+=("$d"); piece_of+=("$e"); done
+    done
+    local nd=${#dirs[@]}
+    local -A said=()
+    {
+        printf '%s\n' "${@//$'\n'/ }"
+        if (( nd )); then printf '%s\n' "${dirs[@]//$'\n'/ }"; fi
+        if (( ${#pieces[@]} )); then printf '%s\n' "${pieces[@]}"; fi
+    } >"$work/names" || return 1
+    for i in "${!ids[@]}"; do
+        local -a nflags=(-a -n -E --color=never)
+        [[ "${cis[$i]}" == true ]] && nflags+=(-i)
+        grep "${nflags[@]}" -e "${res[$i]}" -- "$work/names" >"$work/hits"; g=$?
+        (( g == 1 )) && continue
+        if (( g > 1 )); then
+            printf '%somabackup: pattern %s could not be scanned over the file names%s\n' \
+                "$RED" "${ids[$i]}" "$NC" >&2
+            rc=1; continue
+        fi
+        while IFS= read -r line; do
+            ln="${line%%:*}"; body="${line#*:}"
+            _still_matches "$body" "${res[$i]}" "${cis[$i]}" || continue
+            (( ln > n + nd )) && ln="${piece_of[$(( ln - n - nd - 1 ))]}"
+            [[ -n "${said[$i:$ln]:-}" ]] && continue
+            said["$i:$ln"]=1
+            if (( ln <= n )); then
+                printf '%s\t(a file NAME, not shown: changed path #%s)\n' "${ids[$i]}" "$ln"
+                secret_pos["$ln"]=1
+            else
+                printf '%s\t(a directory NAME, not shown)\n' "${ids[$i]}"
+                d="${dirs[$(( ln - n - 1 ))]}"
+                k=0
+                for p in "$@"; do
+                    k=$((k + 1))
+                    [[ "$p" == "$d"/* ]] && secret_pos["$k"]=1
+                done
+            fi
+        done <"$work/hits"
+    done
+
+    # The tree's own entries, not an index: ls-tree on the written object.
+    if ! git -C "$repo" ls-tree -r -z --full-tree "$tree" >"$work/entries" 2>/dev/null; then
+        printf '%somabackup: cannot list the tree it built -- refusing to call it clean%s\n' \
+            "$RED" "$NC" >&2
+        return 1
+    fi
+    local rec meta mode type oid path
+    while IFS= read -r -d '' rec; do
+        meta="${rec%%$'\t'*}"; path="${rec#*$'\t'}"
+        [[ -n "${pos[$path]:-}" ]] || continue
+        read -r mode type oid <<<"$meta"
+        # Regular files and symlinks are blobs; a gitlink names a commit in
+        # another repository and has no content here.
+        [[ "$type" == blob ]] || continue
+        k="${pos[$path]}"
+        if [[ -n "${secret_pos[$k]:-}" || "$path" == *$'\n'* ]]; then
+            label="changed path #$k"
+        else
+            label="$path"
+        fi
+        if ! git -C "$repo" cat-file blob "$oid" >"$work/raw" 2>/dev/null; then
+            printf '%somabackup: cannot read %s from the tree it built%s\n' "$RED" "$label" "$NC" >&2
+            rc=1; continue
+        fi
+        _scan_bytes "$work/raw" "$work" "$label" || {
+            printf '%somabackup: cannot scan %s%s\n' "$RED" "$label" "$NC" >&2
+            rc=1
+        }
+    done <"$work/entries"
+    return $rc
+}
+
+# scan_commit_object <repo> <deny-file> <workdir> <commit-oid>
+# The deny-list over a commit object as git stores it -- author, committer,
+# every header and the message -- read with replacements off. The push scan
+# reads raw commit objects, so a token in user.name or GIT_AUTHOR_NAME passed
+# every blob check and was written by commit-tree (scout omabackup-25). sync
+# runs this on the commit it has built, BEFORE moving any ref. Hits name only
+# the line of the object; the header itself is never printed.
+scan_commit_object() {
+    local repo="$1" file="$2" work="$3" oid="$4"
+    [[ -f "$file" && -d "$work" && -n "$oid" ]] || return 1
+    # Bytes, not characters: under a UTF-8 locale an invalid byte right before
+    # a token hid it from GNU grep and from bash's =~ (review omabackup-73).
+    local LC_ALL=C; export LC_ALL
+    local GIT_NO_REPLACE_OBJECTS=1; export GIT_NO_REPLACE_OBJECTS
+    local -a DENY_EXCEPTIONS=() ids=() res=() cis=() pre_cs=() pre_ci=()
+    _scan_load_patterns "$file" || return 1
+    git -C "$repo" cat-file commit "$oid" >"$work/raw" 2>/dev/null || {
+        printf '%somabackup: cannot read the commit it built -- refusing to call it clean%s\n' \
+            "$RED" "$NC" >&2
+        return 1
+    }
+    _scan_bytes "$work/raw" "$work" "the commit's own header or message"
 }
 
 report_secrets() {  # report_secrets <repo> <deny-file>

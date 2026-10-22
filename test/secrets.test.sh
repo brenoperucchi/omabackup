@@ -1269,51 +1269,46 @@ assert_contains "$V5D_OUT" "DIE: could not clear"
 # -- review round omabackup-76 ----------------------------------------------------
 # The grep hits of the names pass hold the full name or target that matched,
 # token and all. They were written to "$names.hits", a predictable file made
-# by a plain redirect: 0644 under umask 022 in a shared /tmp. Whatever holds
-# them must be unreadable by others from the moment it exists.
+# by a plain redirect: 0644 under umask 022 in a shared /tmp; a redirect that
+# failed read as "no match"; a signal left the lists behind. The names pass
+# keeps nothing on disk now: each grep writes into a pipe, and TMPDIR is empty
+# while it runs.
 V6P="$SH/v6-perm"; mkdir -p "$V6P/stage" "$V6P/stub" "$V6P/tmp"; chmod 1777 "$V6P/tmp"
 : >"$V6P/stage/$_v5tok.conf"
 cat >"$V6P/stub/grep" <<SHIM
 #!/bin/bash
 if [[ " \$* " == *" -z "* ]]; then
-    o="\$(readlink /proc/\$\$/fd/1)"
-    echo "\$(stat -c %a "\$o") \$(stat -c %a "\$(dirname "\$o")")" >>"$V6P/modes"
+    echo "\$(readlink /proc/\$\$/fd/1) [\$(ls -A "$V6P/tmp" | tr '\n' ' ')]" >>"$V6P/seen"
 fi
 exec /usr/bin/grep "\$@"
 SHIM
 chmod +x "$V6P/stub/grep"
-(umask 022; TMPDIR="$V6P/tmp" _scanf "$V6P/stage" "$V6P/stub" >/dev/null)
-it "the names pass keeps its grep hits where no other user can read them"
-if [[ -s "$V6P/modes" ]] && ! awk '$1 !~ /00$/ && $2 !~ /00$/ {bad=1} END {exit !bad}' "$V6P/modes"; then
+V6P_OUT="$(umask 022; TMPDIR="$V6P/tmp" _scanf "$V6P/stage" "$V6P/stub")"
+it "the names pass keeps its grep hits off the disk"
+if [[ -s "$V6P/seen" ]] && ! command grep -qv '^pipe:\[[0-9]*\] \[\]$' "$V6P/seen"; then
     ok
 else
-    fail "file/dir modes of the hits: $(tr '\n' ' ' <"$V6P/modes" 2>/dev/null)"
+    fail "grep stdout / TMPDIR during the names pass: $(tr '\n' ' ' <"$V6P/seen" 2>/dev/null)"
 fi
+it "and still finds the name"
+assert_contains "$V6P_OUT" "(a file NAME, not shown)"
 it "and leaves nothing behind in TMPDIR"
 [[ -z "$(ls -A "$V6P/tmp")" ]] && ok || fail "left in TMPDIR: $(ls -A "$V6P/tmp")"
 
-# A temporary the scan cannot write is a scan that did not run. The redirect
-# into the hits file failed with status 1 -- grep's "no match" -- and a name
-# carrying a token came back clean. mktemp is a shim that hands out paths the
-# scan cannot write to: a read-only directory for -d, and for plain files a
-# path whose ".hits" sibling is a directory.
-V6W="$SH/v6-write"; mkdir -p "$V6W/stage" "$V6W/stub" "$V6W/tmp"
+# A names pass that cannot run is not a clean one: a grep that fails on the
+# list refuses, its status read through the process substitution.
+V6W="$SH/v6-write"; mkdir -p "$V6W/stage" "$V6W/stub"
 : >"$V6W/stage/$_v5tok.conf"
-cat >"$V6W/stub/mktemp" <<SHIM
+cat >"$V6W/stub/grep" <<'SHIM'
 #!/bin/bash
-n=\$(ls "$V6W/tmp" | wc -l)
-if [[ "\$1" == -d ]]; then
-    d="$V6W/tmp/d\$n"; mkdir "\$d"; chmod 500 "\$d"; echo "\$d"
-else
-    f="$V6W/tmp/f\$n"; : >"\$f"; mkdir -p "\$f.hits"; echo "\$f"
-fi
+[[ " $* " == *" -z "* ]] && { cat >/dev/null; exit 2; }
+exec /usr/bin/grep "$@"
 SHIM
-chmod +x "$V6W/stub/mktemp"
+chmod +x "$V6W/stub/grep"
 PATH="$V6W/stub:$PATH" bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
     scan_files "$1" "$2"' _ "$V6W/stage" "$PWD/secrets.deny.json" >/dev/null 2>&1; V6W_RC=$?
-chmod -R u+w "$V6W/tmp" 2>/dev/null
-it "a names pass whose temporaries cannot be written refuses instead of calling it clean"
-(( V6W_RC != 0 )) && ok || fail "scan_files returned 0 with a token in a file name"
+it "a names pass whose grep fails refuses instead of calling it clean"
+(( V6W_RC != 0 )) && ok || fail "scan_files returned 0 when the names grep failed"
 
 # The prefilter read the raw name and _still_matches the name with newlines as
 # spaces, so a name that only matches with the space -- a key header split by
@@ -1352,3 +1347,134 @@ it "a hidden name below a matching first directory is not said to be at the top"
 V6R="$SH/v6-root"; mkdir -p "$V6R/stage"; : >"$V6R/stage/$_v5tok.conf"
 it "and a hidden name at the top still says so"
 assert_contains "$(_scanf "$V6R/stage")" "at the top"
+
+# -- the history scan must not depend on the user's git display settings ----------
+# `git grep` honours color.ui/color.grep=always even into a pipe. The escape
+# sequence lands right before the token, so the second pass of the regex found
+# no word boundary before `gh` and dropped the hit: push called a history
+# holding a GitHub token clean. Found in review round omabackup-69.
+_ctok="gh""p_$(printf 'B%.0s' {1..36})"
+for _cfg in color.ui color.grep; do
+    CR="$SH/color-$_cfg"
+    _sec_repo "$CR" "probe.conf" "token = $_ctok"
+    git -C "$CR" config "$_cfg" always
+    it "the history scan still finds a token with $_cfg=always"
+    [[ -n "$(scan_secrets "$CR" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+        && ok || fail "$_cfg=always hid a token from the push gate"
+done
+CC="$SH/column"
+_sec_repo "$CC" "probe.conf" "token = $_ctok"
+git -C "$CC" config grep.column true
+it "the history scan still finds a token with grep.column=true"
+[[ -n "$(scan_secrets "$CC" "$PWD/secrets.deny.json" 2>/dev/null)" ]] \
+    && ok || fail "grep.column=true hid a token from the push gate"
+
+# -- scan_tree: a change with no directory above it --------------------------------
+# The names list (files, then the directories above them) was built with
+# `(( ${#dirs[@]} )) && printf ...`, which returns 1 when there is no directory
+# at all -- so a tree whose only change sits at the root read as a scan that
+# could not run. sync never publishes at the root today; scan_tree must not
+# depend on that.
+RT="$SH/root-tree"; git init -q "$RT"
+printf 'clean\n' >"$RT/top.txt"; git -C "$RT" add top.txt
+RT_TREE="$(git -C "$RT" write-tree)"; RT_WORK="$(mktemp -d)"
+scan_tree "$RT" "$PWD/secrets.deny.json" "$RT_TREE" "$RT_WORK" top.txt >/dev/null 2>&1; RT_RC=$?
+it "scan_tree judges a root-level-only change instead of failing"
+(( RT_RC == 0 )) && ok || fail "a clean root-level file made the scan report that it could not run"
+
+printf 'token = %s\n' "$_ctok" >"$RT/top.txt"; git -C "$RT" add top.txt
+RT_TREE="$(git -C "$RT" write-tree)"
+it "and still finds a token in that root-level file"
+[[ -n "$(scan_tree "$RT" "$PWD/secrets.deny.json" "$RT_TREE" "$RT_WORK" top.txt 2>/dev/null)" ]] \
+    && ok || fail "a token in a root-level file was missed"
+
+# -- scan_tree judges bytes, whatever the session's locale -----------------------
+# Same class as the staging and push scans (review omabackup-73): under a UTF-8
+# locale an invalid byte right before a token takes the word boundary away from
+# GNU grep and from bash's =~, and the token read as clean.
+_ztok="gh""p_$(printf 'F%.0s' {1..36})"
+ZT="$SH/utf8-tree"; git init -q "$ZT"
+printf '\xff%s\n' "$_ztok" >"$ZT/bin.dat"; git -C "$ZT" add bin.dat
+ZT_TREE="$(git -C "$ZT" write-tree)"; ZT_WORK="$(mktemp -d)"
+it "scan_tree finds a token after an invalid UTF-8 byte under a UTF-8 locale"
+[[ -n "$(LC_ALL=C.UTF-8 bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+         scan_tree "$1" "$2" "$3" "$4" bin.dat' _ "$ZT" "$PWD/secrets.deny.json" "$ZT_TREE" "$ZT_WORK" 2>/dev/null)" ]] \
+    && ok || fail "a UTF-8 locale hid the token from the pre-commit scan"
+
+# A signal mid-scan (the timer's stop, a ^C) left the scan's private directory
+# behind, and its lists hold the names that matched. The handler clears it,
+# then the signal goes on to whatever the caller had set, or kills as before.
+# grep is a shim that sends TERM to the scanning shell on the names pass. The
+# lists live in pipes now, so there is nothing to clear.
+V6S="$SH/v6-signal"; mkdir -p "$V6S/stage" "$V6S/stub" "$V6S/tmp"
+: >"$V6S/stage/$_v5tok.conf"
+cat >"$V6S/stub/grep" <<'SHIM'
+#!/bin/bash
+[[ " $* " == *" -z "* ]] && kill -TERM "$SCAN_PID"
+exec /usr/bin/grep "$@"
+SHIM
+chmod +x "$V6S/stub/grep"
+TMPDIR="$V6S/tmp" PATH="$V6S/stub:$PATH" bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    export SCAN_PID=$$; scan_files "$1" "$2"; echo "survived the signal"' _ "$V6S/stage" "$PWD/secrets.deny.json" >"$V6S/out" 2>&1; V6S_RC=$?
+it "a TERM mid-scan still ends the scan with the signal's status"
+(( V6S_RC == 143 )) && ok || fail "status $V6S_RC: $(cat "$V6S/out")"
+it "and leaves nothing behind in TMPDIR"
+[[ -z "$(ls -A "$V6S/tmp")" ]] && ok || fail "left in TMPDIR: $(ls -A "$V6S/tmp")"
+
+# The caller's own handler still runs, and its traps come back after a scan.
+V6K="$(TMPDIR="$V6S/tmp" bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    trap "echo caller-handler" HUP
+    scan_files "$1" "$2" >/dev/null 2>&1
+    trap -p HUP' _ "$V6S/stage" "$PWD/secrets.deny.json" 2>&1)"
+it "a scan gives the caller its traps back"
+assert_contains "$V6K" "echo caller-handler"
+
+# -- review round omabackup-78 ----------------------------------------------------
+# The push scan reads names from rev-list --objects, which ends a name at its
+# first newline. A rule anchored with $ matched that piece there and not the
+# joined name here, so a commit the gate accepted blocked every push.
+V8D="$SH/v8-deny.json"
+cat >"$V8D" <<'JSON'
+{"schemaVersion":1,"patterns":[
+ {"id":"custom-end","regex":"secret=[a-z]{16}$","reason":"test rule anchored at the end"}]}
+JSON
+_v8nm="sec""ret=abcdefghijklmnop"
+V8R="$SH/v8-repo"; git init -q "$V8R"
+mkdir -p "$V8R/configs/app" "$V8R/configs/$_v8nm"$'\n'"z"
+printf 'clean\n' >"$V8R/configs/app/$_v8nm"$'\n'"x.txt"
+printf 'clean\n' >"$V8R/configs/$_v8nm"$'\n'"z/in.txt"
+git -C "$V8R" add -A; V8T="$(git -C "$V8R" write-tree)"; V8W="$(mktemp -d "$SH/v8w.XXXX")"
+V8F_OUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_tree "$1" "$2" "$3" "$4" "$5"' _ "$V8R" "$V8D" "$V8T" "$V8W" "configs/app/$_v8nm"$'\n'"x.txt" 2>&1)"
+it "the pre-commit scan judges a file name up to its first newline, as push does"
+assert_contains "$V8F_OUT" "custom-end"
+it "without printing the name"
+assert_not_contains "$V8F_OUT" "$_v8nm"
+V8G_OUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_tree "$1" "$2" "$3" "$4" "$5"' _ "$V8R" "$V8D" "$V8T" "$V8W" "configs/$_v8nm"$'\n'"z/in.txt" 2>&1)"
+it "and a directory name the same way"
+assert_contains "$V8G_OUT" "custom-end"
+assert_not_contains "$V8G_OUT" "$_v8nm"
+
+V8S="$SH/v8-stage"; mkdir -p "$V8S/app"
+: >"$V8S/app/$_v8nm"$'\n'"x.txt"
+ln -s -- "$_v8nm"$'\n'"rest" "$V8S/app/pointer"
+V8S_OUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_files "$1" "$2"' _ "$V8S" "$V8D" 2>&1)"
+it "the staging scan judges a name up to its first newline too"
+assert_contains "$V8S_OUT" "(a file NAME, not shown)"
+it "and a symlink target the same way"
+assert_contains "$V8S_OUT" "symlink target"
+it "printing neither"
+assert_not_contains "$V8S_OUT" "$_v8nm"
+
+# -- review round omabackup-79 ----------------------------------------------------
+# A directory matched only in its piece before a newline: the hint looked for
+# the match on the joined name, found none, and printed the directory.
+V9S="$SH/v9-stage"; mkdir -p "$V9S/cfg/$_v8nm"$'\n'"suffix"
+: >"$V9S/cfg/$_v8nm"$'\n'"suffix/leaf.txt"
+V9S_OUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_files "$1" "$2"' _ "$V9S" "$V8D" 2>&1)"
+it "a name hidden by a piece before a newline gets no hint that prints it"
+assert_contains "$V9S_OUT" "(a file NAME, not shown)"
+assert_not_contains "$V9S_OUT" "abcdefghijklmnop"

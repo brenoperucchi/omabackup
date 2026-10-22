@@ -218,10 +218,18 @@ SH7="$(mktemp -d)"; SR7="$SH7/repo"; SG7="$SH7/g.json"
 mkdir -p "$SH7/.config/app"
 printf 'x\n' >"$SH7/.config/app/f.txt"
 _dest_repo "$SR7"
-printf '#!/bin/sh\nexit 1\n' >"$SR7/.git/hooks/pre-commit"
-chmod +x "$SR7/.git/hooks/pre-commit"
+# The failure is injected with a git shim, not a pre-commit hook: the backup's
+# own commit deliberately runs no hooks (review omabackup-69), so a hook can no
+# longer make it fail -- but a git that refuses still must not read as success.
+mkdir -p "$SH7/stub"
+cat >"$SH7/stub/git" <<SHIM
+#!/bin/bash
+for a in "\$@"; do [[ "\$a" == commit || "\$a" == commit-tree ]] && exit 1; done
+exec "$(command -v git)" "\$@"
+SHIM
+chmod +x "$SH7/stub/git"
 cp "$SG" "$SG7"
-OUT7="$(_sync_env "$SH7" "$SR7" "$SG7" sync --commit)"
+OUT7="$(PATH="$SH7/stub:$PATH" _sync_env "$SH7" "$SR7" "$SG7" sync --commit)"
 
 it "a git commit that fails is not announced as committed"
 assert_not_contains "$OUT7" "committed"
@@ -463,3 +471,843 @@ else fail "a token in a symlink reached the worktree"; fi
 
 it "and nothing was published"
 assert_eq "$(_commits "$R75/repo")" "1"
+
+# -- a secret is refused BEFORE it becomes history ----------------------------------
+# The deny-list used to run only in `push`, and push runs after sync has already
+# committed. So a token that reached a collected file was never refused: it was
+# committed, and from then on the history-wide scan blocked every push until
+# someone rewrote the repository. The scan now runs over exactly what this
+# commit would add, before `git add` makes it permanent, and a hit refuses the
+# commit instead of poisoning the history.
+#
+# The token is assembled at runtime so this file never holds one in the clear.
+_tok="gh""p_$(printf 'A%.0s' {1..36})"
+
+_sec_env() {  # _sec_env <dir> -- a home with one collected app file and a repo
+    mkdir -p "$1/.config/app"
+    printf 'x\n' >"$1/.config/app/f.txt"
+    _dest_repo "$1/repo"
+    cat >"$1/g.json" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/app"]}]}
+JSON
+}
+
+SC1="$(mktemp -d)"; _sec_env "$SC1"
+_sync_env "$SC1" "$SC1/repo" "$SC1/g.json" sync --commit >/dev/null
+printf 'token = %s\n' "$_tok" >"$SC1/.config/app/creds.txt"
+SC1_OUT="$(_sync_env "$SC1" "$SC1/repo" "$SC1/g.json" sync --commit)"; SC1_RC=$?
+
+it "sync --commit refuses when a collected file carries a known credential"
+(( SC1_RC != 0 )) && ok || fail "sync --commit exited 0 with a GitHub token in what it was about to commit"
+
+it "and creates no commit, so the history stays clean"
+assert_eq "$(_commits "$SC1/repo")" "2"
+
+it "and leaves nothing staged for a later commit to sweep up"
+assert_eq "$(git -C "$SC1/repo" diff --cached --name-only)" ""
+
+# The staging scan (#3) refuses this one before publish, under the staging
+# path; the pre-commit gate names the repo path. Either names the file.
+it "and names the rule and the file so the user can act on it"
+assert_contains "$SC1_OUT" "github-token"
+assert_contains "$SC1_OUT" "app/creds.txt"
+
+# The scan covers what THIS commit adds, not the whole tree. A token already in
+# history has already blocked push; blocking sync as well would stop the local
+# backup altogether without protecting anything more.
+SC2="$(mktemp -d)"; _sec_env "$SC2"
+mkdir -p "$SC2/repo/configs/old"
+printf 'token = %s\n' "$_tok" >"$SC2/repo/configs/old/leaked.txt"
+git -C "$SC2/repo" add -A && git -C "$SC2/repo" commit -qm "old leak"
+_sync_env "$SC2" "$SC2/repo" "$SC2/g.json" sync --commit >/dev/null
+
+it "a token already in history does not block committing an unrelated clean change"
+assert_contains "$(git -C "$SC2/repo" log -1 --format=%s)" "omabackup: sync"
+
+# Nor does a file this run did not write. `commit -- written[]` never takes it,
+# so it is not ours to refuse.
+SC3="$(mktemp -d)"; _sec_env "$SC3"
+printf 'token = %s\n' "$_tok" >"$SC3/repo/scratch.txt"
+_sync_env "$SC3" "$SC3/repo" "$SC3/g.json" sync --commit >/dev/null
+
+it "an unrelated file in the repo holding a token does not block the sync"
+assert_contains "$(git -C "$SC3/repo" log -1 --format=%s)" "omabackup: sync"
+
+it "and that file is still left out of the commit"
+assert_not_contains "$(git -C "$SC3/repo" show --name-only --format= HEAD)" "scratch.txt"
+
+# A scan that cannot run is not a clean scan. An unreadable deny-list has to
+# refuse the commit, the same way push already refuses.
+SC4="$(mktemp -d)"; _sec_env "$SC4"
+SC4_OUT="$(OMABACKUP_SECRETS_DENY="$SC4/missing.json" _sync_env "$SC4" "$SC4/repo" "$SC4/g.json" sync --commit)"; SC4_RC=$?
+
+it "sync --commit refuses when the secret scan itself cannot run"
+(( SC4_RC != 0 )) && ok || fail "committed without a deny-list to scan against"
+
+it "and creates no commit in that case either"
+assert_eq "$(_commits "$SC4/repo")" "1"
+
+# Without --commit nothing becomes history, and this gate used to let publish
+# write the file for review. The staging scan (#3) now refuses before publish
+# in both modes, so the token never reaches the worktree at all.
+SC5="$(mktemp -d)"; _sec_env "$SC5"
+printf 'token = %s\n' "$_tok" >"$SC5/.config/app/creds.txt"
+_sync_env "$SC5" "$SC5/repo" "$SC5/g.json" sync >/dev/null; SC5_RC=$?
+
+it "sync without --commit refuses a token too, before publish"
+(( SC5_RC != 0 )) && ok || fail "sync without --commit published a token"
+
+it "and the token never reached the worktree"
+[[ ! -e "$SC5/repo/configs/app/creds.txt" ]] && ok || fail "creds.txt was published"
+
+# -- the scan reads the object git records, not the file in the worktree ----------
+# Review round omabackup-68: the first version grepped the worktree while
+# `git commit -- paths` recorded whatever the worktree held a moment later.
+# The two diverge in ways that matter, each pinned below.
+_REALGIT="$(command -v git)"
+
+# Omarchy keeps ~/.config/nvim/lua/plugins/theme.lua as a RELATIVE symlink into
+# ~/.local/state. Published into the repo it dangles, and grep given a dangling
+# link on its command line exits 2 -- so the first sync of every fresh install
+# was refused forever, with a message naming no file. git records the link
+# text, which holds no secret.
+SY1="$(mktemp -d)"; _sec_env "$SY1"
+mkdir -p "$SY1/.local/state/omarchy/theme" "$SY1/.config/app/lua"
+printf 'return {}\n' >"$SY1/.local/state/omarchy/theme/neovim.lua"
+ln -s ../../../.local/state/omarchy/theme/neovim.lua "$SY1/.config/app/lua/theme.lua"
+_sync_env "$SY1" "$SY1/repo" "$SY1/g.json" sync --commit >/dev/null; SY1_RC=$?
+
+it "a relative symlink that dangles once published does not block the commit"
+(( SY1_RC == 0 )) && ok || fail "sync --commit refused a harmless Omarchy-style theme link"
+
+it "and the link itself is committed"
+assert_contains "$(git -C "$SY1/repo" show --name-only --format= HEAD)" "configs/app/lua/theme.lua"
+
+SY2="$(mktemp -d)"; _sec_env "$SY2"
+ln -s "$SY2/nowhere/at/all" "$SY2/.config/app/gone"
+_sync_env "$SY2" "$SY2/repo" "$SY2/g.json" sync --commit >/dev/null; SY2_RC=$?
+
+it "a dangling symlink does not block the commit"
+(( SY2_RC == 0 )) && ok || fail "sync --commit refused a dangling symlink"
+
+# A link to a file holding a token: git stores the path of the target, not the
+# target, so there is nothing secret in what is committed.
+SY3="$(mktemp -d)"; _sec_env "$SY3"
+printf 'token = %s\n' "$_tok" >"$SY3/outside.txt"
+ln -s "$SY3/outside.txt" "$SY3/.config/app/link"
+SY3_OUT="$(_sync_env "$SY3" "$SY3/repo" "$SY3/g.json" sync --commit)"; SY3_RC=$?
+
+it "a symlink to a file holding a token commits, because the blob is the link text"
+(( SY3_RC == 0 )) && ok || fail "refused over content the commit would not carry"
+
+it "and the target's content is never printed"
+assert_not_contains "$SY3_OUT" "$_tok"
+
+# What is committed is what was scanned. A shim appends a token to a collected
+# file at the moment git is asked to commit: `commit -- paths` re-read the
+# worktree and recorded the token unscanned.
+SY4="$(mktemp -d)"; _sec_env "$SY4"; mkdir -p "$SY4/stub"
+cat >"$SY4/stub/git" <<SHIM
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == commit ]]; then
+        printf 'token = %s\n' "$_tok" >>"$SY4/repo/configs/app/f.txt"; break
+    fi
+done
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SY4/stub/git"
+PATH="$SY4/stub:$PATH" _sync_env "$SY4" "$SY4/repo" "$SY4/g.json" sync --commit >/dev/null
+
+it "a write that lands between the scan and the commit never reaches history"
+assert_not_contains "$(git -C "$SY4/repo" log -p --all 2>/dev/null)" "$_tok"
+
+# If the list of files to scan cannot be produced, nothing was scanned -- that is
+# not "nothing to scan".
+SY5="$(mktemp -d)"; _sec_env "$SY5"; mkdir -p "$SY5/stub"
+cat >"$SY5/stub/git" <<SHIM
+#!/bin/bash
+nm=0; df=0
+# diff or diff-tree: the change list now comes from diff-tree on the written tree.
+for a in "\$@"; do [[ "\$a" == --name-only ]] && nm=1; [[ "\$a" == diff || "\$a" == diff-tree ]] && df=1; done
+(( nm && df )) && exit 128
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SY5/stub/git"
+PATH="$SY5/stub:$PATH" _sync_env "$SY5" "$SY5/repo" "$SY5/g.json" sync --commit >/dev/null; SY5_RC=$?
+
+it "sync --commit refuses when it cannot list what the commit would change"
+(( SY5_RC != 0 )) && ok || fail "an unreadable change list was taken as nothing to scan"
+
+it "and creates no commit"
+assert_eq "$(_commits "$SY5/repo")" "1"
+
+# The artefact scan skips repo.bundle because it is a packfile already scanned
+# as objects. A collected file that happens to share the name is neither.
+SY6="$(mktemp -d)"; _sec_env "$SY6"
+printf 'token = %s\n' "$_tok" >"$SY6/.config/app/repo.bundle"
+_sync_env "$SY6" "$SY6/repo" "$SY6/g.json" sync --commit >/dev/null; SY6_RC=$?
+
+it "a collected file named repo.bundle is scanned like any other"
+(( SY6_RC != 0 )) && ok || fail "a token in a file named repo.bundle was committed"
+
+# A clean filter (git-crypt works this way) changes what is stored. This gate
+# judges the stored blob, and alone it let a token the filter removes through.
+# The staging scan (#3) reads the plaintext before publish and refuses it
+# anyway: decided for 0.4.8 to refuse and document, the user excludes the file
+# or adds an exception.
+SY7="$(mktemp -d)"; _sec_env "$SY7"
+git -C "$SY7/repo" config filter.hide.clean "sed 's/gh[p]_[A-Za-z0-9]*/REDACTED/'"
+git -C "$SY7/repo" config filter.hide.smudge cat
+printf 'configs/app/creds.txt filter=hide\n' >"$SY7/repo/.git/info/attributes"
+printf 'token = %s\n' "$_tok" >"$SY7/.config/app/creds.txt"
+_sync_env "$SY7" "$SY7/repo" "$SY7/g.json" sync --commit >/dev/null; SY7_RC=$?
+
+it "a token a clean filter would remove is still refused before publish"
+(( SY7_RC != 0 )) && ok || fail "a plaintext token behind a clean filter was published"
+
+it "and nothing holds it, stored or published"
+assert_not_contains "$(git -C "$SY7/repo" log -p --all 2>/dev/null)" "$_tok"
+[[ ! -e "$SY7/repo/configs/app/creds.txt" ]] && ok || fail "creds.txt was published"
+
+# The other way round only this gate can see: staging is clean and the clean
+# filter puts the token into the stored blob. The refusal names the repo path
+# and the line, never the content.
+SYI="$(mktemp -d)"; _sec_env "$SYI"
+git -C "$SYI/repo" config filter.leak.clean "sed 's/PLACEHOLDER/$_tok/'"
+git -C "$SYI/repo" config filter.leak.smudge cat
+printf 'configs/app/creds.txt filter=leak\n' >"$SYI/repo/.git/info/attributes"
+printf 'token = PLACEHOLDER\n' >"$SYI/.config/app/creds.txt"
+SYI_OUT="$(_sync_env "$SYI" "$SYI/repo" "$SYI/g.json" sync --commit)"; SYI_RC=$?
+
+it "a token a clean filter adds is refused before the commit"
+(( SYI_RC != 0 )) && ok || fail "the stored blob carried a token and was committed"
+
+it "and the history stays clean"
+assert_not_contains "$(git -C "$SYI/repo" log -p --all 2>/dev/null)" "$_tok"
+
+it "and the refusal names the repo path and the line, not the content"
+assert_contains "$SYI_OUT" "configs/app/creds.txt, line 1"
+assert_not_contains "$SYI_OUT" "$_tok"
+
+# The refusal goes to the systemd journal when the timer runs it. It names the
+# rule, the file and the line -- never the line's content.
+SY8="$(mktemp -d)"; _sec_env "$SY8"
+printf 'token = %s\n' "$_tok" >"$SY8/.config/app/creds.txt"
+SY8_OUT="$(_sync_env "$SY8" "$SY8/repo" "$SY8/g.json" sync --commit)"
+
+it "the refusal never prints the credential itself"
+assert_not_contains "$SY8_OUT" "$_tok"
+
+# The staging scan (#3) refuses first, as "<staging path>:<line>"; the
+# pre-commit form "<repo path>, line N" is covered by the clean-filter case.
+it "but still points at the file and the line"
+assert_contains "$SY8_OUT" "app/creds.txt:1"
+
+# A refusal must not touch what the user had staged by hand, on the same path
+# or on another one.
+SY9="$(mktemp -d)"; _sec_env "$SY9"
+_sync_env "$SY9" "$SY9/repo" "$SY9/g.json" sync --commit >/dev/null
+printf 'mine\n' >"$SY9/repo/notes.txt"; git -C "$SY9/repo" add notes.txt
+printf 'hand-staged\n' >"$SY9/repo/configs/app/f.txt"; git -C "$SY9/repo" add configs/app/f.txt
+SY9_BEFORE="$(git -C "$SY9/repo" ls-files -s -- notes.txt configs/app/f.txt)"
+printf 'token = %s\n' "$_tok" >"$SY9/.config/app/f.txt"
+_sync_env "$SY9" "$SY9/repo" "$SY9/g.json" sync --commit >/dev/null
+
+it "a refusal leaves the user's own staging exactly as it was"
+assert_eq "$(git -C "$SY9/repo" ls-files -s -- notes.txt configs/app/f.txt)" "$SY9_BEFORE"
+
+# -- review round omabackup-69: the candidate had to be read, not grepped ---------
+# `git grep --cached` still interpreted the blob through the user's settings and
+# its own rules. Each case below read something other than the bytes committed.
+
+# A hook runs after the scan with GIT_INDEX_FILE pointing at the candidate, and
+# git re-reads the index after pre-commit on purpose. The backup's own commit
+# runs no hooks.
+SZ1="$(mktemp -d)"; _sec_env "$SZ1"
+_sync_env "$SZ1" "$SZ1/repo" "$SZ1/g.json" sync --commit >/dev/null
+cat >"$SZ1/repo/.git/hooks/pre-commit" <<HOOK
+#!/bin/bash
+printf 'token = %s\n' "$_tok" >>configs/app/f.txt
+git add configs/app/f.txt
+HOOK
+cat >"$SZ1/repo/.git/hooks/prepare-commit-msg" <<HOOK
+#!/bin/bash
+printf '\ntoken = %s\n' "$_tok" >>"\$1"
+HOOK
+chmod +x "$SZ1/repo/.git/hooks/pre-commit" "$SZ1/repo/.git/hooks/prepare-commit-msg"
+printf 'y\n' >"$SZ1/.config/app/f.txt"
+_sync_env "$SZ1" "$SZ1/repo" "$SZ1/g.json" sync --commit >/dev/null
+
+it "a hook cannot slip content or a message into the commit after the scan"
+assert_not_contains "$(git -C "$SZ1/repo" log -p --all 2>/dev/null)" "$_tok"
+
+# git grep skips symlink entries entirely, but git stores the link TEXT as a
+# blob. A link whose text is a token is a token in history.
+SZ2="$(mktemp -d)"; _sec_env "$SZ2"
+ln -s "$_tok" "$SZ2/.config/app/tlink"
+_sync_env "$SZ2" "$SZ2/repo" "$SZ2/g.json" sync --commit >/dev/null; SZ2_RC=$?
+
+it "a symlink whose own text is a token is refused"
+(( SZ2_RC != 0 )) && ok || fail "the link text was committed unscanned"
+
+# A NUL right before the token: bash dropped it when reading the line back, so
+# the second regex pass lost the word boundary and discarded a real hit.
+SZ3="$(mktemp -d)"; _sec_env "$SZ3"
+printf 'a\0%s\n' "$_tok" >"$SZ3/.config/app/bin.dat"
+_sync_env "$SZ3" "$SZ3/repo" "$SZ3/g.json" sync --commit >/dev/null; SZ3_RC=$?
+
+it "a token right after a NUL byte is refused"
+(( SZ3_RC != 0 )) && ok || fail "a NUL before the token hid it"
+
+# Display settings of the repo must not change the verdict.
+for _cfg in "color.ui always" "color.grep always" "grep.column true"; do
+    SZC="$(mktemp -d)"; _sec_env "$SZC"
+    git -C "$SZC/repo" config $_cfg
+    printf 'token = %s\n' "$_tok" >"$SZC/.config/app/creds.txt"
+    _sync_env "$SZC" "$SZC/repo" "$SZC/g.json" sync --commit >/dev/null; SZC_RC=$?
+    it "sync --commit still refuses a token with ${_cfg% *}=${_cfg#* }"
+    (( SZC_RC != 0 )) && ok || fail "${_cfg% *} let a token into the commit"
+done
+
+# git replace swaps what git SHOWS for an object. The candidate names the real
+# blob; reading it through a replacement judged different bytes.
+SZ4="$(mktemp -d)"; _sec_env "$SZ4"
+printf 'token = %s\n' "$_tok" >"$SZ4/.config/app/creds.txt"
+_bad="$(git -C "$SZ4/repo" hash-object -w "$SZ4/.config/app/creds.txt")"
+_good="$(printf 'clean\n' | git -C "$SZ4/repo" hash-object -w --stdin)"
+git -C "$SZ4/repo" replace "$_bad" "$_good"
+_sync_env "$SZ4" "$SZ4/repo" "$SZ4/g.json" sync --commit >/dev/null; SZ4_RC=$?
+
+it "a replacement object cannot stand in for the blob being committed"
+(( SZ4_RC != 0 )) && ok || fail "the scan read the replacement, the commit took the token"
+
+# A published name with glob characters is a literal path, not a pattern: it
+# must not sweep up a same-looking draft this run never wrote.
+SZ5="$(mktemp -d)"; _sec_env "$SZ5"
+_sync_env "$SZ5" "$SZ5/repo" "$SZ5/g.json" sync --commit >/dev/null
+printf 'draft\n' >"$SZ5/repo/configs/app/a1.txt"
+printf 'mine\n' >"$SZ5/.config/app/a[1].txt"
+_sync_env "$SZ5" "$SZ5/repo" "$SZ5/g.json" sync --commit >/dev/null
+
+it "a published file named with glob characters commits only itself"
+assert_not_contains "$(git -C "$SZ5/repo" show --name-only --format= HEAD)" "configs/app/a1.txt"
+
+# If refreshing the user's index after the commit fails, the advice must not
+# reset the WHOLE index and throw away what they staged elsewhere.
+SZ6="$(mktemp -d)"; _sec_env "$SZ6"; mkdir -p "$SZ6/stub"
+cat >"$SZ6/stub/git" <<SHIM
+#!/bin/bash
+if [[ -z "\${GIT_INDEX_FILE:-}" ]]; then
+    for a in "\$@"; do [[ "\$a" == reset ]] && exit 1; done
+fi
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SZ6/stub/git"
+SZ6_OUT="$(PATH="$SZ6/stub:$PATH" _sync_env "$SZ6" "$SZ6/repo" "$SZ6/g.json" sync --commit)"
+
+it "the recovery advice resets only the backed-up paths"
+assert_contains "$SZ6_OUT" "reset -q -- "
+
+# An interrupted sync leaves no candidate index -- nor any copy of a scanned
+# blob -- behind. The shim holds the scan open until the test signals it.
+SZ7="$(mktemp -d)"; _sec_env "$SZ7"; mkdir -p "$SZ7/stub"
+cat >"$SZ7/stub/git" <<SHIM
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == cat-file ]]; then : >"$SZ7/reached"; sleep 2; break; fi
+done
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SZ7/stub/git"
+printf 'z\n' >"$SZ7/.config/app/f.txt"
+PATH="$SZ7/stub:$PATH" HOME="$SZ7" OMABACKUP_GROUPS="$SZ7/g.json" OMABACKUP_STATE="$SZ7/.state" \
+    OMABACKUP_REPO="$SZ7/repo" XDG_RUNTIME_DIR=/nonexistent "$OB" sync --commit >/dev/null 2>&1 &
+SZ7_PID=$!
+for _ in $(seq 1 100); do [[ -e "$SZ7/reached" ]] && break; sleep 0.1; done
+kill -TERM "$SZ7_PID" 2>/dev/null; wait "$SZ7_PID" 2>/dev/null
+
+it "an interrupted sync leaves no candidate index or scanned copy behind"
+[[ -e "$SZ7/reached" && -z "$(ls -d "$SZ7/repo/.git"/omabackup-sync.* 2>/dev/null)" ]] \
+    && ok || fail "the scan was never reached, or its temporary files survived the signal"
+
+# -- review round omabackup-70 ------------------------------------------------------
+# A merge (or cherry-pick) the user is still resolving lives in the git
+# directory, not in the index. A commit built from HEAD plus the backup paths
+# would move HEAD under that operation. The old `commit -- paths` was refused by
+# git in that state; the backup must refuse too and touch nothing.
+SW1="$(mktemp -d)"; _sec_env "$SW1"
+_sync_env "$SW1" "$SW1/repo" "$SW1/g.json" sync --commit >/dev/null
+git -C "$SW1/repo" checkout -q -b side
+printf 'side\n' >"$SW1/repo/README.md"; git -C "$SW1/repo" commit -qam side
+git -C "$SW1/repo" checkout -q -
+printf 'main\n' >"$SW1/repo/README.md"; git -C "$SW1/repo" commit -qam main
+git -C "$SW1/repo" merge -q side >/dev/null 2>&1
+SW1_HEAD="$(git -C "$SW1/repo" rev-parse HEAD)"
+printf 'changed\n' >"$SW1/.config/app/f.txt"
+_sync_env "$SW1" "$SW1/repo" "$SW1/g.json" sync --commit >/dev/null; SW1_RC=$?
+
+it "sync --commit refuses while a merge is in progress"
+(( SW1_RC != 0 )) && ok || fail "the backup committed in the middle of the user's merge"
+
+it "and leaves HEAD and the merge state untouched"
+[[ "$(git -C "$SW1/repo" rev-parse HEAD)" == "$SW1_HEAD" && -f "$SW1/repo/.git/MERGE_HEAD" ]] \
+    && ok || fail "HEAD moved or MERGE_HEAD was cleared"
+
+SW2="$(mktemp -d)"; _sec_env "$SW2"
+_sync_env "$SW2" "$SW2/repo" "$SW2/g.json" sync --commit >/dev/null
+git -C "$SW2/repo" checkout -q -b pick
+printf 'pick\n' >"$SW2/repo/README.md"; git -C "$SW2/repo" commit -qam pick
+git -C "$SW2/repo" checkout -q -
+printf 'here\n' >"$SW2/repo/README.md"; git -C "$SW2/repo" commit -qam here
+git -C "$SW2/repo" cherry-pick pick >/dev/null 2>&1
+printf 'changed\n' >"$SW2/.config/app/f.txt"
+_sync_env "$SW2" "$SW2/repo" "$SW2/g.json" sync --commit >/dev/null; SW2_RC=$?
+
+it "sync --commit refuses while a cherry-pick is in progress"
+(( SW2_RC != 0 )) && [[ -f "$SW2/repo/.git/CHERRY_PICK_HEAD" ]] \
+    && ok || fail "the backup committed in the middle of the user's cherry-pick"
+
+# A NUL INSIDE a quoted value: generic-assigned-secret's negated class crosses
+# the NUL, and the push scan (which drops NULs) sees the whole value. Splitting
+# the blob at NUL hid it, so the commit went in and push was blocked for good.
+SW3="$(mktemp -d)"; _sec_env "$SW3"
+printf 'pass''word = "abcdefgh\0ijklmnopqrstuv"\n' >"$SW3/.config/app/blob.bin"
+_sync_env "$SW3" "$SW3/repo" "$SW3/g.json" sync --commit >/dev/null; SW3_RC=$?
+
+it "a secret value with a NUL inside it is refused, as push would"
+(( SW3_RC != 0 )) && ok || fail "the pre-commit scan was more permissive than the push scan"
+
+# The prefilter must follow each rule's own case sensitivity: with -i, a
+# negated class like [^A] also excludes `a`, so a case-sensitive rule could be
+# skipped by the very pass meant to only save time.
+SW4="$(mktemp -d)"; _sec_env "$SW4"
+cat >"$SW4/deny.json" <<'JSON'
+{"schemaVersion":1,"patterns":[
+ {"id":"custom-cs","regex":"^secret=[^A]{16}$","reason":"test rule, case-sensitive"}]}
+JSON
+printf 'sec''ret=aaaaaaaaaaaaaaaa\n' >"$SW4/.config/app/c.txt"
+OMABACKUP_SECRETS_DENY="$SW4/deny.json" _sync_env "$SW4" "$SW4/repo" "$SW4/g.json" sync --commit >/dev/null; SW4_RC=$?
+
+it "the prefilter never skips what a case-sensitive rule would catch"
+(( SW4_RC != 0 )) && ok || fail "a case-insensitive prefilter hid a case-sensitive rule's hit"
+
+# Hooks defined in config (hook.<name>.event) are not files, so an empty hooks
+# path does not silence them, and --no-verify leaves prepare-commit-msg running.
+SW5="$(mktemp -d)"; _sec_env "$SW5"
+_sync_env "$SW5" "$SW5/repo" "$SW5/g.json" sync --commit >/dev/null
+git -C "$SW5/repo" config hook.leak.event prepare-commit-msg
+git -C "$SW5/repo" config hook.leak.command "printf 'token = %s\n' '$_tok' >>\"\$1\""
+printf 'changed\n' >"$SW5/.config/app/f.txt"
+_sync_env "$SW5" "$SW5/repo" "$SW5/g.json" sync --commit >/dev/null
+
+it "a config-defined hook cannot put anything into the backup's commit message"
+assert_not_contains "$(git -C "$SW5/repo" log -1 --format=%B)" "$_tok"
+
+SW6="$(mktemp -d)"; _sec_env "$SW6"
+_sync_env "$SW6" "$SW6/repo" "$SW6/g.json" sync --commit >/dev/null
+git -C "$SW6/repo" config hook.nope.event prepare-commit-msg
+git -C "$SW6/repo" config hook.nope.command "false"
+printf 'changed\n' >"$SW6/.config/app/f.txt"
+_sync_env "$SW6" "$SW6/repo" "$SW6/g.json" sync --commit >/dev/null
+
+it "a failing config-defined hook does not stop the backup from committing"
+assert_eq "$(_commits "$SW6/repo")" "3"
+
+# The push scan reads every path name in history, not only contents. A file
+# whose NAME holds a token would pass a content-only scan here, be committed,
+# and then block push for good -- the pre-commit scan has to read names too.
+SN1="$(mktemp -d)"; _sec_env "$SN1"
+printf 'harmless\n' >"$SN1/.config/app/$_tok.txt"
+SN1_OUT="$(_sync_env "$SN1" "$SN1/repo" "$SN1/g.json" sync --commit)"; SN1_RC=$?
+
+it "a collected file whose name holds a token is refused"
+(( SN1_RC != 0 )) && ok || fail "a token in a file name was committed; push would then block for good"
+
+it "and the refusal does not print that name in full"
+assert_not_contains "$SN1_OUT" "$_tok"
+
+# -- scout analysis omabackup-25 ------------------------------------------------------
+# A: the commit OBJECT carries author and committer, and the push scan reads raw
+# commit objects. A token in user.name passed every blob check and was written
+# into history by commit-tree.
+SX1="$(mktemp -d)"; _sec_env "$SX1"
+_sync_env "$SX1" "$SX1/repo" "$SX1/g.json" sync --commit >/dev/null
+SX1_HEAD="$(git -C "$SX1/repo" rev-parse HEAD)"
+printf 'changed\n' >"$SX1/.config/app/f.txt"
+SX1_OUT="$(GIT_AUTHOR_NAME="$_tok" GIT_COMMITTER_NAME="$_tok" _sync_env "$SX1" "$SX1/repo" "$SX1/g.json" sync --commit)"; SX1_RC=$?
+
+it "a token in the commit's author or committer is refused before any ref moves"
+(( SX1_RC != 0 )) && [[ "$(git -C "$SX1/repo" rev-parse HEAD)" == "$SX1_HEAD" ]] \
+    && ok || fail "commit-tree wrote a token into the commit header and HEAD moved"
+
+it "and the refusal does not print the header"
+assert_not_contains "$SX1_OUT" "$_tok"
+
+# B: the candidate is built from one HEAD; the commit must sit on that same HEAD.
+# A commit the user makes while the sync scans moved HEAD, the old code re-read
+# it as the parent, and the backup's tree -- built from the earlier HEAD --
+# silently reverted the user's change.
+SX2="$(mktemp -d)"; _sec_env "$SX2"; mkdir -p "$SX2/stub"
+_sync_env "$SX2" "$SX2/repo" "$SX2/g.json" sync --commit >/dev/null
+cat >"$SX2/stub/git" <<SHIM
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == cat-file && ! -e "$SX2/done" ]]; then
+        : >"$SX2/done"
+        printf 'user edit\n' >"$SX2/repo/README.md"
+        env -u GIT_INDEX_FILE "$_REALGIT" -C "$SX2/repo" commit -qam "user commit" >/dev/null 2>&1
+        break
+    fi
+done
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SX2/stub/git"
+printf 'changed\n' >"$SX2/.config/app/f.txt"
+PATH="$SX2/stub:$PATH" _sync_env "$SX2" "$SX2/repo" "$SX2/g.json" sync --commit >/dev/null
+
+it "a commit made during the sync is never reverted by the backup"
+assert_eq "$(git -C "$SX2/repo" show HEAD:README.md 2>/dev/null)" "user edit"
+
+# The branch is fixed too: switching to another branch at the same commit must
+# not land the backup on it.
+SX3="$(mktemp -d)"; _sec_env "$SX3"; mkdir -p "$SX3/stub"
+_sync_env "$SX3" "$SX3/repo" "$SX3/g.json" sync --commit >/dev/null
+SX3_BR="$(git -C "$SX3/repo" symbolic-ref --short HEAD)"
+cat >"$SX3/stub/git" <<SHIM
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == cat-file && ! -e "$SX3/done" ]]; then
+        : >"$SX3/done"
+        env -u GIT_INDEX_FILE "$_REALGIT" -C "$SX3/repo" checkout -q -b other >/dev/null 2>&1
+        break
+    fi
+done
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SX3/stub/git"
+printf 'changed\n' >"$SX3/.config/app/f.txt"
+PATH="$SX3/stub:$PATH" _sync_env "$SX3" "$SX3/repo" "$SX3/g.json" sync --commit >/dev/null
+
+it "a branch switched to during the sync does not receive the backup"
+assert_eq "$(git -C "$SX3/repo" rev-parse other)" "$(git -C "$SX3/repo" rev-parse "$SX3_BR")"
+
+# A replacement of the BASE commit would change the tree the candidate starts
+# from -- outside the written paths, where nothing is scanned or compared.
+SX4="$(mktemp -d)"; _sec_env "$SX4"
+_sync_env "$SX4" "$SX4/repo" "$SX4/g.json" sync --commit >/dev/null
+_empty="$(git -C "$SX4/repo" hash-object -t tree /dev/null)"
+_fake="$(git -C "$SX4/repo" commit-tree "$_empty" -m fake)"
+git -C "$SX4/repo" replace HEAD "$_fake"
+printf 'changed\n' >"$SX4/.config/app/f.txt"
+_sync_env "$SX4" "$SX4/repo" "$SX4/g.json" sync --commit >/dev/null
+
+it "a replaced base commit cannot drop files from the backup's commit"
+assert_contains "$(GIT_NO_REPLACE_OBJECTS=1 git -C "$SX4/repo" ls-tree -r --name-only HEAD)" "README.md"
+
+# C: update-ref runs reference-transaction, from a file or from config. A hook
+# that fails stopped every backup; one that prints reached the journal.
+SX5="$(mktemp -d)"; _sec_env "$SX5"
+_sync_env "$SX5" "$SX5/repo" "$SX5/g.json" sync --commit >/dev/null
+printf '#!/bin/sh\necho FILE >>%s/ran\nexit 1\n' "$SX5" >"$SX5/repo/.git/hooks/reference-transaction"
+chmod +x "$SX5/repo/.git/hooks/reference-transaction"
+git -C "$SX5/repo" config hook.rt.event reference-transaction
+git -C "$SX5/repo" config hook.rt.command "echo CFG >>$SX5/ran; exit 1"
+printf 'changed\n' >"$SX5/.config/app/f.txt"
+_sync_env "$SX5" "$SX5/repo" "$SX5/g.json" sync --commit >/dev/null
+
+it "no reference-transaction hook runs for the backup's commit"
+[[ ! -e "$SX5/ran" && "$(_commits "$SX5/repo")" == 3 ]] \
+    && ok || fail "a reference-transaction hook ran (or blocked the commit)"
+
+# D: a content hit printed the path, and the path itself can be the secret.
+SX6="$(mktemp -d)"; _sec_env "$SX6"
+printf 'token = %s\n' "$_tok" >"$SX6/.config/app/$_tok.conf"
+SX6_OUT="$(_sync_env "$SX6" "$SX6/repo" "$SX6/g.json" sync --commit)"; SX6_RC=$?
+
+it "a file with a token in both its name and its content is refused"
+(( SX6_RC != 0 )) && ok || fail "not refused"
+
+it "and neither the name nor the content is printed"
+assert_not_contains "$SX6_OUT" "$_tok"
+
+# -- review round omabackup-71 ------------------------------------------------------
+# The push scan judges every TREE name too (rev-list --objects lists
+# directories). A rule anchored on a directory's own path never matched the
+# full path of the file below it.
+SY71A="$(mktemp -d)"; _sec_env "$SY71A"
+_dirtok="AKIA$(printf 'A%.0s' {1..16})"
+cat >"$SY71A/deny.json" <<JSON
+{"schemaVersion":1,"patterns":[
+ {"id":"dir-anchored","regex":"^configs/app/AKIA[A-Z0-9]{16}\$","reason":"test rule anchored on a directory"}]}
+JSON
+mkdir -p "$SY71A/.config/app/$_dirtok"
+printf 'clean\n' >"$SY71A/.config/app/$_dirtok/clean.txt"
+SY71A_OUT="$(OMABACKUP_SECRETS_DENY="$SY71A/deny.json" _sync_env "$SY71A" "$SY71A/repo" "$SY71A/g.json" sync --commit)"; SY71A_RC=$?
+
+it "a directory whose own name the deny-list matches is refused"
+(( SY71A_RC != 0 )) && ok || fail "a directory name the push scan would block was committed"
+
+it "and the directory name is not printed"
+assert_not_contains "$SY71A_OUT" "$_dirtok"
+
+# The coverage warning about a published file the repo ignores named that file
+# before any scan ran -- and the name can be the secret.
+SY71B="$(mktemp -d)"; _sec_env "$SY71B"
+printf '%s*\n' "configs/app/gh" >"$SY71B/repo/.gitignore"
+git -C "$SY71B/repo" add .gitignore && git -C "$SY71B/repo" commit -qm ignore
+printf 'harmless\n' >"$SY71B/.config/app/$_tok.txt"
+printf 'token = %s\n' "$_tok" >"$SY71B/.config/app/creds.txt"
+SY71B_OUT="$(_sync_env "$SY71B" "$SY71B/repo" "$SY71B/g.json" sync --commit)"
+
+it "the ignored-file warning never prints a file name"
+assert_not_contains "$SY71B_OUT" "$_tok"
+
+# A token in the name is now refused by the staging scan before the warning
+# exists, so the warning itself is checked with an ordinary ignored file.
+SY71W="$(mktemp -d)"; _sec_env "$SY71W"
+printf 'configs/app/dropped*\n' >"$SY71W/repo/.gitignore"
+git -C "$SY71W/repo" add .gitignore && git -C "$SY71W/repo" commit -qm ignore
+printf 'harmless\n' >"$SY71W/.config/app/dropped-file.txt"
+SY71W_OUT="$(_sync_env "$SY71W" "$SY71W/repo" "$SY71W/g.json" sync --commit)"
+
+it "but still warns that something was dropped"
+assert_contains "$SY71W_OUT" "repo ignores"
+
+it "without naming the dropped file"
+assert_not_contains "$SY71W_OUT" "dropped-file"
+
+# git puts the identity into some of its own errors. A failing commit-tree must
+# not print it.
+SY71C="$(mktemp -d)"; _sec_env "$SY71C"
+_sync_env "$SY71C" "$SY71C/repo" "$SY71C/g.json" sync --commit >/dev/null
+printf 'changed\n' >"$SY71C/.config/app/f.txt"
+SY71C_OUT="$(GIT_AUTHOR_NAME="" GIT_COMMITTER_NAME="" GIT_AUTHOR_EMAIL="$_tok@example.test" GIT_COMMITTER_EMAIL="$_tok@example.test" \
+    _sync_env "$SY71C" "$SY71C/repo" "$SY71C/g.json" sync --commit)"; SY71C_RC=$?
+
+it "a commit-tree that fails on the identity does not print it"
+if (( SY71C_RC != 0 )); then assert_not_contains "$SY71C_OUT" "$_tok"
+else fail "the commit went ahead with an identity git should have refused"; fi
+
+# Hooks that run while the candidate is being BUILT (post-index-change, from a
+# file or from config) and core.fsmonitor. The tree is written before the scan
+# and only that tree is committed, so nothing they do can slip in -- and they
+# are switched off besides.
+for _v in file config fsmonitor; do
+    SY71D="$(mktemp -d)"; _sec_env "$SY71D"
+    _sync_env "$SY71D" "$SY71D/repo" "$SY71D/g.json" sync --commit >/dev/null
+    cat >"$SY71D/inj.sh" <<INJ
+#!/bin/bash
+printf 'token = %s\n' "$_tok" >"$SY71D/repo/sneak.txt"
+git -C "$SY71D/repo" add sneak.txt >/dev/null 2>&1
+INJ
+    chmod +x "$SY71D/inj.sh"
+    case "$_v" in
+        file)      cp "$SY71D/inj.sh" "$SY71D/repo/.git/hooks/post-index-change" ;;
+        config)    git -C "$SY71D/repo" config hook.pic.event post-index-change
+                   git -C "$SY71D/repo" config hook.pic.command "$SY71D/inj.sh" ;;
+        fsmonitor) printf 'printf "/\\0"\n' >>"$SY71D/inj.sh"
+                   git -C "$SY71D/repo" config core.fsmonitor "$SY71D/inj.sh" ;;
+    esac
+    printf 'changed\n' >"$SY71D/.config/app/f.txt"
+    _sync_env "$SY71D" "$SY71D/repo" "$SY71D/g.json" sync --commit >/dev/null
+    it "a $_v hook running while the candidate is built never reaches history"
+    assert_not_contains "$(git -C "$SY71D/repo" log -p --all 2>/dev/null)" "$_tok"
+done
+
+# The commit may only carry what this run wrote. Anything else that reached the
+# candidate -- by any route, hook or not -- refuses the commit, even when clean.
+# A git shim injects the entry right after the candidate's own `add`.
+SY71F="$(mktemp -d)"; _sec_env "$SY71F"; mkdir -p "$SY71F/stub"
+_sync_env "$SY71F" "$SY71F/repo" "$SY71F/g.json" sync --commit >/dev/null
+cat >"$SY71F/stub/git" <<SHIM
+#!/bin/bash
+"$_REALGIT" "\$@"; rc=\$?
+if [[ -n "\${GIT_INDEX_FILE:-}" ]]; then
+    for a in "\$@"; do
+        if [[ "\$a" == add ]]; then
+            oid=\$(printf 'clean but unasked\n' | "$_REALGIT" -C "$SY71F/repo" hash-object -w --stdin)
+            "$_REALGIT" -C "$SY71F/repo" update-index --add --cacheinfo "100644,\$oid,extra.txt"
+            break
+        fi
+    done
+fi
+exit \$rc
+SHIM
+chmod +x "$SY71F/stub/git"
+printf 'changed\n' >"$SY71F/.config/app/f.txt"
+PATH="$SY71F/stub:$PATH" _sync_env "$SY71F" "$SY71F/repo" "$SY71F/g.json" sync --commit >/dev/null; SY71F_RC=$?
+
+it "a path this run did not write never rides into the backup's commit"
+if (( SY71F_RC != 0 )); then assert_not_contains "$(git -C "$SY71F/repo" ls-tree -r --name-only HEAD)" "extra.txt"
+else fail "a path this run never wrote was committed"; fi
+
+# A commit-object scan that could not run is not a match, and must not send the
+# user to check their identity.
+SY71G="$(mktemp -d)"; _sec_env "$SY71G"; mkdir -p "$SY71G/stub"
+_sync_env "$SY71G" "$SY71G/repo" "$SY71G/g.json" sync --commit >/dev/null
+cat >"$SY71G/stub/git" <<SHIM
+#!/bin/bash
+c=0; m=0
+for a in "\$@"; do [[ "\$a" == cat-file ]] && c=1; [[ "\$a" == commit ]] && m=1; done
+(( c && m )) && exit 1
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SY71G/stub/git"
+printf 'changed\n' >"$SY71G/.config/app/f.txt"
+SY71G_OUT="$(PATH="$SY71G/stub:$PATH" _sync_env "$SY71G" "$SY71G/repo" "$SY71G/g.json" sync --commit)"
+
+it "a commit-object scan that cannot run says so, without blaming the identity"
+assert_contains "$SY71G_OUT" "could not complete"
+assert_not_contains "$SY71G_OUT" "user.name"
+
+# Every update-ref failure used to read "HEAD moved during the sync", a busy
+# ref lock included.
+SY71H="$(mktemp -d)"; _sec_env "$SY71H"; mkdir -p "$SY71H/stub"
+_sync_env "$SY71H" "$SY71H/repo" "$SY71H/g.json" sync --commit >/dev/null
+cat >"$SY71H/stub/git" <<SHIM
+#!/bin/bash
+for a in "\$@"; do [[ "\$a" == update-ref ]] && exit 1; done
+exec "$_REALGIT" "\$@"
+SHIM
+chmod +x "$SY71H/stub/git"
+printf 'changed\n' >"$SY71H/.config/app/f.txt"
+SY71H_OUT="$(PATH="$SY71H/stub:$PATH" _sync_env "$SY71H" "$SY71H/repo" "$SY71H/g.json" sync --commit)"
+
+it "a failed branch update does not claim that HEAD moved"
+assert_not_contains "$SY71H_OUT" "HEAD moved"
+
+# The timer runs under the systemd user manager's locale (LANG=en_US.UTF-8 on
+# the development machine). The pre-commit gate must hold there too.
+SU8="$(mktemp -d)"; _sec_env "$SU8"
+printf '\xff%s\n' "$_tok" >"$SU8/.config/app/bin.dat"
+LC_ALL=C.UTF-8 _sync_env "$SU8" "$SU8/repo" "$SU8/g.json" sync --commit >/dev/null; SU8_RC=$?
+it "sync --commit refuses a token after an invalid UTF-8 byte under a UTF-8 locale"
+(( SU8_RC != 0 )) && ok || fail "a UTF-8 locale let a token into the commit"
+
+# -- review round omabackup-78 ------------------------------------------------------
+# A path that changes type. git add drops configs/app/foo when it records
+# configs/app/foo/bar, and dd/x when it records the file dd; the check for
+# paths this run did not write counted those deletions and refused every sync
+# of the repository from then on, blaming a hook. Publish already refuses
+# while the old path is in the worktree, so the user frees it first.
+R78A="$(mktemp -d)"; _sec_env "$R78A"
+printf 'was a file\n' >"$R78A/.config/app/foo"
+_sync_env "$R78A" "$R78A/repo" "$R78A/g.json" sync --commit >/dev/null
+rm -f "$R78A/.config/app/foo"; mkdir -p "$R78A/.config/app/foo"; printf 'now below\n' >"$R78A/.config/app/foo/bar"
+rm -f "$R78A/repo/configs/app/foo"
+_sync_env "$R78A" "$R78A/repo" "$R78A/g.json" sync --commit >/dev/null; R78A_RC=$?
+it "a file that became a directory is committed"
+(( R78A_RC == 0 )) && ok || fail "sync --commit refused a file -> directory change"
+it "and the commit holds the new path"
+assert_contains "$(git -C "$R78A/repo" ls-tree -r --name-only HEAD)" "configs/app/foo/bar"
+
+R78B="$(mktemp -d)"; _sec_env "$R78B"
+mkdir -p "$R78B/.config/app/dd"; printf 'below\n' >"$R78B/.config/app/dd/x"
+_sync_env "$R78B" "$R78B/repo" "$R78B/g.json" sync --commit >/dev/null
+rm -f "$R78B/.config/app/dd/x"; rmdir "$R78B/.config/app/dd"; printf 'now a file\n' >"$R78B/.config/app/dd"
+rm -f "$R78B/repo/configs/app/dd/x"; rmdir "$R78B/repo/configs/app/dd"
+_sync_env "$R78B" "$R78B/repo" "$R78B/g.json" sync --commit >/dev/null; R78B_RC=$?
+it "a directory that became a file is committed"
+(( R78B_RC == 0 )) && ok || fail "sync --commit refused a directory -> file change"
+it "and the commit holds the file, not the old entry"
+R78B_LS="$(git -C "$R78B/repo" ls-tree -r --name-only HEAD)"
+[[ "$R78B_LS" == *"configs/app/dd"* && "$R78B_LS" != *"configs/app/dd/x"* ]] && ok || fail "tree: $R78B_LS"
+
+# Only a deletion a written path implies. A wrapper that drops an unrelated
+# entry from the candidate still refuses.
+R78C="$(mktemp -d)"; _sec_env "$R78C"; mkdir -p "$R78C/stub"
+_sync_env "$R78C" "$R78C/repo" "$R78C/g.json" sync --commit >/dev/null
+cat >"$R78C/stub/git" <<SHIM
+#!/bin/bash
+"$_REALGIT" "\$@"; rc=\$?
+if [[ -n "\${GIT_INDEX_FILE:-}" ]]; then
+    for a in "\$@"; do
+        if [[ "\$a" == add ]]; then
+            "$_REALGIT" -C "$R78C/repo" update-index --force-remove README.md
+            break
+        fi
+    done
+fi
+exit \$rc
+SHIM
+chmod +x "$R78C/stub/git"
+printf 'changed\n' >"$R78C/.config/app/f.txt"
+PATH="$R78C/stub:$PATH" _sync_env "$R78C" "$R78C/repo" "$R78C/g.json" sync --commit >/dev/null; R78C_RC=$?
+it "a deletion this run did not cause still refuses the commit"
+if (( R78C_RC != 0 )); then assert_contains "$(git -C "$R78C/repo" ls-tree -r --name-only HEAD)" "README.md"
+else fail "an unrelated deletion rode into the backup's commit"; fi
+
+# A name with a newline, under a rule anchored with $: refused before it can
+# become history that push would refuse.
+R78D="$(mktemp -d)"; _sec_env "$R78D"
+_sync_env "$R78D" "$R78D/repo" "$R78D/g.json" sync --commit >/dev/null
+cat >"$R78D/deny.json" <<'JSON'
+{"schemaVersion":1,"patterns":[
+ {"id":"custom-end","regex":"secret=[a-z]{16}$","reason":"test rule anchored at the end"}]}
+JSON
+printf 'clean\n' >"$R78D/.config/app/sec""ret=abcdefghijklmnop"$'\n'"x.txt"
+R78D_OUT="$(OMABACKUP_SECRETS_DENY="$R78D/deny.json" _sync_env "$R78D" "$R78D/repo" "$R78D/g.json" sync --commit)"; R78D_RC=$?
+it "a name a rule matches up to its first newline is refused"
+(( R78D_RC != 0 )) && ok || fail "committed a name that push would refuse"
+it "and nothing was committed, nor the name printed"
+assert_eq "$(_commits "$R78D/repo")" "2"
+assert_not_contains "$R78D_OUT" "abcdefghijklmnop"
+
+# A file name only this gate sees: a rule anchored on the repository path,
+# which the staging scan never has.
+R78E="$(mktemp -d)"; _sec_env "$R78E"
+_sync_env "$R78E" "$R78E/repo" "$R78E/g.json" sync --commit >/dev/null
+_r78tok="AKIA$(printf 'B%.0s' {1..16})"
+cat >"$R78E/deny.json" <<JSON
+{"schemaVersion":1,"patterns":[
+ {"id":"repo-anchored","regex":"^configs/app/AKIA[A-Z0-9]{16}\\\\.txt\$","reason":"test rule anchored on the repo path"}]}
+JSON
+printf 'clean\n' >"$R78E/.config/app/$_r78tok.txt"
+R78E_OUT="$(OMABACKUP_SECRETS_DENY="$R78E/deny.json" _sync_env "$R78E" "$R78E/repo" "$R78E/g.json" sync --commit)"; R78E_RC=$?
+it "a file name matched only on its repository path is refused before the commit"
+(( R78E_RC != 0 )) && ok || fail "committed a file name the push scan would refuse"
+it "by the pre-commit gate, without printing the name"
+assert_contains "$R78E_OUT" "changed path #"
+assert_not_contains "$R78E_OUT" "$_r78tok"
+
+# -- review round omabackup-79 ------------------------------------------------------
+# A path this run wrote can only leave the candidate if something else removed
+# it; that was accepted, and the backup lost the file in silence.
+R79A="$(mktemp -d)"; _sec_env "$R79A"; mkdir -p "$R79A/stub"
+_sync_env "$R79A" "$R79A/repo" "$R79A/g.json" sync --commit >/dev/null
+cat >"$R79A/stub/git" <<SHIM
+#!/bin/bash
+"$_REALGIT" "\$@"; rc=\$?
+if [[ -n "\${GIT_INDEX_FILE:-}" ]]; then
+    for a in "\$@"; do
+        if [[ "\$a" == add ]]; then
+            "$_REALGIT" -C "$R79A/repo" update-index --force-remove configs/app/f.txt
+            break
+        fi
+    done
+fi
+exit \$rc
+SHIM
+chmod +x "$R79A/stub/git"
+printf 'another\n' >"$R79A/.config/app/g.txt"
+PATH="$R79A/stub:$PATH" _sync_env "$R79A" "$R79A/repo" "$R79A/g.json" sync --commit >/dev/null; R79A_RC=$?
+it "a deletion of a path this run wrote refuses the commit"
+if (( R79A_RC != 0 )); then assert_contains "$(git -C "$R79A/repo" ls-tree -r --name-only HEAD)" "configs/app/f.txt"
+else fail "a written path was dropped from the backup's commit"; fi
+
+# End to end: the refusal for a directory hidden by its piece before a newline
+# does not print it.
+R79B="$(mktemp -d)"; _sec_env "$R79B"
+cat >"$R79B/deny.json" <<'JSON'
+{"schemaVersion":1,"patterns":[
+ {"id":"custom-end","regex":"secret=[a-z]{16}$","reason":"test rule anchored at the end"}]}
+JSON
+mkdir -p "$R79B/.config/app/sec""ret=abcdefghijklmnop"$'\n'"x"
+printf 'clean\n' >"$R79B/.config/app/sec""ret=abcdefghijklmnop"$'\n'"x/f.txt"
+R79B_OUT="$(OMABACKUP_SECRETS_DENY="$R79B/deny.json" _sync_env "$R79B" "$R79B/repo" "$R79B/g.json" sync --commit)"; R79B_RC=$?
+it "a directory hidden by its piece before a newline is refused without being printed"
+if (( R79B_RC != 0 )); then assert_not_contains "$R79B_OUT" "abcdefghijklmnop"
+else fail "committed a directory name push would refuse"; fi
