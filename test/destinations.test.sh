@@ -1399,3 +1399,40 @@ PATH="$PMF/stub:$PATH" DESTINATIONS_FILE="$PMF/destinations.json" bash -c '
 it "a destination where chmod fails still receives the push"
 [[ $PMFRC -eq 0 && -f "$PMF/dir/omabackup-host-20200102-000000-abc222222222.tar.zst" ]] \
     && ok || fail "push failed (rc $PMFRC) because chmod could not run"
+
+# find picks the old bundle and chmod resolves the name again afterwards. A
+# shared destination can swap the entry for a symlink in between, and plain
+# chmod follows it to whatever it names outside the destination (review
+# omabackup-82). The stub swaps the selected bundle for a link to a directory
+# outside, then hands over to the real chmod.
+PMS="$(mktemp -d)"
+mkdir -p "$PMS/dir" "$PMS/outside" "$PMS/stub"; chmod 755 "$PMS/outside"
+printf 'nas\nhost\n' >"$PMS/dir/.omabackup-destination"
+printf 'old\n' >"$PMS/dir/omabackup-host-20200101-000000-abc111111111.tar.zst"
+chmod 644 "$PMS/dir/omabackup-host-20200101-000000-abc111111111.tar.zst"
+printf 'bundle-content\n' >"$PMS/bundle.tar.zst"
+cat >"$PMS/stub/chmod" <<STUB
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == *omabackup-host-20200101-000000-abc111111111.tar.zst ]]; then
+        rm -f -- "\$a"; ln -s "$PMS/outside" "\$a"
+    fi
+done
+exec /usr/bin/chmod "\$@"
+STUB
+chmod +x "$PMS/stub/chmod"
+cat >"$PMS/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$PMS/dir","keep":5}]}
+JSON
+PMSRC=0
+PATH="$PMS/stub:$PATH" DESTINATIONS_FILE="$PMS/destinations.json" bash -c '
+    source lib/bundle.sh; source lib/destinations.sh
+    _push_dir "nas" "$1" "omabackup-host-20200102-000000-abc222222222.tar.zst"
+' _ "$PMS/bundle.tar.zst" >/dev/null 2>&1 || PMSRC=$?
+
+it "tightening old bundles never follows an entry swapped for a symlink"
+assert_eq "$(stat -c %a "$PMS/outside")" "755"
+
+it "and the push still lands"
+[[ $PMSRC -eq 0 && -f "$PMS/dir/omabackup-host-20200102-000000-abc222222222.tar.zst" ]] \
+    && ok || fail "push failed (rc $PMSRC)"
