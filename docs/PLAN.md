@@ -5362,6 +5362,190 @@ change the target.
    It needs a manual reconcile with `origin/main` before any work is done
    there; nothing was merged into it automatically.
 
+### `sync` scans staging with the deny-list before publishing (2026-09-25)
+
+Contributed by Corey Tyhurst. Sits under Phase 2's first sentence, "a
+fail-closed gate before staging is published to the backup worktree", though it
+is the existing content scanner moved earlier, not the filename gate itself.
+
+**The gap.** `scan_files` ran only from `build_bundle`, and `report_secrets`
+only from `cmd_push`. `cmd_sync` collected, published and committed with no
+scan in between. `omabackup-sync.timer` runs `sync --commit` every fifteen
+minutes, so a private key in a collected directory reached the dotfiles
+worktree and local history on the next tick; the hourly push then refused it
+and told the user to rewrite that history.
+
+**The change.** In `cmd_sync`, after `cmd_collect` and before
+`tracked_path_map`: `assert_deny_understood`, then `scan_files "$STAGING"`.
+A hit prints the scanner's lines and refuses; a scan that cannot run refuses
+too. Both refusals clear staging through a small `_discard_staging` helper
+that checks nothing is left inside, the same measure `cmd_collect` uses at its
+top. The gate is before publish, not before commit, because a plain `sync`
+publishes as well. Same deny-list, same patterns as push, so nothing changes in
+what is accepted, only where it is refused.
+
+**Specs.** Eight in `test/sync.test.sh`, written first: refusal, no commit,
+nothing in the worktree, staging cleared, the scanner's `id<TAB>path` line in
+the output, a PATH-shim `grep` exiting 2 refuses rather than passing, nothing
+published from that unscanned staging, and a clean-staging control. Seven fail
+against `main`'s code; the control passes on both.
+
+`./test/run.sh sync` -- **40 passed, 0 failed**. Full suite in a network-less
+Arch container -- **1453 passed, 5 failed**, against `main`'s
+**1445 passed, 5 failed** at `ba59b3f`. The failing set is identical to main's: the three coverage.test.sh specs that hit the pacman -Qqem bug #2 fixes, the title-row eliding probe (no display fonts) and the VM preflight (no QEMU). Run on a live
+Omarchy session during review, after merging `main` into the branch (only `docs/PLAN.md`
+conflicted): **1473 passed, 0 failed**.
+
+**Review round `omabackup-73`, both REQUEST_CHANGES.** Both reviewers: the
+refusal printed `scan_files`' own report, which carries the matched line, so a
+token went to the journal on every timer tick; and `assert_deny_understood`
+exits through `die`, so an unreadable deny-list left the unscanned staging on
+disk and said "refusing to push" from `sync`. rev-1: `scan_files` always
+skipped files named `repo.bundle`, an exception that only makes sense for the
+artefact's own packfile; under a UTF-8 locale a byte that is not valid UTF-8
+right before a token hides it from GNU grep reading a file and from bash's
+`=~` in `_still_matches`; and `_discard_staging` ignored `find`'s status.
+rev-2: the refusal did not say how to get out of it, now that a hit stops the
+whole local backup.
+
+The locale finding reaches past this PR. Measured on this machine: with the
+byte `0xff` before a GitHub token, `scan_files` and the shipped push scan
+(`scan_secrets`) both find it under `LC_ALL=C` and report clean under
+`C.UTF-8`, and the systemd user manager runs with `LANG=en_US.UTF-8`, so the
+push gate released in 0.4.6 and 0.4.7 was exposed on the timer. Fixed here too.
+
+**Fixes, made on this branch by the maintainer.** `scan_files` and
+`scan_secrets` pin `LC_ALL=C`, which covers grep and `_still_matches`.
+`scan_files` takes the basenames to skip from its caller: the bundle passes
+`repo.bundle`, sync passes nothing. It reports `rule<TAB>path:line`, never the
+line, and judges file names first: a name that matches refuses on its own and
+is never printed, not even for a hit on that file's content.
+`assert_deny_understood` takes the verb for its messages (default `push`); sync
+runs it in a subshell with `publish` and clears staging when it fails.
+`_discard_staging` accepts a staging that is gone, and otherwise requires
+`find` to succeed and list nothing. The refusal says how to get out of it.
+
+Specs: eleven, every new one failing before (the UTF-8 cases for both
+scanners, the line not printed, `repo.bundle`, and in `sync` the line and the
+name not printed, the exit advice, a missing deny-list clearing staging and not
+saying push). Three existing specs asserted the matched key in the scanner's
+output; they now assert the rule and the file. The `_discard_staging` status
+fix has no spec: making `rm` and `find` both fail under the CLI would also
+break the collect that runs before it. Mutants: no locale pin in each scanner,
+`repo.bundle` always skipped, validator outside the subshell.
+
+**Verification round `omabackup-75`.** Both reviewers confirmed the #4 fix
+and, on #3, the locale pin, the `repo.bundle` option, the validator subshell
+and the `_discard_staging` behaviour. Both found that the new names pass
+called `_still_matches` once per file per pattern, about 18 grep processes per
+file: on the real 669-entry staging the scan went from 0.03 s to 11.4 s, and
+from about 2,500 files it alone would exceed the panel's 45 s busy timeout.
+rev-1 also found that a grep error printed the path of a file the scan had
+hidden, and that control bytes in a name reached the output raw. rev-2 found
+that symlinks escaped the names pass and their target text was read by no
+part of the scan, although git commits both; and that a hidden name gave no
+hint where to look. rev-1 showed how to give `_discard_staging` its spec.
+
+**Fix.** The names pass lists files and symlinks once with `find -printf
+'%P\0'` and runs one `grep -z -n` per pattern over the whole list; only
+candidates reach `_still_matches`. Symlink targets are judged the same way and
+never printed. The content grep's stderr is dropped, its status kept and
+reported without a path. Printed paths show control bytes as `?`, and a hidden
+name says the directory it is in when that directory is clean. The
+`_discard_staging` spec extracts the real function and uses PATH shims for
+`rm` and `find`; it fails on the helper before review and passes now. The
+names list lived in three `mktemp` files (mode 600) removed at the end of the
+scan; a signal mid-scan can leave them in `$TMPDIR` (round 76 below moved them
+into one private directory).
+
+Specs: eight new in `test/secrets.test.sh` and two in `test/sync.test.sh`,
+every one failing before its fix; the grep count for 300 clean files is the
+regression for the cost. The existing newline-name spec now expects `a?b.txt`.
+Measured on the real staging: 0.03 s before #3, 11.40 s at `c4d22f1`, 0.05 s
+now.
+
+**Round omabackup-76 (verification of `ab3d67e`).** Both closed every round-75
+finding. rev-1 requested changes over one new P1: the grep hits of the names
+pass hold the full name or target that matched, and they went to
+`"$names.hits"`, a fourth file made by a plain redirect, so 0644 under umask
+022 in a shared `/tmp`. rev-2 approved with three P3, one the same file seen
+from the other side: a redirect that cannot open its target exits 1, grep's
+"no match", so a pre-created `.hits` turned a token in a name into rc 0 (sync
+still refused, only because the bash error text made the output non-empty).
+The other two: the prefilter grep read raw names while `_still_matches` reads
+them with newlines as spaces, so a key header split by a newline in a name or
+target was no longer caught; and the directory hint, cut at the last `/`,
+printed the first part of a `generic-assigned-secret` value that crosses a
+`/`.
+
+**Fix.** Every temporary of the names pass lives in one `mktemp -d` directory
+(0700), the hits file is created up front and a failed write refuses. grep
+reads a copy of the lists with newlines as spaces, the same text
+`_still_matches` judges. `_scan_dir_hint` cuts the path before the first match
+of any pattern, then at the last `/`, and gives no hint when grep cannot
+answer. Six new specs, five failing on `ab3d67e` (hits readable by others,
+unwritable temporaries called clean, newline-split header in a name and in a
+target, hint carrying part of the value) and one for an empty `$TMPDIR` after
+the scan. The signal case is still open and goes with PR zero.
+
+Round omabackup-77 verified those fixes uncommitted: both approved, every
+round-76 finding closed. rev-2 added an optional P3, fixed here: with the match
+in the first directory nothing was left before a `/`, and the hint said "at
+the top" for a file two levels down. "at the top" now depends only on the path
+having no `/`; a cut that leaves no directory gives no hint. Two specs, the
+first failing before the fix.
+
+### The `error:` veto covers every package list (2026-09-27)
+
+Contributed by Corey Tyhurst. The known gap named in the 0.4.7 changelog and
+in item 2 of the "Next" list above; asked for in the PR #2 merge comment.
+
+**The gap.** The `error:` test lived inside the empty-foreign exception, so it
+only ran when `-Qqem` exited 1. pacman drops an entry it cannot parse from
+every query and carries on at status 0. A corrupted native entry therefore
+leaves `-Qqe` and `-Qqen` short while `-Qqem` still lists the real foreign
+packages at status 0; no status is non-zero, the exception is never reached,
+and three short lists are staged and published.
+
+**The change.** The veto runs once, over the concatenated diagnostics of all
+three queries, before any status is judged. An `error:` from any query removes
+all three lists and refuses; `warning:` still passes. The clause inside the
+exception is gone, since the check above has already refused what it covered.
+The refusal takes all three files: pacman said the read was incomplete, so no
+member is worth keeping. On the existing corrupted-database case this now
+removes the explicit and native lists too, which the generator's opening
+comment promised.
+
+**Specs.** Five new in `test/collect.test.sh`, on the existing `_diag_home`
+stub: an error at status 0 on the explicit, the native or the foreign query
+with a non-empty foreign list refuses and leaves no list staged; a warning on
+all three with a foreign package present still collects all three (control);
+the corrupted-database case also loses its explicit and native lists. Five
+fail against `main`'s code; the control passes on both. `main`'s code is the
+mutant that keeps the check inside the exception.
+
+`./test/run.sh collect` -- **69 passed, 0 failed**. Full suite in a
+network-less Arch container -- **1470 passed, 2 failed**, against `main`'s
+**1463 passed, 2 failed** at `d2f22b3`. The failing set is identical to main's: the title-row eliding probe (no display fonts) and the VM preflight (no QEMU); the three coverage.test.sh specs that failed at ba59b3f pass now that #2 is merged. Run on a live Omarchy session during review: **1472 passed, 0 failed**.
+
+**Review round `omabackup-72`.** rev-1 approved. rev-2 measured, on pacman 7.1.0,
+that some `error:` lines describe the configuration rather than the database:
+a repo section named twice in `pacman.conf` (an `Include` repeating `[core]`)
+makes every query print `could not register 'core' database (database already
+registered)` at status 0 while all three lists come out byte-identical to the
+normal ones. 0.4.7 collected such a machine when it had foreign packages; with
+this change collect refuses on it, for every group, until `pacman.conf` is
+fixed. Breno chose to keep the refusal (option 1): only the class of the line
+is judged, and an exception for that string would tie the gate to pacman's
+wording. The refusal now shows pacman's first `error:` line, clipped to 200
+characters and stripped of control bytes, so the user can find the cause. Spec
+DG10 (configuration error on all three, foreign present): the message check
+failed before, passes now. The release notes must say collect can refuse cases
+0.4.7 accepted. rev-2's other P3 (a refusal by status still leaves sibling
+lists staged) predates this change and stays open. `collect` 72/0.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
+
 ### Secret scan before the commit, not only before the push (2026-09-30)
 
 Prerequisite for the three new default groups (`audio`, systemd unit content,

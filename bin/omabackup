@@ -1271,13 +1271,9 @@ collect_generated() {
             # AND the explicit and native lists just written are identical.
             # A pacman that failed quietly cannot fake that -- but one that
             # failed LOUDLY can, which is why the diagnostics are consulted
-            # too: equal lists are two projections of a single database read
-            # and omit together, so a dropped entry leaves them agreeing and
-            # the foreign query empty. An "error:" line from ANY of the three
-            # therefore withdraws the exception. A "warning:" line does not:
-            # a repo named in pacman.conf that has never been synced warns on
-            # every query while all three still answer correctly, and
-            # refusing that would be this very bug again.
+            # first, below: equal lists are two projections of a single
+            # database read and omit together, so a dropped entry leaves them
+            # agreeing and the foreign query empty.
             #
             # -Qqen is deliberately NOT given the same benefit of the doubt.
             # With no sync database pacman calls every package foreign, so
@@ -1300,13 +1296,45 @@ collect_generated() {
             local aur_rc=0
             pkg_diag_m=$({ LC_ALL=C LANGUAGE= pacman --color never -Qqem \
                 >"$STAGING/.generated/pkgs-aur.txt"; } 2>&1) || aur_rc=$?
+            # Every list is judged by the diagnostics before any status is,
+            # because pacman's carry-on does not care what the foreign query
+            # returned: a corrupted entry that happens to be native drops out
+            # of -Qqe and -Qqen while -Qqem still answers at status 0 with the
+            # real foreign packages, and 0.4.7 staged those three short lists
+            # (its changelog names this as the known gap). Only the CLASS of
+            # the line is read. An "error:" line from ANY of the three refuses
+            # the set: pacman said the read was incomplete, so no member is
+            # worth keeping, and a survivor would be the next run's "real
+            # data". A "warning:" line does not: a repo named in pacman.conf
+            # that has never been synced warns on every query while all three
+            # still answer correctly, and refusing that would be the empty-
+            # foreign bug all over again.
+            local pkg_diag_all
+            pkg_diag_all="$pkg_diag_e"$'\n'"$pkg_diag_n"$'\n'"$pkg_diag_m"
+            if [[ "$pkg_diag_all" == "error:"* || "$pkg_diag_all" == *$'\n'"error:"* ]]; then
+                rm -f "$STAGING/.generated/pkgs-explicit.txt" \
+                      "$STAGING/.generated/pkgs-arch.txt" \
+                      "$STAGING/.generated/pkgs-aur.txt"
+                # The refusal names pacman's own first error line. Some of
+                # these come from the configuration, not the database -- a
+                # repo section named twice in pacman.conf prints "could not
+                # register 'core' database (database already registered)" on
+                # every query while all three lists are correct -- and without
+                # the line the user has no way to the file that caused it
+                # (review omabackup-72). Still refused: only the class is
+                # judged; the text is shown, never interpreted. Clipped and
+                # stripped of control bytes before it reaches the journal.
+                local pkg_err_line="" pkg_l
+                while IFS= read -r pkg_l; do
+                    [[ "$pkg_l" == "error:"* ]] && { pkg_err_line="${pkg_l#error: }"; break; }
+                done <<<"$pkg_diag_all"
+                pkg_err_line="$(printf '%s' "$pkg_err_line" | tr -d '[:cntrl:]' | cut -c1-200)"
+                die "could not trust the package lists (pacman: ${pkg_err_line:-reported an error while listing them})"
+            fi
             if (( aur_rc != 0 )); then
-                local pkg_diag_all
-                pkg_diag_all="$pkg_diag_e"$'\n'"$pkg_diag_n"$'\n'"$pkg_diag_m"
                 if (( aur_rc == 1 )) \
                     && [[ ! -s "$STAGING/.generated/pkgs-aur.txt" ]] \
                     && [[ -s "$STAGING/.generated/pkgs-explicit.txt" ]] \
-                    && [[ "$pkg_diag_all" != "error:"* && "$pkg_diag_all" != *$'\n'"error:"* ]] \
                     && [[ "$(<"$STAGING/.generated/pkgs-explicit.txt")" == "$(<"$STAGING/.generated/pkgs-arch.txt")" ]]; then
                     :   # nothing foreign on this machine; the empty list is the answer
                 else
@@ -1332,6 +1360,22 @@ collect_generated() {
         *) die "group $id is mode:gen but its generator ('$gen') is not one this tool knows how to run" ;;
     esac
     (( JSON )) || printf '  %s✓%s %s %s(generated)%s\n' "$GREEN" "$NC" "$id" "$DIM" "$NC"
+}
+
+# Clears staging after a refusal. rm's own status is not the measure, for the
+# reason given at the top of cmd_collect: it can fail on the directory itself
+# while having emptied it. What matters is that nothing is left inside for a
+# later sync to publish, and that is what is checked.
+_discard_staging() {
+    rm -rf "$STAGING" 2>/dev/null
+    # Gone is gone. If it is still there, an empty listing only proves it is
+    # empty when find itself succeeded: a walk that could not read the
+    # directory also prints nothing (review omabackup-73).
+    [[ -e "$STAGING" ]] || return 0
+    local left frc
+    left="$(find "$STAGING" -mindepth 1 -print -quit 2>/dev/null)"; frc=$?
+    (( frc == 0 )) && [[ -z "$left" ]] \
+        || die "could not clear $(_tilde "$STAGING") after refusing it -- remove it by hand before the next sync"
 }
 
 # ── sync ─────────────────────────────────────────────────────────────────────
@@ -1388,6 +1432,41 @@ cmd_sync() {
     fi
 
     JSON=0 cmd_collect >/dev/null || die "collect failed -- refusing to publish whatever staging is left in"
+    # Staging is scanned with the push deny-list BEFORE anything is published.
+    # The scanner used to run in two places only, over the bundle and over
+    # every ref right before `git push`, and neither ever looked at what
+    # `sync` was about to write. The timer runs `sync --commit` unattended
+    # every fifteen minutes, so a private key that appeared in a collected
+    # directory was published into the worktree and committed to local
+    # history on the next tick, and the hourly push then refused it with
+    # advice to rewrite that history. Scanning staging first means the key
+    # never enters the worktree. The gate sits before publish rather than
+    # before commit because a plain `sync` without --commit publishes too.
+    # Same deny-list, same patterns, so nothing push would have accepted is
+    # refused here. On refusal staging is cleared, as it is at the top of
+    # collect: a file left behind is a file the next sync would republish.
+    # The validator exits through die. Run apart, so an unreadable deny-list
+    # still clears the staging it was meant to judge (review omabackup-73).
+    if ! ( assert_deny_understood "$SECRETS_DENY_FILE" publish ); then
+        _discard_staging
+        die "the deny-list cannot be used -- nothing was published"
+    fi
+    local hits
+    hits="$(scan_files "$STAGING" "$SECRETS_DENY_FILE" 2>&1)" || {
+        [[ -n "$hits" ]] && printf '%s\n' "$hits" >&2
+        _discard_staging
+        die "the secret scan could not run over staging -- refusing to publish unscanned"
+    }
+    if [[ -n "$hits" ]]; then
+        printf '%s\n' "$hits" >&2
+        _discard_staging
+        # The whole local backup now stops on a hit, not only the push, so the
+        # refusal says how to get out of it (review omabackup-73).
+        printf '  Remove the credential from the live file, or exclude that file in its\n' >&2
+        printf '  group, or add a justified exception to %s. Nothing\n' "$(_tilde "$SECRETS_DENY_FILE")" >&2
+        printf '  was published; the next sync tries again.\n' >&2
+        die "refusing to publish -- the deny-list matched a file in staging (docs/DESIGN.md §6)"
+    fi
     local list="$OMABACKUP_STATE/last-publish"
     local n tpm
     # Nested inside publish_staging's own argument list, $(tracked_path_map)'s
