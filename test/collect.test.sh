@@ -1010,3 +1010,24 @@ assert_contains "$DG10_OUT" "could not register 'core' database (database alread
 it "and stages none of the three package lists"
 [[ -z "$(find "$DG10/.state/staging/.generated" -name 'pkgs-*.txt' 2>/dev/null)" ]] \
     && ok || fail "a package list was left staged after the refusal"
+
+# ── the state directory is readable by its owner only ───────────────────────
+# Staging holds copies of private dotfiles and plugin patches whose privacy
+# came from a 0700 directory at the source; under the usual 022 umask the
+# state and staging directories were created 0755 (review omabackup-81).
+# The state directory is closed whatever an older version left it at.
+PSH="$(mktemp -d)"; PSG="$PSH/g.json"
+mkdir -p "$PSH/.config/app" "$PSH/.state"; chmod 755 "$PSH/.state"
+printf 'x=y\n' >"$PSH/.config/app/app.conf"
+cat >"$PSG" <<'JSON'
+{"schemaVersion":1,"supportedTargets":["4.*"],"groups":[
+ {"id":"app","label":"App","mode":"copy","coupled":false,"critical":false,
+  "paths":["~/.config/app"]}]}
+JSON
+(umask 022; _env "$PSH" "$PSG" collect >/dev/null)
+
+it "collect leaves the state directory 0700 under a 022 umask"
+assert_eq "$(stat -c %a "$PSH/.state")" "700"
+
+it "and staging 0700"
+assert_eq "$(stat -c %a "$PSH/.state/staging")" "700"

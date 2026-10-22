@@ -13,6 +13,10 @@ Type=oneshot
 # reject policy overrides. The CLI re-pins PATH unconditionally; this is the
 # scheduler's matching defence-in-depth default.
 Environment=PATH=/usr/bin:/bin
+# Everything the run creates is private to the user: staging, the bundle cache,
+# generated lists. The code makes those paths private itself; this is the
+# matching default for anything it does not name (review omabackup-81).
+UMask=0077
 # This run already has a real log -- `journalctl --user -u
 # omabackup-sync.service` -- so it opts out of lib/log.sh's own file log,
 # which exists for what has no log anywhere else (an interactive TUI

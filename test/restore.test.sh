@@ -3280,3 +3280,15 @@ _into_cleanup '$INTOCLEANUP_SAME_HOME/base' '$INTOCLEANUP_SAME_HOME/base'
 it "_into_cleanup does nothing when --into pointed at a directory that already existed (into == boundary)"
 [[ -d "$INTOCLEANUP_SAME_HOME/base" && -f "$INTOCLEANUP_SAME_HOME/base/existing.txt" ]] \
     && ok || fail "an already-existing --into directory (or its contents) should never be touched"
+
+# ── a --into target the restore creates is readable by its owner only ───────
+# The usual use of --into is a scratch directory to see what --apply would do,
+# often outside the home directory. mkdir -p under a 022 umask created it 0755
+# and the restored dotfiles were reachable by other local users
+# (review omabackup-81). Only what the restore creates is made private.
+PIH="$(mktemp -d)"; PIART="$(_res_build "$PIH" '["3.*","4.*"]')"
+(umask 022; HOME="$PIH/home" OMABACKUP_ROOT="$PWD" OMABACKUP_STATE="$PIH/rstate" \
+    XDG_RUNTIME_DIR=/nonexistent "$OB" restore --into "$PIH/inspect/new" --apply "$PIART" >/dev/null 2>&1)
+
+it "restore --into creates its target 0700 under a 022 umask"
+assert_eq "$(stat -c %a "$PIH/inspect/new" 2>/dev/null):$(stat -c %a "$PIH/inspect" 2>/dev/null)" "700:700"

@@ -59,6 +59,13 @@ it "ExecStart points at the tool that ran install, not a hardcoded plugin path"
 # directory that may not exist, or may hold a different version.
 assert_contains "$(grep ExecStart "$IH2/.config/systemd/user/omabackup-sync.service")" "$PWD/bin/omabackup"
 
+# Both services create files under the user's umask: staging, the bundle cache,
+# generated lists. UMask=0077 makes everything the timers write private
+# (review omabackup-81); the code does not rely on it.
+it "both installed services run with UMask=0077"
+assert_eq "$(grep -c '^UMask=0077$' "$IH2/.config/systemd/user/omabackup-sync.service" "$IH2/.config/systemd/user/omabackup-push.service" | tr '\n' ' ')" \
+    "$IH2/.config/systemd/user/omabackup-sync.service:1 $IH2/.config/systemd/user/omabackup-push.service:1 "
+
 it "install records which repo receives the backup"
 assert_contains "$(cat "$IH2/.config/omabackup/env" 2>/dev/null)" "OMABACKUP_REPO=$IR2"
 

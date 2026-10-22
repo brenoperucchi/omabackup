@@ -799,7 +799,9 @@ cmd_config_tui() {
                                 notice="$(tui_sanitize_field "$repo_init_abs") changed while waiting for an answer -- not creating it."
                                 continue
                             fi
-                            if ! mkdir -p -- "$repo_init_abs" 2>/dev/null; then
+                            # Private: it will hold every backed-up file and
+                            # its history (review omabackup-81).
+                            if ! ( umask 077; mkdir -p -- "$repo_init_abs" ) 2>/dev/null; then
                                 notice="Could not create $(tui_sanitize_field "$repo_init_abs")."
                                 continue
                             fi

@@ -128,7 +128,12 @@ _publish_file() {  # _publish_file <src> <dst> <repo-root> [<repo-root-rp>]
         if ! rm -f "$dst.tmp" 2>/dev/null || [[ -e "$dst.tmp" || -L "$dst.tmp" ]]; then
             return 1
         fi
-        jq -S . "$src" >"$dst.tmp" && mv -T -- "$dst.tmp" "$dst"
+        # Created private, then given the source's mode before it takes the
+        # final name. A redirect creates 0666 filtered by the umask, so a 0600
+        # shell.json was published 0644 (review omabackup-81); every other
+        # file keeps its mode through cp -p below.
+        ( umask 077; jq -S . "$src" >"$dst.tmp" ) && chmod --reference="$src" -- "$dst.tmp" \
+            && mv -T -- "$dst.tmp" "$dst"
     else
         # `cp -p`, not `rsync`. rsync costs ~44ms to start against cp's ~0.5ms,
         # and this runs once per staged file: 597 files spent 27 of a sync's 33

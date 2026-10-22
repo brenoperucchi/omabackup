@@ -289,7 +289,14 @@ build_bundle() {
     head="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || return 1
     [[ -n "$head" ]] || return 1
 
-    mkdir -p "$cache" || return 1
+    # Private, and closed again on every build. The key carries the tool's
+    # fingerprint, so a new version never reuses what an older one wrote: those
+    # entries stay at their own keys, 0644 under the usual umask, and nothing
+    # prunes them. The directory is what keeps them from other local users
+    # (review omabackup-81). Only group and others lose access; it lives under
+    # the user's own state directory, so the chmod is never on a filesystem
+    # that cannot take it.
+    ( umask 077; mkdir -p "$cache" ) && chmod go-rwx -- "$cache" || return 1
     out="$(bundle_cache_path "$repo" "$cache")" || return 1
     # A cache hit is trusted only after it re-proves itself. The freshly-built
     # path at the end of this function calls verify_bundle before ever handing
@@ -310,9 +317,6 @@ build_bundle() {
     # is internally consistent by construction, same as every other artifact-
     # tampering PoC in this file.
     if [[ -f "$out" ]]; then
-        # An entry an older version left 0644 is not served at that mode: the
-        # dir destinations copy it, and the copy starts from the source's mode.
-        chmod 600 -- "$out" 2>/dev/null || return 1
         _verify_cache_entry "$out" && { printf '%s\treused' "$out"; return 0; }
         printf 'omabackup: the cached bundle at %s failed its own restore check -- rebuilding\n' \
             "$(_tilde "$out")" >&2

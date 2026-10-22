@@ -1090,6 +1090,14 @@ assert_contains "$MKDIR_TUI" "and initialized an empty git repository there."
 [[ -d "$MKDIR_HOME/fresh-repo/.git" ]] && ok || fail "accepting the offer did not create and init the directory"
 assert_contains "$(cat "$MKDIR_HOME/.config/omabackup/env" 2>/dev/null)" "OMABACKUP_REPO=$MKDIR_HOME/fresh-repo"
 
+# The repository the assistant creates holds every backed-up file and its
+# history; under a 022 umask it was created 0755 (review omabackup-81).
+MKDIR_PRIV_HOME="$(_cfg_home)"
+(umask 022; _cfg_tui_home "$MKDIR_PRIV_HOME" $'1\n'"$MKDIR_PRIV_HOME/fresh-repo"$'\ny\nq\n' "$MKDIR_PRIV_HOME/repo" >/dev/null)
+
+it "and creates that repository 0700"
+assert_eq "$(stat -c %a "$MKDIR_PRIV_HOME/fresh-repo" 2>/dev/null)" "700"
+
 MKDIR_DECLINE_HOME="$(_cfg_home)"
 MKDIR_DECLINE_TUI="$(_cfg_tui_home "$MKDIR_DECLINE_HOME" $'1\n'"$MKDIR_DECLINE_HOME/fresh-repo"$'\nn\nq\n' "$MKDIR_DECLINE_HOME/repo")"
 

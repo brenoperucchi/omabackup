@@ -638,6 +638,14 @@ _push_dir() {  # _push_dir <id> <bundle> <publish-name>
         find "$dir" -maxdepth 1 -type f -regextype posix-extended \
             -regex ".*/omabackup-.+-${DEST_NAME_TAIL%\\.tar\\.zst}\.tar\.zst\.tmp" \
             -delete 2>/dev/null
+        # Versions before 0.4.9 copied bundles here 0644, readable by every
+        # local user who can reach this directory, and retention takes `keep`
+        # pushes to remove them (review omabackup-81). Our own earlier bundles
+        # are tightened here, regular files only. Best effort: a vfat drive
+        # refuses chmod, and that is not a reason to fail a push that landed.
+        find "$dir" -maxdepth 1 -type f -perm /077 -regextype posix-extended \
+            -regex ".*/omabackup-.+-${DEST_NAME_TAIL}" \
+            -exec chmod 600 -- {} + 2>/dev/null || :
     fi
     # A prune failure does not fail the push -- the new copy already landed,
     # and refusing to report that over a retention hiccup would turn a cleanup

@@ -849,8 +849,16 @@ cmd_collect() {
     # way. What matters is whether anything is left INSIDE staging after
     # both have run, checked explicitly rather than inferred from rm's
     # exit code alone.
+    # The state directory holds staging, the bundle cache and the generated
+    # lists: copies of private dotfiles and plugin patches whose privacy came
+    # from a 0700 directory at the source. Under the usual 022 umask it was
+    # created 0755, so group and others lose access here, whatever an older
+    # version left it at (review omabackup-81). The owner's own bits are left
+    # as they are.
+    ( umask 077; mkdir -p "$OMABACKUP_STATE" ) && chmod go-rwx -- "$OMABACKUP_STATE" \
+        || die "could not make $(_tilde "$OMABACKUP_STATE") private"
     rm -rf "$STAGING" 2>/dev/null
-    mkdir -p "$STAGING" || die "could not create $(_tilde "$STAGING")"
+    ( umask 077; mkdir -p "$STAGING" ) || die "could not create $(_tilde "$STAGING")"
     [[ -z "$(find "$STAGING" -mindepth 1 -print -quit 2>/dev/null)" ]] \
         || die "could not clear $(_tilde "$STAGING") before collecting into it -- stale files remain"
     local id mode p e dest n=0 excrc rc
@@ -2886,7 +2894,10 @@ cmd_restore() {
         # component created, a later one refused) and still leave
         # something behind at or under $into, and this die skipped the
         # same cleanup every later one already gets.
-        mkdir -p "$into" || {
+        # Private: the usual --into is a scratch directory, often outside the
+        # home directory, and it receives the backed-up dotfiles in the clear
+        # (review omabackup-81). Only the components created here are affected.
+        ( umask 077; mkdir -p "$into" ) || {
             _into_cleanup "$into" "$into_boundary"
             rm -rf "$x"; die "could not make $(_tilde "$into")"
         }

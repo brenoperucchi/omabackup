@@ -1054,8 +1054,14 @@ it "bundle writes the artifact 0600 under a 022 umask"
 [[ -n "$PMART" ]] && assert_eq "$(stat -c %a "$PMART")" "600" \
     || fail "no bundle produced: $PMOUT"
 
-chmod 644 "$PMART" 2>/dev/null
-PMOUT2="$(umask 022; _bundle_env "$PMH" "$PMR" bundle --json)"
+# The upgrade case. The cache key carries the tool's fingerprint, so a new
+# version never reuses an entry an older one wrote: those stay at their own
+# key, 0644, in a cache directory created 0755, and nothing prunes them. The
+# directory is what closes them off, all at once (review omabackup-81).
+PMC="$PMH/.state/bundles"
+printf 'old history\n' >"$PMC/0000000000000000.tar.zst"
+chmod 644 "$PMC/0000000000000000.tar.zst"; chmod 755 "$PMC"
+(umask 022; _bundle_env "$PMH" "$PMR" bundle --json >/dev/null)
 
-it "a cached artifact left at 0644 is 0600 once bundle reuses it"
-assert_eq "$(printf '%s' "$PMOUT2" | jq -r '.path // empty' 2>/dev/null):$(stat -c %a "$PMART")" "$PMART:600"
+it "an older version's 0644 entries are closed off: the cache directory is 0700"
+assert_eq "$(stat -c %a "$PMC")" "700"

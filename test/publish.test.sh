@@ -565,3 +565,16 @@ printf '#!/bin/bash\necho hi\n' >"$MTH2/staging/.local/bin/tool"
 it "publish_staging reports failure when map_to_repo refuses to place a file"
 publish_staging "$MTH2/staging" "$MTR2" >/dev/null 2>&1 \
     && fail "reported success despite map_to_repo refusing to map a staged file" || ok
+
+# ── a private JSON file stays private when its keys are sorted ──────────────
+# The .json branch writes the sorted copy through a redirect, which creates the
+# file 0666 filtered by the umask, so a 0600 shell.json was published 0644 and
+# replaced a 0600 copy at that mode too (review omabackup-81). Every other file
+# keeps its mode through cp -p.
+STG9="$(mktemp -d)"; REPO9="$(mktemp -d)"; git init -q "$REPO9"
+mkdir -p "$STG9/.config/app"
+printf '{"b":1,"a":2}\n' >"$STG9/.config/app/s.json"; chmod 600 "$STG9/.config/app/s.json"
+(umask 022; publish_staging "$STG9" "$REPO9" >/dev/null)
+
+it "a 0600 JSON file is published 0600, keys sorted"
+assert_eq "$(stat -c %a "$REPO9/configs/app/s.json" 2>/dev/null):$(jq -c . "$REPO9/configs/app/s.json" 2>/dev/null)" '600:{"a":2,"b":1}'

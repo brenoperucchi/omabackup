@@ -1355,3 +1355,47 @@ JSON
 
 it "_push_dir lands a 0644 bundle as 0600 under a 022 umask"
 assert_eq "$(stat -c %a "$PMD/dir/omabackup-mode-bundle.tar.zst" 2>/dev/null)" "600"
+
+# The copies an older version already left 0644 in a destination it owns stay
+# readable until retention reaches them, and never in a directory without the
+# stamp. A push tightens its own earlier bundles there, best effort: a drive
+# that cannot chmod (vfat) must not turn this into a failed push.
+PMO="$(mktemp -d)"
+mkdir -p "$PMO/dir"
+printf 'nas\nhost\n' >"$PMO/dir/.omabackup-destination"
+printf 'old\n' >"$PMO/dir/omabackup-host-20200101-000000-abc111111111.tar.zst"
+chmod 644 "$PMO/dir/omabackup-host-20200101-000000-abc111111111.tar.zst"
+printf 'mine\n' >"$PMO/dir/notes.txt"; chmod 644 "$PMO/dir/notes.txt"
+printf 'bundle-content\n' >"$PMO/bundle.tar.zst"
+cat >"$PMO/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$PMO/dir","keep":5}]}
+JSON
+(umask 022; DESTINATIONS_FILE="$PMO/destinations.json" bash -c '
+    source lib/bundle.sh; source lib/destinations.sh
+    _push_dir "nas" "$1" "omabackup-host-20200102-000000-abc222222222.tar.zst"
+' _ "$PMO/bundle.tar.zst" >/dev/null 2>&1)
+
+it "a push tightens the 0644 bundles an older version left in a destination it owns"
+assert_eq "$(stat -c %a "$PMO/dir/omabackup-host-20200101-000000-abc111111111.tar.zst")" "600"
+
+it "and leaves a file that is not one of its bundles alone"
+assert_eq "$(stat -c %a "$PMO/dir/notes.txt")" "644"
+
+PMF="$(mktemp -d)"
+mkdir -p "$PMF/dir" "$PMF/stub"
+printf 'nas\nhost\n' >"$PMF/dir/.omabackup-destination"
+printf 'old\n' >"$PMF/dir/omabackup-host-20200101-000000-abc111111111.tar.zst"
+printf 'bundle-content\n' >"$PMF/bundle.tar.zst"
+printf '#!/bin/bash\nexit 1\n' >"$PMF/stub/chmod"; chmod +x "$PMF/stub/chmod"
+cat >"$PMF/destinations.json" <<JSON
+{"schemaVersion":1,"destinations":[{"id":"nas","type":"dir","path":"$PMF/dir","keep":5}]}
+JSON
+PMFRC=0
+PATH="$PMF/stub:$PATH" DESTINATIONS_FILE="$PMF/destinations.json" bash -c '
+    source lib/bundle.sh; source lib/destinations.sh
+    _push_dir "nas" "$1" "omabackup-host-20200102-000000-abc222222222.tar.zst"
+' _ "$PMF/bundle.tar.zst" >/dev/null 2>&1 || PMFRC=$?
+
+it "a destination where chmod fails still receives the push"
+[[ $PMFRC -eq 0 && -f "$PMF/dir/omabackup-host-20200102-000000-abc222222222.tar.zst" ]] \
+    && ok || fail "push failed (rc $PMFRC) because chmod could not run"
