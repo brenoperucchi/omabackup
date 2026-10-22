@@ -1667,8 +1667,15 @@ cmd_sync() {
     # backup's name. This holds whatever route the entry took, so it does not
     # depend on having switched every hook off (review omabackup-71). The
     # paths are counted, not printed: a name can be the secret.
+    #
+    # One deletion is ours without being in written[]: a path that changed
+    # type. Publishing configs/app/foo/bar where the file configs/app/foo was
+    # makes `git add` drop foo, and the reverse drops dd/x for a file dd. That
+    # refused every sync of the repository, blaming a hook (review
+    # omabackup-78). A deletion is accepted only when a written path implies
+    # it; any other deletion, or any other change, still refuses.
     local -a all_changed=()
-    if ! _sync_git diff-tree -r -z --name-only --no-renames \
+    if ! _sync_git diff-tree -r -z --name-status --no-renames \
             "$base_tree" "$tree" >"$tdir/list"; then
         _sync_tmp_clean
         printf '\n%somabackup: not committing -- could not list what this commit would change%s\n' "$RED" "$NC" >&2
@@ -1676,15 +1683,26 @@ cmd_sync() {
     fi
     mapfile -d '' -t all_changed <"$tdir/list"
     local -A ours=()
-    local w stray=0
+    local w st cp implied stray=0 i
     for w in "${written[@]}"; do ours["$w"]=1; done
-    for w in "${all_changed[@]}"; do [[ -n "${ours[$w]:-}" ]] || stray=$((stray + 1)); done
+    for (( i = 0; i + 1 < ${#all_changed[@]}; i += 2 )); do
+        st="${all_changed[i]}"; cp="${all_changed[i + 1]}"
+        [[ -n "${ours[$cp]:-}" ]] && continue
+        implied=0
+        if [[ "$st" == D ]]; then
+            for w in "${written[@]}"; do
+                if [[ "$w" == "$cp"/* || "$cp" == "$w"/* ]]; then implied=1; break; fi
+            done
+        fi
+        (( implied )) || stray=$((stray + 1))
+    done
     if (( stray )); then
         _sync_tmp_clean
         printf '\n%somabackup: not committing -- %d path(s) this run did not write reached the commit%s\n' \
             "$RED" "$stray" "$NC" >&2
-        printf '  Something changed the candidate while it was being built (a hook, an\n' >&2
-        printf '  fsmonitor, a wrapper around git). Nothing was committed.\n' >&2
+        printf '  Something other than this sync changed the commit it was building, for\n' >&2
+        printf '  example a git hook, an fsmonitor or a wrapper around git. Nothing was\n' >&2
+        printf '  committed.\n' >&2
         return 1
     fi
 

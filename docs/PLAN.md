@@ -5838,3 +5838,29 @@ for a signal to leave. Specs: grep's stdout on the names pass is a pipe and
 TMPDIR is empty while it runs (fails on the previous code), a failing names
 grep refuses, a TERM mid-scan ends with 143 and an empty TMPDIR, the caller's
 traps are untouched. Real staging (669 entries): 0.058 s.
+
+**Round omabackup-78 (verification of the round-71 fixes, the merge and
+`9703505`).** Both closed every round-71 finding but one half, and the locale
+finding of round 73 at this gate; merge and `9703505` approved. Open:
+rev-2 P2, introduced by `26a0434`: a path that changes type (file `foo` to
+`foo/bar`, or `dd/x` to file `dd`) makes `git add` drop the old entry, the
+check for paths this run did not write counted that deletion, and every sync
+of the repository refused from then on, blaming a hook; `c515b0c` committed
+it. P3 from both (the open half of round-71 rev-2 #2): push reads names from
+`rev-list --objects`, which ends a name at its first newline, so a rule
+anchored with `$` matched that piece in push and not the joined name here or
+in staging. rev-2 also asked for a CLI spec only this gate sees for a file
+name.
+
+**Fix.** The check reads `diff-tree --name-status` and accepts a deletion only
+when a written path implies it (`w` below the deleted path, or the deleted
+path below `w`); any other deletion or change still refuses, and the message
+no longer presumes a hook. `scan_tree` adds, after the joined names and
+directories, one line per piece between newlines, each mapped back to its
+entry and reported once per rule; `scan_files` does the same for names and
+symlink targets. Specs: file to directory and directory to file commit (fail
+on `9703505`), an injected unrelated deletion still refuses (a mutant that
+accepts every deletion fails it), a name with a newline under a `$` rule is
+refused end to end and by `scan_tree`, `scan_files` and a symlink target
+directly (fail on `9703505`), and a file name matched only on its repository
+path is refused by this gate (`changed path #`).

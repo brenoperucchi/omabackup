@@ -664,6 +664,29 @@ scan_files() {
         link_path+=("${link_raw[k]}"); link_target+=("${link_raw[k + 1]}")
     done
 
+    # What grep reads: each name with newlines as spaces, then each piece
+    # between newlines of a name that has them, each view pointing back at its
+    # entry. The push scan ends a name at its first newline (rev-list
+    # --objects), so a rule anchored with $ matched there and not on the
+    # joined name (review omabackup-78). Targets the same way.
+    local -a name_view=() name_of=() tgt_view=() tgt_of=() seg
+    _scan_views() {  # _scan_views <view-array> <of-array> <entries...>
+        local -n _v="$1" _o="$2"; shift 2
+        local _e _i=0 _s
+        _v=("${@//$'\n'/ }"); _o=()
+        for (( _i = 0; _i < $#; _i++ )); do _o+=("$_i"); done
+        _i=0
+        for _e in "$@"; do
+            if [[ "$_e" == *$'\n'* ]]; then
+                mapfile -t seg <<<"$_e"
+                for _s in "${seg[@]}"; do _v+=("$_s"); _o+=("$_i"); done
+            fi
+            _i=$((_i + 1))
+        done
+    }
+    _scan_views name_view name_of "${all_names[@]}"
+    _scan_views tgt_view tgt_of "${link_target[@]}"
+
     local -A secret_name=() name_said=()
     local rel nm rec n g lp lt
     if (( ${#all_names[@]} )); then
@@ -672,15 +695,15 @@ scan_files() {
             local -a zf=(-z -n -a -E --color=never)
             [[ "$ci" == true ]] && zf+=(-i)
             while IFS= read -r -d '' rec; do
-                n="${rec%%:*}"; rel="${all_names[$((n - 1))]}"
-                nm="${rel//$'\n'/ }"
+                n="${rec%%:*}"; rel="${all_names[${name_of[$((n - 1))]}]}"
+                nm="${name_view[$((n - 1))]}"
                 _still_matches "$nm" "$re" "$ci" || continue
                 secret_name["$rel"]=1
                 if [[ -z "${name_said[$rel]:-}" ]]; then
                     name_said["$rel"]=1
                     printf '%s\t(a file NAME, not shown)%s\n' "$id" "$(_scan_dir_hint "$rel" "$patterns")"
                 fi
-            done < <(printf '%s\0' "${all_names[@]//$'\n'/ }" | grep "${zf[@]}" -e "$re" 2>/dev/null)
+            done < <(printf '%s\0' "${name_view[@]}" | grep "${zf[@]}" -e "$re" 2>/dev/null)
             wait "$!"; g=$?
             if (( g > 1 )); then
                 printf '%somabackup: pattern %s could not be scanned over the file names%s\n' "$RED" "$id" "$NC" >&2
@@ -695,15 +718,18 @@ scan_files() {
             local -a tf=(-z -n -a -E --color=never)
             [[ "$ci" == true ]] && tf+=(-i)
             while IFS= read -r -d '' rec; do
-                n="${rec%%:*}"; lt="${link_target[$((n - 1))]}"; lp="${link_path[$((n - 1))]}"
-                _still_matches "${lt//$'\n'/ }" "$re" "$ci" || continue
+                n="${rec%%:*}"; k="${tgt_of[$((n - 1))]}"
+                lt="${link_target[k]}"; lp="${link_path[k]}"
+                _still_matches "${tgt_view[$((n - 1))]}" "$re" "$ci" || continue
+                [[ -n "${name_said[$id:link:$k]:-}" ]] && continue
+                name_said["$id:link:$k"]=1
                 if [[ -n "${secret_name[$lp]:-}" ]]; then
                     printf '%s\t(a symlink target, not shown, of a link whose NAME is not shown)%s\n' \
                         "$id" "$(_scan_dir_hint "$lp" "$patterns")"
                 else
                     printf '%s\t%s (symlink target, not shown)\n' "$id" "$(_scan_safe "$lp")"
                 fi
-            done < <(printf '%s\0' "${link_target[@]//$'\n'/ }" | grep "${tf[@]}" -e "$re" 2>/dev/null)
+            done < <(printf '%s\0' "${tgt_view[@]}" | grep "${tf[@]}" -e "$re" 2>/dev/null)
             wait "$!"; g=$?
             if (( g > 1 )); then
                 printf '%somabackup: pattern %s could not be scanned over the symlink targets%s\n' "$RED" "$id" "$NC" >&2
@@ -881,7 +907,10 @@ scan_tree() {
 
     # One line per path, then one per distinct directory above them, so a hit's
     # line number names exactly one entry. A newline inside a name becomes a
-    # space: a token never holds a newline, so this cannot hide a match.
+    # space, and each piece between newlines gets a line of its own after
+    # those, pointing back at its entry: the push scan reads names from
+    # rev-list --objects, which ends a name at its first newline, so a rule
+    # anchored with $ matched there and not here (review omabackup-78).
     local -A pos=() secret_pos=() dir_line=()
     local -a dirs=()
     local p d k=0 n="$#"
@@ -896,9 +925,20 @@ scan_tree() {
     done
     # `if`, not `&&`: with no directory at all the && form returned 1 and
     # made every root-level-only commit look like a scan that could not run.
+    local -a pieces=() piece_of=() seg
+    local e=0
+    for p in "$@" "${dirs[@]}"; do
+        e=$((e + 1))
+        [[ "$p" == *$'\n'* ]] || continue
+        mapfile -t seg <<<"$p"
+        for d in "${seg[@]}"; do pieces+=("$d"); piece_of+=("$e"); done
+    done
+    local nd=${#dirs[@]}
+    local -A said=()
     {
         printf '%s\n' "${@//$'\n'/ }"
-        if (( ${#dirs[@]} )); then printf '%s\n' "${dirs[@]//$'\n'/ }"; fi
+        if (( nd )); then printf '%s\n' "${dirs[@]//$'\n'/ }"; fi
+        if (( ${#pieces[@]} )); then printf '%s\n' "${pieces[@]}"; fi
     } >"$work/names" || return 1
     for i in "${!ids[@]}"; do
         local -a nflags=(-a -n -E --color=never)
@@ -913,6 +953,9 @@ scan_tree() {
         while IFS= read -r line; do
             ln="${line%%:*}"; body="${line#*:}"
             _still_matches "$body" "${res[$i]}" "${cis[$i]}" || continue
+            (( ln > n + nd )) && ln="${piece_of[$(( ln - n - nd - 1 ))]}"
+            [[ -n "${said[$i:$ln]:-}" ]] && continue
+            said["$i:$ln"]=1
             if (( ln <= n )); then
                 printf '%s\t(a file NAME, not shown: changed path #%s)\n' "${ids[$i]}" "$ln"
                 secret_pos["$ln"]=1

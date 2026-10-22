@@ -1428,3 +1428,42 @@ V6K="$(TMPDIR="$V6S/tmp" bash -c 'source lib/common.sh 2>/dev/null || true; sour
     trap -p HUP' _ "$V6S/stage" "$PWD/secrets.deny.json" 2>&1)"
 it "a scan gives the caller its traps back"
 assert_contains "$V6K" "echo caller-handler"
+
+# -- review round omabackup-78 ----------------------------------------------------
+# The push scan reads names from rev-list --objects, which ends a name at its
+# first newline. A rule anchored with $ matched that piece there and not the
+# joined name here, so a commit the gate accepted blocked every push.
+V8D="$SH/v8-deny.json"
+cat >"$V8D" <<'JSON'
+{"schemaVersion":1,"patterns":[
+ {"id":"custom-end","regex":"secret=[a-z]{16}$","reason":"test rule anchored at the end"}]}
+JSON
+_v8nm="sec""ret=abcdefghijklmnop"
+V8R="$SH/v8-repo"; git init -q "$V8R"
+mkdir -p "$V8R/configs/app" "$V8R/configs/$_v8nm"$'\n'"z"
+printf 'clean\n' >"$V8R/configs/app/$_v8nm"$'\n'"x.txt"
+printf 'clean\n' >"$V8R/configs/$_v8nm"$'\n'"z/in.txt"
+git -C "$V8R" add -A; V8T="$(git -C "$V8R" write-tree)"; V8W="$(mktemp -d "$SH/v8w.XXXX")"
+V8F_OUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_tree "$1" "$2" "$3" "$4" "$5"' _ "$V8R" "$V8D" "$V8T" "$V8W" "configs/app/$_v8nm"$'\n'"x.txt" 2>&1)"
+it "the pre-commit scan judges a file name up to its first newline, as push does"
+assert_contains "$V8F_OUT" "custom-end"
+it "without printing the name"
+assert_not_contains "$V8F_OUT" "$_v8nm"
+V8G_OUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_tree "$1" "$2" "$3" "$4" "$5"' _ "$V8R" "$V8D" "$V8T" "$V8W" "configs/$_v8nm"$'\n'"z/in.txt" 2>&1)"
+it "and a directory name the same way"
+assert_contains "$V8G_OUT" "custom-end"
+assert_not_contains "$V8G_OUT" "$_v8nm"
+
+V8S="$SH/v8-stage"; mkdir -p "$V8S/app"
+: >"$V8S/app/$_v8nm"$'\n'"x.txt"
+ln -s -- "$_v8nm"$'\n'"rest" "$V8S/app/pointer"
+V8S_OUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets.sh
+    scan_files "$1" "$2"' _ "$V8S" "$V8D" 2>&1)"
+it "the staging scan judges a name up to its first newline too"
+assert_contains "$V8S_OUT" "(a file NAME, not shown)"
+it "and a symlink target the same way"
+assert_contains "$V8S_OUT" "symlink target"
+it "printing neither"
+assert_not_contains "$V8S_OUT" "$_v8nm"

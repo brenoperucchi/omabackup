@@ -1186,3 +1186,89 @@ printf '\xff%s\n' "$_tok" >"$SU8/.config/app/bin.dat"
 LC_ALL=C.UTF-8 _sync_env "$SU8" "$SU8/repo" "$SU8/g.json" sync --commit >/dev/null; SU8_RC=$?
 it "sync --commit refuses a token after an invalid UTF-8 byte under a UTF-8 locale"
 (( SU8_RC != 0 )) && ok || fail "a UTF-8 locale let a token into the commit"
+
+# -- review round omabackup-78 ------------------------------------------------------
+# A path that changes type. git add drops configs/app/foo when it records
+# configs/app/foo/bar, and dd/x when it records the file dd; the check for
+# paths this run did not write counted those deletions and refused every sync
+# of the repository from then on, blaming a hook. Publish already refuses
+# while the old path is in the worktree, so the user frees it first.
+R78A="$(mktemp -d)"; _sec_env "$R78A"
+printf 'was a file\n' >"$R78A/.config/app/foo"
+_sync_env "$R78A" "$R78A/repo" "$R78A/g.json" sync --commit >/dev/null
+rm -f "$R78A/.config/app/foo"; mkdir -p "$R78A/.config/app/foo"; printf 'now below\n' >"$R78A/.config/app/foo/bar"
+rm -f "$R78A/repo/configs/app/foo"
+_sync_env "$R78A" "$R78A/repo" "$R78A/g.json" sync --commit >/dev/null; R78A_RC=$?
+it "a file that became a directory is committed"
+(( R78A_RC == 0 )) && ok || fail "sync --commit refused a file -> directory change"
+it "and the commit holds the new path"
+assert_contains "$(git -C "$R78A/repo" ls-tree -r --name-only HEAD)" "configs/app/foo/bar"
+
+R78B="$(mktemp -d)"; _sec_env "$R78B"
+mkdir -p "$R78B/.config/app/dd"; printf 'below\n' >"$R78B/.config/app/dd/x"
+_sync_env "$R78B" "$R78B/repo" "$R78B/g.json" sync --commit >/dev/null
+rm -f "$R78B/.config/app/dd/x"; rmdir "$R78B/.config/app/dd"; printf 'now a file\n' >"$R78B/.config/app/dd"
+rm -f "$R78B/repo/configs/app/dd/x"; rmdir "$R78B/repo/configs/app/dd"
+_sync_env "$R78B" "$R78B/repo" "$R78B/g.json" sync --commit >/dev/null; R78B_RC=$?
+it "a directory that became a file is committed"
+(( R78B_RC == 0 )) && ok || fail "sync --commit refused a directory -> file change"
+it "and the commit holds the file, not the old entry"
+R78B_LS="$(git -C "$R78B/repo" ls-tree -r --name-only HEAD)"
+[[ "$R78B_LS" == *"configs/app/dd"* && "$R78B_LS" != *"configs/app/dd/x"* ]] && ok || fail "tree: $R78B_LS"
+
+# Only a deletion a written path implies. A wrapper that drops an unrelated
+# entry from the candidate still refuses.
+R78C="$(mktemp -d)"; _sec_env "$R78C"; mkdir -p "$R78C/stub"
+_sync_env "$R78C" "$R78C/repo" "$R78C/g.json" sync --commit >/dev/null
+cat >"$R78C/stub/git" <<SHIM
+#!/bin/bash
+"$_REALGIT" "\$@"; rc=\$?
+if [[ -n "\${GIT_INDEX_FILE:-}" ]]; then
+    for a in "\$@"; do
+        if [[ "\$a" == add ]]; then
+            "$_REALGIT" -C "$R78C/repo" update-index --force-remove README.md
+            break
+        fi
+    done
+fi
+exit \$rc
+SHIM
+chmod +x "$R78C/stub/git"
+printf 'changed\n' >"$R78C/.config/app/f.txt"
+PATH="$R78C/stub:$PATH" _sync_env "$R78C" "$R78C/repo" "$R78C/g.json" sync --commit >/dev/null; R78C_RC=$?
+it "a deletion this run did not cause still refuses the commit"
+if (( R78C_RC != 0 )); then assert_contains "$(git -C "$R78C/repo" ls-tree -r --name-only HEAD)" "README.md"
+else fail "an unrelated deletion rode into the backup's commit"; fi
+
+# A name with a newline, under a rule anchored with $: refused before it can
+# become history that push would refuse.
+R78D="$(mktemp -d)"; _sec_env "$R78D"
+_sync_env "$R78D" "$R78D/repo" "$R78D/g.json" sync --commit >/dev/null
+cat >"$R78D/deny.json" <<'JSON'
+{"schemaVersion":1,"patterns":[
+ {"id":"custom-end","regex":"secret=[a-z]{16}$","reason":"test rule anchored at the end"}]}
+JSON
+printf 'clean\n' >"$R78D/.config/app/sec""ret=abcdefghijklmnop"$'\n'"x.txt"
+R78D_OUT="$(OMABACKUP_SECRETS_DENY="$R78D/deny.json" _sync_env "$R78D" "$R78D/repo" "$R78D/g.json" sync --commit)"; R78D_RC=$?
+it "a name a rule matches up to its first newline is refused"
+(( R78D_RC != 0 )) && ok || fail "committed a name that push would refuse"
+it "and nothing was committed, nor the name printed"
+assert_eq "$(_commits "$R78D/repo")" "2"
+assert_not_contains "$R78D_OUT" "abcdefghijklmnop"
+
+# A file name only this gate sees: a rule anchored on the repository path,
+# which the staging scan never has.
+R78E="$(mktemp -d)"; _sec_env "$R78E"
+_sync_env "$R78E" "$R78E/repo" "$R78E/g.json" sync --commit >/dev/null
+_r78tok="AKIA$(printf 'B%.0s' {1..16})"
+cat >"$R78E/deny.json" <<JSON
+{"schemaVersion":1,"patterns":[
+ {"id":"repo-anchored","regex":"^configs/app/AKIA[A-Z0-9]{16}\\\\.txt\$","reason":"test rule anchored on the repo path"}]}
+JSON
+printf 'clean\n' >"$R78E/.config/app/$_r78tok.txt"
+R78E_OUT="$(OMABACKUP_SECRETS_DENY="$R78E/deny.json" _sync_env "$R78E" "$R78E/repo" "$R78E/g.json" sync --commit)"; R78E_RC=$?
+it "a file name matched only on its repository path is refused before the commit"
+(( R78E_RC != 0 )) && ok || fail "committed a file name the push scan would refuse"
+it "by the pre-commit gate, without printing the name"
+assert_contains "$R78E_OUT" "changed path #"
+assert_not_contains "$R78E_OUT" "$_r78tok"
