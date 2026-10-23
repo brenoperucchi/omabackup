@@ -3928,8 +3928,12 @@ omabackup <command> [--json] [--groups a,b]
   reload    update the installed plugin and restart the shell onto it
   enable    start the timers -- the master switch
   disable   stop them; nothing runs until enable
+  install   write the timers (sync every 15 minutes, push hourly) and enable them
   collect   collect the groups into staging (does not touch the repo)
   verify    check that the backup covers what the system actually reads
+  sync      collect, scan with the deny-list, publish into the repo; --commit commits
+  bundle    build the .tar.zst artifact for every destination other than github
+  push      send to each enabled destination that is due; a name sends to it now
   artifacts list what a `dir` destination holds, with each one's own manifest
   restore   plan a restore from an artifact; no file opens a guided TUI
   config    show or safely edit machine-owned settings; no args opens its TUI
