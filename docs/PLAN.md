@@ -6055,3 +6055,17 @@ print the ref name as it is ("the tag chain at ... is deeper than 32",
 "cannot read the tag object at", "names no target", "cannot identify what
 tag ... points at", "cannot read the blob at"), so a ref named after a token
 would reach the journal when one of them fires (review 86, rev-2).
+
+### The usage text names every verb a person runs (2026-10-23)
+
+Contributed by Corey Tyhurst. `omabackup help` left out `install`, `sync`,
+`bundle` and `push`, four verbs the dispatch accepts and a person runs by
+hand. They are added, and `test/help.test.sh` cuts the verbs out of the real
+dispatch `case` and checks both directions, with `log-event` and `kill-group`
+named as internal on purpose. The "every verb" spec fails on `main`; the
+other two are controls. `help` -- **3 passed, 0 failed**. Full suite in a
+network-less Arch container -- **1642 passed, 2 failed** against **1639
+passed, 2 failed** at `928b589`, failing set identical (title-row eliding
+probe, VM preflight). Not run on a live Omarchy session.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
