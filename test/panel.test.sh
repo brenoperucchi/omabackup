@@ -48,6 +48,45 @@ it "a hung startup resolveProc still ends in cliMissing:true, not silence"
 _qml_probe test/qml/resolve-proc-gets-its-own-timeout.qml \
     && ok || fail "a hung resolveProc left cliMissing false -- the widget would stay visible and inert forever"
 
+# ── the widget drives its own CLI, not whatever PATH calls omabackup ────────
+# resolveProc asked PATH first and only fell back to the plugin's bundled copy
+# when nothing on PATH answered. Nothing in this project ever puts omabackup
+# on PATH (the README runs it by its full plugin path), so on an ordinary
+# install the two are the same binary and the order was invisible. On a
+# machine where some OTHER program is installed under that name, the widget
+# quietly drove that program with this plugin's verbs and read its output as
+# status.json. The bundled copy is the one the widget was shipped with, so it
+# is asked first; PATH remains a fallback for a checkout loaded from outside
+# the plugin directory, where the bundled path does not exist. The command
+# under test is the real one, cut out of Panel.qml, so the spec cannot drift
+# from the source the way a hand-copied mirror would.
+_resolve_cmd() {
+    sed -n '/id: resolveProc/,/^  }/p' Panel.qml \
+        | grep -F '"--", root.fallbackCli]' \
+        | sed -E 's/^[[:space:]]*"(.*)", "--", root\.fallbackCli\]$/\1/; s/\\"/"/g'
+}
+RESOLVE_CMD="$(_resolve_cmd)"
+RS="$(mktemp -d)"
+mkdir -p "$RS/path" "$RS/plugin"
+printf '#!/bin/sh\nexit 0\n' >"$RS/path/omabackup"; chmod +x "$RS/path/omabackup"
+printf '#!/bin/sh\nexit 0\n' >"$RS/plugin/omabackup"; chmod +x "$RS/plugin/omabackup"
+
+it "the panel resolves its own bundled CLI before anything named omabackup on PATH"
+if [[ "$(printf '%s\n' "$RESOLVE_CMD" | wc -l)" == 1 ]] \
+   && [[ "$(PATH="$RS/path:$PATH" sh -c "$RESOLVE_CMD" -- "$RS/plugin/omabackup")" == "$RS/plugin/omabackup" ]]; then
+    ok
+else
+    fail "with both present, resolveProc chose PATH's omabackup over the plugin's own copy (or the command could not be extracted from Panel.qml)"
+fi
+
+it "and falls back to PATH only when the bundled copy is missing"
+[[ "$(PATH="$RS/path:$PATH" sh -c "$RESOLVE_CMD" -- "$RS/plugin/absent")" == "$RS/path/omabackup" ]] \
+    && ok || fail "with the bundled copy absent, resolveProc did not fall back to PATH"
+
+it "and resolves nothing when neither exists, so cliMissing can be set"
+[[ -z "$(PATH="$RS/path-absent" sh -c "$RESOLVE_CMD" -- "$RS/plugin/absent")" ]] \
+    && ok || fail "resolveProc printed a path with no omabackup anywhere"
+
 it "an error message set by a failed operation survives its own trailing refresh()"
 _qml_probe test/qml/error-message-survives-followup-refresh.qml \
     && ok || fail "refresh() cleared the error message the operation had just set, one line after setting it"
