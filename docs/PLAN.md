@@ -5965,3 +5965,38 @@ handled (round 84, rev-1).
 
 **Marketplace.** `#12564` keeps its number; its target moves to the 0.4.9
 release commit, which must stay `main`'s HEAD until the maintainers verify it.
+
+### The push refusal says where, never what (2026-10-22)
+
+Contributed by Corey Tyhurst. The open item from the 2026-09-30 section:
+`report_secrets` still printed the matched line.
+
+**The gap.** The push refusal printed each hit as `scan_secrets` gave it,
+commit, path, line number and the line itself, cut to 160 bytes. push runs
+from the hourly timer, so the token went to the journal on every run until
+the history was rewritten. A hit on a file name or a commit message printed
+that name or message line.
+
+**The change.** `scan_secrets` emits `<rule>\t<where>\t<evidence>`. `<where>`
+is built while the commit, path and line are still separate (git grep's
+`<rev>:<path>:<line>:<text>` cannot be split back once a path holds a colon),
+and it names no path or ref that a rule matches, judged whole and per `/`
+part (`_scan_name_hidden`). `report_secrets` prints the rule and `<where>`
+only. The evidence field keeps the existing specs that read `scan_secrets`
+directly unchanged. The bundle's `refusing to build` prints `scan_files`'
+output, already redacted in review omabackup-73, so it is untouched.
+`docs/DESIGN.md` §6 states the rule.
+
+**Specs.** Five in `test/secrets.test.sh` on one repo holding a GitHub token
+in a file, an AWS key id as a file name and a Slack token in a commit
+message: none of the three is printed, the content hit reads
+`leaked.conf, line 1`, and the message hit still names its commit. The first
+four fail on `main`; the last is the control.
+
+`secrets` -- **149 passed, 0 failed**. Full suite in a network-less Arch
+container -- **1634 passed, 2 failed**, against `main`'s **1629 passed, 2
+failed** at `8b6b15a`. The failing set is identical to main's: the title-row
+eliding probe (no display fonts) and the VM preflight (no QEMU). Not run on
+a live Omarchy session.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
