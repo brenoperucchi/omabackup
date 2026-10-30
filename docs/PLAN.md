@@ -6000,3 +6000,18 @@ eliding probe (no display fonts) and the VM preflight (no QEMU). Not run on
 a live Omarchy session.
 
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
+
+**Review 85.** Both reviewers found one leak left: `git grep` quotes a path
+holding a control or non-ASCII byte and writes a newline as a literal `\n`.
+Against a file named `foo`, newline, AWS key, that `n` sat against the key,
+`\bAKIA` no longer matched, the name was judged safe and the key was printed
+in `<where>`. A quoted path is now never shown: the hit gives its commit and
+line only. The spec on a real repo with that file name failed before the fix.
+The message `case` also lists `commit:*` explicitly, and an unknown label
+prints "(location not shown)" instead of the label.
+
+Still open, older than this PR: the refusals raised while reading the refs
+print the ref name as it is ("the tag chain at ... is deeper than 32",
+"cannot read the tag object at", "names no target", "cannot identify what
+tag ... points at", "cannot read the blob at"), so a ref named after a token
+would reach the journal when one of them fires (review 86, rev-2).

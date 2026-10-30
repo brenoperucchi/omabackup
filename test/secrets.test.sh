@@ -131,6 +131,23 @@ assert_contains "$WOUT" "leaked.conf, line 1"
 it "and which commit a message hit is in"
 assert_contains "$WOUT" "commit:$WSHA"
 
+# git grep quotes a path holding a control character and writes the newline as
+# a literal backslash and n. That n sits against the key, so the \b in the AWS
+# rule no longer matched the name as printed, the name was judged safe to show
+# and the key went to the journal (review omabackup-85, both reviewers).
+QH="$(mktemp -d)"; QR="$QH/repo"; QKEY="AKIA""IOSFODNN7EXAMPLE"
+_sec_repo "$QR" "" ""
+printf 'token = %s\n' "gh""p_016C7869C1D4C2E7B0F9A2B3D4E5F60718293A4B" >"$QR/configs/app/foo"$'\n'"$QKEY"
+git -C "$QR" add -A && git -C "$QR" commit -qm two
+printf '{"schemaVersion":1,"destinations":[]}\n' >"$QH/destinations.json"
+QOUT="$(_sec_env "$QH" "$QR" push)"
+
+it "nor a token after a newline in a file name git prints quoted"
+assert_not_contains "$QOUT" "$QKEY"
+
+it "and the quoted name's content hit still gives its commit and line"
+assert_contains "$QOUT" "NAME is not shown), line 1"
+
 # ── github is gated too, not just the bundle destinations ────────────────────
 # The git push sends the same content. Gating only the bundle would leave the
 # default destination as the one hole.

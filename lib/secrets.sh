@@ -533,7 +533,11 @@ scan_secrets() {
             # The heading is "<rev>:<path>" and a rev holds no colon, so the
             # first one splits it whatever the path holds.
             hpath="${head#*:}"
-            if _scan_name_hidden "$hpath" "$patterns"; then
+            # git quotes a path holding a control or non-ASCII byte and writes
+            # it with C escapes, so the rules no longer see the name as it is
+            # (a newline becomes a literal "\n" that defeats a \b before a key).
+            # Such a name is not decoded and not shown (review omabackup-85).
+            if [[ "$hpath" == \"* ]] || _scan_name_hidden "$hpath" "$patterns"; then
                 where="${head:0:12} (content of a file whose NAME is not shown), line ${hit%%:*}"
             else
                 where="${head:0:12} $(_scan_safe "$hpath"), line ${hit%%:*}"
@@ -571,7 +575,9 @@ scan_secrets() {
                     else
                         where="$(_scan_safe "$who")"
                     fi ;;
-                *)       where="$(_scan_safe "$who"), message or header" ;;
+                commit:*) where="$(_scan_safe "$who"), message or header" ;;
+                # A label no producer above writes: say nothing about it.
+                *)       where="(location not shown)" ;;
             esac
             printf '%s\t%s\t%s: %s\n' "$id" "$where" "$who" "$body"
         done <<<"$mout"
