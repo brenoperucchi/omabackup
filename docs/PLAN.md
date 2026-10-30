@@ -6005,3 +6005,53 @@ with the resolver changed to print a path when nothing exists, it fails
 where the old one passed. The `recentLog` comment that still said PATH comes
 first was rewritten, and the comment above `fallbackCli` now says a checkout
 loaded alongside a marketplace install talks to the installed CLI.
+
+### The push refusal says where, never what (2026-10-22)
+
+Contributed by Corey Tyhurst. The open item from the 2026-09-30 section:
+`report_secrets` still printed the matched line.
+
+**The gap.** The push refusal printed each hit as `scan_secrets` gave it,
+commit, path, line number and the line itself, cut to 160 bytes. push runs
+from the hourly timer, so the token went to the journal on every run until
+the history was rewritten. A hit on a file name or a commit message printed
+that name or message line.
+
+**The change.** `scan_secrets` emits `<rule>\t<where>\t<evidence>`. `<where>`
+is built while the commit, path and line are still separate (git grep's
+`<rev>:<path>:<line>:<text>` cannot be split back once a path holds a colon),
+and it names no path or ref that a rule matches, judged whole and per `/`
+part (`_scan_name_hidden`). `report_secrets` prints the rule and `<where>`
+only. The evidence field keeps the existing specs that read `scan_secrets`
+directly unchanged. The bundle's `refusing to build` prints `scan_files`'
+output, already redacted in review omabackup-73, so it is untouched.
+`docs/DESIGN.md` §6 states the rule.
+
+**Specs.** Five in `test/secrets.test.sh` on one repo holding a GitHub token
+in a file, an AWS key id as a file name and a Slack token in a commit
+message: none of the three is printed, the content hit reads
+`leaked.conf, line 1`, and the message hit still names its commit. The first
+four fail on `main`; the last is the control.
+
+`secrets` -- **149 passed, 0 failed**. Full suite in a network-less Arch
+container -- **1634 passed, 2 failed**, against `main`'s **1629 passed, 2
+failed** at `8b6b15a`. The failing set is identical to main's: the title-row
+eliding probe (no display fonts) and the VM preflight (no QEMU). Not run on
+a live Omarchy session.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
+
+**Review 85.** Both reviewers found one leak left: `git grep` quotes a path
+holding a control or non-ASCII byte and writes a newline as a literal `\n`.
+Against a file named `foo`, newline, AWS key, that `n` sat against the key,
+`\bAKIA` no longer matched, the name was judged safe and the key was printed
+in `<where>`. A quoted path is now never shown: the hit gives its commit and
+line only. The spec on a real repo with that file name failed before the fix.
+The message `case` also lists `commit:*` explicitly, and an unknown label
+prints "(location not shown)" instead of the label.
+
+Still open, older than this PR: the refusals raised while reading the refs
+print the ref name as it is ("the tag chain at ... is deeper than 32",
+"cannot read the tag object at", "names no target", "cannot identify what
+tag ... points at", "cannot read the blob at"), so a ref named after a token
+would reach the journal when one of them fires (review 86, rev-2).

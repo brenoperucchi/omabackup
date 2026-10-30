@@ -270,6 +270,10 @@ The same scanner also runs over staging before `sync` publishes anything into
 the worktree, so a credential caught there never reaches a commit; the
 push-time scan over every ref stays as the independent second layer.
 
+Every refusal says where, never what: the rule, the file and the line, or the
+commit. The matched text is not printed, and neither is a file or ref name a
+rule matches. `sync` and `push` run from timers whose output is the journal.
+
 ---
 
 ## 7. Plugin robustness

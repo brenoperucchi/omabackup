@@ -222,7 +222,9 @@ _still_matches() {
 }
 
 # scan_secrets <repo> <deny-file>
-# Prints `<rule-id>\t<commit>:<file>:<line>:<text>` per hit, nothing when clean.
+# Prints `<rule-id>\t<where>\t<commit>:<file>:<line>:<text>` per hit, nothing
+# when clean. <where> is safe to print: it never holds the matched text, nor a
+# name a rule matches. The third field is the evidence and is never printed.
 # Returns non-zero if the scan itself could not be carried out.
 scan_secrets() {
     local repo="$1" file="$2" id re ci hit rc=0
@@ -516,7 +518,7 @@ scan_secrets() {
             rc=1
             continue
         fi
-        local head="" want_head=1 body line_out
+        local head="" want_head=1 body line_out hpath where
         while IFS= read -r hit; do
             if [[ -z "$hit" ]]; then want_head=1; continue; fi
             if (( want_head )); then head="$hit"; want_head=0; continue; fi
@@ -528,7 +530,19 @@ scan_secrets() {
             # failure would have emptied the one part of the finding that says
             # where the secret is.
             line_out="$(printf '%s:%s' "$head" "$hit" | tr -c '[:print:]\t' '.')"
-            printf '%s\t%s\n' "$id" "${line_out:0:200}"
+            # The heading is "<rev>:<path>" and a rev holds no colon, so the
+            # first one splits it whatever the path holds.
+            hpath="${head#*:}"
+            # git quotes a path holding a control or non-ASCII byte and writes
+            # it with C escapes, so the rules no longer see the name as it is
+            # (a newline becomes a literal "\n" that defeats a \b before a key).
+            # Such a name is not decoded and not shown (review omabackup-85).
+            if [[ "$hpath" == \"* ]] || _scan_name_hidden "$hpath" "$patterns"; then
+                where="${head:0:12} (content of a file whose NAME is not shown), line ${hit%%:*}"
+            else
+                where="${head:0:12} $(_scan_safe "$hpath"), line ${hit%%:*}"
+            fi
+            printf '%s\t%s\t%s\n' "$id" "$where" "${line_out:0:200}"
         done <<<"$out"
         fi
 
@@ -552,7 +566,20 @@ scan_secrets() {
             ln="${hit%%:*}"; body="${hit#*:}"
             _still_matches "$body" "$re" "$ci" || continue
             who="${MSGWHO[$((ln - 1))]:-?}"
-            printf '%s\t%s: %s\n' "$id" "$who" "$body"
+            case "$who" in
+                path)    where="a file NAME in the history (not shown)" ;;
+                refname) where="a ref NAME (not shown)" ;;
+                tag:*|blob:*)
+                    if _scan_name_hidden "${who#*:}" "$patterns"; then
+                        where="${who%%:*}:(a ref whose NAME is not shown)"
+                    else
+                        where="$(_scan_safe "$who")"
+                    fi ;;
+                commit:*) where="$(_scan_safe "$who"), message or header" ;;
+                # A label no producer above writes: say nothing about it.
+                *)       where="(location not shown)" ;;
+            esac
+            printf '%s\t%s\t%s: %s\n' "$id" "$where" "$who" "$body"
         done <<<"$mout"
     done <<<"$patterns"
     return $rc
@@ -572,6 +599,23 @@ scan_secrets() {
 # _scan_safe <text> -- control bytes shown as "?", so a file name cannot drive
 # the terminal or the journal it is printed to (review omabackup-75).
 _scan_safe() { local x="$1"; printf '%s' "${x//[[:cntrl:]]/?}"; }
+
+# _scan_name_hidden <name> <patterns> -- 0 when a rule matches the name or any
+# "/"-separated part of it. A path or ref name is free to BE the token, and the
+# push refusal printed it as the place to look (see report_secrets). Judged per
+# part as well, so a rule anchored with ^ and $ still meets a directory name.
+_scan_name_hidden() {
+    local name="${1//$'\n'/ }" id re ci part
+    local -a parts=()
+    mapfile -d / -t parts < <(printf '%s' "$name")
+    while IFS=$'\t' read -r id re ci; do
+        [[ -n "$id" && -n "$re" ]] || continue
+        for part in "$name" "${parts[@]}"; do
+            _still_matches "$part" "$re" "$ci" && return 0
+        done
+    done <<<"$2"
+    return 1
+}
 
 # _scan_dir_hint <rel-path> <patterns> -- " in <dir>/" for a hidden name, so the
 # user knows where to look, unless the directory itself matches a pattern; then
@@ -1042,10 +1086,17 @@ report_secrets() {  # report_secrets <repo> <deny-file>
 
     printf '%somabackup: push blocked -- the deny-list matched what is about to leave this machine%s\n' \
         "$RED" "$NC" >&2
-    while IFS=$'\t' read -r id rest; do
+    # Where, never what. This printed the matched line, cut to 160 bytes, and
+    # push runs from an hourly timer whose stderr is the journal: every run
+    # until the history was rewritten copied the token there again. The staging
+    # scan stopped printing it in review omabackup-73 and sync --commit never
+    # did; this was the last gate that still did (docs/PLAN.md, 2026-09-30).
+    local where
+    while IFS=$'\t' read -r id where rest; do
         [[ -n "$id" ]] || continue
-        printf '  %s%s%s  %s\n' "$YELLOW" "$id" "$NC" "$(printf '%s' "$rest" | head -c 160)" >&2
+        printf '  %s%s%s  %s\n' "$YELLOW" "$id" "$NC" "$where" >&2
     done <<<"$hits"
+    printf '\n  The matched text is not printed here on purpose.\n' >&2
     printf '\n  A leak is irreversible, so this blocks rather than warns (docs/DESIGN.md §6).\n' >&2
     printf '  This scans every reachable commit, every commit message and tag body,\n' >&2
     printf '  and every object a ref names outright: deleting the file does not remove\n' >&2
