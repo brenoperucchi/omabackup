@@ -5965,3 +5965,43 @@ handled (round 84, rev-1).
 
 **Marketplace.** `#12564` keeps its number; its target moves to the 0.4.9
 release commit, which must stay `main`'s HEAD until the maintainers verify it.
+
+### The panel drives its own bundled CLI first (2026-10-22)
+
+Contributed by Corey Tyhurst. A standalone fix outside the phase plan.
+
+**The gap.** `resolveProc` in `Panel.qml` asked PATH for `omabackup` first and
+fell back to the plugin's bundled copy only when nothing on PATH answered.
+Nothing in this project puts `omabackup` on PATH, so on an ordinary install
+the two are the same file. On a machine with some other program installed
+under that name, the widget drove that program with this plugin's verbs and
+read its output as status.
+
+**The change.** The bundled copy is asked first. PATH stays as the fallback
+for a checkout loaded from outside the plugin directory, where the bundled
+path does not exist. One shell string swapped, and the comment above
+`fallbackCli` now says what the lookup is for rather than "on PATH when
+installed".
+
+**Specs.** Three in `test/panel.test.sh`. The resolver command is cut out of
+the real `Panel.qml` with `sed` and run with `sh -c` against fakes, so no
+quickshell is involved and the spec cannot drift from the source. Both
+present: the bundled copy wins (fails on `main`). Bundled copy absent: PATH
+answers. Neither: empty output, so `cliMissing` can be set. The two controls
+pass on both.
+
+`./test/run.sh panel` -- **75 passed, 1 failed** (the title-row eliding probe;
+the container has no display fonts). Full suite in a network-less Arch
+container -- **1632 passed, 2 failed**, against `main`'s **1629 passed, 2 failed** at
+`8b6b15a`. The failing set is identical to main's: the title-row eliding probe (no display fonts) and the VM preflight (no QEMU). Not run on a live Omarchy session.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
+
+**Review 85.** Both reviewers found that the "neither" spec passed without
+running the resolver: `PATH="$RS/path-absent" sh -c` could not find `sh`
+either, so the output was empty and `-z` passed. The spec now resolves `sh`
+first, requires exit status 1, and fails if the extracted command is empty;
+with the resolver changed to print a path when nothing exists, it fails
+where the old one passed. The `recentLog` comment that still said PATH comes
+first was rewritten, and the comment above `fallbackCli` now says a checkout
+loaded alongside a marketplace install talks to the installed CLI.
