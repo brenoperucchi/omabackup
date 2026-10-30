@@ -5996,3 +5996,12 @@ container -- **1632 passed, 2 failed**, against `main`'s **1629 passed, 2 failed
 `8b6b15a`. The failing set is identical to main's: the title-row eliding probe (no display fonts) and the VM preflight (no QEMU). Not run on a live Omarchy session.
 
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
+
+**Review 85.** Both reviewers found that the "neither" spec passed without
+running the resolver: `PATH="$RS/path-absent" sh -c` could not find `sh`
+either, so the output was empty and `-z` passed. The spec now resolves `sh`
+first, requires exit status 1, and fails if the extracted command is empty;
+with the resolver changed to print a path when nothing exists, it fails
+where the old one passed. The `recentLog` comment that still said PATH comes
+first was rewritten, and the comment above `fallbackCli` now says a checkout
+loaded alongside a marketplace install talks to the installed CLI.

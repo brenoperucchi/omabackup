@@ -72,7 +72,7 @@ printf '#!/bin/sh\nexit 0\n' >"$RS/path/omabackup"; chmod +x "$RS/path/omabackup
 printf '#!/bin/sh\nexit 0\n' >"$RS/plugin/omabackup"; chmod +x "$RS/plugin/omabackup"
 
 it "the panel resolves its own bundled CLI before anything named omabackup on PATH"
-if [[ "$(printf '%s\n' "$RESOLVE_CMD" | wc -l)" == 1 ]] \
+if [[ -n "$RESOLVE_CMD" && "$(printf '%s\n' "$RESOLVE_CMD" | wc -l)" == 1 ]] \
    && [[ "$(PATH="$RS/path:$PATH" sh -c "$RESOLVE_CMD" -- "$RS/plugin/omabackup")" == "$RS/plugin/omabackup" ]]; then
     ok
 else
@@ -80,12 +80,17 @@ else
 fi
 
 it "and falls back to PATH only when the bundled copy is missing"
-[[ "$(PATH="$RS/path:$PATH" sh -c "$RESOLVE_CMD" -- "$RS/plugin/absent")" == "$RS/path/omabackup" ]] \
+[[ -n "$RESOLVE_CMD" && "$(PATH="$RS/path:$PATH" sh -c "$RESOLVE_CMD" -- "$RS/plugin/absent")" == "$RS/path/omabackup" ]] \
     && ok || fail "with the bundled copy absent, resolveProc did not fall back to PATH"
 
+# sh is resolved up front: a PATH holding no omabackup holds no sh either, and
+# `PATH=... sh -c` would then fail to start, print nothing and pass without
+# running the resolver at all. Exit status 1 shows it ran and found nothing.
 it "and resolves nothing when neither exists, so cliMissing can be set"
-[[ -z "$(PATH="$RS/path-absent" sh -c "$RESOLVE_CMD" -- "$RS/plugin/absent")" ]] \
-    && ok || fail "resolveProc printed a path with no omabackup anywhere"
+RS_SH="$(command -v sh)"
+RS_OUT="$(PATH="$RS/path-absent" "$RS_SH" -c "$RESOLVE_CMD" -- "$RS/plugin/absent")"; RS_RC=$?
+[[ -n "$RESOLVE_CMD" && -z "$RS_OUT" && "$RS_RC" == 1 ]] \
+    && ok || fail "resolveProc printed '$RS_OUT' (exit $RS_RC) with no omabackup anywhere, or never ran"
 
 it "an error message set by a failed operation survives its own trailing refresh()"
 _qml_probe test/qml/error-message-survives-followup-refresh.qml \

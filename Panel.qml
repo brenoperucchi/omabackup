@@ -559,9 +559,10 @@ Panel {
     // scheduler, which the panel cannot render around at all,
     // destinations/scheduler are structurally essential while recentLog is
     // a 5-line cosmetic preview whose absence already has a defined
-    // meaning ("[] = nothing logged yet"). resolveProc prefers any
-    // `omabackup` already on PATH over this checkout's own binary -- an
-    // updated panel talking to an older CLI still on PATH would emit a v1
+    // meaning ("[] = nothing logged yet"). resolveProc asks the plugin's
+    // bundled CLI first, but a panel loaded from a checkout with no install
+    // beside it falls back to whatever `omabackup` is on PATH -- an
+    // updated panel talking to an older CLI there would emit a v1
     // document with no recentLog key at all, and requiring it here would
     // reject the WHOLE document (destinations, scheduler, config, all of
     // it) over one decorative field, turning an additive change into a
@@ -800,7 +801,10 @@ Panel {
   // OTHER program is installed under that name, asking PATH first drove that
   // program with this plugin's verbs and read its output as status. PATH is
   // kept only as the fallback for a checkout loaded from outside the plugin
-  // directory, where the bundled path does not exist.
+  // directory, where the bundled path does not exist. The bundled path is
+  // fixed, not derived from where this file was loaded: a checkout loaded
+  // while the marketplace install is also present talks to the installed
+  // CLI, not to the checkout's own bin/omabackup.
   readonly property string fallbackCli:
     Quickshell.env("HOME") + "/.config/omarchy/plugins/brenoperucchi.omabackup/bin/omabackup"
   readonly property string tuiCli:
