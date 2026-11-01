@@ -272,7 +272,8 @@ push-time scan over every ref stays as the independent second layer.
 
 Every refusal says where, never what: the rule, the file and the line, or the
 commit. The matched text is not printed, and neither is a file or ref name a
-rule matches. `sync` and `push` run from timers whose output is the journal.
+rule matches, including when the scan itself stops on a ref it cannot read.
+`sync` and `push` run from timers whose output is the journal.
 
 ---
 
