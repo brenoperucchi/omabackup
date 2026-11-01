@@ -225,7 +225,7 @@ publish_staging() {
     local -A destcount=()
     while IFS= read -r -d '' f; do
         rel="${f#"$staging"/}"
-        [[ "$rel" == .generated/* || "$rel" == .plugins/* ]] && continue
+        [[ "$rel" == .generated/* || "$rel" == .plugins/* || "$rel" == .secrets/* ]] && continue
         # map_to_repo's own refusal (a path this cannot map without
         # guessing -- .local/bin with no trackedRepoPath override, say)
         # used to vanish into a bare `continue`: the file stayed staged,
@@ -254,6 +254,21 @@ publish_staging() {
             [[ -f "$f" ]] || continue
             dst="$(_generated_repo_name "$f")" || continue
             rels+=(".generated/${f##*/}"); dsts+=("$dst")
+        done
+    fi
+    # The secrets group's ciphertext, flat under .secrets/. Each file is
+    # checked for the age header here as well as in cmd_sync: this is the
+    # last step before the repo, and a file that is not ciphertext must not
+    # get past it whoever called publish (lib/vault.sh).
+    if [[ -d "$staging/.secrets" ]]; then
+        for f in "$staging"/.secrets/*; do
+            [[ -e "$f" || -L "$f" ]] || continue
+            if ! _secrets_is_age "$f"; then
+                printf 'omabackup: .secrets/%s is not age ciphertext -- refusing to publish it\n' "${f##*/}" >&2
+                failed=$((failed + 1))
+                continue
+            fi
+            rels+=(".secrets/${f##*/}"); dsts+=("secrets/age/${f##*/}")
         done
     fi
     if [[ -f "$staging/.plugins/manifest.txt" ]]; then
