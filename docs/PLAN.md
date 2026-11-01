@@ -6055,3 +6055,31 @@ print the ref name as it is ("the tag chain at ... is deeper than 32",
 "cannot read the tag object at", "names no target", "cannot identify what
 tag ... points at", "cannot read the blob at"), so a ref named after a token
 would reach the journal when one of them fires (review 86, rev-2).
+
+### Refusals raised while reading the refs name no matching ref (2026-11-01)
+
+Contributed by Corey Tyhurst. Closes the "still open" paragraph at the end of
+the previous section (review 86, rev-2).
+
+**The gap.** Five refusals in the walk over the refs printed the ref name as it
+is, and the walk runs before any rule, so a ref named after a token reached the
+journal with no hit ever reported.
+
+**The change.** `_scan_ref_label` judges the name with `_scan_name_hidden` and
+prints `(a ref whose NAME is not shown)` when a rule matches, or the name
+through `_scan_safe` when none does. All five call it. Each is still a refusal.
+`for-each-ref` does not quote, so unlike the paths from `git grep` the rules
+meet the raw name and nothing is hidden unread.
+
+**Specs.** In `test/secrets.test.sh`: a real chain of 34 nested tags, and a
+PATH shim failing exactly one git call for the other four refusals. Also a token
+as one part of a ref name, and a token behind a non-ASCII byte. Seven fail on
+`main`; two are controls.
+
+`secrets` -- **167 passed, 0 failed**. Full suite in a network-less Arch
+container -- **1655 passed, 2 failed**, against `main`'s **1639 passed, 2
+failed** at `928b589`. The failing set is identical to main's: the title-row
+eliding probe (no display fonts) and the VM preflight (no QEMU). Not run on a
+live Omarchy session.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
