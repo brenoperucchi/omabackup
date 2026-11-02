@@ -6318,3 +6318,23 @@ dispatcher had closed the round as partial, blind to rev-2's. Full suite on main
 with PRs 8 and 9: **1771 passed, 0 failed**.
 
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
+
+### The usage text names every verb a person runs (2026-10-23)
+
+Contributed by Corey Tyhurst. `omabackup help` left out `install`, `sync`,
+`bundle` and `push`, four verbs the dispatch accepts and a person runs by
+hand. They are added, and `test/help.test.sh` cuts the verbs out of the real
+dispatch `case` and checks both directions, with `log-event` and `kill-group`
+named as internal on purpose. The "every verb" spec fails on `main`; the
+other two are controls. `help` -- **3 passed, 0 failed**. Full suite in a
+network-less Arch container -- **1642 passed, 2 failed** against **1639
+passed, 2 failed** at `928b589`, failing set identical (title-row eliding
+probe, VM preflight). Not run on a live Omarchy session.
+
+**Review 93**, the same round as PR 9's. Both reviewers approved. Both found
+that the extraction only sees an arm written on one line with one label and
+`cmd_` on it; rev-1 showed that an alias (`foo|bar)`) or a body on the next line
+is skipped and then neither direction fails. Rev-2 added that the `sync` line
+omits that verify can stop the commit. Both suggested to Corey as a follow-up.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
