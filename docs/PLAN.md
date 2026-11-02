@@ -6056,10 +6056,235 @@ print the ref name as it is ("the tag chain at ... is deeper than 32",
 tag ... points at", "cannot read the blob at"), so a ref named after a token
 would reach the journal when one of them fires (review 86, rev-2).
 
+### The secrets group encrypts for age recipients (2026-10-31)
+
+Step 1 of 5 of the secrets plan. The other steps are recorded below.
+
+**Starting point.** Before this, the CLI encrypted nothing. The `secrets`
+group was disabled, its `allowList` was accepted by the validator and read by
+no code, and the two `.age` files in the dotfiles repo were made by hand with
+`age -p`, which no timer can refresh (DESIGN §11.4).
+
+**The design** comes from consultation omabackup-26 (both reviewers) and
+Breno's decisions of 2026-10-31.
+
+- The group has a new mode, `age`. The shipped manifest enables it, and it
+  stays a no-op until `~/.config/omabackup/secrets/files.json` exists.
+- That file and `recipients.txt` are local configuration. The repo is never
+  the authority on who can decrypt. A changed recipients file stops the sync
+  until `omabackup secrets accept` records it.
+- Each file is read once into a private directory, hashed and encrypted from
+  that copy with `age -R`. It reaches the repo as `secrets/age/<name>.age`,
+  next to an encrypted `_index.age` that holds each file's live path and mode.
+- Local state keeps a sha256 of each plaintext, the recipients' fingerprint
+  and the ciphertext's sha256. When all three still match, the sync reuses the
+  ciphertext already in the repo, so an unchanged secret is not a new commit.
+  The hash is never published.
+- A header gate in staging and on the blob about to be committed refuses any
+  file under `secrets/age/` that does not start with `age-encryption.org/v1`.
+  It is the only gate that works there: the deny-list reads text.
+- `secrets drill -i` decrypts everything with a person's identity, compares it
+  with the live files and records the date per recipient. `verify` warns on a
+  recipient never drilled, or not drilled in 90 days.
+- `secrets restore -i` plans by default. `--apply` writes, and `--force`
+  replaces a file that differs. Because age does not authenticate the sender,
+  the index is treated as input: an entry is restored only to a plain name
+  under `~/` with no `.` or `..` component.
+
+**Specs.** There were 42 in `test/vault.test.sh`, each driving the CLI. The
+first 40 were written before the code and 28 of them failed against it; the
+other 12 are guards that held vacuously, such as "the drill never prints the
+secret". The last two cover the forged index and a `files.json` path outside
+`~/`. Both failed before their fix and pass after. The encrypted rescue
+identity (`-i` on an `age -p` file) needs a terminal for the passphrase and is
+not covered by a spec.
+
+**Review 87.** Both reviewers asked for changes. Each fix below has a spec
+that failed before it.
+
+- **Large secrets.** The commit gate read the blob through a pipe that `head`
+  closed early. Under `pipefail`, a secret above about 64 KiB looked like
+  plaintext, and every sync after it failed. The blob is now written to a
+  file first.
+- **Overlapping groups.** A secret inside a tree another group copies was
+  also staged in the clear. Review 88 replaced the first fix; see below.
+- **Ciphertext checked before staging.** Each output is produced in the
+  private directory and checked for the age header there, so neither an age
+  that writes plaintext and then fails nor a bare `collect` leaves anything
+  in staging.
+- **Recipients.** They are read once, and the sync hands age the same
+  normalized lines that `accept` fingerprinted. `accept` also runs each key
+  through age's parser, so a bad checksum or a space inside a key is refused
+  there.
+- **Restore.**
+  - The real directory must sit under `~/`, checked before and after it is
+    created.
+  - The temporary file is a new one made by `mktemp`.
+  - The mode keeps only the owner bits and is at least 600.
+- **Private writers.** The state, accept and drill files are written through
+  `mktemp` and a rename.
+- **Drill.** It takes one identity at a time, so a file holding A and B
+  cannot stamp B as proven.
+- **Paths.** `files.json` follows the same path rule as restore.
+- **Leftovers.** Each run removes the plaintext directory a dead run left in
+  the persistent fallback.
+- **Artifact restores.** A restore plan from an artifact now names
+  `secrets/age/` and the command that restores it.
+
+**Review 88.** Excluding the secrets from other groups by spelling left
+holes: a symlinked spelling, a hardlink, a trailing space, and the
+tracked-only and triple collectors, which never read the exclusions. It is
+replaced by two checks.
+
+- Before any collector runs, `collect` refuses a secret whose real path is,
+  or lies under, the real path of anything another group collects. The
+  triple group counts too, since its patches carry file contents as text.
+- After the collectors run, any staged file with the same size and sha256 as
+  a secret read in that run refuses the whole collect, whatever its name.
+
+Other fixes in this round:
+
+- An empty `files.json` is the group switched off, not an error.
+- A leftover directory with no owner PID in its name is kept.
+- The restore plan refuses a destination outside `~/` just as `--apply`
+  does.
+- The restore temporary is removed by the EXIT trap.
+- `files.json` refuses a path ending in whitespace.
+
+Restore still checks and then renames by path rather than holding directory
+descriptors. Review 89 showed why "anyone who can swap a directory can edit
+`~/.bashrc`" does not hold for a subdirectory shared with another account,
+so that case is now refused instead (below).
+
+**Review 89.** Both reviewers found that the byte check depended on the
+secrets group running. With `--groups` leaving it out, or with
+`enabled:false`, a copy of a secret was committed in the clear. Each fix
+below has a spec that failed before it.
+
+- The declared files are now fingerprinted at the start of every collect,
+  whichever groups run.
+- A failed listing or hash refuses the collect, and the refusal never names
+  the copy, whose name could be the secret.
+- A restore's temporary is refused by its reserved name, since it may hold
+  an older version that no current hash matches.
+- An empty list needs neither age nor recipients, in collect and in verify.
+- Restore refuses a destination when any directory between it and `~/` is
+  not owned by the user or is writable by group or others.
+
+A known limitation, kept on purpose: a secret under a path another group
+collects is refused even when that group's `exclude` or the manifest's
+`excluded[]` names it. Exclusions compared by spelling were what failed in
+rounds 87 and 88. None of the secrets Breno plans to add lies under a group
+in the shipped manifest.
+
+**Review 90.** rev-2 approved. rev-1 found five more ways around the byte
+check or the restore checks, each now covered by a spec that failed before
+the fix.
+
+- A restore's temporary is refused on every collect, with or without a
+  `files.json`: a machine that only ever restored has no list but can still
+  hold one.
+- A git plugin's patch carries a file's bytes as `+` lines, so a copy of a
+  secret inside a plugin no longer matched by hash. The plugin's files are
+  now checked before the patch is made, for the secret's bytes and for the
+  reserved name.
+- A declared secret that is a symlink, is not a regular file, or is over
+  1 MiB is refused before any collector runs, whichever groups are
+  selected. collect_age uses the same check.
+- The fingerprint reads each secret once into the private directory and
+  takes both its size and its hash from that copy. Taken from the live path
+  at two moments, they could describe two versions and match no file.
+- Restore also requires every directory above the home to belong to root or
+  to the user, and one that others can write to to have the sticky bit.
+  Otherwise whoever owns that directory could rename the home between the
+  checks and the write.
+
+**Review 91.** Both reviewers asked for changes. Each fix below has a spec
+that failed before it.
+
+- rev-2: on a machine that only restored there is no `files.json`, so a
+  restore that wrote a secret under a path another group collects was
+  committed in the clear by the next sync. Restore now refuses such a
+  destination, in the plan and in `--apply`, with the same real-path rule
+  collect uses. rev-2 left open whether to refuse or only warn. It refuses,
+  for symmetry with collect.
+- rev-1: a git plugin's patch also carries HEAD's version of each file it
+  touches, as removed and context lines. A copy of a secret committed in a
+  plugin, then edited or deleted, is now checked as HEAD has it, and so is
+  a restore's temporary deleted from HEAD.
+- rev-1: restore decrypts ciphertext anyone holding the public keys can
+  write. Each secret and the index are now capped at 1 MiB once decrypted,
+  the index at 1000 entries, and each decrypt at 60 seconds
+  (`OMABACKUP_SECRETS_DECRYPT_TIMEOUT`). The partial plaintext is removed
+  on every failure.
+- rev-1: an index with control characters is refused before anything is
+  printed, since the plan is the control a person reads. `files.json`
+  refuses them as well.
+
+The byte check over staging now keeps its listing in memory, so it runs
+even when the state directory is not writable. It skips a staged directory
+it cannot list, which publish could not read either. Two coverage specs
+caught that once the check ran on every collect.
+
+**Review 92, the last of six rounds.** rev-2 approved. rev-1 found three
+more gaps, each now covered by a spec that failed before the fix.
+
+- `--groups` narrowed the groups restore compared a destination with, so
+  `secrets restore --groups secrets` could still write a secret where the
+  next full sync collects it in the clear. The comparison now always uses
+  every enabled group, in restore and in collect.
+- Collect could write an index that restore refuses. Collect now refuses a
+  list of more than 1000 files and an index over 1 MiB, the limits restore
+  applies.
+- `OMABACKUP_SECRETS_DECRYPT_TIMEOUT=0` switched the deadline off, because
+  GNU timeout reads 0 as no deadline. The override must be a whole number of
+  seconds from 1 to 9999.
+
+With six rounds used, the unit went to the scout's third analysis
+(`omabackup-27`) instead of a seventh round. The scout confirmed the three
+fixes and found one more gap: restore accepted a destination inside the
+backup itself, so an index naming `~/<repo>/x.env` wrote the plaintext into
+the backup's worktree. Restore now refuses any destination inside the
+configured repo, the directory `--from` names, or the git tree holding it,
+by real path, in the plan and again before `--apply` writes. The scout also
+pointed to a cheap spec for the index-over-1-MiB refusal: 280 names for one
+file with a long path, and a stand-in age. That spec found that the index
+was passed to jq as an argument, so any index over 128 KiB broke collect
+with "Argument list too long". It now goes through stdin.
+
+A second known limitation, from rev-2: restore refuses a home that is
+writable by its group, even on a distro where that group has only the user
+in it. The Omarchy home is `700`, and the refusal says what to change.
+
+Still open, for Breno: whether a restore on a machine that has its own
+`files.json` should cross-check the index against it. Today the printed plan
+is the control, and on a new machine there is no `files.json` yet.
+
+**Breno's decisions for the remaining steps.** Disaster recovery only, not
+sync between machines. The keyring (`Default_keyring.keyring`, which has no
+password on this machine: LUKS plus sddm autologin) and the NSS database go
+into a vault kept only next to the `dir` bundle, never in git history. The
+`.env` files, SSH and rclone stay in git, encrypted. There are two
+recipients: identity A in 1Password and identity B wrapped with a passphrase
+Breno memorizes. Out of scope: StripeCLI.keyring, login.keyring.bak,
+user.keystore (207 bytes, no certificate), the ssh `.bak` files, gnupg and
+kwallet. The order is:
+
+1. the mechanism (this section);
+2. the `.env` files and SSH;
+3. the NSS database, through `sqlite3 .backup`;
+4. the keyring plus `keyrings/default`, with a restore runbook;
+5. a Secret Service export, only if the goal changes.
+
+**Migration.** Breno adds `rclone.conf` and `khronos.master.key` to
+`files.json`. The old `secrets/*.age` files stay where they are, since publish
+never deletes, and are removed by hand after the first drill passes.
+
 ### Refusals raised while reading the refs name no matching ref (2026-11-01)
 
 Contributed by Corey Tyhurst. Closes the "still open" paragraph at the end of
-the previous section (review 86, rev-2).
+the 2026-10-22 section, "The push refusal says where, never what" (review 86,
+rev-2).
 
 **The gap.** Five refusals in the walk over the refs printed the ref name as it
 is, and the walk runs before any rule, so a ref named after a token reached the
@@ -6081,5 +6306,15 @@ container -- **1655 passed, 2 failed**, against `main`'s **1639 passed, 2
 failed** at `928b589`. The failing set is identical to main's: the title-row
 eliding probe (no display fonts) and the VM preflight (no QEMU). Not run on a
 live Omarchy session.
+
+**Review 93**, with PR 8 on top of `main` at `f079b50`. Both reviewers approved.
+Rev-2 noted that `nested-33` alone is 33 tag objects deep and is refused too,
+so the key spec relies on `refs/tags/AKIA...` sorting first; `seq 1 32` would
+remove that. Suggested to Corey as a follow-up. Rev-1 first stopped its
+attestation because `herdr pane current --current` returned the focused pane of
+another space: the Codex sandbox hides `HERDR_*`, so the command falls back to
+the UI focus. Its `herdr agent get` matched, and it wrote its verdict after the
+dispatcher had closed the round as partial, blind to rev-2's. Full suite on main
+with PRs 8 and 9: **1771 passed, 0 failed**.
 
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
