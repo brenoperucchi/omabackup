@@ -6338,3 +6338,32 @@ is skipped and then neither direction fails. Rev-2 added that the `sync` line
 omits that verify can stop the commit. Both suggested to Corey as a follow-up.
 
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
+
+### A passphrase-wrapped identity is accepted in its armored form (2026-11-02)
+
+Found while writing Breno's setup runbook for the secrets group. Identity B is
+wrapped with `age -p` and printed, and only the armored form (`age -p -a`)
+survives paper. `_secrets_load_identity` recognised a wrapped identity by the
+binary header alone, so the armored file was read as a plain identity and
+refused with "holds no age identity". `_secrets_identity_wrapped` now takes
+either header, `-----BEGIN AGE ENCRYPTED FILE-----` included, and age unlocks
+both. The gate on `secrets/age/` still takes binary only.
+
+**Specs.** A stand-in age plays the person typing the passphrase: `age -d --
+<file>` unlocks with a key of its own and every other call goes to the real
+age. The binary form passes before and after (control). The armored form
+through drill and through restore, and an armored file that does not unlock
+being refused as "could not unlock", fail before the fix.
+
+**Review 94.** Both reviewers approved, rev-1 after a PTY probe with the real
+age (binary, armored and CRLF unlock; a plain identity whose comment names the
+header stays plain; a wrong passphrase is "could not unlock"). Rev-2 found that
+age skips blank lines above the armor header and the detection did not, so a
+copy typed back from paper with an empty first line was refused as "holds no
+age identity". The first line that is not blank is now the one judged; the spec
+with blank lines on top failed before that change, and a plain identity whose
+comment names the header is a control. Out of scope and older than this: a
+wrapped identity given through a symlink is read as plain, binary or armored.
+`vault`: **117 passed, 0 failed**.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
