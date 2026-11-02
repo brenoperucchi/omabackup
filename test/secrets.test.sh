@@ -1525,3 +1525,93 @@ V9S_OUT="$(bash -c 'source lib/common.sh 2>/dev/null || true; source lib/secrets
 it "a name hidden by a piece before a newline gets no hint that prints it"
 assert_contains "$V9S_OUT" "(a file NAME, not shown)"
 assert_not_contains "$V9S_OUT" "abcdefghijklmnop"
+
+# ── a refusal raised while reading the refs names no matching ref ────────────
+# Five refusals in scan_secrets' walk over the refs printed the ref name as it
+# is. The walk runs before any rule is applied, so a repository the walk could
+# not finish put a ref named after a token in the journal with no hit ever
+# reported, on every hourly run (docs/PLAN.md, the end of the 2026-10-22 section,
+# review 86). The tag chain is a real repository; the other four need a git that
+# fails on one call, so the shim fails exactly that call and execs the real one.
+_rr_key="AKIA""IOSFODNN7EXAMPLE"
+RRH="$(mktemp -d)"; mkdir -p "$RRH/stub"
+cat >"$RRH/stub/git" <<STUB
+#!/bin/bash
+if [[ -n "\${RR_GIT_MATCH:-}" && "\$*" == *"\$RR_GIT_MATCH"* ]]; then
+    [[ -n "\${RR_GIT_PRINT:-}" ]] && printf '%s\n' "\$RR_GIT_PRINT"
+    exit "\${RR_GIT_RC:-1}"
+fi
+exec "$(command -v git)" "\$@"
+STUB
+chmod +x "$RRH/stub/git"
+
+_rr_repo() {  # _rr_repo <dir> <blob|tag> <ref name under refs/tags>
+    local r="$1"
+    _sec_repo "$r" "" ""
+    if [[ "$2" == blob ]]; then
+        git -C "$r" update-ref "refs/tags/$3" "$(printf 'data\n' | git -C "$r" hash-object -w --stdin)"
+    else
+        git -C "$r" tag -a -m m "$3" HEAD
+    fi
+}
+
+_rr_scan() {  # _rr_scan <repo> -- sets RR_OUT and RR_RC, stderr included
+    RR_RC=0
+    RR_OUT="$(PATH="$RRH/stub:$PATH" scan_secrets "$1" "$PWD/secrets.deny.json" 2>&1)" || RR_RC=$?
+}
+
+RRD="$RRH/deep"; _sec_repo "$RRD" "" ""
+rr_prev=HEAD
+for rr_i in $(seq 1 33); do
+    git -C "$RRD" tag -a -m m "nested-$rr_i" "$rr_prev" 2>/dev/null
+    rr_prev="nested-$rr_i"
+done
+git -C "$RRD" tag -a -m m "$_rr_key" "$rr_prev" 2>/dev/null
+_rr_scan "$RRD"
+it "a tag chain too deep to follow does not print a ref named after a token"
+assert_contains "$RR_OUT" "deeper than 32"
+assert_not_contains "$RR_OUT" "$_rr_key"
+it "and it is still a refusal, not a clean scan"
+assert_eq "$RR_RC" "1"
+
+git -C "$RRD" tag -d "$_rr_key" >/dev/null
+git -C "$RRD" tag -a -m m "aaa-chain" "$rr_prev" 2>/dev/null
+_rr_scan "$RRD"
+it "a ref no rule matches is still named, so the user knows where to look"
+assert_contains "$RR_OUT" "refs/tags/aaa-chain"
+
+RRT="$RRH/tag"; _rr_repo "$RRT" tag "$_rr_key"
+RR_GIT_MATCH="cat-file tag" _rr_scan "$RRT"
+it "an unreadable tag object does not print a ref named after a token"
+assert_contains "$RR_OUT" "cannot read the tag object"
+assert_not_contains "$RR_OUT" "$_rr_key"
+
+RR_GIT_MATCH="cat-file tag" RR_GIT_PRINT="tag x" RR_GIT_RC=0 _rr_scan "$RRT"
+it "a tag object with no target does not print a ref named after a token"
+assert_contains "$RR_OUT" "names no target"
+assert_not_contains "$RR_OUT" "$_rr_key"
+
+RR_GIT_MATCH="cat-file -t" _rr_scan "$RRT"
+it "a tag target git cannot identify does not print a ref named after a token"
+assert_contains "$RR_OUT" "cannot identify what tag"
+assert_not_contains "$RR_OUT" "$_rr_key"
+
+RRB="$RRH/blob"; _rr_repo "$RRB" blob "$_rr_key"
+RR_GIT_MATCH="cat-file blob" _rr_scan "$RRB"
+it "an unreadable blob does not print a ref named after a token"
+assert_contains "$RR_OUT" "cannot read the blob"
+assert_not_contains "$RR_OUT" "$_rr_key"
+
+RRP="$RRH/part"; _rr_repo "$RRP" tag "$_rr_key/release"
+RR_GIT_MATCH="cat-file tag" _rr_scan "$RRP"
+it "a token that is one part of a ref name is hidden with the rest of it"
+assert_contains "$RR_OUT" "cannot read the tag object"
+assert_not_contains "$RR_OUT" "$_rr_key"
+
+# git quotes a path, and that defeated the \b in front of a key (review 85).
+# for-each-ref does not quote, so the rule meets the raw bytes: this pins it.
+RRU="$RRH/utf8"; _rr_repo "$RRU" tag "é$_rr_key"
+RR_GIT_MATCH="cat-file tag" _rr_scan "$RRU"
+it "a token behind a non-ASCII byte in a ref name is hidden too"
+assert_contains "$RR_OUT" "cannot read the tag object"
+assert_not_contains "$RR_OUT" "$_rr_key"

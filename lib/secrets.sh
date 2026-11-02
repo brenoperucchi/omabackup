@@ -396,12 +396,12 @@ scan_secrets() {
                 while [[ -n "$tobj" ]]; do
                     if (( tdepth >= 32 )); then
                         printf '%somabackup: the tag chain at %s is deeper than 32 -- refusing to call it clean%s\n' \
-                            "$RED" "$rname" "$NC" >&2
+                            "$RED" "$(_scan_ref_label "$rname" "$patterns")" "$NC" >&2
                         return 1
                     fi
                     bl="$(git -C "$repo" cat-file tag "$tobj" 2>/dev/null)" \
                         || { printf '%somabackup: cannot read the tag object at %s -- refusing to call it clean%s\n' \
-                                 "$RED" "$rname" "$NC" >&2; return 1; }
+                                 "$RED" "$(_scan_ref_label "$rname" "$patterns")" "$NC" >&2; return 1; }
                     while IFS= read -r bline; do
                         [[ -n "$bline" ]] || continue
                         pairs+="tag:$rname"$'\t'"$bline"$'\n'
@@ -409,19 +409,19 @@ scan_secrets() {
                     tobj="$(printf '%s' "$bl" | awk '/^object /{print $2; exit}')"; tarc=$?
                     if (( tarc != 0 )) || [[ -z "$tobj" ]]; then
                         printf '%somabackup: the tag object at %s names no target -- refusing to call it clean%s\n' \
-                            "$RED" "$rname" "$NC" >&2
+                            "$RED" "$(_scan_ref_label "$rname" "$patterns")" "$NC" >&2
                         return 1
                     fi
                     ttype="$(git -C "$repo" cat-file -t "$tobj" 2>/dev/null)" \
                         || { printf '%somabackup: cannot identify what tag %s points at -- refusing to call it clean%s\n' \
-                                 "$RED" "$rname" "$NC" >&2; return 1; }
+                                 "$RED" "$(_scan_ref_label "$rname" "$patterns")" "$NC" >&2; return 1; }
                     [[ "$ttype" == tag ]] || break
                     tdepth=$((tdepth + 1))
                 done ;;
             blob)
                 bl="$(git -C "$repo" cat-file blob "$robj" 2>/dev/null)" \
                     || { printf '%somabackup: cannot read the blob at %s -- refusing to call it clean%s\n' \
-                             "$RED" "$rname" "$NC" >&2; return 1; }
+                             "$RED" "$(_scan_ref_label "$rname" "$patterns")" "$NC" >&2; return 1; }
                 while IFS= read -r bline; do
                     [[ -n "$bline" ]] || continue
                     pairs+="blob:$rname"$'\t'"$bline"$'\n'
@@ -615,6 +615,20 @@ _scan_name_hidden() {
         done
     done <<<"$2"
     return 1
+}
+
+# _scan_ref_label <refname> <patterns> -- a ref name fit for a refusal raised
+# while the refs are still being read. Those refusals fire before any rule has
+# run, so nothing had judged the name and a ref named after a token went to the
+# journal on every timer run while the repository stayed unreadable (review 86).
+# for-each-ref does not quote, so unlike git grep's paths the rules meet the
+# name as it is and no quoted form needs hiding unread.
+_scan_ref_label() {
+    if _scan_name_hidden "$1" "$2"; then
+        printf '(a ref whose NAME is not shown)'
+    else
+        _scan_safe "$1"
+    fi
 }
 
 # _scan_dir_hint <rel-path> <patterns> -- " in <dir>/" for a hidden name, so the
