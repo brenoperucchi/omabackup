@@ -6367,3 +6367,40 @@ wrapped identity given through a symlink is read as plain, binary or armored.
 `vault`: **117 passed, 0 failed**.
 
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
+
+### Release 0.5.0 (2026-11-02)
+
+Minor version: the `secrets` group is new. It carries #6 and #7 (both from
+Corey Tyhurst), #8 and #9 (Corey, review 93), #10
+(the secrets mechanism, rounds 87 to 92 and the scout) and #11 (the armored
+identity, rounds 94 and 95). `manifest.json` goes to 0.5.0, the only place the
+version lives.
+
+**This machine, before the release.** The timers ran the main checkout at
+`~/Devs/omabackup` (`56785dc`, which reports 0.4.4), not the plugin, because
+`install` had been run from there; the plugin itself was at `d2f22b3` (0.4.7).
+On 2026-11-02 `omarchy plugin update` moved the plugin to `main`'s HEAD
+(`3e37b79`: it follows the default branch, not the marketplace tag), and
+`install` was rerun from the plugin's `bin`, so both units now start
+`~/.config/omarchy/plugins/brenoperucchi.omabackup/bin/omabackup` with
+`UMask=0077`. A manual sync and push both succeeded. The main checkout keeps
+its uncommitted `docs/PLAN.md` and `docs/plans/` and is no longer used by the
+timers.
+
+**Marketplace.** A new `[Verify]: OmaBackup 0.5.0` issue targets the release
+commit, which must stay `main`'s HEAD until the maintainers verify it. The
+standard-installation box stays unchecked, as on `#12564`: `install` is a
+manual step.
+
+**Review 96, on the notes.** Both reviewers checked every claim against the
+code since `v0.4.9`; both asked for the test count, left as a placeholder until
+the full suite on the release commit finished. Both found the panel line too
+narrow: another copy of OmaBackup on PATH is affected too. Rev-1 asked for the
+`.omabackup-restore.*` refusal, which runs on every collect, and for the
+declared-file checks holding under `--groups`; rev-2 had judged the name
+unreachable from 0.4.9 and left it out, so the notes now state it as a fact
+without calling it a likely upgrade problem. Rev-1 also asked that reused
+ciphertext depend on unchanged recipients and local state, as `_secrets_seal`
+does. Rev-2 added the `OMABACKUP_GROUPS` case (a manifest of one's own keeps
+the old `secrets` group) and that the panel change needs a shell restart. No
+unit changed since 0.4.9, so `reload` is not needed for the services.

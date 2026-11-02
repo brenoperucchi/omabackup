@@ -7,6 +7,78 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 loosely while it is pre-1.0: patch releases may still change behaviour when the
 change closes a security hole, and such changes are always called out here.
 
+## [0.5.0] — 2026-11-02
+
+The `secrets` group can now keep files such as `rclone.conf` in your backup,
+encrypted with [age](https://github.com/FiloSottile/age) for public keys you
+choose. It does nothing until you list files for it. Refusals from the secret
+scan before a push no longer print what they matched.
+
+### Read before upgrading
+
+- Nothing changes for the `secrets` group until you list files in
+  `~/.config/omabackup/secrets/files.json`. Once you do, `sync` needs
+  `age` and a `recipients.txt` you accepted with `omabackup secrets accept`,
+  and stops until both are in place. A changed `recipients.txt` stops it again
+  until you accept it.
+- `collect` refuses while a file you listed could leave in the clear by
+  another route: a group that copies its path, a staged file with the same
+  bytes, or a git plugin whose patch carries them. This holds even when the
+  `secrets` group is left out with `--groups`. `collect` also refuses a staged
+  file, or a file in a git plugin's patch, named `.omabackup-restore.*`, the
+  temporary name `secrets restore` writes through.
+- If `OMABACKUP_GROUPS` points at your own manifest, its `secrets` group keeps
+  the old definition. Set its `mode` to `age` and remove `"enabled": false`
+  before listing files.
+- The panel runs the CLI bundled with the plugin before anything named
+  `omabackup` on your PATH, another copy of OmaBackup included. Restart the
+  shell, or run `omabackup reload`, for the panel to pick this up.
+
+### Added
+
+- The `secrets` group has mode `age`. Each file named in `files.json` is
+  encrypted with `age -R` for the keys in `recipients.txt`, and only the
+  ciphertext reaches `secrets/age/` in the repository, next to an encrypted
+  index of where each file lives. Both files are local config, so whoever
+  controls the repository cannot add a recipient. A file must be regular, not
+  a symlink, and at most 1 MiB, and the list holds at most 1000 files. A file
+  that has not changed keeps its ciphertext while the recipients and the local
+  state stay the same, so a sync with nothing new is not a commit.
+- `omabackup secrets drill -i <identity>` decrypts every file with one
+  identity and compares it with the live copy. `verify` warns about each
+  recipient never drilled, or not drilled in 90 days.
+- `omabackup secrets restore -i <identity>` prints a plan and writes only with
+  `--apply`. It never replaces a file that differs unless you pass `--force`,
+  and it writes only into directories private to you under `~/`, never inside
+  the backup or under a path another group copies in the clear.
+- An identity file wrapped with `age -p` works with `-i`, binary or armored
+  (`age -p -a`, the form you can print). age asks for its passphrase.
+- `omabackup help` lists `install`, `sync`, `bundle` and `push`.
+
+### Security
+
+- A push refusal names the rule and where to look (the commit, the file and
+  the line) and no longer prints the matched text. The hourly push used to
+  copy it to the journal on every run until the history was rewritten. A file
+  or ref name a rule matches is not printed either, and neither is a file name
+  git prints quoted.
+- The refusals raised while the push scan reads the refs (a tag chain deeper
+  than 32, an unreadable tag or blob, a tag with no target) no longer print a
+  ref name a rule matches.
+
+### Testing
+
+- Full suite on a real Omarchy session: 1777 passed, 0 failed.
+
+### Thanks
+
+- [Corey Tyhurst](https://github.com/coreytyhurst) wrote the push refusal
+  redaction in [PR #7](https://github.com/brenoperucchi/omabackup/pull/7), the
+  panel CLI order in [PR #6](https://github.com/brenoperucchi/omabackup/pull/6),
+  the complete usage text in
+  [PR #8](https://github.com/brenoperucchi/omabackup/pull/8) and the ref name
+  redaction in [PR #9](https://github.com/brenoperucchi/omabackup/pull/9).
+
 ## [0.4.9] — 2026-10-22
 
 Backups are now readable by their owner only. Earlier versions wrote every
