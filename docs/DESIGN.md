@@ -254,9 +254,35 @@ The golden stays intact; the overlay is disposable. No `libvirt` — just
 
 ## 6. Secrets
 
-**An explicit allow-list**, not a deny-list. Nothing enters `secrets/` without
-being named in the manifest; today that is two files (`rclone.conf.age`,
-`khronos.master.key.age`), encrypted with `age`.
+**An explicit allow-list**, not a deny-list. Nothing enters `secrets/age/`
+without being named in `~/.config/omabackup/secrets/files.json`, and each file
+is encrypted with `age -R` for the public keys in `recipients.txt` beside it.
+Both files are local configuration on purpose. The shipped manifest is public,
+and whoever controls the backup repo must not be able to add a recipient and
+receive the next sync's secrets. A changed recipients file stops the sync until
+`omabackup secrets accept` records it again.
+
+The timer needs only the public keys, which closes the `age -p` problem of
+§11.4. The plaintext is read once into a private directory, hashed and
+encrypted from that copy, then removed. The hash stays in local state and is
+never published, because a hash of a short `.env` is a verifier anyone could
+test guesses against. An encrypted index records each file's live path and
+mode, so a restore on a new machine needs only the repo and an identity.
+
+The deny-list reads text, and a keyring or an SSH key written through in the
+clear would pass it. So every file headed for `secrets/age/` must begin with
+the age header, checked in staging and again on the blob about to be
+committed. Nothing proves without the identity that the backup decrypts:
+`omabackup secrets drill` does it with a person holding the identity, and
+`verify` warns for each recipient never drilled or not drilled in 90 days.
+
+A declared secret must not also leave in the clear through another group.
+Collect refuses when another group's path contains the secret's real path.
+It then compares bytes: before any collector runs, each declared file is
+read once into the private directory and hashed there, and a staged file, or a file a git plugin's patch would
+carry, with the same size and hash refuses the collect. A restore writes
+through a temporary with a reserved name, and that name is refused anywhere
+in staging, since it may hold an older version no hash matches.
 
 On top of that, a deny-list scanner runs over the bundle and **blocks the push**
 on a hit — it does not merely warn. Known harmless false positives
@@ -272,7 +298,8 @@ push-time scan over every ref stays as the independent second layer.
 
 Every refusal says where, never what: the rule, the file and the line, or the
 commit. The matched text is not printed, and neither is a file or ref name a
-rule matches. `sync` and `push` run from timers whose output is the journal.
+rule matches, including when the scan itself stops on a ref it cannot read.
+`sync` and `push` run from timers whose output is the journal.
 
 ---
 

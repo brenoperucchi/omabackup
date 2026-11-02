@@ -158,6 +158,34 @@ credential in it is refused; exclude that file in its group or add a justified
 exception to `secrets.deny.json`. The scan before a push, below, still runs
 over every commit as a second layer.
 
+### Secrets
+
+Files you name in `~/.config/omabackup/secrets/files.json` are encrypted with
+[age](https://github.com/FiloSottile/age) before anything else sees them, and
+reach the repo only as `secrets/age/<name>.age`. The public keys they are
+encrypted for live in `recipients.txt` in the same directory. Keep the private
+identities somewhere else, such as a password manager and a printed copy.
+
+```
+age-keygen -o identity-a.txt          # store it off this machine, then delete it here
+age-keygen -y identity-a.txt >>~/.config/omabackup/secrets/recipients.txt
+omabackup secrets accept              # the sync encrypts for exactly these keys
+omabackup secrets drill -i identity-a.txt
+omabackup secrets restore -i identity-a.txt [--apply] [--force]
+```
+
+```json
+{"schemaVersion":1,"files":[{"live":"~/.config/rclone/rclone.conf","name":"rclone.conf"}]}
+```
+
+A file must be regular, not a symlink, and at most 1 MiB, and the list holds
+at most 1000 files. A collect refuses to run while another group would also
+copy one of them in the clear. An identity file encrypted with `age -p` works
+with `-i` too; age asks for its passphrase. `restore` only plans unless you
+pass `--apply`, and never replaces a file that differs unless you pass
+`--force`. It writes only into directories private to you under `~/`, never
+inside the backup or under a path another group copies in the clear.
+
 ### Before a push
 
 `push` will not send your dotfiles to a GitHub repository that anyone can
@@ -188,7 +216,7 @@ practice, gathered from comparing notes with other Omarchy backup plugins
 - [ ] A `pre_command` hook that runs before a destination's backup/push, for a
       drive or NAS mount that needs waking up first.
 - [ ] Evaluate whole-backup encryption at rest. Today only the `secrets` group
-      is encrypted (`age`, explicit allow-list); everything else — dotfiles,
+      is encrypted (`age -R`, explicit allow-list); everything else — dotfiles,
       scripts, git history — is not. Deliberately out of scope until a real
       destination shows up that isn't already under the user's physical or
       account control.

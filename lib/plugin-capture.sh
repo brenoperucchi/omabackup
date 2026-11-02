@@ -38,6 +38,29 @@ _capture_patch() {
     [[ -n "$real_index" && -f "$real_index" ]] && cp "$real_index" "$tmp_index"
 
     GIT_INDEX_FILE="$tmp_index" git -C "$plugin" add -N -- . 2>/dev/null || true
+    # When the secrets library is loaded, every file the patch would carry is
+    # checked first: once inside a patch, a secret's bytes no longer equal the
+    # secret's, and the staging check after collect cannot see them. Returns
+    # 3 for a flagged file, before writing anything (lib/vault.sh, review 90).
+    if declare -F _secrets_file_flagged >/dev/null; then
+        local names f frc=0
+        names="$(mktemp)" || { rm -f "$tmp_index"; return 1; }
+        # Both sides: the patch carries HEAD's version as removed and context
+        # lines, so a copy committed and then edited or deleted is checked as
+        # HEAD has it. --no-renames lists a rename's old path too (review 91).
+        GIT_INDEX_FILE="$tmp_index" git -C "$plugin" diff HEAD --no-renames --name-only -z >"$names" 2>/dev/null || frc=1
+        while (( frc == 0 )) && IFS= read -r -d '' f; do
+            [[ "${f##*/}" == .omabackup-restore.* ]] && { frc=3; break; }
+            if [[ -f "$plugin/$f" && ! -L "$plugin/$f" ]]; then
+                _secrets_file_flagged "$plugin/$f"
+                case $? in 0) ;; 1) frc=3; break ;; *) frc=1; break ;; esac
+            fi
+            _secrets_blob_flagged "$plugin" "$f"
+            case $? in 0) ;; 1) frc=3 ;; *) frc=1 ;; esac
+        done <"$names"
+        rm -f "$names"
+        (( frc == 0 )) || { rm -f "$tmp_index"; return "$frc"; }
+    fi
     # git diff's own status, checked -- a bare `rm -f "$tmp_index"` right
     # after it, with nothing capturing diff's exit code first, made this
     # function's own return status whatever `rm -f` reported (almost always
@@ -102,6 +125,12 @@ capture_plugin() {
     # _capture_patch's own status, checked -- git diff HEAD failing used
     # to write an empty patch file and still classify the plugin
     # "git+patch", indistinguishable from a genuinely trivial diff.
-    _capture_patch "$plugin" >"$patch_dir/$id.patch" || return 1
+    local prc=0
+    _capture_patch "$plugin" >"$patch_dir/$id.patch" || prc=$?
+    if (( prc )); then
+        rm -f "$patch_dir/$id.patch"
+        (( prc == 3 )) && return 3
+        return 1
+    fi
     echo "git+patch"
 }

@@ -749,6 +749,13 @@ restore_rows() {
                 wait "$!" || return 1
             fi
         fi
+
+        # The secrets group has no declared paths, so the loop above never
+        # sees it. Its ciphertext needs an identity to restore, which this
+        # plan does not have: reported, with the command, never applied.
+        if [[ "$gm" == age && -f "$wt/secrets/age/_index.age" ]]; then
+            printf 'report\t%s\tsecrets/age/\t-\n' "$id"
+        fi
     done <<<"$ids_out"
 }
 

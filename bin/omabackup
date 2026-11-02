@@ -273,6 +273,7 @@ _pkg_for() {
         git)   printf 'git' ;;
         tar)   printf 'tar' ;;
         python3) printf 'python' ;;
+        age-keygen) printf 'age' ;;
         # timeout/head/realpath are coreutils, find is findutils -- neither
         # is a real pacman package under its own binary name (confirmed:
         # `pacman -Si timeout` does not resolve). Found by review (round
@@ -281,7 +282,7 @@ _pkg_for() {
         # in cmd_artifacts/cmd_restore_tui -- find/realpath had the identical
         # pre-existing gap in their own already-shipped require_tools calls,
         # closed in the same table while it was already being touched.
-        timeout|head|realpath|stat) printf 'coreutils' ;;
+        timeout|head|realpath|stat|sha256sum) printf 'coreutils' ;;
         find)  printf 'findutils' ;;
         *)     printf '%s' "$1" ;;
     esac
@@ -620,6 +621,7 @@ cmd_verify() {
             "")         ;;
             *)          finding warn "$id" probe-unknown "probe declared but not implemented: $probe" "" ;;
         esac
+        [[ "$(group_field "$id" mode)" == age ]] && probe_secrets "$id"
     done <<<"$ids_out"
 
     probe_link_integrity
@@ -714,7 +716,7 @@ report() {
 # node_modules despite exclude. Same shape as the bug recorded in
 # docs/CONTEXT.md §4: "a generic loop overrides specific handling".
 KNOWN_FIELDS='["id","label","mode","coupled","critical","paths","probe","enabled","exclude","generator","allowList","note"]'
-KNOWN_MODES='["link","copy","gen","triple"]'
+KNOWN_MODES='["link","copy","gen","triple","age"]'
 
 assert_manifest_understood() {
     local bad line
@@ -870,12 +872,37 @@ cmd_collect() {
     # potentially committing that empty staging over real, previously-tracked
     # content. Died on outright, not merely skipped.
     local ids_out; ids_out="$(groups_ids)" || die "could not read this machine's own group manifest -- refusing to collect against an unreadable schema"
+    # A declared secret must not also be reachable by a group that copies in
+    # the clear. Refused before any collector runs, comparing real paths, so
+    # a symlinked spelling on either side cannot hide the overlap (lib/vault.sh,
+    # reviews 87 and 88).
+    if [[ -e "$SECRETS_FILES" || -L "$SECRETS_FILES" ]]; then
+        _secrets_files_list >/dev/null \
+            || die "$(_tilde "$SECRETS_FILES") is not a secrets list this build understands"
+        local ovl; ovl="$(_secrets_overlap)" || die "could not compare the secrets list with the groups"
+        if [[ -n "$ovl" ]]; then
+            local os og op
+            while IFS=$'\t' read -r os og op; do
+                printf '  %s✗%s %s is declared a secret, and group %s collects %s in the clear\n' "$RED" "$NC" "$os" "$og" "$op" >&2
+            done <<<"$ovl"
+            die "refusing to collect: move each secret out of that group's paths, or drop it from $(_tilde "$SECRETS_FILES")"
+        fi
+        # Read here, for every collect, so the byte check below holds whether
+        # or not the secrets group itself runs (--groups, enabled:false;
+        # review 89).
+        if ! _secrets_fingerprint; then
+            local fw
+            for fw in "${_SECRETS_FP_WHY[@]}"; do printf '  %s✗%s %s\n' "$RED" "$NC" "$fw" >&2; done
+            die "refusing to collect: fix those entries in $(_tilde "$SECRETS_FILES")"
+        fi
+    fi
     while read -r id; do
         [[ -n "$id" ]] || continue
         mode="$(group_field "$id" mode)" || die "could not read group $id's mode from the manifest"
         case "$mode" in
             gen)    collect_generated "$id"; continue ;;
             triple) collect_triple "$id"; continue ;;
+            age)    collect_age "$id"; continue ;;
         esac
 
         local -a ex=()
@@ -966,6 +993,16 @@ cmd_collect() {
     done <<<"$ids_out"
 
     # Reported, not fatal: what was collected is on disk and valid either way.
+    # The overlap check above compares paths. This compares bytes: whatever
+    # collector put it there, and by whatever name (a hardlink, a copy), a
+    # staged file identical to a declared secret refuses the whole collect.
+    # A restore's temporary is refused by its reserved name, since it may
+    # hold an older version no current hash matches (reviews 88 and 89). Run
+    # on every collect, secrets list or not: that temporary is the tool's own
+    # and can exist on a machine that only ever restored (review 90).
+    _secrets_staging_clean_of_secrets \
+        || { rm -rf -- "$STAGING" 2>/dev/null; die "refusing to collect: $_SECRETS_GATE_WHY"; }
+
     write_coverage || true
 
     if (( JSON )); then
@@ -1030,6 +1067,10 @@ write_coverage() {
                         IFS=$'\t' read -r files bytes <<<"$gsz"
                         gf=$((gf + files)); gb=$((gb + bytes))
                     done ;;
+            age)    local asz
+                    if asz="$(_staged_size "$STAGING/.secrets")"; then
+                        IFS=$'\t' read -r gf gb <<<"$asz"
+                    else failed=1; fi ;;
             triple) dest="$STAGING/.plugins"
                     local tsz
                     if tsz="$(_staged_size "$dest")"; then
@@ -1169,8 +1210,11 @@ collect_triple() {
         # site discarded whatever reached it (>/dev/null on the
         # classification, no exit-code check at all) and counted the
         # plugin as collected regardless.
+        local crc=0
         capture_plugin "$p" "$STAGING/.plugins/patches" "$STAGING/.plugins/local" "$STAGING/.plugins/manifest.txt" >/dev/null \
-            || die "could not capture plugin $(_tilde "$p")"
+            || crc=$?
+        (( crc == 3 )) && die "refusing to collect: plugin $(_tilde "$p") holds a declared secret's bytes or a restore's temporary (names not shown) -- remove it from the plugin"
+        (( crc == 0 )) || die "could not capture plugin $(_tilde "$p")"
         n=$((n + 1))
     done
     (( JSON )) || printf '  %s✓%s %s %s(%d, triple strategy)%s\n' "$GREEN" "$NC" "$id" "$DIM" "$n" "$NC"
@@ -1440,6 +1484,16 @@ cmd_sync() {
     fi
 
     JSON=0 cmd_collect >/dev/null || die "collect failed -- refusing to publish whatever staging is left in"
+    # Before the deny scan, which would otherwise read (and could print a
+    # line of) a secret that failed to encrypt. lib/vault.sh explains why the
+    # header, not the deny-list, is the gate for this directory.
+    local sf
+    for sf in "$STAGING"/.secrets/*; do
+        [[ -e "$sf" || -L "$sf" ]] || continue
+        _secrets_is_age "$sf" && continue
+        _discard_staging
+        die "refusing to publish -- .secrets/${sf##*/} is not age ciphertext; nothing was published"
+    done
     # Staging is scanned with the push deny-list BEFORE anything is published.
     # The scanner used to run in two places only, over the bundle and over
     # every ref right before `git push`, and neither ever looked at what
@@ -1716,6 +1770,18 @@ cmd_sync() {
         printf '  committed.\n' >&2
         return 1
     fi
+
+    # The same header gate, on the blobs this commit would actually record.
+    # Written to a file first: see _secrets_is_age on reading through a pipe.
+    local sp
+    for sp in "${changed[@]}"; do
+        [[ "$sp" == "$SECRETS_REPO_DIR"/* ]] || continue
+        _sync_git cat-file blob "$tree:$sp" >"$tdir/blob" 2>/dev/null \
+            && _secrets_is_age "$tdir/blob" && continue
+        _sync_tmp_clean
+        printf '\n%somabackup: not committing -- %s is not age ciphertext%s\n' "$RED" "$sp" "$NC" >&2
+        return 1
+    done
 
     local sec_hits="" sec_rc=0
     if (( ${#changed[@]} )); then
@@ -3164,8 +3230,13 @@ cmd_restore() {
                                 "$YELLOW" "$NC" "$g" "$(_tilde "$dest")" "$DIM" "$NC" ;;
                 escape)     printf '    %s✗%s %-11s %s %s(resolves outside the target home -- refused)%s\n' \
                                 "$RED" "$NC" "$g" "$dest" "$DIM" "$NC" ;;
-                report)     printf '    %s·%s %-11s %s %s(a list to act on, not a file to place)%s\n' \
-                                "$DIM" "$NC" "$g" "$rel" "$DIM" "$NC" ;;
+                report)     if [[ "$rel" == secrets/age/ ]]; then
+                                printf '    %s·%s %-11s %s %s(encrypted: omabackup secrets restore -i <identity> --from <repo>/secrets/age)%s\n' \
+                                    "$DIM" "$NC" "$g" "$rel" "$DIM" "$NC"
+                            else
+                                printf '    %s·%s %-11s %s %s(a list to act on, not a file to place)%s\n' \
+                                    "$DIM" "$NC" "$g" "$rel" "$DIM" "$NC"
+                            fi ;;
             esac
         done <<<"$rows"
         printf '\n  nothing was written. %somabackup restore %s --apply%s to do it\n' \
@@ -3665,6 +3736,7 @@ source "$OMABACKUP_ROOT/lib/publish.sh"
 source "$OMABACKUP_ROOT/lib/bundle.sh"
 source "$OMABACKUP_ROOT/lib/destinations.sh"
 source "$OMABACKUP_ROOT/lib/secrets.sh"
+source "$OMABACKUP_ROOT/lib/vault.sh"
 source "$OMABACKUP_ROOT/lib/restore.sh"
 source "$OMABACKUP_ROOT/lib/artifacts.sh"
 source "$OMABACKUP_ROOT/lib/schedule.sh"
@@ -3745,6 +3817,7 @@ _log_dispatch_start=$EPOCHSECONDS
 _log_dispatch_exit() {
     local rc="$1"
     _sync_tmp_clean
+    _secrets_tmp_clean
     case "$LOG_POLICY" in
         always)  _log_run_always "$LOG_ACTION" "$rc" "$(( EPOCHSECONDS - _log_dispatch_start ))" "$_log_dispatch_signal" ;;
         failure) _log_run_on_failure "$LOG_ACTION" "$rc" "$_log_dispatch_signal" ;;
@@ -3919,6 +3992,7 @@ case "$CMD" in
     log-tail)  cmd_log_tail "${ARGS[@]}" ;;
     log-event) cmd_log_event "${ARGS[@]}" ;;
     kill-group) cmd_kill_group "${ARGS[@]}" ;;
+    secrets)   cmd_secrets "${ARGS[@]}" ;;
     ""|help)
         cat <<'USAGE'
 omabackup <command> [--json] [--groups a,b]
@@ -3938,6 +4012,7 @@ omabackup <command> [--json] [--groups a,b]
   restore   plan a restore from an artifact; no file opens a guided TUI
   config    show or safely edit machine-owned settings; no args opens its TUI
   log-tail  print the last N log lines (default 20)
+  secrets   accept the age recipients, or drill/restore the secrets group
 
 The full cycle is collect -> diff -> verify -> commit. `collect` and `verify`
 are the first two; without them there is no diff for mode:copy groups and

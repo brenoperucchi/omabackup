@@ -170,14 +170,10 @@
     {
       "id": "secrets",
       "label": "Secrets",
-      "mode": "copy",
+      "mode": "age",
       "coupled": false,
       "critical": false,
-      "enabled": false,
-      "allowList": [
-        "~/.config/rclone/rclone.conf"
-      ],
-      "note": "age -p is interactive: no timer can refresh this group (docs/DESIGN.md §11.4)"
+      "note": "Off until ~/.config/omabackup/secrets/files.json exists. The files and the age recipients are local config, never this manifest (docs/DESIGN.md §6)."
     }
   ]
 }
