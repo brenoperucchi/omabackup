@@ -865,3 +865,57 @@ chmod +x "$VX/fakeage/age"
 VOUT="$(PATH="$VX/fakeage:$PATH" _v_env "$VX" sync --commit)"; VRC=$?
 it "collect refuses an index larger than 1 MiB, which restore could not read back"
 [[ "$VRC" != 0 && "$VOUT" == *"index is larger than 1 MiB"* && -z "$(_v_blob "$VX" _index.age)" ]] && ok || fail "rc=$VRC: ${VOUT:0:400}"
+
+# -- a passphrase-wrapped identity, binary or armored -------------------------------
+# The rescue identity is wrapped with `age -p`, and its printed copy is the
+# armored form (`age -p -a`), the only one that fits on paper. The loader knew
+# only the binary header, so the armored file was read as a plain identity and
+# refused. age asks for a passphrase on the terminal, so a stand-in age plays
+# the person typing it: `age -d -- <file>` unlocks with a key of its own, and
+# every other call goes to the real age.
+VP="$(mktemp -d)"; _v_home "$VP" "vaultmark$RANDOM"
+_v_env "$VP" secrets accept >/dev/null
+_v_env "$VP" sync --commit >/dev/null
+mkdir -p "$VP/wrap/bin"
+age-keygen -o "$VP/wrap/k.txt" 2>/dev/null
+age-keygen -o "$VP/wrap/other.txt" 2>/dev/null
+age -r "$(age-keygen -y "$VP/wrap/k.txt")" -o "$VP/wrap/b.age" "$VP/ids/b.txt"
+age -a -r "$(age-keygen -y "$VP/wrap/k.txt")" -o "$VP/wrap/b.age.txt" "$VP/ids/b.txt"
+age -a -r "$(age-keygen -y "$VP/wrap/other.txt")" -o "$VP/wrap/locked.age.txt" "$VP/ids/b.txt"
+cat >"$VP/wrap/bin/age" <<SH
+#!/bin/bash
+if [[ \$# == 3 && "\$1" == -d && "\$2" == -- ]]; then
+    exec "$(command -v age)" -d -i "$VP/wrap/k.txt" -- "\$3"
+fi
+exec "$(command -v age)" "\$@"
+SH
+chmod +x "$VP/wrap/bin/age"
+
+VOUT="$(PATH="$VP/wrap/bin:$PATH" _v_env "$VP" secrets drill -i "$VP/wrap/b.age")"; VRC=$?
+it "a drill unlocks a passphrase-wrapped identity in its binary form"
+[[ "$VRC" == 0 && "$VOUT" == *"drill passed"* ]] && ok || fail "rc=$VRC: $VOUT"
+
+VOUT="$(PATH="$VP/wrap/bin:$PATH" _v_env "$VP" secrets drill -i "$VP/wrap/b.age.txt")"; VRC=$?
+it "and in its armored form, the one that is printed"
+[[ "$VRC" == 0 && "$VOUT" == *"drill passed"* ]] && ok || fail "rc=$VRC: $VOUT"
+
+VOUT="$(PATH="$VP/wrap/bin:$PATH" _v_env "$VP" secrets restore -i "$VP/wrap/b.age.txt")"; VRC=$?
+it "restore takes the armored form too"
+[[ "$VRC" == 0 && "$VOUT" == *"app.env"* ]] && ok || fail "rc=$VRC: $VOUT"
+
+VOUT="$(PATH="$VP/wrap/bin:$PATH" _v_env "$VP" secrets drill -i "$VP/wrap/locked.age.txt")"; VRC=$?
+it "an armored identity that does not unlock is refused as one that did not unlock"
+[[ "$VRC" != 0 && "$VOUT" == *"could not unlock"* ]] && ok || fail "rc=$VRC: $VOUT"
+
+# Typed back from paper, the armored file easily gains blank lines on top; age
+# skips them, so the detection must too (review 94, rev-2).
+{ printf '\n  \r\n'; cat "$VP/wrap/b.age.txt"; } >"$VP/wrap/typed.age.txt"
+VOUT="$(PATH="$VP/wrap/bin:$PATH" _v_env "$VP" secrets drill -i "$VP/wrap/typed.age.txt")"; VRC=$?
+it "an armored identity with blank lines above its header still unlocks"
+[[ "$VRC" == 0 && "$VOUT" == *"drill passed"* ]] && ok || fail "rc=$VRC: $VOUT"
+
+# A plain identity whose comment only mentions the header stays plain.
+{ printf '# -----BEGIN AGE ENCRYPTED FILE-----\n'; cat "$VP/ids/b.txt"; } >"$VP/wrap/plain.txt"
+VOUT="$(PATH="$VP/wrap/bin:$PATH" _v_env "$VP" secrets drill -i "$VP/wrap/plain.txt")"; VRC=$?
+it "a plain identity whose comment names the armor header is still read as plain"
+[[ "$VRC" == 0 && "$VOUT" == *"drill passed"* ]] && ok || fail "rc=$VRC: $VOUT"

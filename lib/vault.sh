@@ -489,10 +489,31 @@ probe_secrets() {
 # wrapped with a passphrase) is decrypted first; age asks for the passphrase
 # on the terminal.
 _SECRETS_ID=""
+# An identity wrapped with `age -p`, in either of the forms age writes: binary,
+# or armored with -a. The armored one is the printed copy of the rescue key,
+# since binary does not survive paper; it used to be read as a plain identity
+# and refused. Only for the identity: secrets/age/ still takes binary alone.
+# age skips blank lines above the armor header, and a copy typed back from
+# paper easily has some, so the first line that is not blank is the one judged
+# (review 94).
+_secrets_identity_wrapped() {
+    local chunk line
+    _secrets_is_age "$1" && return 0
+    [[ -f "$1" && ! -L "$1" ]] || return 1
+    chunk="$(head -c 1024 -- "$1" 2>/dev/null | tr -d '\0')"
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$line" == "-----BEGIN AGE ENCRYPTED FILE-----" ]]
+        return
+    done <<<"$chunk"
+    return 1
+}
+
 _secrets_load_identity() {
     local f="$1"
     [[ -n "$f" && -f "$f" ]] || die "no identity file at ${f:-(none given)}"
-    if _secrets_is_age "$f"; then
+    if _secrets_identity_wrapped "$f"; then
         _SECRETS_ID="$(age -d -- "$f")" || die "could not unlock the identity at $(_tilde "$f")"
     else
         _SECRETS_ID="$(cat -- "$f")" || die "could not read the identity at $(_tilde "$f")"

@@ -181,7 +181,8 @@ omabackup secrets restore -i identity-a.txt [--apply] [--force]
 A file must be regular, not a symlink, and at most 1 MiB, and the list holds
 at most 1000 files. A collect refuses to run while another group would also
 copy one of them in the clear. An identity file encrypted with `age -p` works
-with `-i` too; age asks for its passphrase. `restore` only plans unless you
+with `-i` too, binary or armored (`age -p -a`, the form you can print); age asks
+for its passphrase. `restore` only plans unless you
 pass `--apply`, and never replaces a file that differs unless you pass
 `--force`. It writes only into directories private to you under `~/`, never
 inside the backup or under a path another group copies in the clear.
