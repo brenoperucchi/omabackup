@@ -104,6 +104,50 @@ assert_eq "$(_v_blob "$VH" app.env.age)" "$VB3"
 it "the local state never holds the plaintext"
 [[ -z "$(grep -r -a -l -F "$VM" "$VH/.state" 2>/dev/null)" ]] && ok || fail "plaintext in the state dir"
 
+# -- a hash of the plaintext stays off every command line -------------------------
+# Another account can read any process's arguments in /proc/<pid>/cmdline. An
+# unsalted SHA-256 of a short secret there lets it test guesses offline
+# (marketplace review of 0.5.0). Every command in /usr/bin, the production
+# PATH, is replaced by a wrapper that logs its arguments, then the log is
+# searched for the start of both plaintext hashes, since an abbreviated one
+# still confirms a guess. A command run by absolute path escapes
+# the wrappers, so the two jq calls that record the state must be in the log.
+_v_argv_wrap() {  # _v_argv_wrap <dir> <log>
+    local f
+    mkdir -p "$1"
+    for f in /usr/bin/*; do
+        [[ -f "$f" && -x "$f" ]] || continue
+        printf '#!/usr/bin/bash\nprintf "%%s\\n" %q" $*" >>%q\nexec %q "$@"\n' "${f##*/}" "$2" "$f" >"$1/${f##*/}"
+    done
+    chmod +x "$1"/*
+}
+VS="$(mktemp -d)"; VSM="argvmark$RANDOM$RANDOM"
+_v_home "$VS" "$VSM"
+_v_env "$VS" secrets accept >/dev/null
+_v_argv_wrap "$VS/argv" "$VS/argv.log"
+VOUT="$(PATH="$VS/argv:$PATH" _v_env "$VS" sync --commit)"; VRC=$?
+VSH1="$(sha256sum -- "$VS/.config/app/app.env" | cut -d' ' -f1)"
+VSH2="$(age -d -i "$VS/ids/a.txt" "$VS/repo/secrets/age/_index.age" 2>/dev/null | sha256sum | cut -d' ' -f1)"
+it "a sync logs the jq calls that record the secret's and the index's state"
+[[ "$VRC" == 0 && -n "$(_v_blob "$VS" app.env.age)" ]] \
+    && grep -q -e '^jq .*--arg n app\.env .*--arg c ' "$VS/argv.log" \
+    && grep -q -e '^jq .*--arg n _index .*--arg c ' "$VS/argv.log" && ok \
+    || fail "rc=$VRC log=$(wc -l <"$VS/argv.log" 2>/dev/null): $VOUT"
+
+it "no command it runs is handed the SHA-256 of a secret's plaintext"
+VHIT="$(grep -F -e "${VSH1:0:16}" -- "$VS/argv.log" | cut -c1-60)"
+[[ -z "$VHIT" ]] && ok || fail "hash on a command line: $VHIT"
+
+it "nor the SHA-256 of the index's plaintext"
+VHIT="$(grep -F -e "${VSH2:0:16}" -- "$VS/argv.log" | cut -c1-60)"
+[[ -n "$VSH2" && -z "$VHIT" ]] && ok || fail "hash on a command line: ${VHIT:-index did not decrypt}"
+
+it "and the state still records it, so an unchanged secret keeps its ciphertext"
+VSB1="$(_v_blob "$VS" app.env.age)"
+PATH="$VS/argv:$PATH" _v_env "$VS" sync --commit >/dev/null
+[[ "$(jq -r '."app.env".plain' "$VS/.state/secrets.json" 2>/dev/null)" == "$VSH1" \
+    && "$(_v_blob "$VS" app.env.age)" == "$VSB1" ]] && ok || fail "state or ciphertext changed"
+
 # -- recipients are an accepted anchor --------------------------------------------
 age-keygen -o "$VH/ids/c.txt" 2>/dev/null
 age-keygen -y "$VH/ids/c.txt" >>"$VH/.config/omabackup/secrets/recipients.txt"
@@ -732,6 +776,38 @@ git -C "$VP2/.config/x/plugins/p" commit -qm clean
 printf 'edited\n' >>"$VP2/.config/x/plugins/p/plugin.txt"
 VOUT="$(_v_env "$VP2" sync --commit --groups plugins)"; VRC=$?
 it "an ordinary edit in a git plugin still syncs"
+[[ "$VRC" == 0 ]] && ok || fail "rc=$VRC: $VOUT"
+
+# The same check reads a blob in the plugin's HEAD whose size is a secret's.
+# Its object id is an unsalted SHA-1 of the bytes, so it goes to git through
+# stdin too (review 98). The secret here holds a NUL byte: the bytes hashed
+# must be exactly the blob's.
+VW="$(mktemp -d)"; VWM="argvmark$RANDOM$RANDOM"; _v_home "$VW" "$VWM"
+printf 'TOKEN=%s\0nul\n' "$VWM" >"$VW/.config/app/app.env"
+_v_plugin "$VW"
+_v_env "$VW" secrets accept >/dev/null
+cp "$VW/.config/app/app.env" "$VW/.config/x/plugins/p/kept.env"
+git -C "$VW/.config/x/plugins/p" add kept.env
+git -C "$VW/.config/x/plugins/p" commit -qm kept
+printf 'harmless\n' >"$VW/.config/x/plugins/p/kept.env"
+_v_argv_wrap "$VW/argv" "$VW/argv.log"
+VOUT="$(PATH="$VW/argv:$PATH" _v_env "$VW" sync --commit --groups plugins)"; VRC=$?
+VWO="$(git -C "$VW/.config/x/plugins/p" rev-parse HEAD:kept.env)"
+VWS="$(sha256sum -- "$VW/.config/app/app.env" | cut -d' ' -f1)"
+it "a secret's copy with a NUL byte in a plugin's HEAD is refused after git reads the blob"
+[[ "$VRC" != 0 && "$VOUT" == *"declared secret"* ]] && grep -q -e '^git .* cat-file ' "$VW/argv.log" && ok \
+    || fail "rc=$VRC: $VOUT"
+it "and neither its blob id nor its SHA-256 reaches a command line"
+VHIT="$(grep -F -e "${VWO:0:12}" -e "${VWS:0:16}" -- "$VW/argv.log" | cut -c1-80)"
+[[ -n "$VWO" && -z "$VHIT" ]] && ok || fail "hash on a command line: $VHIT"
+git -C "$VW/.config/x/plugins/p" checkout -q -- kept.env
+git -C "$VW/.config/x/plugins/p" rm -q kept.env
+head -c "$(stat -c %s -- "$VW/.config/app/app.env")" /dev/zero | tr '\0' 'z' >"$VW/.config/x/plugins/p/other.env"
+git -C "$VW/.config/x/plugins/p" add other.env
+git -C "$VW/.config/x/plugins/p" commit -qm other
+printf 'edited\n' >"$VW/.config/x/plugins/p/other.env"
+VOUT="$(_v_env "$VW" sync --commit --groups plugins)"; VRC=$?
+it "a blob of a secret's size that is not the secret still syncs"
 [[ "$VRC" == 0 ]] && ok || fail "rc=$VRC: $VOUT"
 
 # Restore reads ciphertext anyone holding the public keys can write: what it

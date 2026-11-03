@@ -263,7 +263,15 @@ _secrets_blob_flagged() {  # _secrets_blob_flagged <repo> <path>
     read -r m t o sz <<<"${out%%$'\t'*}"
     [[ "$t" == blob ]] || return 0
     [[ -n "${_SECRETS_SIZES[$sz]:-}" ]] || return 0
-    h="$(set -o pipefail; git -C "$1" cat-file blob "$o" 2>/dev/null | sha256sum | cut -d' ' -f1)" || return 2
+    # The object id goes through stdin, never as an argument: it is an
+    # unsalted SHA-1 of the blob's bytes, and when the blob is a secret's copy
+    # another account reading /proc/<pid>/cmdline could test guesses with it
+    # (review 98). The header must name a blob of the size ls-tree gave, or
+    # the read failed; what follows it is exactly that many bytes, then a
+    # newline the last cat drains.
+    h="$(set -o pipefail; printf '%s\n' "$o" \
+        | git -C "$1" cat-file --batch='%(objecttype) %(objectsize)' 2>/dev/null \
+        | { IFS= read -r t && [[ "$t" == "blob $sz" ]] && head -c "$sz" | sha256sum | cut -d' ' -f1 && cat >/dev/null; })" || return 2
     [[ -n "$h" ]] || return 2
     [[ -n "${_SECRETS_SEEN["$sz:$h"]:-}" ]] && return 1
     return 0
@@ -362,8 +370,13 @@ _secrets_seal() {  # _secrets_seal <name> <plain> <out> <rfp>
         return 1
     fi
     mv -T -- "$made" "$out" || return 1
-    _SECRETS_NEW="$(jq --arg n "$name" --arg p "$psha" --arg r "$rfp" --arg c "$(_secrets_sha "$out")" \
-        '.[$n] = {plain:$p, recipients:$r, cipher:$c}' <<<"$_SECRETS_NEW")" || return 1
+    # The plaintext hash goes through stdin, never as an argument: another
+    # account can read any process's arguments in /proc/<pid>/cmdline, and an
+    # unsalted SHA-256 there lets it test guesses at a short secret offline
+    # (marketplace review of 0.5.0). printf is a builtin, so it never execs.
+    _SECRETS_NEW="$(printf '%s\n"%s"\n' "$_SECRETS_NEW" "$psha" \
+        | jq -n --arg n "$name" --arg r "$rfp" --arg c "$(_secrets_sha "$out")" \
+            'input as $s | input as $p | $s | .[$n] = {plain:$p, recipients:$r, cipher:$c}')" || return 1
 }
 
 _SECRETS_OLD='{}'
