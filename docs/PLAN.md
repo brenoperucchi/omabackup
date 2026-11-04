@@ -6404,3 +6404,26 @@ ciphertext depend on unchanged recipients and local state, as `_secrets_seal`
 does. Rev-2 added the `OMABACKUP_GROUPS` case (a manifest of one's own keeps
 the old `secrets` group) and that the panel change needs a shell restart. No
 unit changed since 0.4.9, so `reload` is not needed for the services.
+
+### The deep tag chain spec refuses only the ref under test (2026-11-04)
+
+Contributed by Corey Tyhurst. Takes the follow-up review 93 left on PR 9 (see
+"Refusals raised while reading the refs name no matching ref").
+
+**The gap.** The fixture built 33 nested tags, and `nested-33` alone is over
+the walk's bound of 32, so the key spec tested the key only because
+`refs/tags/AKIA...` sorts before `refs/tags/nested-*`.
+
+**The change.** The nested chain is 32 deep, so only the key's tag and
+`aaa-chain` go over, and a new control expects the chain alone to scan clean.
+
+**Specs.** On a copy of `main` with `_scan_ref_label` printing the raw name and
+the key renamed to sort later, `main`'s deep-chain spec still passes (the
+refusal names `nested-33`); with this change it fails on the key. `secrets` --
+**168 passed, 0 failed**. Full suite in a network-less Arch container -- **1776
+passed, 2 failed**, against `main`'s **1773 passed, 4 failed** at `427e49f`
+(title-row eliding probe, VM preflight, and on `main` also the Config TUI
+Escape spec, which fails only under full-suite load). Not run on a live Omarchy
+session.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
