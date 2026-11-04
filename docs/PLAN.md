@@ -6404,3 +6404,30 @@ ciphertext depend on unchanged recipients and local state, as `_secrets_seal`
 does. Rev-2 added the `OMABACKUP_GROUPS` case (a manifest of one's own keeps
 the old `secrets` group) and that the panel change needs a shell restart. No
 unit changed since 0.4.9, so `reload` is not needed for the services.
+
+### The usage-text spec reads every arm of the dispatch (2026-11-04)
+
+Contributed by Corey Tyhurst. Takes the two follow-ups review 93 left on PR 8
+(see "The usage text names every verb a person runs").
+
+**The gap.** `test/help.test.sh` kept only an arm written on one line with one
+label and `cmd_` on it, so an alias (`foo|bar)`) or a body on the next line was
+skipped and neither direction failed. The `sync` line said `--commit` commits,
+while `cmd_sync` skips the commit when verify fails on coverage or nothing
+changed.
+
+**The change.** One awk pass reads every arm label of the last
+`case "$CMD" in` block, split on `|`, dropping `""`, `*` and `__*`; `help` is
+named as internal. The `sync` line reads "collect, scan, publish into the repo
+and verify; --commit commits if verify passes", on two lines.
+
+**Specs.** On a copy of `main` with `prune|gc)` and a two-line `wipe)` arm
+added, `main`'s spec passes 3/0; with this change "every verb" fails and names
+`gc prune wipe`. `help` -- **3 passed, 0 failed**. Full suite in a network-less
+Arch container -- **1775 passed, 2 failed**, against `main`'s **1773 passed, 4
+failed** at `427e49f` (title-row eliding probe, VM preflight, and on `main`
+also the Config TUI Escape spec, which fails only under full-suite load). The
+container now has `age`; without it 60 secrets-group specs fail there. Not run
+on a live Omarchy session.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
