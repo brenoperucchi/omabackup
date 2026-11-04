@@ -4005,7 +4005,8 @@ omabackup <command> [--json] [--groups a,b]
   install   write the timers (sync every 15 minutes, push hourly) and enable them
   collect   collect the groups into staging (does not touch the repo)
   verify    check that the backup covers what the system actually reads
-  sync      collect, scan with the deny-list, publish into the repo; --commit commits
+  sync      collect, scan, publish into the repo and verify;
+            --commit commits if verify passes
   bundle    build the .tar.zst artifact for every destination other than github
   push      send to each enabled destination that is due; a name sends to it now
   artifacts list what a `dir` destination holds, with each one's own manifest

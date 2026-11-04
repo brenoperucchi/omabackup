@@ -11,14 +11,27 @@
 OB="$PWD/bin/omabackup"
 
 # Called by the panel, the TUI wrapper or a timer, never typed: each one's
-# comment in bin/omabackup says it is left out of the usage text. `__*` verbs
-# are hidden by their name.
-HELP_INTERNAL=" log-event kill-group "
+# comment in bin/omabackup says it is left out of the usage text. `help` is the
+# usage text itself. `__*` verbs are hidden by their name.
+HELP_INTERNAL=" log-event kill-group help "
 
-# Two blocks open with `case "$CMD" in`; the log policy comes first. The
-# dispatch is the one whose arms call a cmd_ function.
-HELP_VERBS="$(sed -n '/^case "\$CMD" in$/,/^esac$/p' "$OB" \
-    | sed -nE 's/^    ([a-z][a-z-]*)\) +.*cmd_[a-z_]+.*/\1/p' | sort -u)"
+# Two blocks open with `case "$CMD" in`; the log policy comes first and the
+# dispatch is the last. The first version of this spec kept only an arm written
+# on one line with a single label and a `cmd_` call on that line, so an alias
+# (`foo|bar)`) or an arm whose body starts on the next line was skipped, and a
+# verb added that way could miss the usage text with both checks still green
+# (found in review of #8 and reproduced with both shapes). Every arm label of
+# the last block is read instead, split on `|`; only `""`, `*` and the hidden
+# `__*` verbs are dropped.
+HELP_VERBS="$(awk '
+    /^case "\$CMD" in$/ { n = 0; on = 1; next }
+    on && /^esac$/      { on = 0; next }
+    on && match($0, /^    [^ ()]+\)/) {
+        k = split(substr($0, 5, RLENGTH - 5), p, "|")
+        for (i = 1; i <= k; i++) v[++n] = p[i]
+    }
+    END { for (i = 1; i <= n; i++) print v[i] }
+' "$OB" | grep -vE '^(""|\*|__.*)$' | sort -u)"
 HH="$(mktemp -d)"
 HELP_OUT="$(HOME="$HH" OMABACKUP_GROUPS="$PWD/groups.default.json" \
     OMABACKUP_STATE="$HH/.state" XDG_RUNTIME_DIR=/nonexistent "$OB" help 2>&1)"
