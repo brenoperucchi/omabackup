@@ -6405,6 +6405,61 @@ does. Rev-2 added the `OMABACKUP_GROUPS` case (a manifest of one's own keeps
 the old `secrets` group) and that the panel change needs a shell restart. No
 unit changed since 0.4.9, so `reload` is not needed for the services.
 
+### The plaintext hash stays off the command line (2026-11-02)
+
+**The finding.** HANCORE-linux, reviewing `427e49f` on marketplace issue
+`#13671` (Low): `_secrets_seal` hashed each secret's plaintext with an unsalted
+SHA-256 and handed it to `jq` as `--arg p`. Any local account can read another
+process's arguments in `/proc/<pid>/cmdline`, so one watching a sync could
+test guesses at a short or predictable secret offline, the private files and
+age notwithstanding. It never exposed the plaintext itself. The same call
+carried the index's hash.
+
+**The fix.** The hash goes to `jq` through stdin, after the state, as a second
+JSON value read with `input`; `printf` is a builtin, so nothing is exec'd with
+it. The state file keeps the same fields, so an existing `secrets.json` still
+matches and nothing is re-encrypted on upgrade.
+
+**Review 98.** Both reviewers found a second verifier of the same kind, older
+than 0.5.0: `_secrets_blob_flagged` read a blob in a git plugin's HEAD with
+`git cat-file blob <oid>`, and the object id is an unsalted SHA-1 of the
+blob's bytes. It ran only for a blob the size of a declared secret, and when
+that blob was a secret's copy the refusal came after the id had been on the
+command line, again on every timer run until the copy left the plugin. The id
+now goes to `git cat-file --batch` through stdin; the header must read
+`blob <size>` with the size `ls-tree` gave, exactly that many bytes are
+hashed, and any other answer, a missing object included, still refuses. Both
+also showed the first specs too narrow: rev-2 that a fixed list of commands
+missed this case, rev-1 that the original leak passed them once `jq` was
+called as `/usr/bin/jq`. The specs now wrap every command in `/usr/bin`, the
+production PATH, and require the two `jq` calls that record the state and a
+`git cat-file` call in the log. Rev-2 traced all of `/usr/bin` through
+accept, sync, verify, drill and restore and found nothing else derived from
+a declared secret's plaintext on a command line. The deny-list scans still
+pass the ids of ordinary files' blobs to `git cat-file`; no declared secret
+reaches them, since the staging gate refuses its bytes first. The index's own
+fields (name, live path, mode) still pass through `jq` arguments; those paths
+are already in the arguments of `stat` and `cp`, and the names in the
+repository.
+
+**Review 100.** Both approved. Rev-2's two P3s were taken: the specs search
+for the first 12 or 16 hex digits of each hash, so an abbreviated id is caught
+too (`cat-file blob "${o:0:12}"` passed before), and the sentence above is
+limited to a declared secret's plaintext.
+
+**Specs.** Against `427e49f` three fail: the secret's hash, the index's hash,
+and the plugin blob's id (a secret holding a NUL byte, so the hashed bytes
+must be the blob's exactly). With `/usr/bin/jq` on the state line, the log
+check fails. Controls: the state still records the hash and an unchanged
+secret keeps its ciphertext; a blob of a secret's size that is not the secret
+still syncs. `vault`: **124 passed, 0 failed**.
+
+**Not done here.** `secrets.json` still stores the unsalted hash, 0600 in the
+0700 state directory, where only the same user or root can read it, and they
+can read the live file too. A keyed hash would protect it if that file ever
+left the machine, at the cost of a key to keep beside it; both reviewers
+advised against it in this fix.
+
 ### The deep tag chain spec refuses only the ref under test (2026-11-04)
 
 Contributed by Corey Tyhurst. Takes the follow-up review 93 left on PR 9 (see
