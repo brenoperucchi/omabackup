@@ -73,8 +73,12 @@ The CLI, scheduler, restore TUI and QuickShell panel are working today.
 ./bin/omabackup status     # Omarchy version, restore range, groups
 ./bin/omabackup collect    # collect the groups into staging
 ./bin/omabackup verify     # check coverage; --json for programmatic use
+./bin/omabackup sync       # collect, scan, publish and verify; --commit commits if verify passes
+./bin/omabackup push       # send to each destination that is due
+./bin/omabackup secrets    # accept recipients, drill or restore the secrets group
 ./bin/omabackup config     # guided settings TUI
 ./bin/omabackup restore    # guided restore TUI
+./bin/omabackup help       # every verb
 ./test/run.sh              # complete regression suite
 ```
 
@@ -217,10 +221,10 @@ practice, gathered from comparing notes with other Omarchy backup plugins
 - [ ] A `pre_command` hook that runs before a destination's backup/push, for a
       drive or NAS mount that needs waking up first.
 - [ ] Evaluate whole-backup encryption at rest. Today only the `secrets` group
-      is encrypted (`age -R`, explicit allow-list); everything else — dotfiles,
-      scripts, git history — is not. Deliberately out of scope until a real
-      destination shows up that isn't already under the user's physical or
-      account control.
+      is encrypted (`age -R`, only the files listed in `files.json`);
+      everything else (dotfiles, scripts, git history) is not. Deliberately
+      out of scope until a real destination shows up that isn't already under
+      the user's physical or account control.
 
 **Suggestions for OmaBackup are welcome.** If you use it, or you looked at
 this and thought of something it should do, open an issue.
