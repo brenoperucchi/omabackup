@@ -1560,12 +1560,22 @@ _rr_scan() {  # _rr_scan <repo> -- sets RR_OUT and RR_RC, stderr included
     RR_OUT="$(PATH="$RRH/stub:$PATH" scan_secrets "$1" "$PWD/secrets.deny.json" 2>&1)" || RR_RC=$?
 }
 
+# The nested chain stops at 32 tag objects, the most the walk follows, so only
+# a tag put on top of it goes over. The first version built 33: `nested-33` was
+# refused on its own, and the key assertion below tested the key only because
+# `refs/tags/AKIA...` sorts before `refs/tags/nested-*`. A key named to sort
+# later would have left the refusal to `nested-33` and the assertion passing
+# without testing anything (found in review of #9). The control pins that the
+# chain alone is clean, so the refusal can only come from the ref under test.
 RRD="$RRH/deep"; _sec_repo "$RRD" "" ""
 rr_prev=HEAD
-for rr_i in $(seq 1 33); do
+for rr_i in $(seq 1 32); do
     git -C "$RRD" tag -a -m m "nested-$rr_i" "$rr_prev" 2>/dev/null
     rr_prev="nested-$rr_i"
 done
+_rr_scan "$RRD"
+it "a tag chain 32 deep is followed to its end, not refused"
+assert_eq "$RR_RC" "0"
 git -C "$RRD" tag -a -m m "$_rr_key" "$rr_prev" 2>/dev/null
 _rr_scan "$RRD"
 it "a tag chain too deep to follow does not print a ref named after a token"
