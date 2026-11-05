@@ -6482,3 +6482,80 @@ Escape spec, which fails only under full-suite load). Not run on a live Omarchy
 session.
 
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
+
+### The usage-text spec reads every arm of the dispatch (2026-11-04)
+
+Contributed by Corey Tyhurst. Takes the two follow-ups review 93 left on PR 8
+(see "The usage text names every verb a person runs").
+
+**The gap.** `test/help.test.sh` kept only an arm written on one line with one
+label and `cmd_` on it, so an alias (`foo|bar)`) or a body on the next line was
+skipped and neither direction failed. The `sync` line said `--commit` commits,
+while `cmd_sync` skips the commit when verify fails on coverage or nothing
+changed.
+
+**The change.** One awk pass reads every arm label of the last
+`case "$CMD" in` block, split on `|`, dropping `""`, `*` and `__*`; `help` is
+named as internal. The `sync` line reads "collect, scan, publish into the repo
+and verify; --commit commits if verify passes", on two lines.
+
+**Specs.** On a copy of `main` with `prune|gc)` and a two-line `wipe)` arm
+added, `main`'s spec passes 3/0; with this change "every verb" fails and names
+`gc prune wipe`. `help` -- **3 passed, 0 failed**. Full suite in a network-less
+Arch container -- **1775 passed, 2 failed**, against `main`'s **1773 passed, 4
+failed** at `427e49f` (title-row eliding probe, VM preflight, and on `main`
+also the Config TUI Escape spec, which fails only under full-suite load). The
+container now has `age`; without it 60 secrets-group specs fail there. Not run
+on a live Omarchy session.
+
+**Review 101.** Both reviewers found that the awk still skipped arms bash
+accepts: `prune | gc)` and `wipe )` with spaces, and `(wipe)` with a leading
+paren. Each one left the verb out of the usage text with all three specs green
+and the count at 19. The awk now takes a leading `(`, trims the spaces around
+each label and strips its quotes; a line starting with `#` is not read. A new
+spec runs the extraction on a fixture dispatch with every one of those shapes,
+plus a two-line arm, a comment, `__hidden`, `""|help` and `*`, and checks the
+exact list. It failed on the first awk (`around`, `paren` and `spaced` missing,
+quotes kept) and passes now. Against the real `bin/omabackup`, `prune | gc)`,
+`wipe )`, `(wipe)` and the two mutants above all fail "every verb" and name
+the verbs, while `#prune)` and `"sync")` change nothing. The extraction still
+reads only the dispatch's four-space indent. Rev-2 also noted that a passing
+verify is needed for a commit but is not enough (the deny-list on the commit,
+a path sync did not write, a branch change or nothing to commit also stop
+it), so the `sync` line says "--commit commits only if verify passes".
+
+**Review 102.** Rev-1 found that the wider pattern took prose or a command at
+the dispatch's indent with a `)` in it (`command example)` added inside the
+usage heredoc, or `printf '%s\n' 'done)'`) as a verb. That fails the spec
+without any verb having changed, so it is noise rather than a miss, but it is
+cheap to close: a line counts only if every label, once trimmed and unquoted,
+is letters, digits, `_` and `-` (or `*`). The fixture now holds both lines and
+failed on the 101 awk with `a line of prose` and the `printf` text in the
+list. With the check, the real dispatch still gives the same 19 verbs, the
+arm mutants above still fail, and the heredoc line changes nothing.
+
+**Review 103.** Rev-2 found the opposite case: a label with a glob or a dot
+(`log-*)`, `[Ss]ync2)`, `st|stat?)`, `self.update)`) failed that class, so the
+whole line was dropped and the verb went missing with every check green. The
+class now also takes `.` and the glob characters `*?[]!`. Prose and the
+`printf` line are still refused, since they hold spaces, inner quotes or a
+backslash. The fixture gained `log-*|dot.ted|x_1-y)`, which failed on the 102
+awk and passes now. On the real `bin/omabackup` the same 19 verbs come out,
+and each of those four labels, added without a usage line, fails "every verb"
+and names itself. A quoted label with a space inside, or an extglob, still
+drops its line.
+
+**Review 104.** Rev-1 found that the checks used each label as a regular
+expression, so `sta.us)` and `status?)` passed as documented by the `status`
+line, and `for v in $HELP_VERBS` expanded a glob such as `te*` against the
+working directory. Both directions now read the lists line by line and compare
+fixed strings with `grep -Fqx`. A name in the usage text is the first word of
+a line indented by exactly two spaces. Two new specs feed the checks literal
+lists: with the old checks one got ` test` where it expected
+` sta.us status? te*`, and the other found nothing where it expected
+` sta.us`. Both pass now. On the real `bin/omabackup`, `sta.us)`, `status?)`
+and `te*)` now fail "every verb" and name themselves, every mutant above still
+fails, and renaming `version` to `vers.on` in the usage text fails both
+directions. The usage text names the same 16 verbs as before.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
