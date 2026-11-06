@@ -6420,10 +6420,11 @@ JSON value read with `input`; `printf` is a builtin, so nothing is exec'd with
 it. The state file keeps the same fields, so an existing `secrets.json` still
 matches and nothing is re-encrypted on upgrade.
 
-**Review 98.** Both reviewers found a second verifier of the same kind, older
-than 0.5.0: `_secrets_blob_flagged` read a blob in a git plugin's HEAD with
-`git cat-file blob <oid>`, and the object id is an unsalted SHA-1 of the
-blob's bytes. It ran only for a blob the size of a declared secret, and when
+**Review 98.** Both reviewers found a second verifier of the same kind, already
+in 0.5.0: `_secrets_blob_flagged` read a blob in a git plugin's HEAD with
+`git cat-file blob <oid>`, and the object id is an unsalted SHA-1 of a header
+with the size and the blob's bytes, so it tests guesses the same way. It ran
+only for a blob the size of a declared secret, and when
 that blob was a secret's copy the refusal came after the id had been on the
 command line, again on every timer run until the copy left the plugin. The id
 now goes to `git cat-file --batch` through stdin; the header must read
@@ -6559,3 +6560,38 @@ fails, and renaming `version` to `vers.on` in the usage text fails both
 directions. The usage text names the same 16 verbs as before.
 
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
+
+### Release 0.5.1 (2026-11-05)
+
+Patch version. It carries the fix for the hash on the command line that the
+marketplace review reported in `#13671` (PR #12), Corey Tyhurst's two spec
+follow-ups (#13 and #14) and the README with new screenshots (#16).
+`manifest.json` goes to 0.5.1.
+
+**Screenshots.** The panel shot and `preview.png` come from the lab VM at
+`~/VMs/hyprsession-lab`, not from this machine. In the guest the plugin is a
+clone of GitHub at `8c79d3b` with only the manifest edited to 0.5.1, so the
+Shell plugins group records it as URL, commit and patch instead of copying the
+test fixtures that the deny-list refuses. The guest has a test repo with a
+local remote, the timers installed, a script tracked under `scripts/bin` and
+one file under age, so every group covers something. The panel has no `open`
+command over IPC, so the shot clicks the bar icon through QMP.
+
+**Marketplace.** `#13671` moves its target to the release commit and is
+retitled `[Verify]: OmaBackup 0.5.1`, as `#12564` was.
+
+**Review 108, on the notes.** Both reviewers found "This predates 0.5.0" wrong:
+`_secrets_blob_flagged` came in with the `secrets` group in `c666429`, so only
+0.5.0 had either case, and the PLAN's own "older than 0.5.0" above was the same
+mistake. Rev-1 noted that a git blob id hashes `blob <size>`, a NUL and the
+bytes, not the bytes alone; the notes now say only that the id can test guesses
+the same way. Rev-2 asked for the summary to say the marketplace found only the
+first case, for "the encrypted index's" to name the plaintext, for the README's
+`sync` line to say "only if" like `help`, and for the thanks to credit Corey's
+rewording of that line. Rev-2 also noted that the index build passes each
+secret's live path to `jq` as an argument; that is a path, not a verifier, and
+is left for after the release. Review 109 approved the corrected notes; rev-2
+asked for the PLAN line on the blob id above to match, and for "describes
+`sync` in full" to say only that `help` now lists verify among the steps.
+
+Full suite on the release tree: **1788 passed, 0 failed**.

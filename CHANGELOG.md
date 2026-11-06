@@ -7,6 +7,44 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 loosely while it is pre-1.0: patch releases may still change behaviour when the
 change closes a security hole, and such changes are always called out here.
 
+## [0.5.1] — 2026-11-05
+
+Two security fixes for the `secrets` group. The marketplace review of 0.5.0
+found the first, and the second turned up while fixing it. Both affect only
+0.5.0, and only once files are listed in `files.json`. Nothing to do when
+upgrading.
+
+### Security
+
+- A sync no longer passes the SHA-256 of a secret's plaintext, or of the
+  plaintext of the encrypted index, as a process argument. Any local account
+  can read another process's arguments, so one watching a sync could test
+  guesses at a short secret offline. The hash now reaches `jq` through stdin.
+  The state file keeps its format, so nothing is re-encrypted.
+- When a git plugin's HEAD held a copy of a declared secret, the check that
+  refuses it passed the blob's object id to `git cat-file` as an argument.
+  That id can be used the same way to test guesses at the secret. It now
+  reaches `git cat-file --batch` through stdin.
+
+### Changed
+
+- The README lists `sync`, `push`, `secrets` and `help`, and the screenshots
+  show the current panel and `omabackup config`.
+- `omabackup help` now lists verify among the steps of `sync` and says
+  `--commit` commits only if verify passes. The README says the same.
+
+### Testing
+
+- Full suite on a real Omarchy session: 1788 passed, 0 failed.
+
+### Thanks
+
+- [Corey Tyhurst](https://github.com/coreytyhurst) rewrote the `sync` line of
+  `omabackup help` and made its spec read every arm of the dispatch in
+  [PR #13](https://github.com/brenoperucchi/omabackup/pull/13).
+  [PR #14](https://github.com/brenoperucchi/omabackup/pull/14), also Corey's,
+  fixed the deep tag chain spec so it tests the key it was written for.
+
 ## [0.5.0] — 2026-11-02
 
 The `secrets` group can now keep files such as `rclone.conf` in your backup,

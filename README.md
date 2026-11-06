@@ -73,7 +73,7 @@ The CLI, scheduler, restore TUI and QuickShell panel are working today.
 ./bin/omabackup status     # Omarchy version, restore range, groups
 ./bin/omabackup collect    # collect the groups into staging
 ./bin/omabackup verify     # check coverage; --json for programmatic use
-./bin/omabackup sync       # collect, scan, publish and verify; --commit commits if verify passes
+./bin/omabackup sync       # collect, scan, publish and verify; --commit commits only if verify passes
 ./bin/omabackup push       # send to each destination that is due
 ./bin/omabackup secrets    # accept recipients, drill or restore the secrets group
 ./bin/omabackup config     # guided settings TUI
