@@ -69,6 +69,7 @@
       "paths": [
         "~/.local/state/omarchy/toggles",
         "~/.local/state/omarchy/migrations",
+        "~/.local/state/omarchy/workspace-layouts",
         "~/.local/state/omarchy/current/theme.name",
         "~/.local/state/omarchy/current/background"
       ],
