@@ -108,6 +108,19 @@ OUT="$(_verify "$H" "$G")"
 it "a deliberately excluded path does not fail"
 assert_eq "$(jq -r .ok <<<"$OUT")" "true"
 
+# -- workspace layouts ---------------------------------------------------------
+# Layouts live in ~/.local/state; the default backup must cover them.
+H="$(_home)"
+mkdir -p "$H/.config/omarchy" "$H/.local/state/omarchy/workspace-layouts"
+printf '{"version": 1}\n' >"$H/.config/omarchy/shell.json"
+printf 'require("hypr.layouts")\n' >>"$H/.config/hypr/hyprland.lua"
+printf 'require_all.files("/omarchy/workspace-layouts")\n' >"$H/.config/hypr/layouts.lua"
+printf 'return {}\n' >"$H/.local/state/omarchy/workspace-layouts/1.lua"
+OUT="$(_verify "$H" "$PWD/groups.default.json")"
+
+it "workspace layouts in state are covered"
+assert_eq "$(jq -r .ok <<<"$OUT")" "true"
+
 # -- phantom path ---------------------------------------------------------------
 # A critical group pointing nowhere used to report "up to date" while covering
 # zero bytes -- which is what happened when Omarchy moved current/ to ~/.local/state.
