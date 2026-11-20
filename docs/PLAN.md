@@ -6595,3 +6595,26 @@ asked for the PLAN line on the blob id above to match, and for "describes
 `sync` in full" to say only that `help` now lists verify among the steps.
 
 Full suite on the release tree: **1788 passed, 0 failed**.
+
+### Push failure specs drive a private GitHub remote (2026-11-20)
+
+Contributed by Corey Tyhurst. Prepares the push trust record agreed in #15
+(T89 Phase 1, item 2).
+
+**The gap.** Seven `_push_github` failure specs pointed origin at
+`https://example.invalid`, a host that is not GitHub, so the privacy gate
+stepped aside. Once #15 refuses an unknown host before `git push`, five of them
+would keep passing with nothing pushed.
+
+**The change.** Each fixture drives a private `github.com` remote, answered by a
+404 `curl` shim, and its fake `git` touches `git.pushes`. The five specs that
+could not tell a refusal from the failure they test check that file.
+
+**Specs.** With every one of the seven shims answering `200`, `destinations` --
+**153 passed, 7 failed**: the five new lines and the sweep's and drain's own
+proofs; every original assertion still passed. On this branch `destinations` --
+**160 passed, 0 failed**. Full suite in a network-less Arch container -- **1792
+passed, 2 failed**, against `main`'s **1787 passed, 2 failed** at `97aac67`
+(VM golden image, title-row eliding). Not run on a live Omarchy session.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
