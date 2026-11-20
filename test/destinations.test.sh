@@ -593,19 +593,33 @@ assert_contains "$GH_CONTROL_LINE" "network down"
 # on git's always-newline-terminated output -- put the full token in the
 # LOG at caps 33-37 the whole time. Fixed the same way the guard itself
 # was fixed: inspect where git's text actually goes now.
+#
+# This spec and the six `_push_github` failure specs after it used to point
+# origin at https://example.invalid, a host that is not GitHub, so the privacy
+# gate had nothing to ask and stepped aside. That worked only because the gate
+# ignored every host but GitHub, and issue #15 closes exactly that gap: once an
+# unknown host is refused before `git push` runs, a spec like "the token never
+# reaches the log" would keep passing with nothing pushed and nothing logged.
+# So each fixture now drives a private github.com remote, answered "not
+# publicly readable" by a 404 curl shim (the same stand-in as the redaction
+# spec above), and its fake git touches git.pushes when asked to push. Where a
+# spec's own assertions could not tell a refusal from the failure it tests,
+# it also checks that file.
 GHSWEEPH="$(mktemp -d)"; GHSWEEPR="$GHSWEEPH/repo"; _dest_repo "$GHSWEEPR"
-git -C "$GHSWEEPR" remote add origin 'https://example.invalid/nonexistent.git'
+git -C "$GHSWEEPR" remote add origin 'https://github.com/user/dotfiles.git'
 printf '{"schemaVersion":1,"destinations":[]}\n' >"$GHSWEEPH/destinations.json"
 GHSWEEP_BIN="$GHSWEEPH/fake-bin"; mkdir -p "$GHSWEEP_BIN"
 cat >"$GHSWEEP_BIN/git" <<EOF
 #!/bin/bash
 if [[ " \$* " == *" push origin HEAD "* ]]; then
+    : >>"$GHSWEEPH/git.pushes"
     printf "fatal: 'https://u:ghp_FULLTOKEN@github.com/a/b.git'\\n"
     exit 1
 fi
 exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$GHSWEEP_BIN/git"
+printf '#!/bin/bash\nprintf 404\n' >"$GHSWEEP_BIN/curl"; chmod +x "$GHSWEEP_BIN/curl"
 GHSWEEP_LEAKED=0
 GHSWEEP_LOGGED_REDACTED=0
 for GHSWEEP_CAP in 5 10 20 30 33 34 35 36 37 38 39 40 41 42 50 60 100; do
@@ -631,12 +645,13 @@ it "the logging path is genuinely exercised -- at least one cap preserves the re
 # a completed marker written by git AFTER a lot of chatter proves git ran
 # to natural completion despite a cap much smaller than its own output ────
 GHDRAINH="$(mktemp -d)"; GHDRAINR="$GHDRAINH/repo"; _dest_repo "$GHDRAINR"
-git -C "$GHDRAINR" remote add origin 'https://example.invalid/nonexistent.git'
+git -C "$GHDRAINR" remote add origin 'https://github.com/user/dotfiles.git'
 GHDRAIN_BIN="$GHDRAINH/fake-bin"; mkdir -p "$GHDRAIN_BIN"
 GHDRAIN_MARKER="$(mktemp -u)"
 cat >"$GHDRAIN_BIN/git" <<EOF
 #!/bin/bash
 if [[ " \$* " == *" push origin HEAD "* ]]; then
+    : >>"$GHDRAINH/git.pushes"
     for i in \$(seq 1 400); do printf 'remote: progress chatter line %d\n' "\$i"; done
     printf 'reached-the-end\n' >"$GHDRAIN_MARKER"
     exit 1
@@ -644,6 +659,7 @@ fi
 exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$GHDRAIN_BIN/git"
+printf '#!/bin/bash\nprintf 404\n' >"$GHDRAIN_BIN/curl"; chmod +x "$GHDRAIN_BIN/curl"
 rm -f "$GHDRAIN_MARKER"
 PATH="$GHDRAIN_BIN:$PATH" OMABACKUP_REPO="$GHDRAINR" OMABACKUP_PUSH_OUTPUT_MAX_BYTES=100 bash -c '
     source lib/destinations.sh
@@ -695,12 +711,13 @@ assert_not_contains "$GH_OLD_STATE" "ghp_ERROR_TOKEN"
 # `tail -c | dest_redact_output` order, this exact fixture leaks
 # `CRETTOKEN` in the clear; against the fixed order, it does not.
 GHTRUNCH="$(mktemp -d)"; GHTRUNCR="$GHTRUNCH/repo"; _dest_repo "$GHTRUNCR"
-git -C "$GHTRUNCR" remote add origin 'https://example.invalid/nonexistent.git'
+git -C "$GHTRUNCR" remote add origin 'https://github.com/user/dotfiles.git'
 printf '{"schemaVersion":1,"destinations":[]}\n' >"$GHTRUNCH/destinations.json"
 GHTRUNC_BIN="$GHTRUNCH/fake-bin"; mkdir -p "$GHTRUNC_BIN"
 cat >"$GHTRUNC_BIN/git" <<EOF
 #!/bin/bash
 if [[ " \$* " == *" push origin HEAD "* ]]; then
+    : >>"$GHTRUNCH/git.pushes"
     printf '%s' "\$(head -c 500 /dev/zero | tr '\\0' x)"
     printf 'https://user:TOPSECRETTOKEN@example.com/repo: fatal error\\n'
     exit 1
@@ -708,6 +725,7 @@ fi
 exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$GHTRUNC_BIN/git"
+printf '#!/bin/bash\nprintf 404\n' >"$GHTRUNC_BIN/curl"; chmod +x "$GHTRUNC_BIN/curl"
 PATH="$GHTRUNC_BIN:$PATH" HOME="$GHTRUNCH" OMABACKUP_GROUPS="$PWD/groups.default.json" \
     OMABACKUP_STATE="$GHTRUNCH/.state" OMABACKUP_REPO="$GHTRUNCR" \
     OMABACKUP_DESTINATIONS="$GHTRUNCH/destinations.json" XDG_RUNTIME_DIR=/nonexistent \
@@ -724,6 +742,9 @@ it "a credential is redacted even when it sits inside output that would otherwis
 assert_not_contains "$GHTRUNC_LOG_CONTENT" "TOPSECRETTOKEN"
 assert_not_contains "$GHTRUNC_LOG_CONTENT" "CRETTOKEN"
 
+it "and git push really ran, so the log above holds git's own failure text"
+[[ -e "$GHTRUNCH/git.pushes" ]] && ok || fail "git push was never invoked; the redaction assertions above checked nothing"
+
 # ── review round omabackup-41 (`omabackup-rev-2`): the push's own failure
 # detection silently depended on the caller's `pipefail` setting ───────────
 # With `pipefail` off, `tail` (the pipe's own last stage) almost never fails
@@ -733,17 +754,19 @@ assert_not_contains "$GHTRUNC_LOG_CONTENT" "CRETTOKEN"
 # itself should not depend on that global staying true forever, the same
 # self-contained standard `_artifact_manifest_file` already holds itself to.
 GHPFH="$(mktemp -d)"; GHPFR="$GHPFH/repo"; _dest_repo "$GHPFR"
-git -C "$GHPFR" remote add origin 'https://example.invalid/nonexistent.git'
+git -C "$GHPFR" remote add origin 'https://github.com/user/dotfiles.git'
 GHPF_BIN="$GHPFH/fake-bin"; mkdir -p "$GHPF_BIN"
 cat >"$GHPF_BIN/git" <<EOF
 #!/bin/bash
 if [[ " \$* " == *" push origin HEAD "* ]]; then
+    : >>"$GHPFH/git.pushes"
     sleep 30
     exit 0
 fi
 exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$GHPF_BIN/git"
+printf '#!/bin/bash\nprintf 404\n' >"$GHPF_BIN/curl"; chmod +x "$GHPF_BIN/curl"
 # _push_github's own stdout ("0" on success, its error text on failure) must
 # be redirected away here -- found by review (round omabackup-42,
 # `omabackup-rev`): capturing it inline ahead of the trailing `printf %s $?`
@@ -761,6 +784,9 @@ GHPF_RC="$(PATH="$GHPF_BIN:$PATH" OMABACKUP_REPO="$GHPFR" OMABACKUP_PUSH_TIMEOUT
 it "_push_github correctly reports a timed-out push as a failure even with pipefail explicitly disabled"
 [[ "$GHPF_RC" == 1 ]] && ok || fail "expected exactly rc=1 with pipefail off; got '$GHPF_RC' (a silent false-success would read '00' here)"
 
+it "and that rc=1 came from the timed-out git push, not from a refusal before it"
+[[ -e "$GHPFH/git.pushes" ]] && ok || fail "git push was never invoked"
+
 # ── review round omabackup-42 (`omabackup-rev`): redacting before truncating
 # reopened the memory bound the byte cap exists to hold ────────────────────
 # `dest_redact_output` is `sed`, which must buffer a complete line before it
@@ -775,17 +801,19 @@ it "_push_github correctly reports a timed-out push as a failure even with pipef
 # redact-then-truncate design across repeated runs, with no flakiness
 # margin to worry about.
 GHMEMH="$(mktemp -d)"; GHMEMR="$GHMEMH/repo"; _dest_repo "$GHMEMR"
-git -C "$GHMEMR" remote add origin 'https://example.invalid/nonexistent.git'
+git -C "$GHMEMR" remote add origin 'https://github.com/user/dotfiles.git'
 GHMEM_BIN="$GHMEMH/fake-bin"; mkdir -p "$GHMEM_BIN"
 cat >"$GHMEM_BIN/git" <<EOF
 #!/bin/bash
 if [[ " \$* " == *" push origin HEAD "* ]]; then
+    : >>"$GHMEMH/git.pushes"
     head -c 200000000 /dev/zero | tr '\\0' x
     exit 1
 fi
 exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$GHMEM_BIN/git"
+printf '#!/bin/bash\nprintf 404\n' >"$GHMEM_BIN/curl"; chmod +x "$GHMEM_BIN/curl"
 GHMEM_RC="$(
     ulimit -v 20000
     PATH="$GHMEM_BIN:$PATH" OMABACKUP_REPO="$GHMEMR" bash -c '
@@ -798,6 +826,9 @@ GHMEM_RC="$(
 it "_push_github stays bounded under a tight memory limit against a single 200MB unterminated line"
 [[ "$GHMEM_RC" == 1 ]] && ok || fail "expected a clean rc=1 under ulimit -v 20000; got '$GHMEM_RC' (empty means the subshell itself was killed -- OOM)"
 
+it "and that rc=1 came after git pushed its 200MB line, not from a refusal before it"
+[[ -e "$GHMEMH/git.pushes" ]] && ok || fail "git push was never invoked"
+
 # ── marketplace security review, 2026-09-06: `git push` had no timeout, and
 # no cap on how much of its output this tool would hold in memory ──────────
 # https://github.com/omacom/omarchy-plugin-marketplace/issues/3968#issuecomment-5560428690:
@@ -806,18 +837,20 @@ it "_push_github stays bounded under a tight memory limit against a single 200MB
 # own memory. Same fake-git PATH-shadow technique already established above
 # in this file for the credential-redaction tests.
 GHTMH="$(mktemp -d)"; GHTMR="$GHTMH/repo"; _dest_repo "$GHTMR"
-git -C "$GHTMR" remote add origin 'https://example.invalid/nonexistent.git'
+git -C "$GHTMR" remote add origin 'https://github.com/user/dotfiles.git'
 printf '{"schemaVersion":1,"destinations":[]}\n' >"$GHTMH/destinations.json"
 GHTM_BIN="$GHTMH/fake-bin"; mkdir -p "$GHTM_BIN"
 cat >"$GHTM_BIN/git" <<EOF
 #!/bin/bash
 if [[ " \$* " == *" push origin HEAD "* ]]; then
+    : >>"$GHTMH/git.pushes"
     sleep 30
     exit 0
 fi
 exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$GHTM_BIN/git"
+printf '#!/bin/bash\nprintf 404\n' >"$GHTM_BIN/curl"; chmod +x "$GHTM_BIN/curl"
 GHTM_START="$(date +%s)"
 GHTM_OUT="$(PATH="$GHTM_BIN:$PATH" HOME="$GHTMH" OMABACKUP_GROUPS="$PWD/groups.default.json" \
     OMABACKUP_STATE="$GHTMH/.state" OMABACKUP_REPO="$GHTMR" \
@@ -831,19 +864,24 @@ it "a hanging git push is killed by OMABACKUP_PUSH_TIMEOUT_SEC rather than hangi
 it "and push reports the failure, not a false success, when the git push step timed out"
 [[ "$GHTM_RC" != 0 ]] && ok || fail "expected a non-zero exit; got 0 with output: $GHTM_OUT"
 
+it "and the hanging git push was really started, so the timeout is what ended it"
+[[ -e "$GHTMH/git.pushes" ]] && ok || fail "git push was never invoked"
+
 GHOUTH="$(mktemp -d)"; GHOUTR="$GHOUTH/repo"; _dest_repo "$GHOUTR"
-git -C "$GHOUTR" remote add origin 'https://example.invalid/nonexistent.git'
+git -C "$GHOUTR" remote add origin 'https://github.com/user/dotfiles.git'
 printf '{"schemaVersion":1,"destinations":[]}\n' >"$GHOUTH/destinations.json"
 GHOUT_BIN="$GHOUTH/fake-bin"; mkdir -p "$GHOUT_BIN"
 cat >"$GHOUT_BIN/git" <<EOF
 #!/bin/bash
 if [[ " \$* " == *" push origin HEAD "* ]]; then
+    : >>"$GHOUTH/git.pushes"
     head -c 50000 /dev/zero | tr '\\0' x
     exit 1
 fi
 exec "$REAL_GIT" "\$@"
 EOF
 chmod +x "$GHOUT_BIN/git"
+printf '#!/bin/bash\nprintf 404\n' >"$GHOUT_BIN/curl"; chmod +x "$GHOUT_BIN/curl"
 GHOUT_OUT="$(PATH="$GHOUT_BIN:$PATH" HOME="$GHOUTH" OMABACKUP_GROUPS="$PWD/groups.default.json" \
     OMABACKUP_STATE="$GHOUTH/.state" OMABACKUP_REPO="$GHOUTR" \
     OMABACKUP_DESTINATIONS="$GHOUTH/destinations.json" XDG_RUNTIME_DIR=/nonexistent \
@@ -851,6 +889,9 @@ GHOUT_OUT="$(PATH="$GHOUT_BIN:$PATH" HOME="$GHOUTH" OMABACKUP_GROUPS="$PWD/group
 
 it "a failed push's captured output stays bounded near OMABACKUP_PUSH_OUTPUT_MAX_BYTES, not the full 50000-byte stream"
 (( ${#GHOUT_OUT} < 3000 )) && ok || fail "expected well under 3000 chars for a 1000-byte cap, got ${#GHOUT_OUT}"
+
+it "and git push really ran and wrote its 50000 bytes, so the bound above was tested"
+[[ -e "$GHOUTH/git.pushes" ]] && ok || fail "git push was never invoked"
 
 # The default timer path includes the implicit origin alongside configured
 # destinations. Naming a destination is an intentional narrow retry and must
