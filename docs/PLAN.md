@@ -6595,3 +6595,26 @@ asked for the PLAN line on the blob id above to match, and for "describes
 `sync` in full" to say only that `help` now lists verify among the steps.
 
 Full suite on the release tree: **1788 passed, 0 failed**.
+
+### The privacy gate reads the host git connects to (2026-11-20)
+
+Contributed by Corey Tyhurst. A hole in the T89 Phase 1 gate, found by review
+while writing the #15 feature.
+
+**The bug.** `dest_github_slug` ended the authority at the first `/` and then
+dropped everything up to the last `@`. Git, through curl, ends it at `/`, `?`
+or `#`, so `https://evil.com?@github.com/o/r` was checked as `github.com/o/r`
+and pushed to `evil.com`.
+
+**The change.** A URL with `?`, `#` or `\` before its first `/` is refused
+(status 2), so the gate skips that push and says so. Refused, not parsed a
+second way, for the reason a `%`-encoded host is refused.
+
+**Specs.** Five URLs beside the `%67ithub` specs; all five fail on `main`
+(`destinations` -- **155 passed, 5 failed**). On this branch `destinations` --
+**160 passed, 0 failed**. Full suite in a network-less Arch container -- **1790
+passed, 4 failed**, against `main`'s **1787 passed, 2 failed** at `97aac67`;
+the two extra are the load-flaky Config TUI Escape spec, which passes alone
+(`config` -- **240 passed, 0 failed**). Not run on a live Omarchy session.
+
+No version bump and no `CHANGELOG.md` entry: left to the release commit.
