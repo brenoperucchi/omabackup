@@ -477,6 +477,45 @@ for PG6D_URL in 'https://evil.com?@github.com/o/r' 'https://evil.com#@github.com
         && ok || fail "probed=$([[ -e "$PG6D/curl.calls" ]] && echo yes || echo no) pushed=$([[ -e "$PG6D/git.pushes" ]] && echo yes || echo no) out: $PG6D_OUT"
 done
 
+# Two more places where the host git connects to is not the host this function
+# read (review round omabackup-110, `omabackup-rev-2`, reproduced on git 2.56.0
+# with a fake ssh that prints its arguments).
+#   - `%2f` in the userinfo of an `ssh://` or `git://` URL. Git, not curl,
+#     parses those, and it decodes the whole URL BEFORE it finds the end of the
+#     host, so `ssh://evil.com%2f@github.com/o/r` connects to evil.com while
+#     this function read github.com. A `%` is already refused in the host
+#     because a second decoder has to agree with git's byte for byte; the same
+#     reason applies to the userinfo, so a `%` anywhere in the authority is
+#     refused.
+#   - square brackets. Git strips them from the host, userinfo and all
+#     (`git@[github.com]:o/r` reaches github.com, `[git@github.com]@evil.com:o/r`
+#     reaches github.com too), while this function read `[github.com]`, a host
+#     that is "positively not GitHub", so the push went to GitHub with no
+#     probe. Brackets are refused unless they wrap a plain IPv6 literal, which
+#     can never be github.com.
+for PG6E_URL in 'ssh://evil.com%2f@github.com/o/r' 'git://evil.com%2f@github.com/o/r' \
+                'https::ssh://evil.com%2f@github.com/o/r' 'ssh://%5bgit@github.com%5d@evil.com/o/r' \
+                'git@[github.com]:o/r' '[git@github.com]:o/r' 'ssh://git@[github.com]/o/r' \
+                'ssh://[git@github.com]@evil.com/o/r' '[git@github.com]@evil.com:o/r'; do
+    PG6E="$(mktemp -d)"; _gate_fixture "$PG6E" "$PG6E_URL" 404
+    PG6E_OUT="$(_gate_push "$PG6E" github)"
+
+    it "a remote whose authority holds % or a bracket outside an IPv6 literal is never probed and never pushed to: $PG6E_URL"
+    [[ ! -e "$PG6E/curl.calls" && ! -e "$PG6E/git.pushes" && "$PG6E_OUT" == *skipped* ]] \
+        && ok || fail "probed=$([[ -e "$PG6E/curl.calls" ]] && echo yes || echo no) pushed=$([[ -e "$PG6E/git.pushes" ]] && echo yes || echo no) out: $PG6E_OUT"
+done
+
+# Controls: a plain IPv6 literal still reads as "not GitHub" and is pushed to
+# unchanged, with no probe and no refusal.
+for PG6F_URL in 'ssh://[::1]/o/r' 'ssh://git@[2001:db8::1]:2222/o/r' 'git@[::1]:o/r'; do
+    PG6F="$(mktemp -d)"; _gate_fixture "$PG6F" "$PG6F_URL" 200
+    _gate_push "$PG6F" github >/dev/null
+
+    it "an IPv6 literal origin is still pushed to unchanged, with no probe: $PG6F_URL"
+    [[ -e "$PG6F/git.pushes" && ! -e "$PG6F/curl.calls" ]] && ok \
+        || fail "pushed=$([[ -e "$PG6F/git.pushes" ]] && echo yes || echo no) probed=$([[ -e "$PG6F/curl.calls" ]] && echo yes || echo no)"
+done
+
 PG7="$(mktemp -d)"; _gate_fixture "$PG7" 'https://breno:ghp_PROBE_TOKEN@github.com/user/dotfiles.git' 200
 PG7_OUT="$(_gate_push "$PG7" github)"
 

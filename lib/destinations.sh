@@ -265,9 +265,38 @@ dest_github_push_url() {
 #     read as github.com/o/r while git connected to evil.com. A private or
 #     absent o/r answered 404 and the push went out. None of the three belongs
 #     in a hostname, so the URL is refused rather than parsed a second way.
-# The caller refuses all four.
+#   - a `%` anywhere in the authority, userinfo included. For `ssh://` and
+#     `git://` git, not curl, parses the URL, and it decodes the whole URL
+#     BEFORE it finds the end of the host: `ssh://evil.com%2f@github.com/o/r`
+#     connects to evil.com while the `@` rule above read github.com (review
+#     omabackup-110). Same reason as the host: no second decoder.
+#   - a `[` or `]` that does not wrap a plain IPv6 literal. Git strips brackets
+#     from the host and the userinfo alike, so `git@[github.com]:o/r` and
+#     `[git@github.com]@evil.com:o/r` reach github.com while this function read
+#     `[github.com]` or `evil.com`. A plain IPv6 literal can never be github.com
+#     and keeps working.
+# The caller refuses all six.
+#
+# Not covered, on purpose: a host alias in ~/.ssh/config that points at
+# github.com (`git@github-work:o/r`) reads as "not GitHub". Resolving it would
+# take `ssh -G`, and `core.sshCommand`, `GIT_SSH` and `GIT_SSH_COMMAND` can
+# point at another ssh or another config, so the answer would not hold.
 #
 # Never prints its input: a remote URL may carry a token in its userinfo.
+# Brackets in an authority are refused unless they wrap a plain IPv6 literal.
+# <kind> is `url` (the text is the authority of `scheme://...`) or `scp` (the
+# text is everything before the first `/` of `[user@]host:path`).
+_dest_brackets_ok() {  # _dest_brackets_ok <text> <url|scp>
+    local t="$1" re
+    [[ "$t" == *[\[\]]* ]] || return 0
+    if [[ "$2" == url ]]; then
+        re='^([^][@]*@)?\[[0-9A-Fa-f:.]+\](:[0-9]*)?$'
+    else
+        re='^([^][@]*@)?\[[0-9A-Fa-f:.]+\]:.*$'
+    fi
+    [[ "$t" =~ $re ]]
+}
+
 dest_github_slug() {
     local u="$1" rest auth path="" host helper=0
     [[ "$u" =~ ^[Ee][Xx][Tt]:: ]] && return 2
@@ -278,7 +307,8 @@ dest_github_slug() {
     if [[ "$u" =~ ^[A-Za-z][A-Za-z0-9+.-]*://(.*)$ ]]; then
         rest="${BASH_REMATCH[1]}"
         auth="${rest%%/*}"
-        [[ "$auth" == *[?#\\]* ]] && return 2
+        [[ "$auth" == *[?#\\%]* ]] && return 2
+        _dest_brackets_ok "$auth" url || return 2
         [[ "$rest" == */* ]] && path="${rest#*/}"
     elif (( helper )); then
         return 2
@@ -287,6 +317,7 @@ dest_github_slug() {
         # after a slash belongs to a local path, not to a host.
         auth="${u%%:*}"; path="${u#*:}"
         [[ "$auth" == */* ]] && return 1
+        _dest_brackets_ok "${u%%/*}" scp || return 2
     else
         return 1
     fi
