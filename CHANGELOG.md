@@ -7,6 +7,53 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 loosely while it is pre-1.0: patch releases may still change behaviour when the
 change closes a security hole, and such changes are always called out here.
 
+## [0.5.2] — 2026-11-26
+
+The check that runs before `push` now reads the host git actually connects to,
+and a layout folder joins the default backup. Nothing to do when upgrading. A
+few unusual remotes are now skipped by `push` instead of being pushed, which is
+listed below.
+
+### Security
+
+- Before pushing to a GitHub remote, `push` asks GitHub whether the repository
+  is public and refuses to push your backup to a public one. That check read
+  the host out of the remote URL in a way git does not, so
+  `https://evil.com?@github.com/o/r` was checked as `github.com/o/r` while git
+  connected to `evil.com`. The check now reads the host the way git and curl do.
+- More spellings that point git at a host other than the one the check read are
+  refused, and `push` says so and skips that remote: `%`-encoded hosts, brackets
+  that do not wrap an IPv6 address, `@[` after the host (`ssh://evil.com/x@[github.com]/o/r`),
+  an empty host in an `http(s)` URL (`https:///github.com/o/r`) and
+  non-ASCII host names, which curl converts to ASCII before it connects.
+- A few legitimate remotes are skipped as a result, all of them rare: an IPv6
+  address with a zone id, a `%`-encoded user name in an `ssh://` URL, and an
+  internationalized host name. A bracket or an `@` in a directory name
+  (`archive[year]`, `team@year`) still pushes as before.
+- Not covered: a host alias in `~/.ssh/config` that points at github.com, an IP
+  address of GitHub's, an explicit remote helper, and an HTTP redirect.
+
+### Changed
+
+- The default backup now includes `~/.local/state/omarchy/workspace-layouts`.
+- The push failure specs use a private GitHub remote as their fixture instead
+  of a host nobody checked.
+
+### Testing
+
+- Full suite: 1835 passed, 0 failed.
+
+### Thanks
+
+- [Anton Petrov](https://github.com/Psychosoc1al) added the workspace layouts
+  folder to the default backup in
+  [PR #17](https://github.com/brenoperucchi/omabackup/pull/17).
+- [Corey Tyhurst](https://github.com/coreytyhurst) found the host-reading hole
+  in the push check and fixed it in
+  [PR #19](https://github.com/brenoperucchi/omabackup/pull/19), and moved the
+  push failure specs to a private GitHub remote in
+  [PR #18](https://github.com/brenoperucchi/omabackup/pull/18).
+
 ## [0.5.1] — 2026-11-05
 
 Two security fixes for the `secrets` group. The marketplace review of 0.5.0
