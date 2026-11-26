@@ -217,6 +217,20 @@ dest_github_push_url() {
     printf '%s' "$url" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@#\1#'
 }
 
+# Brackets in an authority are refused unless they wrap a plain IPv6 literal.
+# <kind> is `url` (the text is the authority of `scheme://...`) or `scp` (the
+# text is everything before the first `/` of `[user@]host:path`).
+_dest_brackets_ok() {  # _dest_brackets_ok <text> <url|scp>
+    local t="$1" re
+    [[ "$t" == *[\[\]]* ]] || return 0
+    if [[ "$2" == url ]]; then
+        re='^([^][@]*@)?\[[0-9A-Fa-f:.]+\](:[0-9]*)?$'
+    else
+        re='^([^][@]*@)?\[[0-9A-Fa-f:.]+\]:.*$'
+    fi
+    [[ "$t" =~ $re ]]
+}
+
 # Reduce a remote URL to the GitHub repository it names. Prints OWNER/REPO.
 #   0  a GitHub remote, and exactly one owner/repo
 #   1  positively not a GitHub remote (the caller leaves it alone)
@@ -265,17 +279,25 @@ dest_github_push_url() {
 #     read as github.com/o/r while git connected to evil.com. A private or
 #     absent o/r answered 404 and the push went out. None of the three belongs
 #     in a hostname, so the URL is refused rather than parsed a second way.
-#   - a `%` anywhere in the authority, userinfo included. For `ssh://` and
-#     `git://` git, not curl, parses the URL, and it decodes the whole URL
-#     BEFORE it finds the end of the host: `ssh://evil.com%2f@github.com/o/r`
-#     connects to evil.com while the `@` rule above read github.com (review
-#     omabackup-110). Same reason as the host: no second decoder.
+#   - a `%` anywhere in the authority of a URL that git does not hand to curl
+#     (anything but `http://` and `https://`). Git itself parses those, and it
+#     decodes the whole URL BEFORE it finds the end of the host:
+#     `ssh://evil.com%2f@github.com/o/r` connects to evil.com while the `@`
+#     rule above read github.com (review omabackup-110). Same reason as the
+#     host: no second decoder. Curl does not do this, so for `http(s)://` a `%`
+#     in the userinfo is left alone (`https://DOMAIN%5Cuser@host/...` is a
+#     real spelling); a `%` in the HOST is refused for every scheme.
 #   - a `[` or `]` that does not wrap a plain IPv6 literal. Git strips brackets
 #     from the host and the userinfo alike, so `git@[github.com]:o/r` and
 #     `[git@github.com]@evil.com:o/r` reach github.com while this function read
 #     `[github.com]` or `evil.com`. A plain IPv6 literal can never be github.com
-#     and keeps working.
-# The caller refuses all six.
+#     and keeps working. Git also looks for `@[` in everything after the
+#     authority, so `ssh://evil.com/x@[github.com]/o/r` connects to github.com
+#     (and `%5b`/`%5d` in the path do the same, after the decode): for the same
+#     non-curl URLs a bracket or `%5b`/`%5d` after the authority is refused too
+#     (review omabackup-111). A zone id in an IPv6 literal (`[fe80::1%25eth0]`)
+#     is refused with the `%`; it is too rare to justify its own parser.
+# The caller refuses all of these.
 #
 # Not covered, on purpose: a host alias in ~/.ssh/config that points at
 # github.com (`git@github-work:o/r`) reads as "not GitHub". Resolving it would
@@ -283,34 +305,32 @@ dest_github_push_url() {
 # point at another ssh or another config, so the answer would not hold.
 #
 # Never prints its input: a remote URL may carry a token in its userinfo.
-# Brackets in an authority are refused unless they wrap a plain IPv6 literal.
-# <kind> is `url` (the text is the authority of `scheme://...`) or `scp` (the
-# text is everything before the first `/` of `[user@]host:path`).
-_dest_brackets_ok() {  # _dest_brackets_ok <text> <url|scp>
-    local t="$1" re
-    [[ "$t" == *[\[\]]* ]] || return 0
-    if [[ "$2" == url ]]; then
-        re='^([^][@]*@)?\[[0-9A-Fa-f:.]+\](:[0-9]*)?$'
-    else
-        re='^([^][@]*@)?\[[0-9A-Fa-f:.]+\]:.*$'
-    fi
-    [[ "$t" =~ $re ]]
-}
-
 dest_github_slug() {
-    local u="$1" rest auth path="" host helper=0
+    local u="$1" rest auth path="" host helper="" scheme="" tail via_curl=0
     [[ "$u" =~ ^[Ee][Xx][Tt]:: ]] && return 2
-    if [[ "$u" =~ ^[A-Za-z0-9][A-Za-z0-9+.-]*::(.*)$ ]]; then
-        u="${BASH_REMATCH[1]}"
-        helper=1
+    if [[ "$u" =~ ^([A-Za-z0-9][A-Za-z0-9+.-]*)::(.*)$ ]]; then
+        helper="${BASH_REMATCH[1],,}"
+        u="${BASH_REMATCH[2]}"
     fi
-    if [[ "$u" =~ ^[A-Za-z][A-Za-z0-9+.-]*://(.*)$ ]]; then
-        rest="${BASH_REMATCH[1]}"
+    if [[ "$u" =~ ^([A-Za-z][A-Za-z0-9+.-]*)://(.*)$ ]]; then
+        scheme="${BASH_REMATCH[1],,}"
+        rest="${BASH_REMATCH[2]}"
         auth="${rest%%/*}"
-        [[ "$auth" == *[?#\\%]* ]] && return 2
+        [[ "$auth" == *[?#\\]* ]] && return 2
+        # Only http(s) goes through curl, which leaves the userinfo alone. Every
+        # other URL is parsed by git, which decodes it first.
+        if [[ "$scheme" == http || "$scheme" == https ]] \
+            && [[ -z "$helper" || "$helper" == http || "$helper" == https ]]; then
+            via_curl=1
+        fi
+        if (( ! via_curl )); then
+            [[ "$auth" == *%* ]] && return 2
+            tail="${rest:${#auth}}"
+            [[ "$tail" == *[\[\]]* || "${tail,,}" == *%5[bd]* ]] && return 2
+        fi
         _dest_brackets_ok "$auth" url || return 2
         [[ "$rest" == */* ]] && path="${rest#*/}"
-    elif (( helper )); then
+    elif [[ -n "$helper" ]]; then
         return 2
     elif [[ "$u" == *:* ]]; then
         # scp-like `[user@]host:path`. Git's own rule: a colon that comes
@@ -318,6 +338,8 @@ dest_github_slug() {
         auth="${u%%:*}"; path="${u#*:}"
         [[ "$auth" == */* ]] && return 1
         _dest_brackets_ok "${u%%/*}" scp || return 2
+        tail="${u%%/*}"; tail="${u:${#tail}}"
+        [[ "$tail" == *[\[\]]* ]] && return 2
     else
         return 1
     fi

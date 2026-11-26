@@ -496,7 +496,10 @@ done
 for PG6E_URL in 'ssh://evil.com%2f@github.com/o/r' 'git://evil.com%2f@github.com/o/r' \
                 'https::ssh://evil.com%2f@github.com/o/r' 'ssh://%5bgit@github.com%5d@evil.com/o/r' \
                 'git@[github.com]:o/r' '[git@github.com]:o/r' 'ssh://git@[github.com]/o/r' \
-                'ssh://[git@github.com]@evil.com/o/r' '[git@github.com]@evil.com:o/r'; do
+                'ssh://[git@github.com]@evil.com/o/r' '[git@github.com]@evil.com:o/r' \
+                'ssh://evil.com/x@[github.com]/o/r' 'ssh://evil.com/x%40%5bgithub.com%5d/o/r' \
+                'ssh://evil.com/x@%5BGITHUB.com%5D/o/r' 'evil.com:x/@[github.com]:o/r' \
+                'git@evil.com:o/@[github.com]:r'; do
     PG6E="$(mktemp -d)"; _gate_fixture "$PG6E" "$PG6E_URL" 404
     PG6E_OUT="$(_gate_push "$PG6E" github)"
 
@@ -504,6 +507,29 @@ for PG6E_URL in 'ssh://evil.com%2f@github.com/o/r' 'git://evil.com%2f@github.com
     [[ ! -e "$PG6E/curl.calls" && ! -e "$PG6E/git.pushes" && "$PG6E_OUT" == *skipped* ]] \
         && ok || fail "probed=$([[ -e "$PG6E/curl.calls" ]] && echo yes || echo no) pushed=$([[ -e "$PG6E/git.pushes" ]] && echo yes || echo no) out: $PG6E_OUT"
 done
+
+# Git also looks for `@[` in everything AFTER the authority and strips the
+# brackets (review round omabackup-111, `omabackup-rev-2`):
+# `ssh://evil.com/x@[github.com]/o/r` reaches github.com while the host read
+# was evil.com, so the push went to GitHub with no probe. The same holds for
+# `%5b`/`%5d` in the path of an `ssh://` URL, after git's decode, and for the
+# scp-like spellings. Curl does none of this, which is why the `%` rules above
+# and these are for URLs git parses itself.
+#
+# Controls: curl parses an https URL and leaves its userinfo alone, so an
+# encoded character there (an e-mail user, a DOMAIN%5Cuser login) must still
+# reach the probe: refused when the repository is public, pushed when it is not.
+PG6G="$(mktemp -d)"; _gate_fixture "$PG6G" 'https://a%40b.com@github.com/o/r' 404
+_gate_push "$PG6G" github >/dev/null
+it "an https remote with an encoded userinfo is still probed and pushed to when the repository is not public"
+[[ -e "$PG6G/curl.calls" && -e "$PG6G/git.pushes" ]] && ok \
+    || fail "probed=$([[ -e "$PG6G/curl.calls" ]] && echo yes || echo no) pushed=$([[ -e "$PG6G/git.pushes" ]] && echo yes || echo no)"
+
+PG6H="$(mktemp -d)"; _gate_fixture "$PG6H" 'https://DOMAIN%5cuser@github.com/o/r' 200
+PG6H_OUT="$(_gate_push "$PG6H" github)"
+it "and the same remote is refused, not skipped, when the repository is public"
+[[ ! -e "$PG6H/git.pushes" && "$PG6H_OUT" == *refusing* ]] && ok \
+    || fail "pushed=$([[ -e "$PG6H/git.pushes" ]] && echo yes || echo no) out: $PG6H_OUT"
 
 # Controls: a plain IPv6 literal still reads as "not GitHub" and is pushed to
 # unchanged, with no probe and no refusal.
