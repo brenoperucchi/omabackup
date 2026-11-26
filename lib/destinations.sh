@@ -217,20 +217,20 @@ dest_github_push_url() {
     printf '%s' "$url" | sed -E 's#^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@#\1#'
 }
 
+# What follows the authority may hold a bracket, or an @, in a directory name
+# (`archive[year]`, `team@year`), and that is fine. It only matters when git can
+# read it as the start of the host: git looks for the two characters `@[` in a
+# row after the authority, after decoding the URL once. So a path is refused
+# only when it holds `@[` in any of its spellings (`@%5b`, `%40[`, `%40%5b`).
+# Anything less is a path (reviews omabackup-112 and 114).
+_dest_tail_ok() {  # _dest_tail_ok <text after the authority>
+    local t="${1,,}"
+    [[ "$t" == *@\[* || "$t" == *@%5b* || "$t" == *%40\[* || "$t" == *%40%5b* ]] && return 1
+    return 0
+}
 # Brackets in an authority are refused unless they wrap a plain IPv6 literal.
 # <kind> is `url` (the text is the authority of `scheme://...`) or `scp` (the
 # text is everything before the first `/` of `[user@]host:path`).
-# What follows the authority may hold a bracket in a directory name
-# (`archive[year]`), and that is fine. It only matters when git can read it as
-# the start of the host: git looks for `@[` after the authority, after decoding
-# the URL. So a path is refused only when it carries an `@` (or `%40`) together
-# with a `[` (or `%5b`); a bracket alone is a path (review omabackup-112).
-_dest_tail_ok() {  # _dest_tail_ok <text after the authority>
-    local t="${1,,}"
-    [[ "$t" == *@* || "$t" == *%40* ]] || return 0
-    [[ "$t" == *[\[\]]* || "$t" == *%5[bd]* ]] && return 1
-    return 0
-}
 _dest_brackets_ok() {  # _dest_brackets_ok <text> <url|scp>
     local t="$1" re
     [[ "$t" == *[\[\]]* ]] || return 0
@@ -318,6 +318,7 @@ _dest_brackets_ok() {  # _dest_brackets_ok <text> <url|scp>
 # Never prints its input: a remote URL may carry a token in its userinfo.
 dest_github_slug() {
     local u="$1" rest auth path="" host helper="" scheme="" tail via_curl=0
+    local LC_ALL=C   # byte-wise: the non-ASCII host check must not depend on the locale
     [[ "$u" =~ ^[Ee][Xx][Tt]:: ]] && return 2
     if [[ "$u" =~ ^([A-Za-z0-9][A-Za-z0-9+.-]*)::(.*)$ ]]; then
         helper="${BASH_REMATCH[1],,}"
@@ -328,11 +329,11 @@ dest_github_slug() {
         rest="${BASH_REMATCH[2]}"
         auth="${rest%%/*}"
         [[ "$auth" == *[?#\\]* ]] && return 2
-        # An empty authority is only a real thing for file://. For http(s) curl
+        # An empty authority is only a real thing for a plain file:// URL. For http(s) curl
         # skips extra slashes after the scheme, so `https:///github.com/o/r`
         # connects to github.com while this function saw no host at all
         # (review omabackup-112). Anything else that names no host is refused.
-        [[ -z "$auth" && "$scheme" != file ]] && return 2
+        [[ -z "$auth" && ( "$scheme" != file || -n "$helper" ) ]] && return 2
         # Only http(s) goes through curl, which leaves the userinfo alone. Every
         # other URL is parsed by git, which decodes it first.
         if [[ "$scheme" == http || "$scheme" == https ]] \
@@ -355,7 +356,10 @@ dest_github_slug() {
         [[ "$auth" == */* ]] && return 1
         # Brackets before the colon are a host spelling and go through the
         # IPv6 check; brackets after it are part of the path (`archive[year]`).
-        [[ "$auth" == *[\[\]]* ]] && { _dest_brackets_ok "${u%%/*}" scp || return 2; }
+        if [[ "$auth" == *[\[\]]* ]]; then
+            _dest_brackets_ok "${u%%/*}" scp || return 2
+            path="${u#*]:}"     # the first colon was inside the IPv6 literal
+        fi
         _dest_tail_ok "$path" || return 2
     else
         return 1
@@ -363,6 +367,10 @@ dest_github_slug() {
     auth="${auth##*@}"
     host="${auth%%:*}"
     [[ "$host" == *%* ]] && return 2
+    # curl turns a non-ASCII host name into ASCII (IDNA, UTS #46 mappings
+    # included) before it connects, and this function would compare the raw
+    # text. Refused rather than normalized a second way (review omabackup-114).
+    [[ "$host" =~ [^\ -~] ]] && return 2
     host="${host,,}"
     host="${host%.}"
     case "$host" in

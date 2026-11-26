@@ -6642,28 +6642,34 @@ No version bump and no `CHANGELOG.md` entry: left to the release commit.
 
 ### The privacy gate and git's own URL parser (2026-11-26)
 
-Review of the #19 merge (rounds omabackup-110 to 113) found more spellings where
+Review of the #19 merge (rounds omabackup-110 to 115) found more spellings where
 git connects to a host that `dest_github_slug` read differently. Commits
-`f79a85f`, `ac47c1c` and `6a5f923`.
+`f79a85f`, `ac47c1c`, `6a5f923` and the one after it.
 
-**What git does that the function did not.** For `ssh://`, `git://` and
-helper URLs git parses the URL itself: it url-decodes the whole URL before it
-finds the end of the host, strips `[` and `]` from host and userinfo, and looks
-for `@[` in everything after the authority. Only `http(s)://` goes to curl,
-which ends the authority at `/ ? #`, skips extra slashes after the scheme and
-leaves the userinfo alone.
+**What git does that the function did not.** For `ssh://` and `git://` URLs
+(and the other schemes git reads itself) git parses the URL: it url-decodes the
+whole URL once before it finds the end of the host, strips `[` and `]` from
+host and userinfo, and looks for the two characters `@[` in everything after the
+authority. A remote helper receives the URL as an argument and does what it
+wants with it, so for helpers the rules below are a conservative guess, not a
+statement about the helper. `http(s)://` goes to curl, which ends the authority
+at `/ ? #`, skips extra slashes after the scheme, normalizes a non-ASCII host
+name to ASCII (IDNA) and decodes user and password only after it has split out
+the authority.
 
 **The rules now.** Refused (status 2, the push is skipped and says so):
 - a `%` in the authority of a URL git parses itself, and a `%` in the host for
   every scheme;
-- a bracket that does not wrap a plain IPv6 literal, in the authority;
-- after the authority, a `[`/`]` (or `%5b`/`%5d`) together with an `@`/`%40`,
-  for URLs git parses itself (`ssh://evil.com/x@[github.com]/o/r`);
-- an empty authority for anything but `file://`
-  (`https:///github.com/o/r` reaches github.com through curl).
-A bracket alone in a directory name (`archive[year]`) is a path and is pushed
-to unchanged. `https://DOMAIN%5Cuser@host/...` keeps working: curl does not
-decode the userinfo.
+- a bracket in the authority that does not wrap a plain IPv6 literal;
+- `@[` after the authority, in any spelling (`@%5b`, `%40[`, `%40%5b`), for the
+  same URLs and for the path of a scp-like remote
+  (`ssh://evil.com/x@[github.com]/o/r`);
+- an empty authority, except for a plain `file://` URL with no explicit helper
+  (`https:///github.com/o/r` reaches github.com through curl);
+- a non-ASCII host name, for every scheme.
+A bracket or an `@` alone in a directory name (`archive[year]`, `team@year`) is
+a path and is pushed to unchanged. `https://DOMAIN%5Cuser@host/...` keeps
+working: curl splits the authority before it decodes the credentials.
 
 **Still refused although legitimate, on purpose.** IPv6 with a zone id
 (`[fe80::1%25eth0]`), and a `%`-encoded userinfo in an `ssh://` URL. Rare, and
@@ -6675,8 +6681,9 @@ alias, an explicit helper, `core.sshCommand`, or an HTTP redirect, and push
 resolves `origin` again after the probe. Binding probe and push to one resolved
 set is separate work, not done here (rev-1, round 112 and 113, P2).
 
-**Specs.** `destinations` -- **191 passed, 0 failed**. Against the previous
-`lib/destinations.sh` the 7 newest fail (3 empty authorities, 4 bracket-in-path
-controls); `f79a85f` fails the 7 that `ac47c1c` added; `main` fails the 5 from
+**Specs.** `destinations` -- **196 passed, 0 failed**. Against the previous
+`lib/destinations.sh` the 5 newest fail (2 non-ASCII hosts, 1 helper with an
+empty authority, 2 path controls with `@`); the 7 before them fail against
+`ac47c1c` (3 empty authorities, 4 bracket-in-path controls); `f79a85f` fails the 7 that `ac47c1c` added; `main` fails the 5 from
 #19 and the 14 bypass URLs. Full suite on `ac47c1c` -- **1818 passed, 0
 failed**; rerun on the release tree before the tag.

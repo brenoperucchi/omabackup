@@ -500,7 +500,8 @@ for PG6E_URL in 'ssh://evil.com%2f@github.com/o/r' 'git://evil.com%2f@github.com
                 'ssh://evil.com/x@[github.com]/o/r' 'ssh://evil.com/x%40%5bgithub.com%5d/o/r' \
                 'ssh://evil.com/x@%5BGITHUB.com%5D/o/r' 'evil.com:x/@[github.com]:o/r' \
                 'git@evil.com:o/@[github.com]:r' \
-                'https:///github.com/o/r' 'http:///github.com/o/r' 'https:////github.com/o/r'; do
+                'https:///github.com/o/r' 'http:///github.com/o/r' 'https:////github.com/o/r' \
+                'https://gıthub.com/o/r' 'https://ｇithub.com/o/r' 'foo::file:///github.com/o/r'; do
     PG6E="$(mktemp -d)"; _gate_fixture "$PG6E" "$PG6E_URL" 404
     PG6E_OUT="$(_gate_push "$PG6E" github)"
 
@@ -547,7 +548,8 @@ done
 # name is a path, not a host. These are not GitHub, so they are pushed to
 # unchanged with no probe and no refusal.
 for PG6I_URL in 'ssh://git@backup.example/archive[year]/r' 'git@backup.example:archive[year]/r' \
-                'backup.example:archive[year]/r' 'file:///srv/archive[year]/r'; do
+                'backup.example:archive[year]/r' 'file:///srv/archive[year]/r' \
+                'git@[2001:db8::1]:archive/team@year/r' 'ssh://git@backup.example/archive[year]/team@year/r'; do
     PG6I="$(mktemp -d)"; _gate_fixture "$PG6I" "$PG6I_URL" 200
     _gate_push "$PG6I" github >/dev/null
 
