@@ -6646,16 +6646,16 @@ Review of the #19 merge (rounds omabackup-110 to 115) found more spellings where
 git connects to a host that `dest_github_slug` read differently. Commits
 `f79a85f`, `ac47c1c`, `6a5f923` and the one after it.
 
-**What git does that the function did not.** For `ssh://` and `git://` URLs
-(and the other schemes git reads itself) git parses the URL: it url-decodes the
-whole URL once before it finds the end of the host, strips `[` and `]` from
-host and userinfo, and looks for the two characters `@[` in everything after the
-authority. A remote helper receives the URL as an argument and does what it
-wants with it, so for helpers the rules below are a conservative guess, not a
-statement about the helper. `http(s)://` goes to curl, which ends the authority
-at `/ ? #`, skips extra slashes after the scheme, normalizes a non-ASCII host
-name to ASCII (IDNA) and decodes user and password only after it has split out
-the authority.
+**What git does that the function did not.** For `ssh://` and `git://` URLs git
+parses the URL itself: it url-decodes the whole URL once before it finds the end
+of the host, strips `[` and `]` from host and userinfo, and looks for the two
+characters `@[` in everything after the authority. A `helper::url` or an
+unknown scheme goes to a `git-remote-<name>` helper, which does what it wants
+with the argument; those are held to the same rules as a conservative guess,
+not as a statement about the helper. `http(s)://` and `ftp(s)://` go to curl,
+which ends the authority at `/ ? #`, skips extra slashes after the scheme,
+normalizes a non-ASCII host name to ASCII (IDNA) and decodes user and password
+only after it has split out the authority.
 
 **The rules now.** Refused (status 2, the push is skipped and says so):
 - a `%` in the authority of a URL git parses itself, and a `%` in the host for
@@ -6672,18 +6672,19 @@ a path and is pushed to unchanged. `https://DOMAIN%5Cuser@host/...` keeps
 working: curl splits the authority before it decodes the credentials.
 
 **Still refused although legitimate, on purpose.** IPv6 with a zone id
-(`[fe80::1%25eth0]`), and a `%`-encoded userinfo in an `ssh://` URL. Rare, and
-the refusal fails closed.
+(`[fe80::1%25eth0]`), a `%`-encoded userinfo in an `ssh://` URL, and a
+non-ASCII (IDN) host name. Rare, and the refusal fails closed.
 
 **Scope of the guarantee.** The gate classifies the effective URL that
 `git remote get-url --push --all` prints. It does not resolve an ssh_config
-alias, an explicit helper, `core.sshCommand`, or an HTTP redirect, and push
-resolves `origin` again after the probe. Binding probe and push to one resolved
-set is separate work, not done here (rev-1, round 112 and 113, P2).
+alias, an IP literal of GitHub's (`git@140.82.121.4:o/r`), an explicit helper,
+`core.sshCommand`, or an HTTP redirect, and push resolves `origin` again after
+the probe. Binding probe and push to one resolved set is separate work, not
+done here (rev-1, rounds 112 to 114, P2).
 
-**Specs.** `destinations` -- **196 passed, 0 failed**. Against the previous
-`lib/destinations.sh` the 5 newest fail (2 non-ASCII hosts, 1 helper with an
-empty authority, 2 path controls with `@`); the 7 before them fail against
-`ac47c1c` (3 empty authorities, 4 bracket-in-path controls); `f79a85f` fails the 7 that `ac47c1c` added; `main` fails the 5 from
-#19 and the 14 bypass URLs. Full suite on `ac47c1c` -- **1818 passed, 0
-failed**; rerun on the release tree before the tag.
+**Specs.** `destinations` -- **196 passed, 0 failed**. The 5 newest (2 non-ASCII
+hosts, 1 helper with an empty authority, 2 path controls with `@`) fail against
+the library of `6a5f923`. Measured in round 114 with the test file of
+`6a5f923` (191 specs): `ac47c1c` fails 7, `f79a85f` fails 12, `main` fails 22
+(the 5 from #19, the 14 bypass URLs and the 3 empty authorities). Full suite on
+`ac47c1c` -- **1818 passed, 0 failed**; rerun on the release tree before the tag.

@@ -310,8 +310,9 @@ _dest_brackets_ok() {  # _dest_brackets_ok <text> <url|scp>
 #     is refused with the `%`; it is too rare to justify its own parser.
 # The caller refuses all of these.
 #
-# Not covered, on purpose: a host alias in ~/.ssh/config that points at
-# github.com (`git@github-work:o/r`) reads as "not GitHub". Resolving it would
+# Not covered, on purpose: an IP literal of GitHub's (`git@140.82.121.4:o/r`)
+# and a host alias in ~/.ssh/config that points at
+# github.com (`git@github-work:o/r`) both read as "not GitHub". Resolving them would
 # take `ssh -G`, and `core.sshCommand`, `GIT_SSH` and `GIT_SSH_COMMAND` can
 # point at another ssh or another config, so the answer would not hold.
 #
