@@ -344,9 +344,10 @@ dest_github_slug() {
         # (review omabackup-112). Anything else that names no host is refused.
         [[ -z "$auth" && ( "$scheme" != file || -n "$helper" ) ]] && return 2
         # via_curl is the gate's conservative class: http(s), alone or behind an
-        # http(s) helper name. Curl leaves the userinfo alone. Every other URL is
-        # held to the stricter rules for what git parses itself, which decodes it
-        # first (a helper or an unknown scheme does its own parsing: a guess).
+        # http(s) helper name. Curl splits out the authority first and decodes user
+        # and password only after that, so a `%` in the userinfo is harmless. Every
+        # other URL is held to the stricter rules for what git parses itself, which
+        # decodes it first (a helper or an unknown scheme parses on its own: a guess).
         if [[ "$scheme" == http || "$scheme" == https ]] \
             && [[ -z "$helper" || "$helper" == http || "$helper" == https ]]; then
             via_curl=1

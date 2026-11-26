@@ -6642,9 +6642,9 @@ No version bump and no `CHANGELOG.md` entry: left to the release commit.
 
 ### The privacy gate and git's own URL parser (2026-11-26)
 
-Review of the #19 merge (rounds omabackup-110 to 115) found more spellings where
+Review of the #19 merge (rounds omabackup-110 to 116) found more spellings where
 git connects to a host that `dest_github_slug` read differently. Commits
-`f79a85f`, `ac47c1c`, `6a5f923` and the one after it.
+`f79a85f`, `ac47c1c`, `6a5f923`, `b7e7bec` and `e610fe1`.
 
 **What git does that the function did not.** For `ssh://` and `git://` URLs git
 parses the URL itself: it url-decodes the whole URL once before it finds the end
@@ -6686,7 +6686,8 @@ done here (rev-1, rounds 112 to 114, P2).
 (2 non-ASCII hosts, 1 helper with an empty authority, 2 path controls with `@`)
 fail against the library of `6a5f923`; the scp control with a literal
 `%40%5B` in the path (round 115) fails against the library of `73694a4`; the
-other 5 added in round 115 are regression cover that already passed. Measured in round 114 with the test file of
-`6a5f923` (191 specs): `ac47c1c` fails 7, `f79a85f` fails 12, `main` fails 22
+other 4 added in round 115 (3 refused URLs and the UTF-8 locale spec) are
+regression cover that already passed. Measured in round 114 with the test file
+of `6a5f923` (191 specs): `ac47c1c` fails 7, `f79a85f` fails 12, `main` fails 22
 (the 5 from #19, the 14 bypass URLs and the 3 empty authorities). Full suite on
-`ac47c1c` -- **1818 passed, 0 failed**; rerun on the release tree before the tag.
+`e610fe1` -- **1835 passed, 0 failed**; rerun on the release tree before the tag.
