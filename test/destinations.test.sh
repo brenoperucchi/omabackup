@@ -501,11 +501,12 @@ for PG6E_URL in 'ssh://evil.com%2f@github.com/o/r' 'git://evil.com%2f@github.com
                 'ssh://evil.com/x@%5BGITHUB.com%5D/o/r' 'evil.com:x/@[github.com]:o/r' \
                 'git@evil.com:o/@[github.com]:r' \
                 'https:///github.com/o/r' 'http:///github.com/o/r' 'https:////github.com/o/r' \
-                'https://gıthub.com/o/r' 'https://ｇithub.com/o/r' 'foo::file:///github.com/o/r'; do
+                'https://gıthub.com/o/r' 'https://ｇithub.com/o/r' 'foo::file:///github.com/o/r' \
+                'https://github。com/o/r' 'https://GİTHUB.com/o/r' 'git@ｇithub.com:o/r'; do
     PG6E="$(mktemp -d)"; _gate_fixture "$PG6E" "$PG6E_URL" 404
     PG6E_OUT="$(_gate_push "$PG6E" github)"
 
-    it "a remote whose authority holds % or a bracket outside an IPv6 literal is never probed and never pushed to: $PG6E_URL"
+    it "a remote whose host git or curl would read differently is never probed and never pushed to: $PG6E_URL"
     [[ ! -e "$PG6E/curl.calls" && ! -e "$PG6E/git.pushes" && "$PG6E_OUT" == *skipped* ]] \
         && ok || fail "probed=$([[ -e "$PG6E/curl.calls" ]] && echo yes || echo no) pushed=$([[ -e "$PG6E/git.pushes" ]] && echo yes || echo no) out: $PG6E_OUT"
 done
@@ -549,7 +550,8 @@ done
 # unchanged with no probe and no refusal.
 for PG6I_URL in 'ssh://git@backup.example/archive[year]/r' 'git@backup.example:archive[year]/r' \
                 'backup.example:archive[year]/r' 'file:///srv/archive[year]/r' \
-                'git@[2001:db8::1]:archive/team@year/r' 'ssh://git@backup.example/archive[year]/team@year/r'; do
+                'git@[2001:db8::1]:archive/team@year/r' 'ssh://git@backup.example/archive[year]/team@year/r' \
+                'git@backup.example:archive/team%40%5Byear/r'; do
     PG6I="$(mktemp -d)"; _gate_fixture "$PG6I" "$PG6I_URL" 200
     _gate_push "$PG6I" github >/dev/null
 
@@ -557,6 +559,12 @@ for PG6I_URL in 'ssh://git@backup.example/archive[year]/r' 'git@backup.example:a
     [[ -e "$PG6I/git.pushes" && ! -e "$PG6I/curl.calls" ]] && ok \
         || fail "pushed=$([[ -e "$PG6I/git.pushes" ]] && echo yes || echo no) probed=$([[ -e "$PG6I/curl.calls" ]] && echo yes || echo no)"
 done
+
+PG6J="$(mktemp -d)"; _gate_fixture "$PG6J" 'https://GİTHUB.com/o/r' 404
+PG6J_OUT="$(LC_ALL=C.UTF-8 _gate_push "$PG6J" github)"
+it "the host check gives the same answer under a UTF-8 locale"
+[[ ! -e "$PG6J/curl.calls" && ! -e "$PG6J/git.pushes" && "$PG6J_OUT" == *skipped* ]] && ok \
+    || fail "probed=$([[ -e "$PG6J/curl.calls" ]] && echo yes || echo no) pushed=$([[ -e "$PG6J/git.pushes" ]] && echo yes || echo no) out: $PG6J_OUT"
 
 PG7="$(mktemp -d)"; _gate_fixture "$PG7" 'https://breno:ghp_PROBE_TOKEN@github.com/user/dotfiles.git' 200
 PG7_OUT="$(_gate_push "$PG7" github)"

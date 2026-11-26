@@ -6662,8 +6662,8 @@ only after it has split out the authority.
   every scheme;
 - a bracket in the authority that does not wrap a plain IPv6 literal;
 - `@[` after the authority, in any spelling (`@%5b`, `%40[`, `%40%5b`), for the
-  same URLs and for the path of a scp-like remote
-  (`ssh://evil.com/x@[github.com]/o/r`);
+  URLs git parses itself (`ssh://evil.com/x@[github.com]/o/r`); for a scp-like
+  remote, which git copies without decoding, only the literal `@[`;
 - an empty authority, except for a plain `file://` URL with no explicit helper
   (`https:///github.com/o/r` reaches github.com through curl);
 - a non-ASCII host name, for every scheme.
@@ -6682,9 +6682,11 @@ alias, an IP literal of GitHub's (`git@140.82.121.4:o/r`), an explicit helper,
 the probe. Binding probe and push to one resolved set is separate work, not
 done here (rev-1, rounds 112 to 114, P2).
 
-**Specs.** `destinations` -- **196 passed, 0 failed**. The 5 newest (2 non-ASCII
-hosts, 1 helper with an empty authority, 2 path controls with `@`) fail against
-the library of `6a5f923`. Measured in round 114 with the test file of
+**Specs.** `destinations` -- **201 passed, 0 failed**. The 5 added in round 114
+(2 non-ASCII hosts, 1 helper with an empty authority, 2 path controls with `@`)
+fail against the library of `6a5f923`; the scp control with a literal
+`%40%5B` in the path (round 115) fails against the library of `73694a4`; the
+other 5 added in round 115 are regression cover that already passed. Measured in round 114 with the test file of
 `6a5f923` (191 specs): `ac47c1c` fails 7, `f79a85f` fails 12, `main` fails 22
 (the 5 from #19, the 14 bypass URLs and the 3 empty authorities). Full suite on
 `ac47c1c` -- **1818 passed, 0 failed**; rerun on the release tree before the tag.

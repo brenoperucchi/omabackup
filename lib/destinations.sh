@@ -302,18 +302,26 @@ _dest_brackets_ok() {  # _dest_brackets_ok <text> <url|scp>
 #     from the host and the userinfo alike, so `git@[github.com]:o/r` and
 #     `[git@github.com]@evil.com:o/r` reach github.com while this function read
 #     `[github.com]` or `evil.com`. A plain IPv6 literal can never be github.com
-#     and keeps working. Git also looks for `@[` in everything after the
-#     authority, so `ssh://evil.com/x@[github.com]/o/r` connects to github.com
-#     (and `%5b`/`%5d` in the path do the same, after the decode): for the same
-#     non-curl URLs a bracket or `%5b`/`%5d` after the authority is refused too
-#     (review omabackup-111). A zone id in an IPv6 literal (`[fe80::1%25eth0]`)
-#     is refused with the `%`; it is too rare to justify its own parser.
+#     and keeps working. A zone id in an IPv6 literal (`[fe80::1%25eth0]`) is
+#     refused with the `%`; it is too rare to justify its own parser.
+#   - `@[` after the authority, which is where git starts a host over again:
+#     `ssh://evil.com/x@[github.com]/o/r` connects to github.com. For the URLs
+#     git parses itself the pair is refused in any spelling after one decode
+#     (`@%5b`, `%40[`, `%40%5b`); for a scp-like remote, which git copies without
+#     decoding, only the literal `@[` is. A bracket or an `@` alone in a
+#     directory name (`archive[year]`, `team@year`) is a path and passes
+#     (reviews omabackup-111, 112, 114, 115).
+#   - an empty authority, except a plain `file://` URL with no explicit helper:
+#     curl skips extra slashes, so `https:///github.com/o/r` reaches github.com.
+#   - a non-ASCII host name, for every scheme: curl turns it into ASCII (IDNA)
+#     before it connects, and this function compares the raw bytes.
 # The caller refuses all of these.
 #
 # Not covered, on purpose: an IP literal of GitHub's (`git@140.82.121.4:o/r`)
-# and a host alias in ~/.ssh/config that points at
-# github.com (`git@github-work:o/r`) both read as "not GitHub". Resolving them would
-# take `ssh -G`, and `core.sshCommand`, `GIT_SSH` and `GIT_SSH_COMMAND` can
+# and a host alias in ~/.ssh/config that points at github.com
+# (`git@github-work:o/r`) both read as "not GitHub". They are separate limits:
+# an IP says nothing about who owns it, and resolving an alias would take
+# `ssh -G`, and `core.sshCommand`, `GIT_SSH` and `GIT_SSH_COMMAND` can
 # point at another ssh or another config, so the answer would not hold.
 #
 # Never prints its input: a remote URL may carry a token in its userinfo.
@@ -335,8 +343,10 @@ dest_github_slug() {
         # connects to github.com while this function saw no host at all
         # (review omabackup-112). Anything else that names no host is refused.
         [[ -z "$auth" && ( "$scheme" != file || -n "$helper" ) ]] && return 2
-        # Only http(s) goes through curl, which leaves the userinfo alone. Every
-        # other URL is parsed by git, which decodes it first.
+        # via_curl is the gate's conservative class: http(s), alone or behind an
+        # http(s) helper name. Curl leaves the userinfo alone. Every other URL is
+        # held to the stricter rules for what git parses itself, which decodes it
+        # first (a helper or an unknown scheme does its own parsing: a guess).
         if [[ "$scheme" == http || "$scheme" == https ]] \
             && [[ -z "$helper" || "$helper" == http || "$helper" == https ]]; then
             via_curl=1
@@ -361,7 +371,8 @@ dest_github_slug() {
             _dest_brackets_ok "${u%%/*}" scp || return 2
             path="${u#*]:}"     # the first colon was inside the IPv6 literal
         fi
-        _dest_tail_ok "$path" || return 2
+        # scp-like text is copied, not decoded: only a literal `@[` can start a host.
+        [[ "$path" == *@\[* ]] && return 2
     else
         return 1
     fi
