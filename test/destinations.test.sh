@@ -458,6 +458,25 @@ for PG6C_URL in 'https://%67ithub.com/o/r' 'https://github%2ecom/o/r' 'ssh://git
         && ok || fail "probed=$([[ -e "$PG6C/curl.calls" ]] && echo yes || echo no) pushed=$([[ -e "$PG6C/git.pushes" ]] && echo yes || echo no) out: $PG6C_OUT"
 done
 
+# The host is what git connects to, and git (through curl) ends a URL's
+# authority at the first `/`, `?` or `#`. dest_github_slug ended it at `/`
+# only, then dropped everything up to the last `@` as userinfo, so in
+# `https://evil.com?@github.com/o/r` it read the host as github.com while git
+# connects to evil.com: GitHub was asked about o/r, a private or absent repo
+# answered 404, and the push went to evil.com. `\` is refused with them,
+# because some URL parsers read it as `/`. None of the three belongs in a
+# hostname, so a URL with one before its first `/` is refused, not decoded.
+for PG6D_URL in 'https://evil.com?@github.com/o/r' 'https://evil.com#@github.com/o/r' \
+                'https://evil.com\@github.com/o/r' 'ssh://evil.com?@github.com/o/r' \
+                'https://github.com?x/o/r'; do
+    PG6D="$(mktemp -d)"; _gate_fixture "$PG6D" "$PG6D_URL" 404
+    PG6D_OUT="$(_gate_push "$PG6D" github)"
+
+    it "a remote whose authority holds ? # or \\ is never probed and never pushed to: $PG6D_URL"
+    [[ ! -e "$PG6D/curl.calls" && ! -e "$PG6D/git.pushes" && "$PG6D_OUT" == *skipped* ]] \
+        && ok || fail "probed=$([[ -e "$PG6D/curl.calls" ]] && echo yes || echo no) pushed=$([[ -e "$PG6D/git.pushes" ]] && echo yes || echo no) out: $PG6D_OUT"
+done
+
 PG7="$(mktemp -d)"; _gate_fixture "$PG7" 'https://breno:ghp_PROBE_TOKEN@github.com/user/dotfiles.git' 200
 PG7_OUT="$(_gate_push "$PG7" github)"
 

@@ -259,7 +259,13 @@ dest_github_push_url() {
 #     ...`). A helper can reach anywhere, and only a URL says where. `ext::`
 #     is always a command with arguments, even when its first token looks like
 #     a URL, so it is never an address we can safely map to GitHub.
-# The caller refuses all three.
+#   - a `?`, `#` or `\` before the path. Git, through curl, ends the authority
+#     at the first `/`, `?` or `#`; this function ended it at `/` only and then
+#     dropped everything up to the last `@`, so `https://evil.com?@github.com/o/r`
+#     read as github.com/o/r while git connected to evil.com. A private or
+#     absent o/r answered 404 and the push went out. None of the three belongs
+#     in a hostname, so the URL is refused rather than parsed a second way.
+# The caller refuses all four.
 #
 # Never prints its input: a remote URL may carry a token in its userinfo.
 dest_github_slug() {
@@ -272,6 +278,7 @@ dest_github_slug() {
     if [[ "$u" =~ ^[A-Za-z][A-Za-z0-9+.-]*://(.*)$ ]]; then
         rest="${BASH_REMATCH[1]}"
         auth="${rest%%/*}"
+        [[ "$auth" == *[?#\\]* ]] && return 2
         [[ "$rest" == */* ]] && path="${rest#*/}"
     elif (( helper )); then
         return 2
