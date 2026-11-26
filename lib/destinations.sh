@@ -220,6 +220,17 @@ dest_github_push_url() {
 # Brackets in an authority are refused unless they wrap a plain IPv6 literal.
 # <kind> is `url` (the text is the authority of `scheme://...`) or `scp` (the
 # text is everything before the first `/` of `[user@]host:path`).
+# What follows the authority may hold a bracket in a directory name
+# (`archive[year]`), and that is fine. It only matters when git can read it as
+# the start of the host: git looks for `@[` after the authority, after decoding
+# the URL. So a path is refused only when it carries an `@` (or `%40`) together
+# with a `[` (or `%5b`); a bracket alone is a path (review omabackup-112).
+_dest_tail_ok() {  # _dest_tail_ok <text after the authority>
+    local t="${1,,}"
+    [[ "$t" == *@* || "$t" == *%40* ]] || return 0
+    [[ "$t" == *[\[\]]* || "$t" == *%5[bd]* ]] && return 1
+    return 0
+}
 _dest_brackets_ok() {  # _dest_brackets_ok <text> <url|scp>
     local t="$1" re
     [[ "$t" == *[\[\]]* ]] || return 0
@@ -317,6 +328,11 @@ dest_github_slug() {
         rest="${BASH_REMATCH[2]}"
         auth="${rest%%/*}"
         [[ "$auth" == *[?#\\]* ]] && return 2
+        # An empty authority is only a real thing for file://. For http(s) curl
+        # skips extra slashes after the scheme, so `https:///github.com/o/r`
+        # connects to github.com while this function saw no host at all
+        # (review omabackup-112). Anything else that names no host is refused.
+        [[ -z "$auth" && "$scheme" != file ]] && return 2
         # Only http(s) goes through curl, which leaves the userinfo alone. Every
         # other URL is parsed by git, which decodes it first.
         if [[ "$scheme" == http || "$scheme" == https ]] \
@@ -326,7 +342,7 @@ dest_github_slug() {
         if (( ! via_curl )); then
             [[ "$auth" == *%* ]] && return 2
             tail="${rest:${#auth}}"
-            [[ "$tail" == *[\[\]]* || "${tail,,}" == *%5[bd]* ]] && return 2
+            _dest_tail_ok "$tail" || return 2
         fi
         _dest_brackets_ok "$auth" url || return 2
         [[ "$rest" == */* ]] && path="${rest#*/}"
@@ -337,9 +353,10 @@ dest_github_slug() {
         # after a slash belongs to a local path, not to a host.
         auth="${u%%:*}"; path="${u#*:}"
         [[ "$auth" == */* ]] && return 1
-        _dest_brackets_ok "${u%%/*}" scp || return 2
-        tail="${u%%/*}"; tail="${u:${#tail}}"
-        [[ "$tail" == *[\[\]]* ]] && return 2
+        # Brackets before the colon are a host spelling and go through the
+        # IPv6 check; brackets after it are part of the path (`archive[year]`).
+        [[ "$auth" == *[\[\]]* ]] && { _dest_brackets_ok "${u%%/*}" scp || return 2; }
+        _dest_tail_ok "$path" || return 2
     else
         return 1
     fi

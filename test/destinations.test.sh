@@ -499,7 +499,8 @@ for PG6E_URL in 'ssh://evil.com%2f@github.com/o/r' 'git://evil.com%2f@github.com
                 'ssh://[git@github.com]@evil.com/o/r' '[git@github.com]@evil.com:o/r' \
                 'ssh://evil.com/x@[github.com]/o/r' 'ssh://evil.com/x%40%5bgithub.com%5d/o/r' \
                 'ssh://evil.com/x@%5BGITHUB.com%5D/o/r' 'evil.com:x/@[github.com]:o/r' \
-                'git@evil.com:o/@[github.com]:r'; do
+                'git@evil.com:o/@[github.com]:r' \
+                'https:///github.com/o/r' 'http:///github.com/o/r' 'https:////github.com/o/r'; do
     PG6E="$(mktemp -d)"; _gate_fixture "$PG6E" "$PG6E_URL" 404
     PG6E_OUT="$(_gate_push "$PG6E" github)"
 
@@ -540,6 +541,19 @@ for PG6F_URL in 'ssh://[::1]/o/r' 'ssh://git@[2001:db8::1]:2222/o/r' 'git@[::1]:
     it "an IPv6 literal origin is still pushed to unchanged, with no probe: $PG6F_URL"
     [[ -e "$PG6F/git.pushes" && ! -e "$PG6F/curl.calls" ]] && ok \
         || fail "pushed=$([[ -e "$PG6F/git.pushes" ]] && echo yes || echo no) probed=$([[ -e "$PG6F/curl.calls" ]] && echo yes || echo no)"
+done
+
+# Controls (review omabackup-112): a bracket that is only part of a directory
+# name is a path, not a host. These are not GitHub, so they are pushed to
+# unchanged with no probe and no refusal.
+for PG6I_URL in 'ssh://git@backup.example/archive[year]/r' 'git@backup.example:archive[year]/r' \
+                'backup.example:archive[year]/r' 'file:///srv/archive[year]/r'; do
+    PG6I="$(mktemp -d)"; _gate_fixture "$PG6I" "$PG6I_URL" 200
+    _gate_push "$PG6I" github >/dev/null
+
+    it "a bracket in a directory name is a path, so the origin is pushed to unchanged: $PG6I_URL"
+    [[ -e "$PG6I/git.pushes" && ! -e "$PG6I/curl.calls" ]] && ok \
+        || fail "pushed=$([[ -e "$PG6I/git.pushes" ]] && echo yes || echo no) probed=$([[ -e "$PG6I/curl.calls" ]] && echo yes || echo no)"
 done
 
 PG7="$(mktemp -d)"; _gate_fixture "$PG7" 'https://breno:ghp_PROBE_TOKEN@github.com/user/dotfiles.git' 200
