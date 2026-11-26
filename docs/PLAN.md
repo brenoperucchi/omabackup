@@ -6639,3 +6639,44 @@ the two extra are the load-flaky Config TUI Escape spec, which passes alone
 (`config` -- **240 passed, 0 failed**). Not run on a live Omarchy session.
 
 No version bump and no `CHANGELOG.md` entry: left to the release commit.
+
+### The privacy gate and git's own URL parser (2026-11-26)
+
+Review of the #19 merge (rounds omabackup-110 to 113) found more spellings where
+git connects to a host that `dest_github_slug` read differently. Commits
+`f79a85f`, `ac47c1c` and `6a5f923`.
+
+**What git does that the function did not.** For `ssh://`, `git://` and
+helper URLs git parses the URL itself: it url-decodes the whole URL before it
+finds the end of the host, strips `[` and `]` from host and userinfo, and looks
+for `@[` in everything after the authority. Only `http(s)://` goes to curl,
+which ends the authority at `/ ? #`, skips extra slashes after the scheme and
+leaves the userinfo alone.
+
+**The rules now.** Refused (status 2, the push is skipped and says so):
+- a `%` in the authority of a URL git parses itself, and a `%` in the host for
+  every scheme;
+- a bracket that does not wrap a plain IPv6 literal, in the authority;
+- after the authority, a `[`/`]` (or `%5b`/`%5d`) together with an `@`/`%40`,
+  for URLs git parses itself (`ssh://evil.com/x@[github.com]/o/r`);
+- an empty authority for anything but `file://`
+  (`https:///github.com/o/r` reaches github.com through curl).
+A bracket alone in a directory name (`archive[year]`) is a path and is pushed
+to unchanged. `https://DOMAIN%5Cuser@host/...` keeps working: curl does not
+decode the userinfo.
+
+**Still refused although legitimate, on purpose.** IPv6 with a zone id
+(`[fe80::1%25eth0]`), and a `%`-encoded userinfo in an `ssh://` URL. Rare, and
+the refusal fails closed.
+
+**Scope of the guarantee.** The gate classifies the effective URL that
+`git remote get-url --push --all` prints. It does not resolve an ssh_config
+alias, an explicit helper, `core.sshCommand`, or an HTTP redirect, and push
+resolves `origin` again after the probe. Binding probe and push to one resolved
+set is separate work, not done here (rev-1, round 112 and 113, P2).
+
+**Specs.** `destinations` -- **191 passed, 0 failed**. Against the previous
+`lib/destinations.sh` the 7 newest fail (3 empty authorities, 4 bracket-in-path
+controls); `f79a85f` fails the 7 that `ac47c1c` added; `main` fails the 5 from
+#19 and the 14 bypass URLs. Full suite on `ac47c1c` -- **1818 passed, 0
+failed**; rerun on the release tree before the tag.
